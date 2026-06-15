@@ -27,9 +27,12 @@ current project. You can add instances, switch between them, and exited instance
 removed automatically.
 
 - **Left sidebar** lists all running instances (`claude #N`); the focused one is highlighted.
+  Each carries a **status dot**: green `ready` (idle / waiting for you), yellow `working`
+  (mid-turn), red `needs you` (a question, permission, or idle wait). See *Status indicators*.
 - **Center pane** shows the focused instance's live Claude, or a clean "No active Claude"
   hint when none are running.
-- **Right sidebar** shows project path, instance count, center-pane size, and the key legend.
+- **Right sidebar** shows project path, instance count, center-pane size, a status legend,
+  and the key legend.
 
 Real "general info" content for the right sidebar is a future milestone.
 
@@ -41,6 +44,10 @@ Real "general info" content for the right sidebar is a future milestone.
 - **Ctrl+Q ×2** — quit Mulpex (press twice within 3s; the first press shows a red
   "press Ctrl+Q again to quit" banner on the center pane, which clears after the window lapses)
 - **everything else (incl. Ctrl+C, Esc)** — forwarded to the focused Claude
+- **mouse wheel** — scrolls Mulpex's scrollback view of the focused Claude
+- **left click-drag** — selects text in the center pane; **double-click** selects a word and
+  **double-click+drag** extends by whole words; copies to the clipboard on release, with a
+  brief `✓ copied N chars` flash in the title (see *Mouse: scrollback + selection*)
 
 **The macOS keybinding minefield (why the keys are what they are):**
 
@@ -75,6 +82,83 @@ so you can cycle forward through all instances.
   by the reader thread flipping the shared `dirty` flag on EOF.
 - Each `TermSession` has a stable display `id` (`claude #N`); `App.next_id` only increments.
 
+### Status indicators (WORKING / WAITING / NEEDS YOU)
+
+Each sidebar instance shows what its Claude is doing, sourced from **Claude Code lifecycle
+hooks** — *not* by scraping the screen (robust across CC versions).
+
+- At spawn, `App` creates a per-run scratch dir `$TMPDIR/mulpex-<pid>/` and writes one
+  static `settings.json` into it (`HOOK_SETTINGS_JSON` in `app.rs`).
+- Each `TermSession` is launched with `--settings <that file>` plus env
+  `MULPEX_INSTANCE_ID=<id>` and `MULPEX_STATE_DIR=<dir>`. The hooks are one-liners that
+  `printf` a single word into `$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID`, so **one static
+  settings file serves every instance** (the id lives in the env, not the file). Using
+  `--settings` means we never touch the user's project `.claude/settings.json`.
+- State machine: `UserPromptSubmit` / `PostToolUse` → `working`; `Stop` → `waiting`;
+  `PreToolUse[AskUserQuestion]` and the `permission_prompt` / `idle_prompt` **Notification**
+  matchers → `needs`. A fresh instance with no file yet reads as `Waiting` (ready).
+- `App` polls the state files every ~200ms (`STATUS_POLL`) and on change requests a redraw.
+  Most transitions coincide with PTY output (already a redraw trigger); the poll is the
+  backstop for the idle notification, which produces no output.
+- **Known gap:** `AskUserQuestion` does not reliably fire its own hook, and `Stop` does not
+  fire while a question is pending — so a session blocked on a question can read `working`
+  until the `idle_prompt` notification arrives (the backstop). `--dangerously-skip-permissions`
+  (how we launch) suppresses the permission UI, so the live states are mostly working↔waiting
+  plus the idle/question case. Verified: hooks fire with the real `claude` binary
+  (`working` mid-turn → `waiting` on Stop).
+- Cleanup: `impl Drop for App` clears `instances` (killing every process group, see teardown)
+  **before** `remove_dir_all`ing the scratch dir, so no child recreates a state file after.
+
+### Mouse: scrollback + selection
+
+Two facts drive the design: (1) without mouse capture the outer terminal turns the wheel into
+**arrow keys** in the alternate screen (so it moved the prompt cursor, not the conversation);
+(2) Claude Code renders its conversation **inline** and relies on the *terminal's* scrollback —
+it does **not** scroll on the wheel itself. So forwarding the wheel to Claude does nothing
+useful. Instead Mulpex behaves like tmux: it keeps its own scrollback and the wheel scrolls
+*our* view of it.
+
+- The vt100 parser is created with a real scrollback (`SCROLLBACK_LEN = 10_000`, a lazily
+  growing `VecDeque` — not preallocated). Previously it was `0`, so there was nothing to
+  scroll back to.
+- `main.rs` enables `EnableMouseCapture` (required just to *receive* the wheel — crossterm has
+  no wheel-only mode). `App::on_mouse` handles `ScrollUp`/`ScrollDown` over the center pane by
+  moving the focused `TermSession`'s scrollback offset (`scroll_up`/`scroll_down`, ±3 lines;
+  vt100 clamps). Events over a sidebar, and non-wheel events, are ignored.
+- Any input (`send_to_active`) calls `scroll_to_bottom()` first, so typing snaps back to live
+  output like a normal terminal. The center-pane title shows `↑ scrollback −N · type to return`
+  with a yellow border while scrolled up, so it's obvious you're not at live.
+- Mouse events only redraw when the offset actually changed (no storm on `1003` moves);
+  scrolling is a Mulpex-side view change, so it sets the redraw itself (not via the PTY
+  `dirty` flag).
+- **Text selection / copy (tmux copy-mode style).** Capture suppresses the outer terminal's
+  drag-to-select, so Mulpex does selection itself rather than offloading it (which would force
+  an Option-drag bypass). The protocol forces this: there is no "wheel-only" mouse mode — the
+  wheel is reported through the same button modes as clicks/drags, so enabling the wheel
+  necessarily enables click/drag reporting, which suppresses terminal-native selection.
+  - `App::on_mouse` tracks a left **Down → Drag → Up** as a `Selection` of visible-screen
+    cells `(row, col)`; `ui::highlight_selection` overlays a blue background on those cells
+    *after* the `PseudoTerminal` renders (via `Frame::buffer_mut`).
+  - **Double-click** (two Downs on the same cell within `DOUBLE_CLICK` = 400ms) selects a
+    word: `TermSession::word_at` expands the cell over word chars (`is_word_char` =
+    alphanumeric + `_-./~+@:`, so paths/URLs grab whole). It's stored as the `word_pivot`;
+    dragging then unions the pivot word with the word under the cursor, so the selection
+    grows whole-word-at-a-time.
+  - On release, `TermSession::selection_text` reads the range with vt100's scrollback-aware
+    `contents_between` (start inclusive, end made exclusive) and `copy_to_clipboard` pipes it
+    to `pbcopy` (macOS; best-effort), returning the char count. A bare click (no drag, no
+    word) selects nothing.
+  - **Why no ⌘C / the "✓ copied" flash:** ⌘ combos are owned by the terminal/macOS menu and
+    never reach Mulpex, so ⌘C can't be bound — and iTerm2's own ⌘C only copies *its* mouse
+    selection, which our mouse reporting suppresses (hence iTerm2's "disable mouse reporting?"
+    nag if you press ⌘C). So copy happens automatically on release; the center title flashes
+    `✓ copied N chars` (green, `COPIED_FLASH` = 2s) so you trust it and don't reach for ⌘C.
+    (⌘V still works normally — iTerm2 sends a bracketed paste, which we forward to Claude.)
+  - The selection is in *view* coordinates, so it's cleared on scroll and on any key input;
+    `ui::center_inner_rect` is the shared source of truth for pane geometry / coordinate
+    mapping. Verified end-to-end (simulated drag, double-click, and word-drag → exact
+    clipboard matches + blue highlight + flash).
+
 ## Stack
 
 Rust + ratatui. Verified working dependency chain (see `Cargo.toml`):
@@ -98,21 +182,32 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
 ## Architecture (`src/`)
 
 - `main.rs` — entry point. Uses `ratatui::init()` (raw mode + alternate screen + a panic
-  hook that restores the terminal) and `ratatui::restore()`. Enables bracketed paste.
+  hook that restores the terminal) and `ratatui::restore()`. Enables bracketed paste and
+  mouse capture (and disables both on exit).
 - `app.rs` — `App` state + event loop. Holds `instances: Vec<TermSession>` and an `active`
   index. Polls events (~15ms), redraws when input is handled or the PTY reader signals new
   output via a shared `dirty` flag, and reaps exited sessions each iteration. Routes the
-  reserved combos (Ctrl+Q/N/↑/↓); all other keys forward to the focused session.
-- `term_session.rs` — `TermSession`: spawns `claude` on a PTY, a reader thread feeds the
-  `vt100::Parser`, `resize()` updates both the parser and the PTY master, and `Drop`
-  tears down the child (see teardown note). All instances share one `dirty` flag.
+  reserved combos (Ctrl+Q/N/↑/↓); all other keys forward to the focused session. Also owns
+  the status pipeline: the `Status` enum, the `HOOK_SETTINGS_JSON` it writes, the scratch
+  dir, the ~200ms `refresh_statuses` poll, and an `impl Drop` that tears down sessions then
+  removes the scratch dir (see *Status indicators*).
+- `term_session.rs` — `TermSession`: spawns `claude` on a PTY (with `--settings` + the
+  `MULPEX_INSTANCE_ID`/`MULPEX_STATE_DIR` env for status hooks), a reader thread feeds the
+  `vt100::Parser` (created with a `SCROLLBACK_LEN` buffer), `resize()` updates both the parser
+  and the PTY master, `scroll_up`/`scroll_down`/`scroll_to_bottom`/`scrollback` drive the
+  wheel-scroll view, and `Drop` tears down the child (see teardown note). All instances share
+  one `dirty` flag.
 - `keymap.rs` — `key_to_bytes`: translate crossterm `KeyEvent`s into the byte sequences a
   terminal program expects (control bytes, ESC-prefixed alt, CSI arrows/keys with xterm
-  modifier encoding, function keys). This is what makes the embedded session feel native.
+  modifier encoding, function keys). This makes the embedded session feel native. (Mouse is
+  handled separately as Mulpex-side scrollback, not forwarded — see *Mouse: scrollback +
+  selection*.)
 - `ui.rs` — the 3-pane `Layout` (`Length(30) | Min(20) | Length(34)`), focus border
   styling, and compositing the `PseudoTerminal` into the center pane. `center_inner_size`
-  is the single source of truth for the PTY size (pane minus its border).
-- `pane.rs` — placeholder sidebar renderers (instances list, info panel).
+  is the single source of truth for the PTY size (pane minus its border); `center_inner_rect`
+  gives the same area with its position, used for mouse-coordinate translation.
+- `pane.rs` — sidebar renderers: the instances list (each row a status-coloured dot + word
+  via `Status::indicator`) and the info panel (project, counts, status legend, key legend).
 
 ## Keyboard model (decided)
 
@@ -143,10 +238,16 @@ torn down. Verified: after Ctrl+Q ×2 with multiple instances, no orphaned `clau
 ## Build / run
 
 ```sh
-cargo build              # or: cargo build --release
-cargo run                # runs in the current directory's project
-cargo install --path .   # installs `mulpex` on PATH
+cargo build                       # or: cargo build --release
+cargo run                         # runs in the current directory's project
+cargo install --path . --locked   # installs `mulpex` on PATH
 ```
+
+**Always install with `--locked`.** `cargo install` ignores `Cargo.lock` by default and
+re-resolves dependencies, which pulls a newer `ratatui-core`/`ratatui-widgets` than
+`tui-term` 0.3 targets — producing the confusing `PseudoTerminal doesn't implement Widget`
+(E0277) error even though `cargo build` (which respects the lockfile) compiles fine.
+`--locked` makes the install use the pinned, known-good versions.
 
 ## How to verify (no real terminal needed)
 

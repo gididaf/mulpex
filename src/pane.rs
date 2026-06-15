@@ -18,7 +18,7 @@ pub fn render_instances(f: &mut Frame, area: Rect, app: &App, focused: bool) {
 
     let items: Vec<ListItem> = if app.instances.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "(none — Ctrl+N)",
+            "(none — Ctrl+T)",
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
@@ -28,16 +28,30 @@ pub fn render_instances(f: &mut Frame, area: Rect, app: &App, focused: bool) {
             .map(|(i, session)| {
                 let active = i == app.active;
                 let marker = if active { "▸ " } else { "  " };
-                let text = format!("{}● claude #{}", marker, session.id());
-                let style = if active {
+                let (dot_color, word) = app.status_of(session.id()).indicator();
+
+                // Active rows get the cyan highlight bar; the status dot/word
+                // keep their own colour on top of it so state stays legible.
+                let base = if active {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Green)
+                    Style::default()
                 };
-                ListItem::new(Line::from(Span::styled(text, style)))
+                let name_style = if active {
+                    base
+                } else {
+                    base.fg(Color::Gray)
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, base),
+                    Span::styled("● ", base.fg(dot_color)),
+                    Span::styled(format!("claude #{}", session.id()), name_style),
+                    Span::styled(format!("  {}", word), base.fg(dot_color).add_modifier(Modifier::DIM)),
+                ]))
             })
             .collect()
     };
@@ -84,6 +98,11 @@ pub fn render_info(f: &mut Frame, area: Rect, app: &App, focused: bool) {
             ))
         },
         Line::from(""),
+        Line::from(Span::styled("Status", label())),
+        status_legend(Color::Green, "ready (waiting for you)"),
+        status_legend(Color::Yellow, "working"),
+        status_legend(Color::LightRed, "needs you"),
+        Line::from(""),
         Line::from(Span::styled("Keys", label())),
         Line::from(" Ctrl+T    new instance"),
         Line::from(" Ctrl+]    next instance"),
@@ -100,4 +119,12 @@ fn label() -> Style {
     Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+/// One `● description` row for the info-pane status legend.
+fn status_legend(color: Color, text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(color)),
+        Span::styled(text.to_string(), Style::default().fg(Color::Gray)),
+    ])
 }

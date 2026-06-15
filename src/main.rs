@@ -19,8 +19,8 @@ mod ui;
 use std::io::stdout;
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
@@ -44,11 +44,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let _ = execute!(stdout(), EnableBracketedPaste);
+    // Capture mouse events so we can forward them to Claude (scroll, clicks)
+    // instead of letting the outer terminal translate the wheel into arrow keys.
+    let _ = execute!(stdout(), EnableMouseCapture);
 
     let size = terminal.size()?;
     let result = app::App::new(project_dir, Rect::new(0, 0, size.width, size.height), kitty)
         .and_then(|mut app| app.run(&mut terminal));
 
+    let _ = execute!(stdout(), DisableMouseCapture);
     let _ = execute!(stdout(), DisableBracketedPaste);
     if kitty {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
