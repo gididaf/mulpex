@@ -269,4 +269,4 @@ own `claude` child, then confirm that exact PID is gone after quit.
 
 ## Last Wrapped Commit
 
-`7fb6a27765bb3adc38f3d163032815f665937c52` — 2026-06-15
+`d4a47a257e1b85eb8bac7b2711fc583a712e1d66` — 2026-06-15
