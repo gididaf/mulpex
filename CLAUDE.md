@@ -165,3 +165,7 @@ tmux kill-session -t mptest
 To check for orphaned children precisely (avoid broad `pkill -f claude`, which would hit
 unrelated Claude processes): `MPID=$(pgrep -x mulpex); pgrep -P "$MPID"` to find Mulpex's
 own `claude` child, then confirm that exact PID is gone after quit.
+
+## Last Wrapped Commit
+
+`7fb6a27765bb3adc38f3d163032815f665937c52` — 2026-06-15
