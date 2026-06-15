@@ -1,6 +1,6 @@
 //! Application state and the main event loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 
 use crate::keymap::key_to_bytes;
+use crate::persist::{self, SessionStore};
 use crate::term_session::TermSession;
 use crate::ui;
 
@@ -160,6 +161,13 @@ pub struct App {
     /// Latest known status per instance id, refreshed from the state files.
     statuses: HashMap<usize, Status>,
     last_status_poll: Instant,
+    /// Per-project store of session ids to restore on the next launch.
+    store: SessionStore,
+    /// Instance ids that have been "worked on" — either restored from a previous
+    /// launch, or having fired at least one lifecycle hook this run (i.e. a
+    /// prompt was submitted, so the session has real content). Only these are
+    /// persisted; a freshly spawned, never-used instance is never remembered.
+    worked: HashSet<usize>,
 }
 
 impl App {
@@ -174,31 +182,65 @@ impl App {
         let settings_path = state_dir.join("settings.json");
         std::fs::write(&settings_path, HOOK_SETTINGS_JSON)?;
 
-        let first = TermSession::spawn(
-            1,
-            &project_dir,
-            rows,
-            cols,
-            Arc::clone(&dirty),
-            &settings_path,
-            &state_dir,
-        )?;
+        // Restore the sessions worked on the last time Mulpex ran in this
+        // project: relaunch each saved id with `--resume`. Any that fail to
+        // resume (e.g. their transcript was cleaned up) simply don't come back;
+        // they get pruned on the next persist.
+        let store = SessionStore::new(&project_dir);
+        let mut instances: Vec<TermSession> = Vec::new();
+        let mut worked: HashSet<usize> = HashSet::new();
+        for session_id in store.load() {
+            let id = instances.len() + 1;
+            if let Ok(session) = TermSession::spawn(
+                id,
+                &project_dir,
+                rows,
+                cols,
+                Arc::clone(&dirty),
+                &settings_path,
+                &state_dir,
+                &session_id,
+                true,
+            ) {
+                worked.insert(id);
+                instances.push(session);
+            }
+        }
+
+        // No restorable sessions → start one fresh, with a brand-new session id.
+        if instances.is_empty() {
+            let session_id = persist::new_uuid();
+            let first = TermSession::spawn(
+                1,
+                &project_dir,
+                rows,
+                cols,
+                Arc::clone(&dirty),
+                &settings_path,
+                &state_dir,
+                &session_id,
+                false,
+            )?;
+            instances.push(first);
+        }
+
+        let next_id = instances.len() + 1;
 
         let project_name = project_dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| project_dir.display().to_string());
 
-        Ok(Self {
+        let app = Self {
             project_dir,
             project_name,
-            instances: vec![first],
+            instances,
             active: 0,
             focus: Focus::Center,
             keyboard_enhanced,
             quit_armed_at: None,
             dirty,
-            next_id: 2,
+            next_id,
             center_cols: cols,
             center_rows: rows,
             center_inner,
@@ -210,7 +252,25 @@ impl App {
             settings_path,
             statuses: HashMap::new(),
             last_status_poll: Instant::now(),
-        })
+            store,
+            worked,
+        };
+        // Reconcile the store with what actually came back (prunes any sessions
+        // that no longer resume).
+        app.persist_sessions();
+        Ok(app)
+    }
+
+    /// Write the set of worked-on instances' session ids to the per-project
+    /// store, preserving sidebar order, so the next launch can restore them.
+    fn persist_sessions(&self) {
+        let ids: Vec<String> = self
+            .instances
+            .iter()
+            .filter(|s| self.worked.contains(&s.id()))
+            .map(|s| s.session_id().to_string())
+            .collect();
+        self.store.save(&ids);
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
@@ -303,15 +363,26 @@ impl App {
     /// status changed (so the caller can request a redraw).
     fn refresh_statuses(&mut self) -> bool {
         let mut changed = false;
+        let mut newly_worked = false;
         for session in &self.instances {
             let id = session.id();
-            let status = std::fs::read_to_string(self.state_dir.join(id.to_string()))
-                .ok()
+            let file = std::fs::read_to_string(self.state_dir.join(id.to_string())).ok();
+            // The presence of a state file means at least one lifecycle hook
+            // fired — i.e. a prompt was submitted, so this is a real session
+            // worth remembering.
+            if file.is_some() && self.worked.insert(id) {
+                newly_worked = true;
+            }
+            let status = file
+                .as_deref()
                 .and_then(|s| Status::from_word(s.trim()))
                 .unwrap_or(Status::Waiting);
             if self.statuses.insert(id, status) != Some(status) {
                 changed = true;
             }
+        }
+        if newly_worked {
+            self.persist_sessions();
         }
         changed
     }
@@ -574,6 +645,7 @@ impl App {
     /// Spawn a new Claude in the project dir and focus it.
     fn spawn_instance(&mut self) {
         let id = self.next_id;
+        let session_id = persist::new_uuid();
         match TermSession::spawn(
             id,
             &self.project_dir,
@@ -582,6 +654,8 @@ impl App {
             Arc::clone(&self.dirty),
             &self.settings_path,
             &self.state_dir,
+            &session_id,
+            false,
         ) {
             Ok(session) => {
                 self.next_id += 1;
@@ -636,6 +710,11 @@ impl App {
             // The focused session died; focus the nearest surviving neighbour.
             None => old_active.min(self.instances.len() - 1),
         };
+
+        // A closed instance is forgotten: drop its id from the worked set and
+        // re-persist so it won't be restored next launch.
+        self.worked.retain(|id| self.instances.iter().any(|s| s.id() == *id));
+        self.persist_sessions();
         true
     }
 

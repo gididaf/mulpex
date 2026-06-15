@@ -20,6 +20,10 @@ const SCROLLBACK_LEN: usize = 10_000;
 /// A live `claude` process plus the virtual screen it is drawing to.
 pub struct TermSession {
     id: usize,
+    /// The Claude Code session id (a UUID) this instance runs under, assigned by
+    /// Mulpex via `--session-id` (or `--resume`d on restore). Persisted so the
+    /// session can be brought back on a later launch.
+    session_id: String,
     parser: Arc<RwLock<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -45,6 +49,12 @@ impl TermSession {
     /// state into `state_dir/<id>`. The hooks key the file off the
     /// `MULPEX_INSTANCE_ID` / `MULPEX_STATE_DIR` env vars set here, so one
     /// static settings file serves every instance.
+    ///
+    /// `session_id` is a UUID identifying the Claude Code conversation. When
+    /// `resume` is false the session is created fresh with that id
+    /// (`--session-id <uuid>`); when true an existing session is reopened
+    /// (`--resume <uuid>`), restoring a conversation from an earlier launch.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: usize,
         dir: &Path,
@@ -53,6 +63,8 @@ impl TermSession {
         dirty: Arc<AtomicBool>,
         settings_path: &Path,
         state_dir: &Path,
+        session_id: &str,
+        resume: bool,
     ) -> anyhow::Result<Self> {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -67,6 +79,14 @@ impl TermSession {
 
         let mut cmd = CommandBuilder::new("claude");
         cmd.arg("--dangerously-skip-permissions");
+        // Either create the session with our chosen id, or resume that exact
+        // conversation from a previous launch.
+        if resume {
+            cmd.arg("--resume");
+        } else {
+            cmd.arg("--session-id");
+        }
+        cmd.arg(session_id);
         cmd.arg("--settings");
         cmd.arg(settings_path);
         cmd.env("IS_SANDBOX", "1");
@@ -107,6 +127,7 @@ impl TermSession {
 
         Ok(Self {
             id,
+            session_id: session_id.to_string(),
             parser,
             writer,
             master,
@@ -120,6 +141,11 @@ impl TermSession {
     /// Stable display identifier (e.g. shown as "claude #3").
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// The Claude Code session id (UUID) this instance runs under.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Shared handle to the virtual screen, for rendering.

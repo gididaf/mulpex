@@ -13,6 +13,7 @@
 mod app;
 mod keymap;
 mod pane;
+mod persist;
 mod term_session;
 mod ui;
 
