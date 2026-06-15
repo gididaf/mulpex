@@ -24,7 +24,9 @@ mulpex
 
 3-pane layout with **multiple live, fully-interactive Claude Code sessions** for the
 current project. You can add instances, switch between them, and exited instances are
-removed automatically.
+removed automatically. The **sessions you worked on are remembered**: quit Mulpex and
+reopen it in the same project and it auto-resumes them with their prior conversations
+(see *Session persistence*).
 
 - **Left sidebar** lists all running instances (`claude #N`); the focused one is highlighted.
   Each carries a **status dot**: green `ready` (idle / waiting for you), yellow `working`
@@ -81,6 +83,38 @@ so you can cycle forward through all instances.
   exits, the center shows the empty-state hint. Sessions are reaped in the main loop, woken
   by the reader thread flipping the shared `dirty` flag on EOF.
 - Each `TermSession` has a stable display `id` (`claude #N`); `App.next_id` only increments.
+
+### Session persistence (restore on restart)
+
+Mulpex remembers the Claude Code sessions you worked on per project, so reopening it in the
+same directory **auto-resumes them live** (their prior conversation reappears). Sourced from
+Claude Code's own session storage via the `--session-id` / `--resume` CLI flags — *not* by
+saving any conversation content ourselves.
+
+- **Assign at spawn.** Every `TermSession` gets a UUID (`persist::new_uuid`, dependency-free
+  from `/dev/urandom`) and is launched with `--session-id <uuid>` (fresh) so Mulpex
+  deterministically owns each session's id. On restore it's launched with `--resume <uuid>`
+  instead, which reopens that exact conversation (`resume` flag on `TermSession::spawn`).
+- **Only "worked on" instances are remembered.** An instance is recorded only once a
+  lifecycle hook has fired for it — i.e. a prompt was submitted, so a real conversation
+  exists on disk. A freshly spawned, never-used instance is *never* saved (this is the
+  "instances without a session don't reappear" rule). `App.worked: HashSet<usize>` tracks
+  these: `refresh_statuses` adds an id the moment its hook state file appears; restored
+  instances start already in the set.
+- **The store.** `persist::SessionStore` writes one file per project under
+  `~/.mulpex/sessions/<key>.txt` — Mulpex's own dir, separate from Claude's. The `<key>` is a
+  readable tail of the project path plus a stable **FNV-1a** hash of the full path (unique,
+  bounded length, stable across rebuilds — deliberately *not* `DefaultHasher`, whose output
+  isn't stable). The file's first line is `# <project dir>` for collision verification;
+  remaining lines are session UUIDs in sidebar order. `App::persist_sessions` rewrites it
+  whenever the worked set changes (new hook fired, or `reap_dead` drops a closed instance).
+- **Closed = forgotten.** When an instance exits, `reap_dead` prunes it from `worked` and
+  re-persists, so it won't come back next launch. Sessions that fail to `--resume` (e.g. the
+  transcript was cleaned up after 30 days) simply don't restore and self-heal: they're pruned
+  on the next persist. `App::new` reconciles the store on startup (persists what actually
+  came back). If nothing is restorable, it starts one fresh instance as before.
+- Verified end-to-end with the real `claude` binary (single + multi-instance resume show the
+  prior conversation; a never-prompted instance is not remembered).
 
 ### Status indicators (WORKING / WAITING / NEEDS YOU)
 
@@ -190,13 +224,20 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   reserved combos (Ctrl+Q/N/↑/↓); all other keys forward to the focused session. Also owns
   the status pipeline: the `Status` enum, the `HOOK_SETTINGS_JSON` it writes, the scratch
   dir, the ~200ms `refresh_statuses` poll, and an `impl Drop` that tears down sessions then
-  removes the scratch dir (see *Status indicators*).
+  removes the scratch dir (see *Status indicators*). And the session-persistence pipeline:
+  the `worked` set, `persist_sessions`, restore-on-startup in `App::new` (see *Session
+  persistence*).
+- `persist.rs` — session persistence: `new_uuid` (dependency-free RFC-4122 v4 from
+  `/dev/urandom`) for the `--session-id` assigned to each instance, and `SessionStore`
+  (per-project `~/.mulpex/sessions/<key>.txt` load/save, keyed by an FNV-1a hash of the
+  project path) recording which session UUIDs to `--resume` next launch.
 - `term_session.rs` — `TermSession`: spawns `claude` on a PTY (with `--settings` + the
-  `MULPEX_INSTANCE_ID`/`MULPEX_STATE_DIR` env for status hooks), a reader thread feeds the
-  `vt100::Parser` (created with a `SCROLLBACK_LEN` buffer), `resize()` updates both the parser
-  and the PTY master, `scroll_up`/`scroll_down`/`scroll_to_bottom`/`scrollback` drive the
-  wheel-scroll view, and `Drop` tears down the child (see teardown note). All instances share
-  one `dirty` flag.
+  `MULPEX_INSTANCE_ID`/`MULPEX_STATE_DIR` env for status hooks, plus `--session-id <uuid>`
+  for a fresh session or `--resume <uuid>` to restore one — the `session_id`/`resume` args),
+  a reader thread feeds the `vt100::Parser` (created with a `SCROLLBACK_LEN` buffer),
+  `resize()` updates both the parser and the PTY master,
+  `scroll_up`/`scroll_down`/`scroll_to_bottom`/`scrollback` drive the wheel-scroll view, and
+  `Drop` tears down the child (see teardown note). All instances share one `dirty` flag.
 - `keymap.rs` — `key_to_bytes`: translate crossterm `KeyEvent`s into the byte sequences a
   terminal program expects (control bytes, ESC-prefixed alt, CSI arrows/keys with xterm
   modifier encoding, function keys). This makes the embedded session feel native. (Mouse is
@@ -225,7 +266,9 @@ The user's `claude` is a **zsh function** running `command claude
 directly (the real one at `~/.local/bin/claude`, a compiled native binary), which
 **bypasses the function**. To match the user's `claude`, `TermSession::spawn` replicates
 it: argv `claude --dangerously-skip-permissions`, env `IS_SANDBOX=1`, cwd = launch dir.
-(Make these overridable via config in a later milestone.)
+(Make these overridable via config in a later milestone.) It also appends
+`--session-id <uuid>` (new) or `--resume <uuid>` (restore) for session persistence, and
+`--settings <file>` for the status hooks.
 
 ## Teardown / no orphans (important)
 
@@ -269,4 +312,4 @@ own `claude` child, then confirm that exact PID is gone after quit.
 
 ## Last Wrapped Commit
 
-`d4a47a257e1b85eb8bac7b2711fc583a712e1d66` — 2026-06-15
+`daf9857952d32a055836f0e9bcf08393c2a5dbe4` — 2026-06-15
