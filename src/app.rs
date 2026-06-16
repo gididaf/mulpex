@@ -1,7 +1,7 @@
 //! Application state and the main event loop.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +61,20 @@ struct Selection {
 /// `Notification` can fire with no output, so we poll as a backstop.
 const STATUS_POLL: Duration = Duration::from_millis(200);
 
+/// How many entries the "Recent edits" feed keeps / displays.
+const EDIT_FEED_MAX: usize = 8;
+
+/// One record from the per-run edit feed (`state_dir/edits.log`): which instance
+/// edited which file, and when. Mirrored for the info pane's "Recent edits" view.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EditEntry {
+    pub instance: usize,
+    /// The edited file's basename (for display).
+    pub name: String,
+    /// Unix seconds when the edit was allowed.
+    pub ts: u64,
+}
+
 /// What a Claude instance is doing, derived from its lifecycle hooks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -93,34 +107,56 @@ impl Status {
     }
 }
 
-/// Claude Code settings injected per session via `--settings`. The hooks write
-/// a one-word state into `$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID` (both env vars
-/// set by `TermSession::spawn`), which the sidebar polls. Content is fully
-/// static — the instance id lives in the env, not the file — so every instance
-/// shares this one file.
+/// Claude Code settings injected per session via `--settings`, wiring two kinds
+/// of lifecycle hooks. Both key off `$MULPEX_INSTANCE_ID` / `$MULPEX_STATE_DIR`
+/// (env vars set by `TermSession::spawn`), so this one file is shared by every
+/// instance — except for `__MULPEX_BIN__`, which `App::new` substitutes with the
+/// absolute path of the running mulpex binary before writing the file.
 ///
-/// State machine: `UserPromptSubmit`/`PostToolUse` → working; `Stop` → waiting;
+/// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
 /// `PreToolUse[AskUserQuestion]` and the `permission_prompt`/`idle_prompt`
-/// notifications → needs. `--dangerously-skip-permissions` suppresses the
-/// permission UI but the events still let us flag idle/question waits; the
-/// idle notification is the backstop if AskUserQuestion fires no hook.
+/// notifications → needs. `Stop` → waiting (now via the helper, which also
+/// releases locks). The sidebar polls these one-word state files.
+///
+/// **File-locking coordinator** — the `PreToolUse` matchers for the edit tools
+/// (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) and for `Bash` invoke
+/// `mulpex hook pretooluse`, which acts as a per-file semaphore: it atomically
+/// acquires the lock for the target file before the edit runs and denies a
+/// second instance editing a file another holds. The `Stop` hook runs
+/// `mulpex hook stop` to release that instance's locks (per-turn lifetime) and
+/// write its `waiting` status. A `deny` from these hooks holds even under
+/// `--dangerously-skip-permissions`. See `hook.rs`.
 const HOOK_SETTINGS_JSON: &str = r#"{
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "printf working > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
+      { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook userpromptsubmit" } ] }
     ],
     "PostToolUse": [
       { "hooks": [ { "type": "command", "command": "printf working > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
+      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] },
+      { "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse", "timeout": 280 } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse" } ] }
     ],
     "Notification": [
       { "matcher": "permission_prompt|idle_prompt", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "printf waiting > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
+      { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook stop" } ] }
     ]
+  }
+}
+"#;
+
+/// `--mcp-config` registering this binary as the per-instance coordination-hub
+/// MCP server (`mulpex mcp`). One static file serves every instance because the
+/// server reads its identity from the inherited `MULPEX_*` env, exactly like the
+/// hooks. `__MULPEX_BIN__` is substituted with the running binary's path in
+/// `App::new`. See `mcp.rs`.
+const MCP_CONFIG_JSON: &str = r#"{
+  "mcpServers": {
+    "mulpex": { "type": "stdio", "command": "__MULPEX_BIN__", "args": ["mcp"] }
   }
 }
 "#;
@@ -160,6 +196,22 @@ pub struct App {
     settings_path: PathBuf,
     /// Latest known status per instance id, refreshed from the state files.
     statuses: HashMap<usize, Status>,
+    /// File → holder instance id, mirrored from the on-disk lock table under
+    /// `state_dir/locks/`. Observed only (the hooks own writes); drives the
+    /// info-pane "Locks" view and the leaked-lock reaper.
+    locks: HashMap<PathBuf, usize>,
+    /// Newest-first tail of the per-run edit feed (`state_dir/edits.log`), for
+    /// the info-pane "Recent edits" view. Observed only (the hooks append it).
+    recent_edits: Vec<EditEntry>,
+    /// Per-instance current task, mirrored from `state_dir/tasks/<id>` (written by
+    /// the UserPromptSubmit hook + the `hub_set_focus` MCP tool). For the sidebar.
+    tasks: HashMap<usize, String>,
+    /// Total queued hub messages across all `state_dir/inbox/<id>/`. For the
+    /// info-pane "Messages" line.
+    pending_messages: usize,
+    /// Instances currently blocked waiting on a locked file: id → (basename,
+    /// holder id), mirrored from `state_dir/waiting/<id>`. For the ⏳ indicator.
+    waiting: HashMap<usize, (String, usize)>,
     last_status_poll: Instant,
     /// Per-project store of session ids to restore on the next launch.
     store: SessionStore,
@@ -180,7 +232,28 @@ impl App {
         let state_dir = std::env::temp_dir().join(format!("mulpex-{}", std::process::id()));
         std::fs::create_dir_all(&state_dir)?;
         let settings_path = state_dir.join("settings.json");
-        std::fs::write(&settings_path, HOOK_SETTINGS_JSON)?;
+        // The lock/release hooks invoke this same binary as `mulpex hook …`;
+        // bake its absolute path into the settings (PATH may not carry it).
+        let bin = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "mulpex".to_string());
+        std::fs::write(&settings_path, HOOK_SETTINGS_JSON.replace("__MULPEX_BIN__", &bin))?;
+        // The coordination hub's MCP server is registered via this static config
+        // (--mcp-config); identity comes from the inherited env, so one file
+        // serves every instance. See mcp.rs.
+        std::fs::write(
+            state_dir.join("mcp.json"),
+            MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &bin),
+        )?;
+        // The coordinator's on-disk state lives under state_dir (so `App::Drop`'s
+        // `remove_dir_all` already cleans it up): Phase 1's locks/ + history/ +
+        // edits.log, and Phase 2's tasks/ (per-instance current task) + inbox/
+        // (per-recipient hub messages).
+        std::fs::create_dir_all(state_dir.join("locks"))?;
+        std::fs::create_dir_all(state_dir.join("history"))?;
+        std::fs::create_dir_all(state_dir.join("tasks"))?;
+        std::fs::create_dir_all(state_dir.join("inbox"))?;
+        std::fs::create_dir_all(state_dir.join("waiting"))?;
 
         // Restore the sessions worked on the last time Mulpex ran in this
         // project: relaunch each saved id with `--resume`. Any that fail to
@@ -251,6 +324,11 @@ impl App {
             state_dir,
             settings_path,
             statuses: HashMap::new(),
+            locks: HashMap::new(),
+            recent_edits: Vec::new(),
+            tasks: HashMap::new(),
+            pending_messages: 0,
+            waiting: HashMap::new(),
             last_status_poll: Instant::now(),
             store,
             worked,
@@ -258,6 +336,9 @@ impl App {
         // Reconcile the store with what actually came back (prunes any sessions
         // that no longer resume).
         app.persist_sessions();
+        // Publish the live instance set so the hub MCP server / hooks can
+        // enumerate peers (see mcp.rs `live_ids`).
+        app.write_live_instances();
         Ok(app)
     }
 
@@ -316,9 +397,14 @@ impl App {
                 redraw = true;
             }
 
-            // Refresh WORKING/WAITING/NEEDS indicators from the hook state files.
+            // Refresh WORKING/WAITING/NEEDS indicators and the file-lock table
+            // from the hook state files (same ~200ms cadence).
             if self.last_status_poll.elapsed() >= STATUS_POLL {
-                if self.refresh_statuses() {
+                let mut changed = self.refresh_statuses();
+                changed |= self.refresh_locks();
+                changed |= self.refresh_edits();
+                changed |= self.refresh_hub();
+                if changed {
                     redraw = true;
                 }
                 self.last_status_poll = Instant::now();
@@ -385,6 +471,175 @@ impl App {
             self.persist_sessions();
         }
         changed
+    }
+
+    /// The current file-lock table: locked file → holder instance id. For the UI.
+    pub fn locks(&self) -> &HashMap<PathBuf, usize> {
+        &self.locks
+    }
+
+    /// Re-read the on-disk lock table (`state_dir/locks/`) into `self.locks`, and
+    /// **reap** any lock whose holder instance is no longer alive — i.e. it
+    /// crashed or was killed before its `Stop` hook released it (mulpex is the
+    /// authority on liveness, since `reap_dead` runs earlier each loop). Returns
+    /// whether the visible lock set changed.
+    fn refresh_locks(&mut self) -> bool {
+        let live: HashSet<usize> = self.instances.iter().map(|s| s.id()).collect();
+        let mut current: HashMap<PathBuf, usize> = HashMap::new();
+        let locks_dir = self.state_dir.join("locks");
+        if let Ok(entries) = std::fs::read_dir(&locks_dir) {
+            for entry in entries.flatten() {
+                let file = entry.path();
+                let Some((holder, path)) = read_lock(&file) else {
+                    continue;
+                };
+                if live.contains(&holder) {
+                    current.insert(path, holder);
+                } else {
+                    // Leaked lock from a dead instance → reclaim it.
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+        }
+        if current != self.locks {
+            self.locks = current;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The "Recent edits" feed (newest first), for the info pane.
+    pub fn recent_edits(&self) -> &[EditEntry] {
+        &self.recent_edits
+    }
+
+    /// Re-read the tail of the per-run edit feed into `self.recent_edits`
+    /// (newest first, capped at `EDIT_FEED_MAX`). Returns whether it changed.
+    fn refresh_edits(&mut self) -> bool {
+        let new = read_recent_edits(&self.state_dir.join("edits.log"), EDIT_FEED_MAX);
+        if new != self.recent_edits {
+            self.recent_edits = new;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// This instance's current task (for the sidebar), if it has published one.
+    pub fn task_of(&self, id: usize) -> Option<&str> {
+        self.tasks.get(&id).map(String::as_str).filter(|t| !t.is_empty())
+    }
+
+    /// Total queued hub messages across all instances' inboxes (for the info pane).
+    pub fn pending_messages(&self) -> usize {
+        self.pending_messages
+    }
+
+    /// Re-read the hub state mirrored from disk: each instance's current task
+    /// (`state_dir/tasks/<id>`, written by the UserPromptSubmit hook and the
+    /// `hub_set_focus` tool) and the total queued messages (`state_dir/inbox/`).
+    /// Tasks/inboxes of dead instances are reaped (mulpex is the liveness
+    /// authority). Returns whether anything the UI shows changed.
+    fn refresh_hub(&mut self) -> bool {
+        let live: HashSet<usize> = self.instances.iter().map(|s| s.id()).collect();
+
+        // Tasks: read live instances', prune dead ones' files.
+        let mut tasks: HashMap<usize, String> = HashMap::new();
+        let tasks_dir = self.state_dir.join("tasks");
+        if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
+            for entry in entries.flatten() {
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if !live.contains(&id) {
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+                if let Ok(t) = std::fs::read_to_string(entry.path()) {
+                    let t = t.trim().to_string();
+                    if !t.is_empty() {
+                        tasks.insert(id, t);
+                    }
+                }
+            }
+        }
+
+        // Messages: count queued per inbox, reaping dead recipients' dirs.
+        let mut pending = 0usize;
+        let inbox_dir = self.state_dir.join("inbox");
+        if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+            for entry in entries.flatten() {
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if !live.contains(&id) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    continue;
+                }
+                pending += std::fs::read_dir(entry.path()).map(|d| d.flatten().count()).unwrap_or(0);
+            }
+        }
+
+        // Waiting indicators: which instances are blocked on a locked file.
+        let mut waiting: HashMap<usize, (String, usize)> = HashMap::new();
+        let waiting_dir = self.state_dir.join("waiting");
+        if let Ok(entries) = std::fs::read_dir(&waiting_dir) {
+            for entry in entries.flatten() {
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if !live.contains(&id) {
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+                if let Ok(body) = std::fs::read_to_string(entry.path()) {
+                    let mut parts = body.trim().splitn(2, '\t');
+                    if let (Some(name), Some(holder)) = (parts.next(), parts.next()) {
+                        if let Ok(holder) = holder.trim().parse::<usize>() {
+                            waiting.insert(id, (name.to_string(), holder));
+                        }
+                    }
+                }
+            }
+        }
+
+        let changed =
+            tasks != self.tasks || pending != self.pending_messages || waiting != self.waiting;
+        self.tasks = tasks;
+        self.pending_messages = pending;
+        self.waiting = waiting;
+        changed
+    }
+
+    /// Instances currently blocked waiting on a locked file: id → (file
+    /// basename, holder id). For the info pane's ⏳ indicator.
+    pub fn waiting(&self) -> &HashMap<usize, (String, usize)> {
+        &self.waiting
+    }
+
+    /// Write the live instance ids (one per line) to `state_dir/instances`, the
+    /// authoritative peer list the hub MCP server / hooks read. Called whenever
+    /// the instance set changes (startup, spawn, reap).
+    fn write_live_instances(&self) {
+        let mut out = String::new();
+        for session in &self.instances {
+            out.push_str(&session.id().to_string());
+            out.push('\n');
+        }
+        let _ = std::fs::write(self.state_dir.join("instances"), out);
     }
 
     /// Handle Ctrl+Q: arm on the first press, quit on a second press within the
@@ -661,6 +916,7 @@ impl App {
                 self.next_id += 1;
                 self.instances.push(session);
                 self.active = self.instances.len() - 1;
+                self.write_live_instances();
             }
             // If spawning fails we simply don't add an instance; the next
             // redraw still happens via the key event.
@@ -715,13 +971,73 @@ impl App {
         // re-persist so it won't be restored next launch.
         self.worked.retain(|id| self.instances.iter().any(|s| s.id() == *id));
         self.persist_sessions();
+        // Keep the hub's peer list in sync with the surviving instances.
+        self.write_live_instances();
         true
     }
+}
 
-    /// Center pane size `(cols, rows)`, for the info panel.
-    pub fn center_size(&self) -> (u16, u16) {
-        (self.center_cols, self.center_rows)
+/// Read the last `max` records from the edit feed at `path`, newest first.
+/// Only the file's tail is read (records are short, the file grows all session),
+/// and a partial leading line from the cut is dropped. Malformed lines are
+/// skipped; a missing file yields an empty feed.
+fn read_recent_edits(path: &Path, max: usize) -> Vec<EditEntry> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let tail = len.min(TAIL_BYTES);
+    if f.seek(SeekFrom::End(-(tail as i64))).is_err() {
+        return Vec::new();
     }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // If we started mid-file, the first line may be a fragment — drop it.
+    if tail < len && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let mut out = Vec::new();
+    for line in lines.iter().rev() {
+        if out.len() >= max {
+            break;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let (Some(ts), Some(inst), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(ts), Ok(instance)) = (ts.parse::<u64>(), inst.parse::<usize>()) else {
+            continue;
+        };
+        let name = Path::new(p)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string());
+        out.push(EditEntry { instance, name, ts });
+    }
+    out
+}
+
+/// Parse a lock file written by `hook.rs` into `(holder instance id, locked
+/// path)`. Returns `None` if either field is missing/unparseable.
+fn read_lock(file: &Path) -> Option<(usize, PathBuf)> {
+    let content = std::fs::read_to_string(file).ok()?;
+    let mut holder: Option<usize> = None;
+    let mut path: Option<PathBuf> = None;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("instance=") {
+            holder = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("path=") {
+            path = Some(PathBuf::from(v.trim()));
+        }
+    }
+    Some((holder?, path?))
 }
 
 /// Copy `text` to the macOS system clipboard via `pbcopy`. Best-effort: any

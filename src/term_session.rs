@@ -17,6 +17,31 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 /// can scroll back through the conversation. Grows lazily up to this cap.
 const SCROLLBACK_LEN: usize = 10_000;
 
+/// Standing instructions injected into every instance via `--append-system-prompt`
+/// so each Claude knows it's part of Mulpex's coordination hub and how to behave
+/// — especially that a lock-deny is normal coordination, not an error to bypass
+/// or escalate. Pairs with the `mcp__mulpex__*` tools (see mcp.rs).
+const HUB_RULES: &str = "You are one of several parallel Claude Code instances that Mulpex is \
+running in this SAME directory at the same time. A shared coordination hub is available to you \
+as MCP tools named mcp__mulpex__* . Use them to stay consistent with the other instances:\n\
+- mcp__mulpex__hub_instances — see every instance's status, current task, and which files it \
+holds locks on.\n\
+- mcp__mulpex__hub_set_focus — publish what YOU are working on (do this when you start a \
+substantial task).\n\
+- mcp__mulpex__hub_file_owner — before editing a file others might also touch, check who (if \
+anyone) is currently editing it and why.\n\
+- mcp__mulpex__hub_send / mcp__mulpex__hub_inbox — message another instance, and read messages \
+sent to you.\n\
+IMPORTANT — file locks are AUTOMATIC and you do not manage them: while another instance is \
+editing a file, your edit to it simply WAITS and then goes through on its own as soon as they \
+finish (their lock releases when their turn ends). So just make your edit normally — if it \
+pauses, that is the hub waiting for the other instance, not an error; let it complete. You must \
+NOT try to work around a busy file (no shell/printf/sed/cp writes to it) and must NOT ask the \
+user what to do about it — it is handled for you. Only in the rare case an edit is finally \
+refused after a long wait should you simply try again or move on to other work; never escalate \
+a lock to the user. Use the hub tools to see what others are doing if you want to pick \
+independent work meanwhile.";
+
 /// A live `claude` process plus the virtual screen it is drawing to.
 pub struct TermSession {
     id: usize,
@@ -89,9 +114,25 @@ impl TermSession {
         cmd.arg(session_id);
         cmd.arg("--settings");
         cmd.arg(settings_path);
+        // Register the coordination-hub MCP server (one static config; identity
+        // arrives via the MULPEX_* env below). See app.rs MCP_CONFIG_JSON / mcp.rs.
+        cmd.arg("--mcp-config");
+        cmd.arg(state_dir.join("mcp.json"));
+        // Teach every instance the hub rules up front, so a lock-deny reads as
+        // normal coordination (don't bypass / don't ask the user) and the
+        // mcp__mulpex__* tools get used. Injected, never touching project files.
+        cmd.arg("--append-system-prompt");
+        cmd.arg(HUB_RULES);
         cmd.env("IS_SANDBOX", "1");
         cmd.env("MULPEX_INSTANCE_ID", id.to_string());
         cmd.env("MULPEX_STATE_DIR", state_dir);
+        // The file-locking hooks need the project root (canonicalized so it
+        // matches the canonical edit paths they lock) to scope coordination to
+        // files inside the project. See hook.rs.
+        cmd.env(
+            "MULPEX_PROJECT_DIR",
+            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+        );
         cmd.cwd(dir);
 
         let child = pair.slave.spawn_command(cmd)?;

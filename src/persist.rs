@@ -113,8 +113,9 @@ impl SessionStore {
 
 /// FNV-1a 64-bit hash — small, stable, and dependency-free, used to make the
 /// store filename unique per project path without relying on `DefaultHasher`
-/// (whose output isn't guaranteed stable across builds).
-fn fnv1a(data: &[u8]) -> u64 {
+/// (whose output isn't guaranteed stable across builds). Also reused by the
+/// lock coordinator (`hook.rs`) to key a file path to a lock/history entry.
+pub(crate) fn fnv1a(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
         h ^= b as u64;

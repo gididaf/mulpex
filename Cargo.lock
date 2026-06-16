@@ -724,6 +724,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "ratatui",
+ "serde_json",
  "tui-term",
  "vt100",
 ]

@@ -14,14 +14,30 @@ use crate::pane;
 pub const LEFT_WIDTH: u16 = 30;
 pub const RIGHT_WIDTH: u16 = 34;
 
-/// Split an area into `[left sidebar, center, right sidebar]`.
+/// Split the whole window vertically into `[top bar, middle (3-pane band),
+/// bottom bar]`. The top bar (Project + a rule) is 2 rows; the bottom bar (keys
+/// + keyboard mode) is 1 row; the 3 panes get everything in between.
+pub fn outer_layout(area: Rect) -> [Rect; 3] {
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
+/// Split the window into `[left sidebar, center, right sidebar]`. The split is
+/// taken over the middle band (between the top and bottom bars), so callers pass
+/// the full window rect and still get the correct pane geometry.
 pub fn layout(area: Rect) -> [Rect; 3] {
+    let [_, middle, _] = outer_layout(area);
     let chunks = Layout::horizontal([
         Constraint::Length(LEFT_WIDTH),
         Constraint::Min(20),
         Constraint::Length(RIGHT_WIDTH),
     ])
-    .split(area);
+    .split(middle);
     [chunks[0], chunks[1], chunks[2]]
 }
 
@@ -41,8 +57,11 @@ pub fn center_inner_size(area: Rect) -> (u16, u16) {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let [top, _middle, bottom] = outer_layout(f.area());
     let [left, center, right] = layout(f.area());
 
+    pane::render_top_bar(f, top, app);
+    pane::render_bottom_bar(f, bottom, app);
     pane::render_instances(f, left, app, matches!(app.focus, Focus::Left));
     pane::render_info(f, right, app, matches!(app.focus, Focus::Right));
 

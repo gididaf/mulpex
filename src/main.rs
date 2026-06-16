@@ -11,7 +11,9 @@
 //! Ctrl+Q quits Mulpex; every other key forwards to Claude.
 
 mod app;
+mod hook;
 mod keymap;
+mod mcp;
 mod pane;
 mod persist;
 mod term_session;
@@ -28,6 +30,20 @@ use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::layout::Rect;
 
 fn main() -> anyhow::Result<()> {
+    // When invoked as `mulpex hook <event>` we are a Claude Code lifecycle hook,
+    // not the TUI. Handle it and exit BEFORE any terminal setup — this is the
+    // file-locking coordinator's enforcement path (see hook.rs).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("hook") {
+        return hook::run(&args[2..]);
+    }
+    // `mulpex mcp` is the inner coordination-hub MCP server, registered on each
+    // Claude instance via --mcp-config. Like the hook, it's a stdio subcommand
+    // that must run BEFORE any terminal setup (see mcp.rs).
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        return mcp::run(&args[2..]);
+    }
+
     let project_dir = std::env::current_dir()?;
 
     // ratatui::init() enables raw mode + alternate screen and installs a panic
