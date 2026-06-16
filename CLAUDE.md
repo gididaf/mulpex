@@ -1,16 +1,20 @@
 # Mulpex
 
-A CLI tool, opened from inside a project directory, that wraps live **Claude Code**
-sessions in a 3-pane terminal shell:
+A CLI tool, opened from inside a project directory, that wraps **multiple live, parallel
+Claude Code sessions** — working in the **same directory** (deliberately *not* git
+worktrees) — in a coordinated terminal shell:
 
 ```
+ project · /path/to/project                                         ← top bar
+────────────────────────────────────────────────────────────────────
 ┌──────────────┬────────────────────────────┬──────────────┐
-│ instances    │   Claude Code              │ info         │
-│ sidebar      │   (behaves exactly         │ sidebar      │
-│ (running CC  │    like `claude`)          │ (general     │
-│  for project)│                            │  info)       │
+│ instances    │   Claude Code              │ info / hub   │
+│ sidebar      │   (behaves exactly         │ (locks,      │
+│ (+ each one's│    like `claude`)          │  waiting,    │
+│  task)       │                            │  edits, msgs)│
 └──────────────┴────────────────────────────┴──────────────┘
    left sidebar          center pane            right sidebar
+ Ctrl+T new · Ctrl+] next · … · Ctrl+Q×2 quit          [kitty]  ← bottom bar
 ```
 
 Run it from a project directory:
@@ -22,21 +26,22 @@ mulpex
 
 ## Status (done)
 
-3-pane layout with **multiple live, fully-interactive Claude Code sessions** for the
-current project. You can add instances, switch between them, and exited instances are
+3-pane layout (with full-width **top bar** = project, **bottom bar** = key legend +
+keyboard mode) hosting **multiple live, fully-interactive Claude Code sessions** for the
+current project that **coordinate with each other** through a shared hub (see *The
+coordination hub*). You can add instances, switch between them, and exited instances are
 removed automatically. The **sessions you worked on are remembered**: quit Mulpex and
 reopen it in the same project and it auto-resumes them with their prior conversations
 (see *Session persistence*).
 
 - **Left sidebar** lists all running instances (`claude #N`); the focused one is highlighted.
-  Each carries a **status dot**: green `ready` (idle / waiting for you), yellow `working`
-  (mid-turn), red `needs you` (a question, permission, or idle wait). See *Status indicators*.
+  Each carries a **status dot** (green `ready`, yellow `working`, red `needs you`; see
+  *Status indicators*) and, beneath it, that instance's **current task** (from the hub).
 - **Center pane** shows the focused instance's live Claude, or a clean "No active Claude"
   hint when none are running.
-- **Right sidebar** shows project path, instance count, center-pane size, a status legend,
-  and the key legend.
-
-Real "general info" content for the right sidebar is a future milestone.
+- **Right sidebar (the hub view)** shows the live coordination state: **Locks** (file →
+  holder), **Waiting** (who's ⏳ blocked on whose file), **Recent edits**, and **Messages**
+  (queued cross-instance mail). See *The coordination hub*.
 
 ### Keybindings
 
@@ -122,15 +127,18 @@ Each sidebar instance shows what its Claude is doing, sourced from **Claude Code
 hooks** — *not* by scraping the screen (robust across CC versions).
 
 - At spawn, `App` creates a per-run scratch dir `$TMPDIR/mulpex-<pid>/` and writes one
-  static `settings.json` into it (`HOOK_SETTINGS_JSON` in `app.rs`).
+  static `settings.json` into it (`HOOK_SETTINGS_JSON` in `app.rs`), with `__MULPEX_BIN__`
+  substituted to the running binary's absolute path so hooks can invoke `mulpex hook …`.
 - Each `TermSession` is launched with `--settings <that file>` plus env
-  `MULPEX_INSTANCE_ID=<id>` and `MULPEX_STATE_DIR=<dir>`. The hooks are one-liners that
-  `printf` a single word into `$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID`, so **one static
-  settings file serves every instance** (the id lives in the env, not the file). Using
-  `--settings` means we never touch the user's project `.claude/settings.json`.
+  `MULPEX_INSTANCE_ID=<id>`, `MULPEX_STATE_DIR=<dir>`, `MULPEX_PROJECT_DIR=<canonical>`, so
+  **one static settings file serves every instance** (identity lives in the env, not the
+  file). Using `--settings` means we never touch the user's project `.claude/settings.json`.
 - State machine: `UserPromptSubmit` / `PostToolUse` → `working`; `Stop` → `waiting`;
   `PreToolUse[AskUserQuestion]` and the `permission_prompt` / `idle_prompt` **Notification**
-  matchers → `needs`. A fresh instance with no file yet reads as `Waiting` (ready).
+  matchers → `needs`. A fresh instance with no file yet reads as `Waiting` (ready). The
+  simple states are still one-word `printf`s; `UserPromptSubmit` and `Stop` now route through
+  the `mulpex hook` helper (it also drives the coordination hub — see below), but keep writing
+  the same status word.
 - `App` polls the state files every ~200ms (`STATUS_POLL`) and on change requests a redraw.
   Most transitions coincide with PTY output (already a redraw trigger); the poll is the
   backstop for the idle notification, which produces no output.
@@ -142,6 +150,93 @@ hooks** — *not* by scraping the screen (robust across CC versions).
   (`working` mid-turn → `waiting` on Stop).
 - Cleanup: `impl Drop for App` clears `instances` (killing every process group, see teardown)
   **before** `remove_dir_all`ing the scratch dir, so no child recreates a state file after.
+
+## The coordination hub (file locking + inner MCP)
+
+The "main event": parallel instances in **one directory** must not clobber each other or
+drift out of sync. Two layers handle this, both built on the same env-keyed, file-based IPC
+under `$MULPEX_STATE_DIR` as the status dots. The enforcement lives in **`mulpex hook`** and
+**`mulpex mcp`** (hidden subcommands of the same binary, dispatched in `main.rs` before
+`ratatui::init()`); the TUI only ships+wires them and *observes* the state for the hub view.
+
+### Phase 1 — file-locking coordinator (`hook.rs`)
+
+A per-file **semaphore**, enforced by a `PreToolUse` hook (`mulpex hook pretooluse`). The
+lock key is an FNV-1a hash of the canonical absolute path; the lock token is an `O_EXCL`
+file under `state_dir/locks/<hash>` (atomic test-and-set) holding `instance=/path=/ts=`.
+
+- **Edit tools** (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`): acquire the lock before the
+  edit. Free or already ours → acquire + allow; held by another → **wait** (see below).
+  Released per-turn by `mulpex hook stop`. An awareness note is injected when a *different*
+  instance edited the file earlier this session (`state_dir/history/<hash>`).
+- **Transparent auto-wait (no user involvement).** A blocked edit/read does **not** deny
+  immediately — it **waits** (polling every `LOCK_POLL`, up to `LOCK_WAIT` ≈ 4 min) for the
+  holder's turn to end, then proceeds. A blocking hook costs **zero model tokens** (the model
+  is idle awaiting the tool result), so this is a near-free transparent serialization. The
+  `--settings` matcher carries a `timeout` *above* `LOCK_WAIT` because **a PreToolUse hook
+  that times out is treated as *allow*** — we must always return an explicit decision first.
+- **Reads are gated too** (`read_guard`). Reading a file another instance is actively editing
+  yields a stale snapshot, and Claude Code then rejects the follow-up edit with *"file
+  modified since read"* — pre-empting our lock and causing churn. So a read of a held file
+  **waits** for the holder to finish, then returns the *final* content, so the edit applies
+  cleanly in one shot. (Cost: every `Read` now forks the hook; reads of unlocked files return
+  instantly.) Both waits **early-exit** if the holder is itself blocked on the user (`needs`).
+- **Bash**: best-effort — denies immediately if the command text names a currently-locked
+  path (no wait); builds / `npm install` pass through.
+- A `deny` (only after the full wait budget) names the holder *and their current task*, framed
+  as normal coordination ("don't bypass, don't ask the user"). `App::refresh_locks` mirrors
+  `locks/` to the UI and **reaps** locks held by dead instances.
+
+### Phase 2 — inner MCP coordination hub (`mcp.rs`)
+
+A hand-rolled **stdio JSON-RPC MCP server** (`mulpex mcp`), registered on every instance via
+`--mcp-config <state_dir/mcp.json>`. One static config serves all instances because identity
+arrives through the inherited `MULPEX_*` env (the server is a child of `claude`). Tools are
+namespaced `mcp__mulpex__*` and callable with no prompts under
+`--dangerously-skip-permissions`. Minimum protocol: `initialize` / `tools/list` /
+`tools/call` (+ `ping`), newline-delimited; notifications (no `id`) are ignored; every
+handler **fails soft**. Tools:
+
+- `hub_instances` — every instance's id / status / task / held files (+ my unread count).
+- `hub_set_focus` — publish *my* current task (refines the auto-captured prompt).
+- `hub_file_owner` — who holds a path, and what they're working on.
+- `hub_send` / `hub_inbox` — message another instance (or `all`), and read my mailbox.
+
+**Awareness plumbing:** the `UserPromptSubmit` hook (`mulpex hook userpromptsubmit`)
+auto-captures the prompt as the instance's baseline task (`state_dir/tasks/<id>`) and injects
+a compact live snapshot of the *other* instances into each turn via `additionalContext`.
+Standing **hub rules** are injected with `--append-system-prompt` (a const `HUB_RULES` in
+`term_session.rs`) — teaching each instance it's one of several parallel Claudes, that locks
+are normal (never bypass or ask the user; the edit waits and proceeds), and how to use the
+`mcp__mulpex__*` tools. None of this touches the user's project files.
+
+### Shared on-disk state (under `state_dir`)
+
+```
+<id>                 status word (working|waiting|needs)
+instances            live instance ids, one per line (App writes; mcp/hook read for peers)
+locks/<hash>         lock token: instance=/path=/ts=   (O_EXCL)
+history/<hash>       last editor of a file (awareness notes)
+edits.log            append-only TSV "ts\tinstance\tpath" (Recent edits feed)
+tasks/<id>           one line: instance's current task
+inbox/<id>/<uuid>    a message JSON for instance <id>
+waiting/<id>         "<basename>\t<holder>" while blocked waiting on a lock (⏳ indicator)
+mcp.json             the --mcp-config registering `mulpex mcp`
+settings.json        the --settings hooks
+```
+
+`refresh_locks` / `refresh_hub` (the same ~200ms poll as the status dots) mirror these into
+`App` for the hub view and reap entries belonging to dead instances. `App::Drop`'s
+`remove_dir_all` cleans the whole scratch dir on quit.
+
+### Verified
+
+End-to-end via the tmux self-test harness (`scripts/selftest_collision.sh`): two real
+instances forced into a genuine same-file collision; the blocked instance's read waits
+~60–80s, returns the final content, and edits cleanly **in one shot — zero staleness errors,
+zero questions to the user, zero shell-bypass attempts** (vs. the messy interleave without
+read-gating). MCP tools, task capture, live `⏳ Waiting` panel, and per-instance task lines
+all confirmed on-screen.
 
 ### Mouse: scrollback + selection
 
@@ -205,6 +300,7 @@ Rust + ratatui. Verified working dependency chain (see `Cargo.toml`):
 - `portable-pty` 0.9 — spawn `claude` on a PTY; clone reader / take writer; `resize()`.
 - `vt100` 0.15 — parse Claude Code's ANSI/VT output into a screen buffer.
 - `libc` — process-group kill on teardown (see below).
+- `serde_json` — parse hook tool-call JSON and implement the `mulpex mcp` JSON-RPC server.
 
 ## Why the center pane needs a terminal emulator
 
@@ -215,40 +311,44 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
 
 ## Architecture (`src/`)
 
-- `main.rs` — entry point. Uses `ratatui::init()` (raw mode + alternate screen + a panic
-  hook that restores the terminal) and `ratatui::restore()`. Enables bracketed paste and
-  mouse capture (and disables both on exit).
+- `main.rs` — entry point. **Dispatches the hidden subcommands first**: `mulpex hook <event>`
+  → `hook::run` and `mulpex mcp` → `mcp::run`, both *before* `ratatui::init()` (they're stdio
+  helpers, not the TUI). Otherwise sets up the terminal via `ratatui::init()` (+ panic hook +
+  `ratatui::restore()`), bracketed paste, mouse capture, and the Kitty protocol.
 - `app.rs` — `App` state + event loop. Holds `instances: Vec<TermSession>` and an `active`
   index. Polls events (~15ms), redraws when input is handled or the PTY reader signals new
-  output via a shared `dirty` flag, and reaps exited sessions each iteration. Routes the
-  reserved combos (Ctrl+Q/N/↑/↓); all other keys forward to the focused session. Also owns
-  the status pipeline: the `Status` enum, the `HOOK_SETTINGS_JSON` it writes, the scratch
-  dir, the ~200ms `refresh_statuses` poll, and an `impl Drop` that tears down sessions then
-  removes the scratch dir (see *Status indicators*). And the session-persistence pipeline:
-  the `worked` set, `persist_sessions`, restore-on-startup in `App::new` (see *Session
-  persistence*).
-- `persist.rs` — session persistence: `new_uuid` (dependency-free RFC-4122 v4 from
-  `/dev/urandom`) for the `--session-id` assigned to each instance, and `SessionStore`
-  (per-project `~/.mulpex/sessions/<key>.txt` load/save, keyed by an FNV-1a hash of the
-  project path) recording which session UUIDs to `--resume` next launch.
-- `term_session.rs` — `TermSession`: spawns `claude` on a PTY (with `--settings` + the
-  `MULPEX_INSTANCE_ID`/`MULPEX_STATE_DIR` env for status hooks, plus `--session-id <uuid>`
-  for a fresh session or `--resume <uuid>` to restore one — the `session_id`/`resume` args),
-  a reader thread feeds the `vt100::Parser` (created with a `SCROLLBACK_LEN` buffer),
-  `resize()` updates both the parser and the PTY master,
-  `scroll_up`/`scroll_down`/`scroll_to_bottom`/`scrollback` drive the wheel-scroll view, and
-  `Drop` tears down the child (see teardown note). All instances share one `dirty` flag.
-- `keymap.rs` — `key_to_bytes`: translate crossterm `KeyEvent`s into the byte sequences a
-  terminal program expects (control bytes, ESC-prefixed alt, CSI arrows/keys with xterm
-  modifier encoding, function keys). This makes the embedded session feel native. (Mouse is
-  handled separately as Mulpex-side scrollback, not forwarded — see *Mouse: scrollback +
-  selection*.)
-- `ui.rs` — the 3-pane `Layout` (`Length(30) | Min(20) | Length(34)`), focus border
-  styling, and compositing the `PseudoTerminal` into the center pane. `center_inner_size`
-  is the single source of truth for the PTY size (pane minus its border); `center_inner_rect`
-  gives the same area with its position, used for mouse-coordinate translation.
-- `pane.rs` — sidebar renderers: the instances list (each row a status-coloured dot + word
-  via `Status::indicator`) and the info panel (project, counts, status legend, key legend).
+  output via a shared `dirty` flag, and reaps exited sessions each iteration. Owns the status
+  pipeline (the `Status` enum, `HOOK_SETTINGS_JSON` + the `MCP_CONFIG_JSON` it writes, the
+  scratch dir, the ~200ms `refresh_statuses` poll, `impl Drop`), the session-persistence
+  pipeline (`worked`, `persist_sessions`, restore in `App::new`), and the **hub mirror**:
+  `locks`/`tasks`/`pending_messages`/`waiting` maps, `refresh_locks`/`refresh_hub`,
+  `write_live_instances` (the peer list), and dead-instance reaping (see *The coordination
+  hub*).
+- `hook.rs` — the `mulpex hook` subcommand: the file-locking enforcement (`pretooluse` →
+  `edit_guard`/`read_guard`/`bash_guard` with the `acquire_or_wait`/`wait_until_free` loops),
+  `stop` (release locks + write `waiting` status), and `userpromptsubmit` (capture task +
+  inject peer snapshot). `Ctx::from_env` + the `read_field`/`canonical_target`/`now` helpers
+  are shared with `mcp.rs`.
+- `mcp.rs` — the `mulpex mcp` subcommand: the stdio JSON-RPC coordination-hub server and its
+  five `hub_*` tools, plus `peers_context` (used by the UserPromptSubmit hook). Reads the
+  shared `state_dir` files; no new crates beyond `serde_json`.
+- `persist.rs` — session persistence: `new_uuid` (RFC-4122 v4 from `/dev/urandom`, reused for
+  message ids) and `SessionStore` (per-project `~/.mulpex/sessions/<key>.txt`). `fnv1a`
+  (pub(crate)) keys both the session store filename and the lock/history hashes.
+- `term_session.rs` — `TermSession`: spawns `claude` on a PTY with `--settings`,
+  `--mcp-config <state_dir/mcp.json>`, `--append-system-prompt <HUB_RULES>`, the `MULPEX_*`
+  env (incl. `MULPEX_PROJECT_DIR`), and `--session-id`/`--resume`. A reader thread feeds the
+  `vt100::Parser` (with `SCROLLBACK_LEN`); `resize`/`scroll_*` and `Drop` as before. The
+  `HUB_RULES` const lives here.
+- `keymap.rs` — `key_to_bytes`: translate crossterm `KeyEvent`s into terminal byte sequences,
+  so the embedded session feels native. (Mouse is Mulpex-side, not forwarded.)
+- `ui.rs` — `outer_layout` splits the window into `[top bar (2) | middle | bottom bar (1)]`;
+  `layout` splits the middle into the `Length(30) | Min(20) | Length(34)` panes (callers pass
+  the full rect). Focus borders + compositing the `PseudoTerminal`. `center_inner_size`/
+  `center_inner_rect` (now relative to the middle band) drive PTY size + mouse mapping.
+- `pane.rs` — renderers: `render_top_bar` (project), `render_bottom_bar` (keys + keyboard
+  mode), `render_instances` (status dot + each instance's task line), and `render_info` (the
+  hub view: Locks / Waiting ⏳ / Recent edits / Messages).
 
 ## Keyboard model (decided)
 
@@ -267,8 +367,10 @@ directly (the real one at `~/.local/bin/claude`, a compiled native binary), whic
 **bypasses the function**. To match the user's `claude`, `TermSession::spawn` replicates
 it: argv `claude --dangerously-skip-permissions`, env `IS_SANDBOX=1`, cwd = launch dir.
 (Make these overridable via config in a later milestone.) It also appends
-`--session-id <uuid>` (new) or `--resume <uuid>` (restore) for session persistence, and
-`--settings <file>` for the status hooks.
+`--session-id <uuid>` (new) or `--resume <uuid>` (restore) for session persistence,
+`--settings <file>` for the status + locking hooks, `--mcp-config <file>` to register the
+`mulpex mcp` coordination hub, and `--append-system-prompt <HUB_RULES>` to teach the hub
+rules (see *The coordination hub*).
 
 ## Teardown / no orphans (important)
 
@@ -308,8 +410,15 @@ tmux kill-session -t mptest
 
 To check for orphaned children precisely (avoid broad `pkill -f claude`, which would hit
 unrelated Claude processes): `MPID=$(pgrep -x mulpex); pgrep -P "$MPID"` to find Mulpex's
-own `claude` child, then confirm that exact PID is gone after quit.
+own `claude` child, then confirm that exact PID is gone after quit. Note `pgrep -x mulpex`
+also matches the `mulpex mcp` server children — filter them out by args when finding the TUI.
+
+**Coordination self-test:** `scripts/selftest_collision.sh` reinstalls, resets a scratch
+project, launches two real instances in tmux, drives a lock-gated same-file collision, and
+inspects both session transcripts (`~/.claude/projects/<proj>/*.jsonl`) for staleness
+errors / user-facing asks / shell-bypass attempts and the read-gate wait. This is how the hub
+is verified end-to-end without manual clicking.
 
 ## Last Wrapped Commit
 
-`daf9857952d32a055836f0e9bcf08393c2a5dbe4` — 2026-06-15
+`372e7d8133c215e556dfd4690a10774920fdac13` — 2026-06-16
