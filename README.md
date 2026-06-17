@@ -45,6 +45,26 @@ coordination hub that:
 The result, in real multi-instance runs on overlapping files: **zero staleness errors, zero
 coordination questions to you, and output that compiles clean.**
 
+## Why not git worktrees?
+
+The usual way to parallelize AI agents is to give each one its own **git worktree** — a
+separate checkout on a separate branch. That's the right tool when the agents work on
+genuinely *independent* features that barely touch the same files. But the moment they work on
+the **same** code — the common case — worktrees turn the hard part into a deferred bill:
+
+| | git worktrees | Mulpex (one shared dir) |
+| --- | --- | --- |
+| **Integration** | Deferred to a **big-bang merge** at the end — and merging N AI branches that all edited `main.rs` is exactly the conflict hell you wanted to avoid. | **Continuous.** Writes are serialized in real time; the tree is always integrated and compiles. No merge step. |
+| **Seeing each other's work** | An agent works against a **stale copy** until others commit and it rebases — so they duplicate effort and build against interfaces that no longer exist. | Every edit is on disk the instant it's written; each instance reads the **real current state** and is handed a live snapshot of what the others are doing. |
+| **Build artifacts & services** | N worktrees = N `target/` dirs, N `node_modules`, N full builds, N times the disk. Can't share **one running dev server / DB**. | One `target/`, one `node_modules`, one dev server. A single (e.g. Rust) compile, not N. |
+| **Per-agent setup** | Each worktree needs its own dependency install, `.env`, and config. | **Zero.** Every instance just runs `claude` in the directory you launched from. |
+| **Conflicts** | Surface **late**, all at once, far from the context that created them. | Surface **never** — the per-file lock makes two instances literally unable to write the same file at once; the loser waits and proceeds. |
+
+In short: worktrees give you *isolation* and make you **pay for it at merge time**. Mulpex
+gives you *coordination* and keeps the tree integrated the whole way, so the painful part —
+combining overlapping work — simply never happens. Reach for worktrees when you *want* throwaway
+isolation; reach for Mulpex when you want several Claudes to actually build one thing together.
+
 ## Install
 
 Needs the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH` — Mulpex
