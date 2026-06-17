@@ -47,8 +47,20 @@ coordination questions to you, and output that compiles clean.**
 
 ## Install
 
-Requires [Rust](https://rustup.rs/) and the [Claude Code](https://claude.com/claude-code) CLI
-(`claude`) on your `PATH`.
+Needs the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH` — Mulpex
+hosts real `claude` sessions.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gididaf/mulpex/master/install.sh | bash
+```
+
+This downloads the prebuilt binary for your platform (macOS Intel/ARM, Linux x86_64) and
+installs it to `~/.local/bin`. Override the location with `MULPEX_BIN_DIR=/usr/local/bin`. If
+no prebuilt binary matches your platform, the script falls back to building from source (needs
+[Rust](https://rustup.rs/)).
+
+<details>
+<summary>Build from source instead</summary>
 
 ```sh
 git clone https://github.com/gididaf/mulpex.git
@@ -60,6 +72,8 @@ cargo install --path . --locked
 > can pull a `ratatui` version incompatible with `tui-term` 0.3, producing a confusing
 > `PseudoTerminal doesn't implement Widget` build error. `--locked` pins the known-good
 > versions.
+
+</details>
 
 ## Use
 
