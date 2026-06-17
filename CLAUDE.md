@@ -468,6 +468,6 @@ inspects both session transcripts (`~/.claude/projects/<proj>/*.jsonl`) for stal
 errors / user-facing asks / shell-bypass attempts and the read-gate wait. This is how the hub
 is verified end-to-end without manual clicking.
 
-## Last Wrapped Commit
+## Last Synced Commit
 
-`372e7d8133c215e556dfd4690a10774920fdac13` — 2026-06-16
+`a763a7158775e177b0381a02ecf61d0975211e8b` — 2026-06-17
