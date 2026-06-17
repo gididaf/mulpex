@@ -13,9 +13,12 @@
 //!   only when the command names a path another instance currently holds. On an
 //!   allowed edit of a file a *different* instance changed earlier this session
 //!   it injects an awareness note so the new editor reads the current state.
-//! - `stop` fires when an instance finishes its turn: it releases every lock that
-//!   instance holds (per-turn lifetime) and writes its `waiting` status word
-//!   (preserving the sidebar status behavior the old `printf` Stop hook had).
+//! - `stop` fires when an instance finishes its turn: if it still has unread hub
+//!   mail it BLOCKS the stop (the model continues and reads its inbox), so no turn
+//!   ends with unhandled coordination messages; otherwise it releases every lock
+//!   that instance holds (per-turn lifetime) and writes its `waiting` status word.
+//! - `posttooluse` keeps the `working` status word and nudges the instance to read
+//!   newly-arrived hub mail mid-turn (deduped, so once per message).
 //!
 //! Identity/coordination come from env vars set at spawn (`MULPEX_INSTANCE_ID`,
 //! `MULPEX_STATE_DIR`, `MULPEX_PROJECT_DIR`), inherited by the hook process. The
@@ -49,6 +52,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     };
     match args.first().map(String::as_str).unwrap_or("") {
         "pretooluse" => pretooluse(&ctx),
+        "posttooluse" => posttooluse(&ctx),
         "stop" => stop(&ctx),
         "userpromptsubmit" => userpromptsubmit(&ctx),
         _ => Ok(()),
@@ -237,10 +241,6 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
                 &hist_file,
                 format!("instance={}\nts={}\npath={}\n", ctx.instance, now(), path.display()),
             );
-            // Append to the per-run edit feed (newest-last), which mulpex tails
-            // for the "Recent edits" view. One `write_all` of a short line is
-            // atomic under `O_APPEND`, so concurrent instances never interleave.
-            append_edit_log(ctx, &path);
             if let Some(note) = note {
                 emit("allow", None, Some(&note));
             }
@@ -365,22 +365,60 @@ fn bash_guard(ctx: &Ctx, command: &str) {
     }
 }
 
-/// Append one record to the per-run edit feed (`$MULPEX_STATE_DIR/edits.log`),
-/// TSV `ts\tinstance\tpath`. Built as one string and written with a single
-/// `write_all` so the `O_APPEND` write is atomic across concurrent instances.
-fn append_edit_log(ctx: &Ctx, path: &Path) {
-    let line = format!("{}\t{}\t{}\n", now(), ctx.instance, path.display());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ctx.state_dir.join("edits.log"))
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+/// Path of the per-instance "last unread count we nudged about" marker. Used to
+/// nudge once per *new* message (not on every tool call). Lives beside the inbox
+/// dirs but is named `<id>.notified` (not a bare integer), so neither
+/// `unread_for` (reads `inbox/<id>/`) nor `App`'s inbox scan (integer names only)
+/// ever counts it.
+fn notified_marker(ctx: &Ctx) -> PathBuf {
+    ctx.inbox_dir.join(format!("{}.notified", ctx.instance))
 }
 
-/// Release every lock held by this instance and write its `waiting` status.
+/// Handle a Stop event: an instance must not finish its turn holding unread hub
+/// mail (a peer may be coordinating a change that affects its work). If there is
+/// unread mail, **block** the stop with a reason telling it to read the inbox —
+/// the model then continues, calls `hub_inbox`, and clears it. Otherwise this is
+/// a normal stop: release the instance's locks (per-turn) and mark it `waiting`.
 fn stop(ctx: &Ctx) -> anyhow::Result<()> {
+    // `stop_hook_active` is set when this Stop already fired as a result of a
+    // prior Stop-block — never block twice in a row, so a model that ignores the
+    // nudge can still finish (no wedge).
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let already_continued = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|j| j.get("stop_hook_active").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
+    // Per-turn locks release at *every* turn boundary — including when we block to
+    // deliver mail. The continuation re-acquires (via `edit_guard`) anything it
+    // actually edits, so holding them across the block would only add contention:
+    // another instance could time out waiting on a lock we're no longer using.
+    release_my_locks(ctx);
+
+    let unread = crate::mcp::unread_for(ctx, ctx.instance);
+    if unread > 0 && !already_continued {
+        let reason = format!(
+            "You have {unread} unread hub message(s) from other Mulpex instances. Call \
+             mcp__mulpex__hub_inbox to read them before finishing — a peer may be \
+             coordinating a change that affects your work, so handle it now."
+        );
+        println!("{}", serde_json::json!({ "decision": "block", "reason": reason }));
+        // The turn continues, so keep the `working` status (locks already freed).
+        let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
+        return Ok(());
+    }
+
+    // The turn is really ending; reset the nudge high-water mark to the current
+    // (now-read, usually 0) count so the next message re-nudges cleanly.
+    let _ = std::fs::write(notified_marker(ctx), unread.to_string());
+    // Preserve the sidebar status the old `printf waiting` Stop hook produced.
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "waiting");
+    Ok(())
+}
+
+/// Release every lock currently held by this instance (per-turn lifetime).
+fn release_my_locks(ctx: &Ctx) {
     if let Ok(entries) = std::fs::read_dir(&ctx.locks_dir) {
         for entry in entries.flatten() {
             let file = entry.path();
@@ -389,8 +427,38 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
             }
         }
     }
-    // Preserve the sidebar status the old `printf waiting` Stop hook produced.
-    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "waiting");
+}
+
+/// Handle a PostToolUse event: keep the sidebar status `working` (preserving the
+/// old `printf` hook), and — the moment new hub mail has arrived *mid-turn* —
+/// inject a one-line nudge so the instance reads it without waiting for its turn
+/// to end. Deduped via the `<id>.notified` high-water mark so a single message
+/// nudges once, not on every subsequent tool call.
+fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
+
+    let unread = crate::mcp::unread_for(ctx, ctx.instance);
+    let marker = notified_marker(ctx);
+    let last: usize = read_field_or_line(&marker)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if unread > last {
+        let reason = format!(
+            "[Mulpex hub] You have {unread} unread message(s) from other instances — call \
+             mcp__mulpex__hub_inbox to read them (a peer may be coordinating a change that \
+             affects your work)."
+        );
+        let out = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": reason,
+            }
+        });
+        println!("{out}");
+    }
+    // Track the high-water mark (whether it rose or fell, e.g. after a hub_inbox
+    // read cleared it) so each new message nudges exactly once.
+    let _ = std::fs::write(&marker, unread.to_string());
     Ok(())
 }
 

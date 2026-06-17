@@ -111,6 +111,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         None => render_empty_center(f, inner),
     }
+
+    // The full-screen message reader (Ctrl+M) overlays everything when open.
+    if app.show_messages {
+        pane::render_message_log(f, f.area(), app);
+    }
 }
 
 /// Overlay the drag-selection highlight onto the already-rendered center pane by

@@ -235,7 +235,29 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
             delivered.push(to);
         }
     }
+    if !delivered.is_empty() {
+        log_message(ctx, &to_raw, message);
+    }
     Ok(json!({ "ok": !delivered.is_empty(), "delivered_to": delivered }).to_string())
+}
+
+/// Append a sent message to the persistent cross-instance conversation log
+/// (`state_dir/messages.log`), TSV `ts\tfrom\tto\tbody`. The body's backslashes,
+/// tabs and newlines are escaped so each message stays on one line (the UI
+/// decodes them). Unlike the inbox files (deleted when the recipient reads them)
+/// this log persists, so Mulpex can show the full instance-to-instance
+/// conversation. One `write_all` under `O_APPEND` is atomic across instances.
+fn log_message(ctx: &Ctx, to: &str, body: &str) {
+    let esc = body.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+    let line = format!("{}\t{}\t{}\t{}\n", now(), ctx.instance, to, esc);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ctx.state_dir.join("messages.log"))
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn hub_inbox(ctx: &Ctx) -> String {
@@ -322,7 +344,7 @@ fn task_of(ctx: &Ctx, id: usize) -> String {
         .unwrap_or_default()
 }
 
-fn unread_for(ctx: &Ctx, id: usize) -> usize {
+pub(crate) fn unread_for(ctx: &Ctx, id: usize) -> usize {
     std::fs::read_dir(ctx.inbox_dir.join(id.to_string()))
         .map(|d| d.flatten().count())
         .unwrap_or(0)

@@ -40,7 +40,13 @@ NOT try to work around a busy file (no shell/printf/sed/cp writes to it) and mus
 user what to do about it — it is handled for you. Only in the rare case an edit is finally \
 refused after a long wait should you simply try again or move on to other work; never escalate \
 a lock to the user. Use the hub tools to see what others are doing if you want to pick \
-independent work meanwhile.";
+independent work meanwhile.\n\
+STALE READS — a parallel instance may change a shared file between when you read it and when \
+you edit it. If much happened since your last read of a hot shared file (e.g. main.rs / lib.rs / \
+mod.rs or any file you know others also touch) — you dispatched a subagent, ran a long build, or \
+many steps passed — RE-READ it right before editing. Editing against a stale read fails with \
+\"File has been modified since read\" and costs you a re-read+retry anyway; reading first avoids \
+the round-trip and silently picking up the peer's changes.";
 
 /// A live `claude` process plus the virtual screen it is drawing to.
 pub struct TermSession {

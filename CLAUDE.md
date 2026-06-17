@@ -40,14 +40,19 @@ reopen it in the same project and it auto-resumes them with their prior conversa
 - **Center pane** shows the focused instance's live Claude, or a clean "No active Claude"
   hint when none are running.
 - **Right sidebar (the hub view)** shows the live coordination state: **Locks** (file →
-  holder), **Waiting** (who's ⏳ blocked on whose file), **Recent edits**, and **Messages**
-  (queued cross-instance mail). See *The coordination hub*.
+  holder), **Waiting** (who's ⏳ blocked on whose file), and **Messages** — the persistent
+  cross-instance conversation (who→who + a snippet, newest first, with an unread count). Press
+  **Ctrl+M** for the full-screen message reader. See *The coordination hub*.
 
 ### Keybindings
 
 - **Ctrl+T** — new Claude instance (in the project dir)
 - **Ctrl+]** — focus next instance (wraps)
 - **Ctrl+[** — focus previous instance (wraps) — *Kitty protocol only, see below*
+- **Ctrl+M** — open/close the full-screen cross-instance message reader (↑↓/PageUp-Down/wheel
+  scroll, Esc/q/Ctrl+M to close) — *Kitty protocol only: `Ctrl+M` IS the Enter byte (`0x0D`),
+  so like `Ctrl+[` we only match the disambiguated `Char('m')+CONTROL` the Kitty protocol
+  emits; in legacy mode Ctrl+M stays Enter and forwards to Claude untouched.*
 - **Ctrl+Q ×2** — quit Mulpex (press twice within 3s; the first press shows a red
   "press Ctrl+Q again to quit" banner on the center pane, which clears after the window lapses)
 - **everything else (incl. Ctrl+C, Esc)** — forwarded to the focused Claude
@@ -77,8 +82,9 @@ reopen it in the same project and it auto-resumes them with their prior conversa
 (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) when
 `supports_keyboard_enhancement()` reports it (e.g. recent iTerm2). The **info pane shows
 `Keyboard: enhanced (kitty)` or `legacy (Ctrl+[ off)`** so you can tell whether `Ctrl+[`
-will work. When it reads legacy, only `Ctrl+[` is affected — `Ctrl+]` (next) still works,
-so you can cycle forward through all instances.
+will work. When it reads legacy, `Ctrl+[` (prev) and `Ctrl+M` (message reader) are affected —
+both rely on Kitty disambiguation — but `Ctrl+]` (next) still works, so you can cycle forward
+through all instances.
 
 ### Instance lifecycle
 
@@ -136,9 +142,10 @@ hooks** — *not* by scraping the screen (robust across CC versions).
 - State machine: `UserPromptSubmit` / `PostToolUse` → `working`; `Stop` → `waiting`;
   `PreToolUse[AskUserQuestion]` and the `permission_prompt` / `idle_prompt` **Notification**
   matchers → `needs`. A fresh instance with no file yet reads as `Waiting` (ready). The
-  simple states are still one-word `printf`s; `UserPromptSubmit` and `Stop` now route through
-  the `mulpex hook` helper (it also drives the coordination hub — see below), but keep writing
-  the same status word.
+  `AskUserQuestion` and `Notification` matchers are still one-word `printf`s; `UserPromptSubmit`,
+  `PostToolUse`, and `Stop` all route through the `mulpex hook` helper (which also drives the
+  coordination hub — see below) but keep writing the same status word. (`PostToolUse` and
+  `Stop` moved off `printf` so they can also deliver hub mail — see *Message delivery*.)
 - `App` polls the state files every ~200ms (`STATUS_POLL`) and on change requests a redraw.
   Most transitions coincide with PTY output (already a redraw trigger); the poll is the
   backstop for the idle notification, which produces no output.
@@ -205,10 +212,33 @@ handler **fails soft**. Tools:
 **Awareness plumbing:** the `UserPromptSubmit` hook (`mulpex hook userpromptsubmit`)
 auto-captures the prompt as the instance's baseline task (`state_dir/tasks/<id>`) and injects
 a compact live snapshot of the *other* instances into each turn via `additionalContext`.
+
+**Message delivery (don't let mail rot).** A peer's `hub_send` is only useful if the recipient
+reads it — but the awareness snapshot rides on `UserPromptSubmit`, which never re-fires for a
+single-prompt/autonomous instance, so mail arriving after its last prompt used to go unseen
+(the locks still prevented clobbering, but the *intent* of the message was lost). Two hooks
+close the gap, both keyed on the unread count (`mcp::unread_for`, = files under `inbox/<id>/`):
+- **`mulpex hook posttooluse`** (now routed through the binary, replacing the old `printf
+  working`) keeps the `working` status word *and* injects a one-line "you have N unread"
+  nudge the moment new mail arrives **mid-turn**. Deduped via a high-water mark in
+  `inbox/<id>.notified`, so a message nudges **once**, not on every subsequent tool call.
+- **`mulpex hook stop`** will not let a turn end with unread mail: if `unread > 0` it returns
+  `{"decision":"block","reason":…}`, so the model continues and reads its inbox.
+  `stop_hook_active` is honoured — it never blocks twice in a row, so a model that ignores the
+  nudge still finishes (no wedge). On a normal stop it writes `waiting` as before.
+  **Locks release at every turn boundary, including a blocked stop** (`release_my_locks` runs
+  *before* the block decision): the continuation re-acquires (via `edit_guard`) anything it
+  actually edits, so holding locks across the block would only add contention — a peer could
+  time out waiting on a lock this instance is no longer using.
 Standing **hub rules** are injected with `--append-system-prompt` (a const `HUB_RULES` in
 `term_session.rs`) — teaching each instance it's one of several parallel Claudes, that locks
-are normal (never bypass or ask the user; the edit waits and proceeds), and how to use the
-`mcp__mulpex__*` tools. None of this touches the user's project files.
+are normal (never bypass or ask the user; the edit waits and proceeds), how to use the
+`mcp__mulpex__*` tools, and a **stale-read rule**: re-read a hot shared file (main.rs / lib.rs /
+mod.rs / any file others also touch) right before editing if much happened since the last read
+(a dispatched subagent, a long build, many steps). The per-turn lock serializes *writes* but
+can't refresh a read taken minutes earlier, so a read held across a long turn edits stale and
+Claude Code rejects it with "File has been modified since read"; re-reading first avoids that
+round-trip. None of this touches the user's project files.
 
 ### Shared on-disk state (under `state_dir`)
 
@@ -217,9 +247,11 @@ are normal (never bypass or ask the user; the edit waits and proceeds), and how 
 instances            live instance ids, one per line (App writes; mcp/hook read for peers)
 locks/<hash>         lock token: instance=/path=/ts=   (O_EXCL)
 history/<hash>       last editor of a file (awareness notes)
-edits.log            append-only TSV "ts\tinstance\tpath" (Recent edits feed)
 tasks/<id>           one line: instance's current task
-inbox/<id>/<uuid>    a message JSON for instance <id>
+inbox/<id>/<uuid>    a message JSON for instance <id> (deleted when read via hub_inbox)
+inbox/<id>.notified  high-water mark of the unread count we last nudged about (dedup)
+messages.log         append-only TSV "ts\tfrom\tto\tbody" — the PERSISTENT conversation
+                     feed (survives reads; powers the Messages pane + Ctrl+M reader)
 waiting/<id>         "<basename>\t<holder>" while blocked waiting on a lock (⏳ indicator)
 mcp.json             the --mcp-config registering `mulpex mcp`
 settings.json        the --settings hooks
@@ -237,6 +269,18 @@ instances forced into a genuine same-file collision; the blocked instance's read
 zero questions to the user, zero shell-bypass attempts** (vs. the messy interleave without
 read-gating). MCP tools, task capture, live `⏳ Waiting` panel, and per-instance task lines
 all confirmed on-screen.
+
+**Real-world run (2026-06-17, first use on a Bevy game, 4 parallel instances):** a level editor,
+a shotgun+weapon-wheel, an alien enemy, and enemy sounds — all editing overlapping files
+(combat.rs ×3, main.rs ×3, enemy.rs ×3) concurrently. Result: **zero staleness errors, zero
+denies, zero coordination questions to the user, zero shell-bypass attempts**, and the merged
+output compiled clean (`cargo check --all-features`). The transparent read-wait engaged for real
+(one instance's `Read combat.rs`/`Read main.rs` blocked ~145s, then edited cleanly). The one gap
+found — a single-prompt instance never read 2 messages sent to it after its only prompt — is what
+the *Message delivery* hooks (Stop-block + PostToolUse nudge) now fix. Those two hooks are
+verified by driving `mulpex hook stop`/`posttooluse` directly (block on unread, no double-block
+under `stop_hook_active`, nudge-once dedup) and `messages.log` persistence via the real `mulpex
+mcp` server; `read_messages` parsing has unit tests (`cargo test`).
 
 ### Mouse: scrollback + selection
 
@@ -321,17 +365,20 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   pipeline (the `Status` enum, `HOOK_SETTINGS_JSON` + the `MCP_CONFIG_JSON` it writes, the
   scratch dir, the ~200ms `refresh_statuses` poll, `impl Drop`), the session-persistence
   pipeline (`worked`, `persist_sessions`, restore in `App::new`), and the **hub mirror**:
-  `locks`/`tasks`/`pending_messages`/`waiting` maps, `refresh_locks`/`refresh_hub`,
-  `write_live_instances` (the peer list), and dead-instance reaping (see *The coordination
-  hub*).
+  `locks`/`tasks`/`pending_messages`/`waiting`/`messages` maps, `refresh_locks`/`refresh_hub`/
+  `refresh_messages` (`read_messages` tails `messages.log`), `write_live_instances` (the peer
+  list), dead-instance reaping, and the `show_messages`/`msg_scroll` state for the Ctrl+M reader
+  (see *The coordination hub*).
 - `hook.rs` — the `mulpex hook` subcommand: the file-locking enforcement (`pretooluse` →
   `edit_guard`/`read_guard`/`bash_guard` with the `acquire_or_wait`/`wait_until_free` loops),
-  `stop` (release locks + write `waiting` status), and `userpromptsubmit` (capture task +
-  inject peer snapshot). `Ctx::from_env` + the `read_field`/`canonical_target`/`now` helpers
-  are shared with `mcp.rs`.
+  `posttooluse` (status `working` + mid-turn unread-mail nudge, deduped via `<id>.notified`),
+  `stop` (block the stop while mail is unread, else release locks + write `waiting`), and
+  `userpromptsubmit` (capture task + inject peer snapshot). `Ctx::from_env` + the
+  `read_field`/`canonical_target`/`now` helpers are shared with `mcp.rs`.
 - `mcp.rs` — the `mulpex mcp` subcommand: the stdio JSON-RPC coordination-hub server and its
-  five `hub_*` tools, plus `peers_context` (used by the UserPromptSubmit hook). Reads the
-  shared `state_dir` files; no new crates beyond `serde_json`.
+  five `hub_*` tools, plus `peers_context`/`unread_for` (used by the hooks). `hub_send` also
+  appends to the persistent `messages.log`. Reads the shared `state_dir` files; no new crates
+  beyond `serde_json`.
 - `persist.rs` — session persistence: `new_uuid` (RFC-4122 v4 from `/dev/urandom`, reused for
   message ids) and `SessionStore` (per-project `~/.mulpex/sessions/<key>.txt`). `fnv1a`
   (pub(crate)) keys both the session store filename and the lock/history hashes.
@@ -347,13 +394,15 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   the full rect). Focus borders + compositing the `PseudoTerminal`. `center_inner_size`/
   `center_inner_rect` (now relative to the middle band) drive PTY size + mouse mapping.
 - `pane.rs` — renderers: `render_top_bar` (project), `render_bottom_bar` (keys + keyboard
-  mode), `render_instances` (status dot + each instance's task line), and `render_info` (the
-  hub view: Locks / Waiting ⏳ / Recent edits / Messages).
+  mode), `render_instances` (status dot + each instance's task line), `render_info` (the hub
+  view: Locks / Waiting ⏳ / Messages feed with unread count + snippets), and
+  `render_message_log` (the full-screen Ctrl+M reader: full bodies, word-wrapped, newest first).
 
 ## Keyboard model (decided)
 
 - **Direct combos, no leader key.** Mulpex reserves a *minimal* set of combos; everything
-  else forwards to Claude. Currently the only reserved combo is **Ctrl+Q → quit**.
+  else forwards to Claude. Reserved: **Ctrl+Q** (quit), **Ctrl+T** (new), **Ctrl+]** (next),
+  **Ctrl+[** (prev, Kitty-only), **Ctrl+M** (message reader, Kitty-only).
 - Raw mode means Mulpex gets every Ctrl/Alt/Fn/arrow/letter key first; macOS ⌘ combos stay
   owned by the terminal emulator (iTerm2) and cannot be intercepted by any app.
 - Future: optionally enable the Kitty keyboard protocol on the outer terminal for richer

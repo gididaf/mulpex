@@ -61,17 +61,21 @@ struct Selection {
 /// `Notification` can fire with no output, so we poll as a backstop.
 const STATUS_POLL: Duration = Duration::from_millis(200);
 
-/// How many entries the "Recent edits" feed keeps / displays.
-const EDIT_FEED_MAX: usize = 8;
+/// How many of the most recent hub messages we keep in memory for the views.
+const MSG_FEED_MAX: usize = 200;
 
-/// One record from the per-run edit feed (`state_dir/edits.log`): which instance
-/// edited which file, and when. Mirrored for the info pane's "Recent edits" view.
+/// One record from the persistent cross-instance conversation log
+/// (`state_dir/messages.log`, written by the `hub_send` MCP tool). Mirrored for
+/// the info pane's "Messages" feed and the full-screen message reader (Ctrl+M).
 #[derive(Clone, PartialEq, Eq)]
-pub struct EditEntry {
-    pub instance: usize,
-    /// The edited file's basename (for display).
-    pub name: String,
-    /// Unix seconds when the edit was allowed.
+pub struct MsgEntry {
+    /// Sending instance id.
+    pub from: usize,
+    /// Recipient label: an instance id (`"3"`) or `"all"`.
+    pub to: String,
+    /// Full message body (newlines/tabs decoded from the on-disk escaping).
+    pub body: String,
+    /// Unix seconds when the message was sent.
     pub ts: u64,
 }
 
@@ -132,7 +136,7 @@ const HOOK_SETTINGS_JSON: &str = r#"{
       { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook userpromptsubmit" } ] }
     ],
     "PostToolUse": [
-      { "hooks": [ { "type": "command", "command": "printf working > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
+      { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook posttooluse" } ] }
     ],
     "PreToolUse": [
       { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] },
@@ -175,6 +179,10 @@ pub struct App {
     pub keyboard_enhanced: bool,
     /// Set on the first Ctrl+Q; a second Ctrl+Q within `QUIT_CONFIRM` quits.
     quit_armed_at: Option<Instant>,
+    /// Whether the full-screen cross-instance message reader (Ctrl+M) is open.
+    pub show_messages: bool,
+    /// Scroll offset (lines from the top) of the message reader while open.
+    pub msg_scroll: u16,
     dirty: Arc<AtomicBool>,
     next_id: usize,
     center_cols: u16,
@@ -200,9 +208,10 @@ pub struct App {
     /// `state_dir/locks/`. Observed only (the hooks own writes); drives the
     /// info-pane "Locks" view and the leaked-lock reaper.
     locks: HashMap<PathBuf, usize>,
-    /// Newest-first tail of the per-run edit feed (`state_dir/edits.log`), for
-    /// the info-pane "Recent edits" view. Observed only (the hooks append it).
-    recent_edits: Vec<EditEntry>,
+    /// Newest-first tail of the persistent cross-instance conversation log
+    /// (`state_dir/messages.log`), for the info-pane "Messages" feed and the
+    /// full-screen reader. Observed only (the `hub_send` MCP tool appends it).
+    messages: Vec<MsgEntry>,
     /// Per-instance current task, mirrored from `state_dir/tasks/<id>` (written by
     /// the UserPromptSubmit hook + the `hub_set_focus` MCP tool). For the sidebar.
     tasks: HashMap<usize, String>,
@@ -246,9 +255,9 @@ impl App {
             MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &bin),
         )?;
         // The coordinator's on-disk state lives under state_dir (so `App::Drop`'s
-        // `remove_dir_all` already cleans it up): Phase 1's locks/ + history/ +
-        // edits.log, and Phase 2's tasks/ (per-instance current task) + inbox/
-        // (per-recipient hub messages).
+        // `remove_dir_all` already cleans it up): Phase 1's locks/ + history/, and
+        // Phase 2's tasks/ (per-instance current task), inbox/ (per-recipient hub
+        // messages) + messages.log (the persistent conversation feed).
         std::fs::create_dir_all(state_dir.join("locks"))?;
         std::fs::create_dir_all(state_dir.join("history"))?;
         std::fs::create_dir_all(state_dir.join("tasks"))?;
@@ -321,11 +330,13 @@ impl App {
             last_click: None,
             copied_flash: None,
             should_quit: false,
+            show_messages: false,
+            msg_scroll: 0,
             state_dir,
             settings_path,
             statuses: HashMap::new(),
             locks: HashMap::new(),
-            recent_edits: Vec::new(),
+            messages: Vec::new(),
             tasks: HashMap::new(),
             pending_messages: 0,
             waiting: HashMap::new(),
@@ -402,7 +413,7 @@ impl App {
             if self.last_status_poll.elapsed() >= STATUS_POLL {
                 let mut changed = self.refresh_statuses();
                 changed |= self.refresh_locks();
-                changed |= self.refresh_edits();
+                changed |= self.refresh_messages();
                 changed |= self.refresh_hub();
                 if changed {
                     redraw = true;
@@ -509,17 +520,18 @@ impl App {
         }
     }
 
-    /// The "Recent edits" feed (newest first), for the info pane.
-    pub fn recent_edits(&self) -> &[EditEntry] {
-        &self.recent_edits
+    /// The cross-instance message feed (newest first), for the info pane and the
+    /// full-screen reader.
+    pub fn messages(&self) -> &[MsgEntry] {
+        &self.messages
     }
 
-    /// Re-read the tail of the per-run edit feed into `self.recent_edits`
-    /// (newest first, capped at `EDIT_FEED_MAX`). Returns whether it changed.
-    fn refresh_edits(&mut self) -> bool {
-        let new = read_recent_edits(&self.state_dir.join("edits.log"), EDIT_FEED_MAX);
-        if new != self.recent_edits {
-            self.recent_edits = new;
+    /// Re-read the tail of the conversation log into `self.messages` (newest
+    /// first, capped at `MSG_FEED_MAX`). Returns whether it changed.
+    fn refresh_messages(&mut self) -> bool {
+        let new = read_messages(&self.state_dir.join("messages.log"), MSG_FEED_MAX);
+        if new != self.messages {
+            self.messages = new;
             true
         } else {
             false
@@ -651,6 +663,17 @@ impl App {
         }
     }
 
+    /// Open the full-screen cross-instance message reader (Ctrl+M), scrolled to
+    /// the top (newest messages).
+    fn open_messages(&mut self) {
+        self.show_messages = true;
+        self.msg_scroll = 0;
+    }
+
+    fn close_messages(&mut self) {
+        self.show_messages = false;
+    }
+
     /// Whether a quit confirmation is currently pending (drives the banner).
     pub fn quit_armed(&self) -> bool {
         self.quit_armed_at
@@ -662,13 +685,41 @@ impl App {
             return;
         }
 
+        let m = key.modifiers;
+
+        // While the full-screen message reader is open it captures all keys: it
+        // closes on Esc/q/Ctrl+M and scrolls on the arrows / PageUp-Down. Nothing
+        // is forwarded to Claude — it's a read-only overlay.
+        if self.show_messages {
+            let ctrl_m = m.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'));
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.close_messages(),
+                _ if ctrl_m => self.close_messages(),
+                KeyCode::Up | KeyCode::Char('k') => self.msg_scroll = self.msg_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.msg_scroll = self.msg_scroll.saturating_add(1),
+                KeyCode::PageUp => self.msg_scroll = self.msg_scroll.saturating_sub(10),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.msg_scroll = self.msg_scroll.saturating_add(10),
+                KeyCode::Home => self.msg_scroll = 0,
+                _ => {}
+            }
+            return;
+        }
+
         // Mulpex's reserved combos. Everything else (incl. Ctrl+C and Claude's
         // own Ctrl-shortcuts) forwards to the focused Claude.
-        let m = key.modifiers;
         if m.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('q') => {
                     self.on_quit_key();
+                    return;
+                }
+                // Ctrl+M → open the message reader. Like Ctrl+[, this only arrives
+                // as Char('m')+CONTROL under the Kitty protocol; a legacy terminal
+                // maps Ctrl+M to Enter (KeyCode::Enter), which we never match here,
+                // so Enter keeps flowing to Claude untouched.
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.open_messages();
                     return;
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') => {
@@ -718,6 +769,21 @@ impl App {
     /// Returns whether a redraw is needed. Coordinates are mapped to the pane's
     /// 0-based visible cells (clamped, so a drag past the edge selects to it).
     fn on_mouse(&mut self, me: MouseEvent) -> bool {
+        // While the message reader is open the wheel scrolls it; other mouse
+        // events are swallowed (no center-pane selection behind the overlay).
+        if self.show_messages {
+            match me.kind {
+                MouseEventKind::ScrollUp => {
+                    self.msg_scroll = self.msg_scroll.saturating_sub(3);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.msg_scroll = self.msg_scroll.saturating_add(3);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
         let inner = self.center_inner;
         let inside = me.column >= inner.x
             && me.row >= inner.y
@@ -977,14 +1043,14 @@ impl App {
     }
 }
 
-/// Read the last `max` records from the edit feed at `path`, newest first.
-/// Only the file's tail is read (records are short, the file grows all session),
-/// and a partial leading line from the cut is dropped. Malformed lines are
-/// skipped; a missing file yields an empty feed.
-fn read_recent_edits(path: &Path, max: usize) -> Vec<EditEntry> {
+/// Read the last `max` records from the conversation log at `path`, newest first.
+/// Only the file's tail is read (the file grows all session) and a partial leading
+/// line from the cut is dropped. Malformed lines are skipped; a missing file
+/// yields an empty feed. Bodies are un-escaped (`\n`/`\t`/`\\`) back to real text.
+fn read_messages(path: &Path, max: usize) -> Vec<MsgEntry> {
     use std::io::{Read, Seek, SeekFrom};
 
-    const TAIL_BYTES: u64 = 16 * 1024;
+    const TAIL_BYTES: u64 = 128 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
     };
@@ -1008,18 +1074,44 @@ fn read_recent_edits(path: &Path, max: usize) -> Vec<EditEntry> {
         if out.len() >= max {
             break;
         }
-        let mut parts = line.splitn(3, '\t');
-        let (Some(ts), Some(inst), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+        let mut parts = line.splitn(4, '\t');
+        let (Some(ts), Some(from), Some(to), Some(body)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
-        let (Ok(ts), Ok(instance)) = (ts.parse::<u64>(), inst.parse::<usize>()) else {
+        let (Ok(ts), Ok(from)) = (ts.parse::<u64>(), from.parse::<usize>()) else {
             continue;
         };
-        let name = Path::new(p)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.to_string());
-        out.push(EditEntry { instance, name, ts });
+        out.push(MsgEntry {
+            from,
+            to: to.to_string(),
+            body: unescape_msg(body),
+            ts,
+        });
+    }
+    out
+}
+
+/// Reverse the one-line escaping `log_message` applies (`\\`, `\t`, `\n`).
+fn unescape_msg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
     }
     out
 }
@@ -1052,6 +1144,52 @@ fn copy_to_clipboard(text: &str) {
             // `stdin` drops here, closing the pipe so `pbcopy` can finish.
         }
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescape_round_trips_send_escaping() {
+        // Mirrors mcp::log_message's escaping of `\`, `\t`, `\n`.
+        let body = "line one\nline two\twith tab\\and backslash";
+        let esc = body
+            .replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n");
+        assert!(!esc.contains('\n')); // stays single-line on disk
+        assert_eq!(unescape_msg(&esc), body);
+    }
+
+    #[test]
+    fn read_messages_parses_log_newest_first() {
+        let dir = std::env::temp_dir().join(format!("mulpex-msgtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("messages.log");
+        std::fs::write(
+            &log,
+            "100\t2\t1\tfirst line\\nsecond line\n200\t3\tall\thello all\n",
+        )
+        .unwrap();
+
+        let msgs = read_messages(&log, 50);
+        assert_eq!(msgs.len(), 2);
+        // Newest first.
+        assert_eq!(msgs[0].from, 3);
+        assert_eq!(msgs[0].to, "all");
+        assert_eq!(msgs[0].body, "hello all");
+        assert_eq!(msgs[1].from, 2);
+        assert_eq!(msgs[1].to, "1");
+        assert_eq!(msgs[1].body, "first line\nsecond line"); // unescaped
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_messages_missing_file_is_empty() {
+        assert!(read_messages(Path::new("/no/such/mulpex.log"), 10).is_empty());
     }
 }
 
