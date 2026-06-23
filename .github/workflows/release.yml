@@ -22,7 +22,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         run: |
@@ -36,6 +36,6 @@ jobs:
         run: tar -czf mulpex-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release mulpex
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: mulpex-${{ matrix.target }}.tar.gz
