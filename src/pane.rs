@@ -52,15 +52,20 @@ pub fn render_instances(f: &mut Frame, area: Rect, app: &App, focused: bool) {
                     Span::styled(format!("claude #{}", session.id()), name_style),
                     Span::styled(format!("  {}", word), base.fg(dot_color).add_modifier(Modifier::DIM)),
                 ])];
-                // Second line: what this instance is currently working on (from
-                // the hub), so you see at a glance who's doing what.
+                // Below the name: what this instance is currently working on
+                // (re-summarized from its latest prompt each turn), word-wrapped
+                // across up to 3 lines so it's legible at a glance — not a hard
+                // mid-word cut. Indented 4 to sit under "claude #N".
                 if let Some(task) = app.task_of(session.id()) {
-                    rows.push(Line::from(Span::styled(
-                        format!("    {}", truncate(task, 24)),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    let text_width = (area.width as usize).saturating_sub(2 + 4);
+                    for line in wrap_words(task, text_width, 3) {
+                        rows.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
                 }
                 ListItem::new(rows)
             })
@@ -93,17 +98,11 @@ pub fn render_top_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(vec![project, rule]), area);
 }
 
-/// Full-width bottom bar: the key legend plus the keyboard-protocol indicator
-/// (whether Ctrl+[ is distinguishable from Esc), all on one row.
-pub fn render_bottom_bar(f: &mut Frame, area: Rect, app: &App) {
+/// Full-width bottom bar: the key legend.
+pub fn render_bottom_bar(f: &mut Frame, area: Rect) {
     let key = Style::default().fg(Color::Cyan);
     let dim = Style::default().fg(Color::Gray);
     let sep = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
-    let (kbd_text, kbd_color) = if app.keyboard_enhanced {
-        ("kitty", Color::Green)
-    } else {
-        ("legacy: Ctrl+[ off", Color::Yellow)
-    };
     let line = Line::from(vec![
         Span::styled(" Ctrl+T", key),
         Span::styled(" new", dim),
@@ -122,8 +121,6 @@ pub fn render_bottom_bar(f: &mut Frame, area: Rect, app: &App) {
         sep(),
         Span::styled("Ctrl+C", key),
         Span::styled(" → Claude", dim),
-        Span::raw("   "),
-        Span::styled(format!("[{kbd_text}]"), Style::default().fg(kbd_color)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -241,14 +238,51 @@ fn snippet(body: &str, max: usize) -> String {
 }
 
 /// Truncate `s` to at most `max` chars, appending `…` when cut.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+/// Word-wrap `text` into at most `max_lines` lines of `width` chars each, breaking
+/// on whitespace (a single over-long word is hard-split). If the text doesn't fit
+/// in `max_lines`, the last line ends with an ellipsis to signal the cut. Used for
+/// the per-instance task line in the sidebar.
+fn wrap_words(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
     }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        // A single word longer than the line: flush, then hard-split it.
+        if word.chars().count() > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            for ch in word.chars() {
+                if cur.chars().count() == width {
+                    lines.push(std::mem::take(&mut cur));
+                }
+                cur.push(ch);
+            }
+            continue;
+        }
+        let sep = usize::from(!cur.is_empty());
+        if cur.chars().count() + sep + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        } else if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    // Cap to max_lines; mark truncation with a trailing ellipsis.
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            let mut t: String = last.chars().take(width.saturating_sub(1)).collect();
+            t.push('…');
+            *last = t;
+        }
+    }
+    lines
 }
 
 fn label() -> Style {
@@ -374,3 +408,34 @@ fn ago(secs: u64) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_words;
+
+    #[test]
+    fn wraps_on_word_boundaries_without_losing_text() {
+        let out = wrap_words("add a level editor with grid snapping", 20, 3);
+        assert!(out.iter().all(|l| l.chars().count() <= 20), "{out:?}");
+        assert_eq!(out.join(" "), "add a level editor with grid snapping");
+    }
+
+    #[test]
+    fn caps_at_max_lines_with_ellipsis() {
+        let out = wrap_words("one two three four five six seven eight nine ten", 8, 2);
+        assert_eq!(out.len(), 2);
+        assert!(out.last().unwrap().ends_with('…'), "{out:?}");
+    }
+
+    #[test]
+    fn hard_splits_an_overlong_word() {
+        let out = wrap_words("supercalifragilistic", 6, 3);
+        assert!(out.iter().all(|l| l.chars().count() <= 6), "{out:?}");
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn empty_width_yields_nothing() {
+        assert!(wrap_words("anything", 0, 3).is_empty());
+    }
+}

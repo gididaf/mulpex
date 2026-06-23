@@ -174,9 +174,6 @@ pub struct App {
     /// Index into `instances` of the focused session (only valid when non-empty).
     pub active: usize,
     pub focus: Focus,
-    /// Whether the Kitty keyboard protocol is active (decides if Ctrl+[ can be
-    /// distinguished from Esc). Shown in the info pane.
-    pub keyboard_enhanced: bool,
     /// Set on the first Ctrl+Q; a second Ctrl+Q within `QUIT_CONFIRM` quits.
     quit_armed_at: Option<Instant>,
     /// Whether the full-screen cross-instance message reader (Ctrl+M) is open.
@@ -232,7 +229,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(project_dir: PathBuf, area: Rect, keyboard_enhanced: bool) -> anyhow::Result<Self> {
+    pub fn new(project_dir: PathBuf, area: Rect) -> anyhow::Result<Self> {
         let dirty = Arc::new(AtomicBool::new(true));
         let (cols, rows) = ui::center_inner_size(area);
         let center_inner = ui::center_inner_rect(area);
@@ -319,7 +316,6 @@ impl App {
             instances,
             active: 0,
             focus: Focus::Center,
-            keyboard_enhanced,
             quit_armed_at: None,
             dirty,
             next_id,

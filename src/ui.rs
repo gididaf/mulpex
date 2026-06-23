@@ -1,4 +1,5 @@
-//! The 3-pane layout and top-level render: instances sidebar | Claude | info.
+//! The layout and top-level render: a left sidebar (instances stacked over the
+//! info/hub) beside the big Claude pane.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,9 +11,8 @@ use tui_term::widget::PseudoTerminal;
 use crate::app::{App, Focus};
 use crate::pane;
 
-/// Fixed sidebar widths; the center pane takes the remaining space.
-pub const LEFT_WIDTH: u16 = 30;
-pub const RIGHT_WIDTH: u16 = 34;
+/// Fixed left-sidebar width; the center pane takes the remaining space.
+pub const LEFT_WIDTH: u16 = 32;
 
 /// Split the whole window vertically into `[top bar, middle (3-pane band),
 /// bottom bar]`. The top bar (Project + a rule) is 2 rows; the bottom bar (keys
@@ -27,18 +27,19 @@ pub fn outer_layout(area: Rect) -> [Rect; 3] {
     [chunks[0], chunks[1], chunks[2]]
 }
 
-/// Split the window into `[left sidebar, center, right sidebar]`. The split is
-/// taken over the middle band (between the top and bottom bars), so callers pass
-/// the full window rect and still get the correct pane geometry.
+/// Split the window into `[instances, center, info]`. The left sidebar column
+/// is stacked vertically — the instances list on top, the info/hub below it —
+/// and the center (Claude) pane takes all the remaining width. `center` stays at
+/// index 1 so `center_inner_rect`/mouse mapping need no other changes. The split
+/// is taken over the middle band (between the top and bottom bars), so callers
+/// pass the full window rect and still get the correct pane geometry.
 pub fn layout(area: Rect) -> [Rect; 3] {
     let [_, middle, _] = outer_layout(area);
-    let chunks = Layout::horizontal([
-        Constraint::Length(LEFT_WIDTH),
-        Constraint::Min(20),
-        Constraint::Length(RIGHT_WIDTH),
-    ])
-    .split(middle);
-    [chunks[0], chunks[1], chunks[2]]
+    let [left_col, center] =
+        Layout::horizontal([Constraint::Length(LEFT_WIDTH), Constraint::Min(20)]).areas(middle);
+    let [instances, info] =
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(left_col);
+    [instances, center, info]
 }
 
 /// The drawable rect of the center pane, inside its border. This is where the
@@ -58,12 +59,12 @@ pub fn center_inner_size(area: Rect) -> (u16, u16) {
 
 pub fn draw(f: &mut Frame, app: &App) {
     let [top, _middle, bottom] = outer_layout(f.area());
-    let [left, center, right] = layout(f.area());
+    let [instances, center, info] = layout(f.area());
 
     pane::render_top_bar(f, top, app);
-    pane::render_bottom_bar(f, bottom, app);
-    pane::render_instances(f, left, app, matches!(app.focus, Focus::Left));
-    pane::render_info(f, right, app, matches!(app.focus, Focus::Right));
+    pane::render_bottom_bar(f, bottom);
+    pane::render_instances(f, instances, app, matches!(app.focus, Focus::Left));
+    pane::render_info(f, info, app, matches!(app.focus, Focus::Right));
 
     // Center pane: border drawn by us, the focused Claude screen composited inside.
     // A pending quit confirmation takes over the title/border (red) so it's

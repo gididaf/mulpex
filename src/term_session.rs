@@ -48,6 +48,24 @@ many steps passed — RE-READ it right before editing. Editing against a stale r
 \"File has been modified since read\" and costs you a re-read+retry anyway; reading first avoids \
 the round-trip and silently picking up the peer's changes.";
 
+/// User-mandated planning discipline, injected alongside `HUB_RULES` into every
+/// instance. Zero-assumptions rule: surface assumptions and confirm them via
+/// `AskUserQuestion` *before* finalizing a plan or writing code.
+const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
+identify ALL potential assumptions your plan/implementation would rely on (about requirements, \
+scope, file/library choices, edge cases, expected behavior). Use the AskUserQuestion tool to \
+verify those assumptions with the user FIRST, so the resulting plan or implementation is \
+perfectly aligned with their requirements — aim for zero unverified assumptions. Do not silently \
+pick a default on anything that could reasonably go more than one way; ask.\n\
+NOTE — the AskUserQuestion tool here has been MODIFIED to raise its limits: it now accepts up to \
+10 questions per call (not 4) and up to 10 options per question (not 4). Your training assumed a \
+cap of 4 of each, but that no longer applies — do not artificially trim your questions or options \
+to 4. Take full advantage of the higher limits whenever it helps reach zero unverified \
+assumptions: ask all the questions you genuinely need in a single call (batch them rather than \
+drip-feeding across turns), and give each question all the distinct options that genuinely apply \
+— up to 10 of each. Don't pad to hit 10; use exactly as many as the situation truly warrants, \
+just no longer artificially limited to 4.";
+
 /// A live `claude` process plus the virtual screen it is drawing to.
 pub struct TermSession {
     id: usize,
@@ -108,7 +126,7 @@ impl TermSession {
             pixel_height: 0,
         })?;
 
-        let mut cmd = CommandBuilder::new("claude");
+        let mut cmd = claude_command();
         cmd.arg("--dangerously-skip-permissions");
         // Either create the session with our chosen id, or resume that exact
         // conversation from a previous launch.
@@ -128,7 +146,7 @@ impl TermSession {
         // normal coordination (don't bypass / don't ask the user) and the
         // mcp__mulpex__* tools get used. Injected, never touching project files.
         cmd.arg("--append-system-prompt");
-        cmd.arg(HUB_RULES);
+        cmd.arg(format!("{HUB_RULES}\n{PLANNING_RULES}"));
         cmd.env("IS_SANDBOX", "1");
         cmd.env("MULPEX_INSTANCE_ID", id.to_string());
         cmd.env("MULPEX_STATE_DIR", state_dir);
@@ -320,6 +338,75 @@ impl TermSession {
 /// URLs so double-clicking a path/URL grabs the whole thing.
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '+' | '@' | ':')
+}
+
+/// The AskUserQuestion schema caps Mulpex always runs Claude with: max questions
+/// per call and max options per question (stock Claude Code hardcodes both to 4).
+const MAX_Q: u32 = 10;
+const MAX_A: u32 = 10;
+
+/// The `claude` to spawn. The user's shell wraps `claude` so that setting
+/// `MAX_Q`/`MAX_A` runs a *byte-patched* copy of the binary with the
+/// AskUserQuestion schema caps raised (questions/options 4 → 10) — the cap is a
+/// hardcoded Zod bound baked into Claude Code's compiled JS bundle, so there is
+/// no flag/env/setting to change it; patching the binary is the only lever.
+/// `portable-pty` execs the binary directly and bypasses that zsh function, so we
+/// replicate it here: always run the q=10/a=10 variant, built on demand and
+/// cached under `~/.cache/claude-patched/` (rebuilt whenever Claude Code
+/// auto-updates). The patch itself lives in `~/.local/bin/patch-claude-maxq.py`,
+/// the same script the shell uses. Falls back to plain `claude` if the patched
+/// build is unavailable for any reason, so Mulpex still works (just with the
+/// stock caps).
+fn claude_command() -> CommandBuilder {
+    match patched_claude_bin() {
+        Some(bin) => CommandBuilder::new(bin),
+        None => CommandBuilder::new("claude"),
+    }
+}
+
+/// Resolve (building on demand) the path to the MAX_Q/MAX_A-patched `claude`,
+/// mirroring the user's zsh function. Returns `None` (→ fall back to stock
+/// `claude`) if the patch script is missing, the build fails, or no usable
+/// binary results.
+fn patched_claude_bin() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let script = home.join(".local/bin/patch-claude-maxq.py");
+    if !script.is_file() {
+        return None; // not this machine's setup → use stock claude
+    }
+    let stock = home.join(".local/bin/claude");
+    let cache = home
+        .join(".cache/claude-patched")
+        .join(format!("claude-q{MAX_Q}a{MAX_A}"));
+
+    // Rebuild when the cached copy is missing or older than the stock binary
+    // (e.g. Claude Code auto-updated). `metadata` follows symlinks, matching the
+    // shell's `-nt` on the `~/.local/bin/claude` symlink → its version target.
+    let need_build = match (mtime(&cache), mtime(&stock)) {
+        (None, _) => true,
+        (Some(c), Some(s)) => s > c,
+        (Some(_), None) => false, // no stock to compare; keep what we have
+    };
+    if need_build {
+        let ok = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(MAX_Q.to_string())
+            .arg(MAX_A.to_string())
+            .arg(&cache)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+    }
+    cache.is_file().then_some(cache)
+}
+
+fn mtime(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 impl Drop for TermSession {

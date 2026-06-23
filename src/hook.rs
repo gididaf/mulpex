@@ -33,15 +33,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::persist::fnv1a;
 
-/// How long a blocked edit will WAIT for the holder's turn to end before falling
-/// back to a deny. The model burns no tokens while a hook blocks (it's idle
-/// awaiting the tool result), so this is a near-free transparent wait. Kept well
-/// under Claude Code's PreToolUse hook timeout (a timeout would *allow* the edit,
-/// which must never happen for a lock) — see the matcher's `timeout` in app.rs.
+/// Hard ceiling on how long a blocked edit waits for a *continuously-hot* holder
+/// before proceeding contended (allow-with-awareness, never a deny). In practice
+/// the idle-lease (`LOCK_IDLE`) frees a file long before this — a waiter only
+/// nears this ceiling when the holder is genuinely editing the *same* file over
+/// and over for minutes, where blocking is correct. The model burns no tokens
+/// while a hook blocks (it's idle awaiting the tool result), so the wait is
+/// near-free. Kept well under Claude Code's PreToolUse hook timeout (a timeout
+/// would *allow* the edit) — see the matcher's `timeout` in app.rs.
 const LOCK_WAIT: Duration = Duration::from_secs(240);
 
+/// Idle-lease window: a lock is held for the holder's whole turn, but its `ts` is
+/// **heartbeated** every time the holder actually touches that file. A waiter
+/// reclaims a lock whose `ts` is older than this — i.e. the holder acquired it
+/// but has moved on to other files this turn, so there's no reason to block for
+/// the rest of their turn. This makes block time track *real file activity*, not
+/// turn length. If the holder later re-edits the reclaimed file from a stale
+/// buffer, Claude Code's own "file modified since read" check + the HUB_RULES
+/// re-read nudge self-heal it in one cycle (see term_session.rs).
+const LOCK_IDLE: Duration = Duration::from_secs(30);
+
 /// How often the waiting edit re-checks whether the lock has been released (the
-/// holder's `Stop` hook deletes it). A small local poll, only while blocked.
+/// holder's `Stop` hook deletes it) or gone idle. A small local poll, only while
+/// blocked.
 const LOCK_POLL: Duration = Duration::from_millis(400);
 
 /// Entry point for `mulpex hook <event>`. Decisions are emitted to stdout; this
@@ -186,7 +200,12 @@ fn wait_until_free(ctx: &Ctx, lock_file: &Path, path: &Path) {
             None => break,                                     // free (or gone)
             Some(owner) if owner == ctx.id_str() => break,     // ours → fine
             Some(owner) => {
-                if Instant::now() >= deadline || holder_blocked_on_user(ctx, &owner) {
+                // Stop waiting once the holder is idle on this file (LOCK_IDLE),
+                // stuck on the user, or the budget elapsed — then allow the read.
+                if Instant::now() >= deadline
+                    || holder_blocked_on_user(ctx, &owner)
+                    || lock_is_stale(lock_file)
+                {
                     break;
                 }
                 if !marked {
@@ -224,15 +243,16 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
         _ => None,
     };
 
-    // Acquire the lock — WAITING for the holder's turn to end rather than denying
-    // immediately. A blocked PreToolUse hook costs no model tokens (the model is
-    // idle awaiting the tool result), so a same-file collision resolves itself
-    // with zero user involvement: the edit just proceeds once the file frees.
-    // Only a wait past the budget (or a holder that's itself stuck on the user)
-    // falls back to a deny.
+    // Acquire the lock — WAITING for the file to free rather than denying. A
+    // blocked PreToolUse hook costs no model tokens (the model is idle awaiting
+    // the tool result), so a same-file collision resolves itself with zero user
+    // involvement: the edit proceeds once the file frees OR the holder goes idle
+    // on it (`LOCK_IDLE`, reclaimed). We never deny — a holder that's stuck on the
+    // user, or genuinely hot for the full budget, falls back to proceeding
+    // *contended* with a stale-read awareness note instead of blocking forever.
     match acquire_or_wait(ctx, &lock_file, &path) {
-        AcquireOutcome::Denied(owner) => {
-            deny_edit(ctx, &path, &owner);
+        AcquireOutcome::Contended(owner) => {
+            allow_contended(ctx, &path, &owner);
             return;
         }
         AcquireOutcome::Acquired => {
@@ -251,11 +271,13 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
 
 /// Outcome of trying to acquire a file's lock (possibly after waiting).
 enum AcquireOutcome {
-    /// We hold the lock (freshly acquired, already ours, or a stray we reclaimed).
+    /// We hold the lock (freshly acquired, already ours, or a stale/stray we
+    /// reclaimed). Edit proceeds cleanly with the lock held.
     Acquired,
-    /// Still held by `<instance id>` after the wait budget (or the holder is
-    /// blocked on the user, so waiting is pointless).
-    Denied(String),
+    /// Still actively held by `<instance id>` after the full wait budget, or the
+    /// holder is blocked on the user (waiting is pointless). The edit proceeds
+    /// *contended* — allowed with a stale-read awareness note, never denied.
+    Contended(String),
 }
 
 /// Acquire `lock_file` for this instance, **waiting** up to `LOCK_WAIT` for a
@@ -272,21 +294,32 @@ fn acquire_or_wait(ctx: &Ctx, lock_file: &Path, path: &Path) -> AcquireOutcome {
             .open(lock_file)
         {
             Ok(mut f) => {
-                let _ = write!(
-                    f,
-                    "instance={}\npath={}\nts={}\n",
-                    ctx.instance,
-                    path.display(),
-                    now()
-                );
+                let _ = write!(f, "{}", lock_token(ctx.instance, path));
                 break AcquireOutcome::Acquired;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match read_field(lock_file, "instance") {
-                    Some(owner) if owner == ctx.id_str() => break AcquireOutcome::Acquired,
+                    Some(owner) if owner == ctx.id_str() => {
+                        // Already ours — heartbeat the lease so it stays "hot"
+                        // while we're actively touching this file.
+                        let _ = std::fs::write(lock_file, lock_token(ctx.instance, path));
+                        break AcquireOutcome::Acquired;
+                    }
                     Some(owner) => {
+                        // Holder stuck on the user, or hot for the full budget:
+                        // proceed contended rather than block forever.
                         if Instant::now() >= deadline || holder_blocked_on_user(ctx, &owner) {
-                            break AcquireOutcome::Denied(owner);
+                            break AcquireOutcome::Contended(owner);
+                        }
+                        // Idle-lease reclaim: the holder acquired this file but
+                        // hasn't touched it within LOCK_IDLE — they've moved on.
+                        // Drop their stale token so the next iteration's O_EXCL
+                        // create claims it atomically (two racing waiters can't
+                        // both win). `release_my_locks` only deletes locks still
+                        // owned by `self`, so the old holder won't clobber ours.
+                        if lock_is_stale(lock_file) {
+                            let _ = std::fs::remove_file(lock_file);
+                            continue;
                         }
                         if !marked {
                             mark_waiting(ctx, path, &owner);
@@ -472,7 +505,9 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_ok() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
-            if let Some(prompt) = json.get("userPrompt").and_then(|v| v.as_str()) {
+            // Claude Code's UserPromptSubmit payload carries the text under
+            // `prompt` (NOT `userPrompt`) — see code.claude.com/docs hooks.
+            if let Some(prompt) = json.get("prompt").and_then(|v| v.as_str()) {
                 let task = crate::mcp::summarize(prompt);
                 if !task.is_empty() {
                     let _ = std::fs::write(ctx.tasks_dir.join(ctx.id_str()), &task);
@@ -516,6 +551,48 @@ fn deny_edit(ctx: &Ctx, path: &Path, owner: &str) {
          call mcp__mulpex__hub_file_owner to check a file, or hub_instances to see everyone."
     );
     emit("deny", Some(&reason), None);
+}
+
+/// Edit fallback when a file stays *actively* held after the full wait budget (or
+/// the holder is stuck on the user): proceed with a stale-read awareness note
+/// rather than deny. Leans on Claude's intelligence + Claude Code's own "file
+/// modified since read" check — exactly the "be aware, don't block forever"
+/// tradeoff. Only reached in the rare hot/contended case; the idle-lease frees
+/// most files long before this.
+fn allow_contended(ctx: &Ctx, path: &Path, owner: &str) {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let doing = read_field_or_line(&ctx.tasks_dir.join(owner))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!(", who is working on: \"{t}\""))
+        .unwrap_or_default();
+    let note = format!(
+        "{name} is being edited concurrently by claude #{owner}{doing}. Proceeding anyway: \
+         re-read {name} RIGHT NOW immediately before you write it, so your edit applies to \
+         its current contents. If Claude Code reports \"File has been modified since read\", \
+         that's expected coordination between parallel instances — just re-read and retry, \
+         do NOT ask the user and do NOT use shell workarounds."
+    );
+    emit("allow", None, Some(&note));
+}
+
+/// The `key=value` body of a lock token: who holds the file, its path, and the
+/// heartbeat timestamp (`ts`) that `lock_is_stale` compares against `LOCK_IDLE`.
+fn lock_token(instance: usize, path: &Path) -> String {
+    format!("instance={}\npath={}\nts={}\n", instance, path.display(), now())
+}
+
+/// A lock is *stale* (reclaimable by a waiter) when its holder hasn't heartbeated
+/// it within `LOCK_IDLE` — i.e. acquired the file but moved on to others this
+/// turn. A missing/garbled `ts` also reads stale (a waiter shouldn't block on an
+/// un-dateable token).
+fn lock_is_stale(lock_file: &Path) -> bool {
+    match read_field(lock_file, "ts").and_then(|s| s.parse::<u64>().ok()) {
+        Some(ts) => now().saturating_sub(ts) >= LOCK_IDLE.as_secs(),
+        None => true,
+    }
 }
 
 /// Read a small single-value file (the task files are a bare line, not `k=v`).

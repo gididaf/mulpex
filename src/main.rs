@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     let _ = execute!(stdout(), EnableMouseCapture);
 
     let size = terminal.size()?;
-    let result = app::App::new(project_dir, Rect::new(0, 0, size.width, size.height), kitty)
+    let result = app::App::new(project_dir, Rect::new(0, 0, size.width, size.height))
         .and_then(|mut app| app.run(&mut terminal));
 
     let _ = execute!(stdout(), DisableMouseCapture);
