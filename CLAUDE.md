@@ -7,14 +7,19 @@ worktrees) — in a coordinated terminal shell:
 ```
  project · /path/to/project                                         ← top bar
 ────────────────────────────────────────────────────────────────────
-┌──────────────┬────────────────────────────┬──────────────┐
-│ instances    │   Claude Code              │ info / hub   │
-│ sidebar      │   (behaves exactly         │ (locks,      │
-│ (+ each one's│    like `claude`)          │  waiting,    │
-│  task)       │                            │  edits, msgs)│
-└──────────────┴────────────────────────────┴──────────────┘
-   left sidebar          center pane            right sidebar
- Ctrl+T new · Ctrl+] next · … · Ctrl+Q×2 quit          [kitty]  ← bottom bar
+┌──────────────┬───────────────────────────────────────────┐
+│ instances    │                                            │
+│ (+ each one's│         Claude Code                         │
+│  task)       │         (behaves exactly like `claude`)     │
+├──────────────┤                                            │
+│ info / hub   │                                            │
+│ (locks,      │                                            │
+│  waiting,    │                                            │
+│  msgs)       │                                            │
+└──────────────┴───────────────────────────────────────────┘
+   left column                  center pane
+ (instances over the hub)
+ Ctrl+T new · Ctrl+] next · … · Ctrl+Q×2 quit              ← bottom bar
 ```
 
 Run it from a project directory:
@@ -26,23 +31,26 @@ mulpex
 
 ## Status (done)
 
-3-pane layout (with full-width **top bar** = project, **bottom bar** = key legend +
-keyboard mode) hosting **multiple live, fully-interactive Claude Code sessions** for the
-current project that **coordinate with each other** through a shared hub (see *The
-coordination hub*). You can add instances, switch between them, and exited instances are
-removed automatically. The **sessions you worked on are remembered**: quit Mulpex and
-reopen it in the same project and it auto-resumes them with their prior conversations
-(see *Session persistence*).
+Two-column layout (with full-width **top bar** = project, **bottom bar** = key legend)
+hosting **multiple live, fully-interactive Claude Code sessions** for the current project
+that **coordinate with each other** through a shared hub (see *The coordination hub*). You
+can add instances, switch between them, and exited instances are removed automatically. The
+**sessions you worked on are remembered**: quit Mulpex and reopen it in the same project and
+it auto-resumes them with their prior conversations (see *Session persistence*).
 
-- **Left sidebar** lists all running instances (`claude #N`); the focused one is highlighted.
-  Each carries a **status dot** (green `ready`, yellow `working`, red `needs you`; see
-  *Status indicators*) and, beneath it, that instance's **current task** (from the hub).
+- **Left column** is split vertically: the **instances list** on top, the **info/hub view**
+  below it. The instances list shows all running instances (`claude #N`); the focused one is
+  highlighted. Each carries a **status dot** (green `ready`, yellow `working`, red `needs
+  you`; see *Status indicators*) and, beneath it, that instance's **current task** (from the
+  hub, word-wrapped across up to 3 lines).
 - **Center pane** shows the focused instance's live Claude, or a clean "No active Claude"
-  hint when none are running.
-- **Right sidebar (the hub view)** shows the live coordination state: **Locks** (file →
-  holder), **Waiting** (who's ⏳ blocked on whose file), and **Messages** — the persistent
-  cross-instance conversation (who→who + a snippet, newest first, with an unread count). Press
-  **Ctrl+M** for the full-screen message reader. See *The coordination hub*.
+  hint when none are running. It takes all the width left over by the single left column
+  (there is no separate right sidebar anymore).
+- **The info/hub view** (lower half of the left column) shows the live coordination state:
+  **Locks** (file → holder), **Waiting** (who's ⏳ blocked on whose file), and **Messages** —
+  the persistent cross-instance conversation (who→who + a snippet, newest first, with an
+  unread count). Press **Ctrl+M** for the full-screen message reader. See *The coordination
+  hub*.
 
 ### Keybindings
 
@@ -80,11 +88,12 @@ reopen it in the same project and it auto-resumes them with their prior conversa
 
 `main.rs` enables the **Kitty keyboard protocol**
 (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) when
-`supports_keyboard_enhancement()` reports it (e.g. recent iTerm2). The **info pane shows
-`Keyboard: enhanced (kitty)` or `legacy (Ctrl+[ off)`** so you can tell whether `Ctrl+[`
-will work. When it reads legacy, `Ctrl+[` (prev) and `Ctrl+M` (message reader) are affected —
+`supports_keyboard_enhancement()` reports it (e.g. recent iTerm2). When the protocol is
+*not* active (legacy mode), `Ctrl+[` (prev) and `Ctrl+M` (message reader) are affected —
 both rely on Kitty disambiguation — but `Ctrl+]` (next) still works, so you can cycle forward
-through all instances.
+through all instances. (There used to be a `[kitty]`/`[legacy]` indicator on the bottom bar
+and the `App.keyboard_enhanced` flag behind it; both were removed — the bottom bar is now
+just the key legend.)
 
 ### Instance lifecycle
 
@@ -170,29 +179,43 @@ under `$MULPEX_STATE_DIR` as the status dots. The enforcement lives in **`mulpex
 
 A per-file **semaphore**, enforced by a `PreToolUse` hook (`mulpex hook pretooluse`). The
 lock key is an FNV-1a hash of the canonical absolute path; the lock token is an `O_EXCL`
-file under `state_dir/locks/<hash>` (atomic test-and-set) holding `instance=/path=/ts=`.
+file under `state_dir/locks/<hash>` (atomic test-and-set) holding `instance=/path=/ts=`
+(written via `lock_token`). The `ts` is a **heartbeat**: it's rewritten every time the holder
+actually touches that file, so a waiter can tell a live edit from an abandoned one.
 
 - **Edit tools** (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`): acquire the lock before the
-  edit. Free or already ours → acquire + allow; held by another → **wait** (see below).
-  Released per-turn by `mulpex hook stop`. An awareness note is injected when a *different*
-  instance edited the file earlier this session (`state_dir/history/<hash>`).
-- **Transparent auto-wait (no user involvement).** A blocked edit/read does **not** deny
-  immediately — it **waits** (polling every `LOCK_POLL`, up to `LOCK_WAIT` ≈ 4 min) for the
-  holder's turn to end, then proceeds. A blocking hook costs **zero model tokens** (the model
-  is idle awaiting the tool result), so this is a near-free transparent serialization. The
-  `--settings` matcher carries a `timeout` *above* `LOCK_WAIT` because **a PreToolUse hook
-  that times out is treated as *allow*** — we must always return an explicit decision first.
+  edit. Free or already ours → acquire + allow (and re-stamp the heartbeat); held by another
+  → **wait** (see below). Released per-turn by `mulpex hook stop`. An awareness note is
+  injected when a *different* instance edited the file earlier this session
+  (`state_dir/history/<hash>`).
+- **Transparent auto-wait, then proceed — never a hard deny.** A blocked edit/read does **not**
+  deny: it **waits** (polling every `LOCK_POLL`) and then proceeds. Two things end the wait
+  early so block time tracks *real file activity*, not turn length:
+  - **Idle-lease (`LOCK_IDLE` ≈ 30s).** If the holder's heartbeat goes stale (`lock_is_stale`)
+    — they acquired the file but moved on to other files this turn — a waiter **reclaims** it:
+    it deletes the stale token so the next `O_EXCL` create wins atomically (two racing waiters
+    can't both win; `release_my_locks` only deletes locks still owned by `self`, so the old
+    holder won't clobber the new one).
+  - **Hot holder / stuck-on-user.** If the holder is *continuously* editing the same file for
+    the full `LOCK_WAIT` (≈ 4 min) budget, or is itself blocked on the user (`needs`), the
+    waiter stops blocking and proceeds **contended** (`allow_contended`) — allowed *with a
+    stale-read awareness note* telling the model to re-read the file right now before writing,
+    leaning on Claude Code's own "file modified since read" check. There is no `deny` path for
+    edits anymore.
+  A blocking hook costs **zero model tokens** (the model is idle awaiting the tool result), so
+  the wait is near-free. The `--settings` matcher carries a `timeout` *above* `LOCK_WAIT`
+  because **a PreToolUse hook that times out is treated as *allow*** — we must always return an
+  explicit decision first.
 - **Reads are gated too** (`read_guard`). Reading a file another instance is actively editing
   yields a stale snapshot, and Claude Code then rejects the follow-up edit with *"file
   modified since read"* — pre-empting our lock and causing churn. So a read of a held file
-  **waits** for the holder to finish, then returns the *final* content, so the edit applies
-  cleanly in one shot. (Cost: every `Read` now forks the hook; reads of unlocked files return
-  instantly.) Both waits **early-exit** if the holder is itself blocked on the user (`needs`).
+  **waits** for the holder to finish (or go idle), then returns the *final* content, so the
+  edit applies cleanly in one shot. (Cost: every `Read` now forks the hook; reads of unlocked
+  files return instantly.) The wait **early-exits** on the same conditions: holder idle
+  (`LOCK_IDLE`), holder blocked on the user (`needs`), or the budget elapsed.
 - **Bash**: best-effort — denies immediately if the command text names a currently-locked
   path (no wait); builds / `npm install` pass through.
-- A `deny` (only after the full wait budget) names the holder *and their current task*, framed
-  as normal coordination ("don't bypass, don't ask the user"). `App::refresh_locks` mirrors
-  `locks/` to the UI and **reaps** locks held by dead instances.
+- `App::refresh_locks` mirrors `locks/` to the UI and **reaps** locks held by dead instances.
 
 ### Phase 2 — inner MCP coordination hub (`mcp.rs`)
 
@@ -212,6 +235,8 @@ handler **fails soft**. Tools:
 **Awareness plumbing:** the `UserPromptSubmit` hook (`mulpex hook userpromptsubmit`)
 auto-captures the prompt as the instance's baseline task (`state_dir/tasks/<id>`) and injects
 a compact live snapshot of the *other* instances into each turn via `additionalContext`.
+(The prompt text is read from the payload's `prompt` field — *not* `userPrompt`, which was a
+bug that silently disabled task capture until fixed.)
 
 **Message delivery (don't let mail rot).** A peer's `hub_send` is only useful if the recipient
 reads it — but the awareness snapshot rides on `UserPromptSubmit`, which never re-fires for a
@@ -230,22 +255,31 @@ close the gap, both keyed on the unread count (`mcp::unread_for`, = files under 
   *before* the block decision): the continuation re-acquires (via `edit_guard`) anything it
   actually edits, so holding locks across the block would only add contention — a peer could
   time out waiting on a lock this instance is no longer using.
-Standing **hub rules** are injected with `--append-system-prompt` (a const `HUB_RULES` in
-`term_session.rs`) — teaching each instance it's one of several parallel Claudes, that locks
-are normal (never bypass or ask the user; the edit waits and proceeds), how to use the
-`mcp__mulpex__*` tools, and a **stale-read rule**: re-read a hot shared file (main.rs / lib.rs /
-mod.rs / any file others also touch) right before editing if much happened since the last read
-(a dispatched subagent, a long build, many steps). The per-turn lock serializes *writes* but
-can't refresh a read taken minutes earlier, so a read held across a long turn edits stale and
-Claude Code rejects it with "File has been modified since read"; re-reading first avoids that
-round-trip. None of this touches the user's project files.
+Standing **hub rules** are injected with `--append-system-prompt` — two consts in
+`term_session.rs`, joined and passed as one prompt:
+- `HUB_RULES` — teaches each instance it's one of several parallel Claudes, that locks are
+  normal (never bypass or ask the user; the edit waits and proceeds), how to use the
+  `mcp__mulpex__*` tools, and a **stale-read rule**: re-read a hot shared file (main.rs /
+  lib.rs / mod.rs / any file others also touch) right before editing if much happened since
+  the last read (a dispatched subagent, a long build, many steps). The per-turn lock
+  serializes *writes* but can't refresh a read taken minutes earlier, so a read held across a
+  long turn edits stale and Claude Code rejects it with "File has been modified since read";
+  re-reading first avoids that round-trip.
+- `PLANNING_RULES` — a user-mandated **zero-assumptions** discipline: before finalizing a plan
+  or implementing, surface ALL assumptions and verify them with the user via `AskUserQuestion`
+  first. It also tells the model that the `AskUserQuestion` tool here is **modified** to allow
+  up to **10 questions per call and 10 options per question** (stock Claude Code hardcodes both
+  to 4), so it shouldn't artificially trim to 4 — see *Raised AskUserQuestion caps* under
+  *Embedded `claude` invocation*.
+
+None of this touches the user's project files.
 
 ### Shared on-disk state (under `state_dir`)
 
 ```
 <id>                 status word (working|waiting|needs)
 instances            live instance ids, one per line (App writes; mcp/hook read for peers)
-locks/<hash>         lock token: instance=/path=/ts=   (O_EXCL)
+locks/<hash>         lock token: instance=/path=/ts=   (O_EXCL; ts heartbeated → idle-lease)
 history/<hash>       last editor of a file (awareness notes)
 tasks/<id>           one line: instance's current task
 inbox/<id>/<uuid>    a message JSON for instance <id> (deleted when read via hub_inbox)
@@ -370,11 +404,13 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   list), dead-instance reaping, and the `show_messages`/`msg_scroll` state for the Ctrl+M reader
   (see *The coordination hub*).
 - `hook.rs` — the `mulpex hook` subcommand: the file-locking enforcement (`pretooluse` →
-  `edit_guard`/`read_guard`/`bash_guard` with the `acquire_or_wait`/`wait_until_free` loops),
+  `edit_guard`/`read_guard`/`bash_guard` with the `acquire_or_wait`/`wait_until_free` loops,
+  the `lock_token`/`lock_is_stale` heartbeat helpers driving the `LOCK_IDLE` idle-lease, and
+  `allow_contended` — the never-deny fallback that proceeds with a stale-read note),
   `posttooluse` (status `working` + mid-turn unread-mail nudge, deduped via `<id>.notified`),
   `stop` (block the stop while mail is unread, else release locks + write `waiting`), and
-  `userpromptsubmit` (capture task + inject peer snapshot). `Ctx::from_env` + the
-  `read_field`/`canonical_target`/`now` helpers are shared with `mcp.rs`.
+  `userpromptsubmit` (capture task from the payload's `prompt` field + inject peer snapshot).
+  `Ctx::from_env` + the `read_field`/`canonical_target`/`now` helpers are shared with `mcp.rs`.
 - `mcp.rs` — the `mulpex mcp` subcommand: the stdio JSON-RPC coordination-hub server and its
   five `hub_*` tools, plus `peers_context`/`unread_for` (used by the hooks). `hub_send` also
   appends to the persistent `messages.log`. Reads the shared `state_dir` files; no new crates
@@ -383,20 +419,27 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   message ids) and `SessionStore` (per-project `~/.mulpex/sessions/<key>.txt`). `fnv1a`
   (pub(crate)) keys both the session store filename and the lock/history hashes.
 - `term_session.rs` — `TermSession`: spawns `claude` on a PTY with `--settings`,
-  `--mcp-config <state_dir/mcp.json>`, `--append-system-prompt <HUB_RULES>`, the `MULPEX_*`
-  env (incl. `MULPEX_PROJECT_DIR`), and `--session-id`/`--resume`. A reader thread feeds the
-  `vt100::Parser` (with `SCROLLBACK_LEN`); `resize`/`scroll_*` and `Drop` as before. The
-  `HUB_RULES` const lives here.
+  `--mcp-config <state_dir/mcp.json>`, `--append-system-prompt <HUB_RULES + PLANNING_RULES>`,
+  the `MULPEX_*` env (incl. `MULPEX_PROJECT_DIR`), and `--session-id`/`--resume`. The binary
+  it execs is resolved by `claude_command`/`patched_claude_bin` — a byte-patched `claude` with
+  raised AskUserQuestion caps when available, else stock `claude` (see *Embedded `claude`
+  invocation*). A reader thread feeds the `vt100::Parser` (with `SCROLLBACK_LEN`);
+  `resize`/`scroll_*` and `Drop` as before. The `HUB_RULES` and `PLANNING_RULES` consts (and
+  the `MAX_Q`/`MAX_A` caps) live here.
 - `keymap.rs` — `key_to_bytes`: translate crossterm `KeyEvent`s into terminal byte sequences,
   so the embedded session feels native. (Mouse is Mulpex-side, not forwarded.)
 - `ui.rs` — `outer_layout` splits the window into `[top bar (2) | middle | bottom bar (1)]`;
-  `layout` splits the middle into the `Length(30) | Min(20) | Length(34)` panes (callers pass
-  the full rect). Focus borders + compositing the `PseudoTerminal`. `center_inner_size`/
-  `center_inner_rect` (now relative to the middle band) drive PTY size + mouse mapping.
-- `pane.rs` — renderers: `render_top_bar` (project), `render_bottom_bar` (keys + keyboard
-  mode), `render_instances` (status dot + each instance's task line), `render_info` (the hub
-  view: Locks / Waiting ⏳ / Messages feed with unread count + snippets), and
-  `render_message_log` (the full-screen Ctrl+M reader: full bodies, word-wrapped, newest first).
+  `layout` splits the middle into `[Length(LEFT_WIDTH=32) | Min(20)]` and then splits the left
+  column vertically into `[instances 45% | info 55%]`, returning `[instances, center, info]`
+  (center stays at index 1 so `center_inner_rect`/mouse mapping need no change). There is no
+  longer a right sidebar / `RIGHT_WIDTH`. Focus borders + compositing the `PseudoTerminal`.
+  `center_inner_size`/`center_inner_rect` (relative to the middle band) drive PTY size + mouse
+  mapping.
+- `pane.rs` — renderers: `render_top_bar` (project), `render_bottom_bar` (just the key legend
+  now), `render_instances` (status dot + each instance's task line, word-wrapped across up to
+  3 lines via `wrap_words` — unit-tested), `render_info` (the hub view: Locks / Waiting ⏳ /
+  Messages feed with unread count + snippets), and `render_message_log` (the full-screen
+  Ctrl+M reader: full bodies, word-wrapped, newest first).
 
 ## Keyboard model (decided)
 
@@ -418,8 +461,29 @@ it: argv `claude --dangerously-skip-permissions`, env `IS_SANDBOX=1`, cwd = laun
 (Make these overridable via config in a later milestone.) It also appends
 `--session-id <uuid>` (new) or `--resume <uuid>` (restore) for session persistence,
 `--settings <file>` for the status + locking hooks, `--mcp-config <file>` to register the
-`mulpex mcp` coordination hub, and `--append-system-prompt <HUB_RULES>` to teach the hub
-rules (see *The coordination hub*).
+`mulpex mcp` coordination hub, and `--append-system-prompt <HUB_RULES + PLANNING_RULES>` to
+teach the hub rules and the zero-assumptions planning discipline (see *The coordination hub*).
+
+### Raised AskUserQuestion caps (the patched `claude` binary)
+
+The cap on `AskUserQuestion` — max 4 questions per call, max 4 options per question — is a
+hardcoded Zod schema bound **baked into Claude Code's compiled JS bundle**. There is no flag,
+env var, `--settings` key, or MCP mechanism to change it; byte-patching the binary is the only
+lever. The user's shell already does this: `MAX_Q`/`MAX_A` env vars make their `claude` zsh
+function build (via `~/.local/bin/patch-claude-maxq.py`) and run a *patched* copy with the
+bounds raised, cached under `~/.cache/claude-patched/claude-q<q>a<a>` and rebuilt when Claude
+Code auto-updates.
+
+`portable-pty` execs the binary directly and bypasses that zsh function, so `term_session.rs`
+replicates it: `patched_claude_bin` resolves `~/.cache/claude-patched/claude-q10a10`, building
+it on demand with the same patch script (rebuilding when the stock `~/.local/bin/claude` is
+newer), and `claude_command` spawns it. The caps are fixed at `MAX_Q = 10` / `MAX_A = 10`. It
+**fails soft**: if the patch script is missing (e.g. another machine), `python3` fails, or no
+usable binary results, it falls back to plain `claude` with the stock caps — Mulpex still
+works. The matching `PLANNING_RULES` system-prompt note tells the model the caps are raised so
+it actually uses them. (This is tied to the user's machine setup; it is *not* portable to
+other users without that patch script — a candidate for a Rust-native port if Mulpex is ever
+shipped widely.)
 
 ## Teardown / no orphans (important)
 
@@ -452,7 +516,7 @@ for a real sized terminal:
 tmux new-session -d -s mptest -x 140 -y 40
 tmux send-keys -t mptest './target/debug/mulpex' Enter
 sleep 6
-tmux capture-pane -t mptest -p          # should show all 3 panes + live Claude
+tmux capture-pane -t mptest -p          # should show both columns + live Claude
 tmux send-keys -t mptest C-q            # Ctrl+Q quits
 tmux kill-session -t mptest
 ```
@@ -470,4 +534,4 @@ is verified end-to-end without manual clicking.
 
 ## Last Synced Commit
 
-`a763a7158775e177b0381a02ecf61d0975211e8b` — 2026-06-17
+`639139f1ad6263309fc48c7394242f6bf40d32e2` — 2026-06-23

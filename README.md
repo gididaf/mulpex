@@ -12,14 +12,19 @@ without them stepping on each other.
 ```
  project · /path/to/project                                         ← top bar
 ────────────────────────────────────────────────────────────────────
-┌──────────────┬────────────────────────────┬──────────────┐
-│ instances    │   Claude Code              │ info / hub   │
-│ sidebar      │   (behaves exactly         │ (locks,      │
-│ (+ each one's│    like `claude`)          │  waiting,    │
-│  task)       │                            │  edits, msgs)│
-└──────────────┴────────────────────────────┴──────────────┘
-   left sidebar          center pane            right sidebar
- Ctrl+T new · Ctrl+] next · … · Ctrl+Q×2 quit          [kitty]  ← bottom bar
+┌──────────────┬───────────────────────────────────────────┐
+│ instances    │                                            │
+│ (+ each one's│         Claude Code                         │
+│  task)       │         (behaves exactly like `claude`)     │
+├──────────────┤                                            │
+│ info / hub   │                                            │
+│ (locks,      │                                            │
+│  waiting,    │                                            │
+│  msgs)       │                                            │
+└──────────────┴───────────────────────────────────────────┘
+   left column                  center pane
+ (instances over the hub)
+ Ctrl+T new · Ctrl+] next · … · Ctrl+Q×2 quit              ← bottom bar
 ```
 
 ## Why
@@ -109,15 +114,18 @@ When you quit and reopen Mulpex in the same project, the sessions you actually w
 **auto-resume live**, with their prior conversations intact (powered by Claude Code's own
 `--session-id` / `--resume`, not by copying any conversation content).
 
-### The three panes
+### The layout
 
-- **Left — instances.** Every running session (`claude #N`) with a **status dot**
-  (🟢 ready · 🟡 working · 🔴 needs you) and its **current task** beneath it.
+A single **left column** beside the big **Claude pane** — the left column is split into two
+stacked sections:
+
+- **Instances** (top of the left column). Every running session (`claude #N`) with a **status
+  dot** (🟢 ready · 🟡 working · 🔴 needs you) and its **current task** beneath it.
 - **Center — Claude.** The focused session's live Claude, behaving exactly like `claude` in a
-  normal terminal.
-- **Right — the hub.** Live coordination state: **Locks** (file → holder), **Waiting** (who's
-  ⏳ blocked on whose file), and **Messages** (the cross-instance conversation, newest first,
-  with an unread count).
+  normal terminal. Takes all the width beside the left column.
+- **The hub** (bottom of the left column). Live coordination state: **Locks** (file → holder),
+  **Waiting** (who's ⏳ blocked on whose file), and **Messages** (the cross-instance
+  conversation, newest first, with an unread count).
 
 ### Keybindings
 
@@ -136,13 +144,13 @@ When you quit and reopen Mulpex in the same project, the sessions you actually w
 > (dead keys), so navigation lives on Ctrl+letters, which terminals leave alone. A couple of
 > bindings (`Ctrl+[`, `Ctrl+M`) need the **Kitty keyboard protocol** to be distinguishable
 > from Esc / Enter; Mulpex enables it automatically when your terminal supports it (e.g. recent
-> iTerm2) and the info pane shows whether it's active. `Ctrl+]` (next) always works regardless.
+> iTerm2). `Ctrl+]` (next) always works regardless.
 
 ## How it works
 
 Each instance is a real `claude` binary running on its own PTY, sized to the center pane and
 rendered through a `vt100` terminal emulator (the same job tmux does internally) so it fits
-between the sidebars.
+beside the left column.
 
 Coordination is built on lightweight, file-based IPC in a per-run scratch directory, wired into
 Claude Code through its official extension points — **no patching of your project**:
