@@ -345,18 +345,23 @@ fn is_word_char(c: char) -> bool {
 const MAX_Q: u32 = 10;
 const MAX_A: u32 = 10;
 
-/// The `claude` to spawn. The user's shell wraps `claude` so that setting
-/// `MAX_Q`/`MAX_A` runs a *byte-patched* copy of the binary with the
-/// AskUserQuestion schema caps raised (questions/options 4 → 10) — the cap is a
-/// hardcoded Zod bound baked into Claude Code's compiled JS bundle, so there is
-/// no flag/env/setting to change it; patching the binary is the only lever.
-/// `portable-pty` execs the binary directly and bypasses that zsh function, so we
-/// replicate it here: always run the q=10/a=10 variant, built on demand and
-/// cached under `~/.cache/claude-patched/` (rebuilt whenever Claude Code
-/// auto-updates). The patch itself lives in `~/.local/bin/patch-claude-maxq.py`,
-/// the same script the shell uses. Falls back to plain `claude` if the patched
-/// build is unavailable for any reason, so Mulpex still works (just with the
-/// stock caps).
+/// The patcher that raises the caps, **vendored** from the public
+/// `claude-more-questions` project (MIT) and embedded into the Mulpex binary so
+/// no separate install is needed — see `assets/patch-claude-maxq.py`. It rewrites
+/// the `.max(4)` Zod bounds (+ the tool's description strings) in a copy of the
+/// `claude` binary, byte-length-preserving, then re-signs it ad-hoc.
+const MAXQ_PATCHER: &str = include_str!("../assets/patch-claude-maxq.py");
+
+/// The `claude` to spawn. The AskUserQuestion caps (4 questions / 4 options) are
+/// a hardcoded Zod bound baked into Claude Code's compiled JS bundle — no
+/// flag/env/setting changes them, so byte-patching the binary is the only lever.
+/// We run a q=10/a=10 patched copy, built on demand and cached under
+/// `~/.cache/claude-patched/` (the same cache the `claude-more-questions` CLI uses,
+/// so they share builds; rebuilt whenever Claude Code auto-updates). The patch
+/// script is vendored + embedded (`MAXQ_PATCHER`), so this needs no prior install
+/// and works on any macOS machine with `python3` + `codesign` + a native `claude`.
+/// Falls back to plain `claude` if anything is unavailable (non-macOS, no `claude`
+/// found, build fails), so Mulpex always works — just with the stock caps.
 fn claude_command() -> CommandBuilder {
     match patched_claude_bin() {
         Some(bin) => CommandBuilder::new(bin),
@@ -364,35 +369,51 @@ fn claude_command() -> CommandBuilder {
     }
 }
 
-/// Resolve (building on demand) the path to the MAX_Q/MAX_A-patched `claude`,
-/// mirroring the user's zsh function. Returns `None` (→ fall back to stock
-/// `claude`) if the patch script is missing, the build fails, or no usable
-/// binary results.
+/// Resolve (building on demand) the path to the MAX_Q/MAX_A-patched `claude`.
+/// Returns `None` (→ fall back to stock `claude`) when patching isn't possible:
+/// not macOS, no stock `claude` located, or the build/sign step fails.
 fn patched_claude_bin() -> Option<std::path::PathBuf> {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    let script = home.join(".local/bin/patch-claude-maxq.py");
-    if !script.is_file() {
-        return None; // not this machine's setup → use stock claude
+    // The patcher relies on macOS `codesign` + a Mach-O binary; elsewhere there's
+    // nothing to do but run stock `claude`.
+    if !cfg!(target_os = "macos") {
+        return None;
     }
-    let stock = home.join(".local/bin/claude");
-    let cache = home
-        .join(".cache/claude-patched")
-        .join(format!("claude-q{MAX_Q}a{MAX_A}"));
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    // Locate the stock binary the same way the patcher does (so the freshness
+    // check compares against the exact source it will copy): the canonical
+    // install path first, else whatever `claude` is on PATH.
+    let stock = {
+        let default = home.join(".local/bin/claude");
+        if default.exists() {
+            default
+        } else {
+            which_claude()?
+        }
+    };
+
+    let cache_dir = home.join(".cache/claude-patched");
+    let cache = cache_dir.join(format!("claude-q{MAX_Q}a{MAX_A}"));
 
     // Rebuild when the cached copy is missing or older than the stock binary
-    // (e.g. Claude Code auto-updated). `metadata` follows symlinks, matching the
-    // shell's `-nt` on the `~/.local/bin/claude` symlink → its version target.
+    // (e.g. Claude Code auto-updated). `metadata` follows symlinks, so a symlinked
+    // stock resolves to its version target's mtime.
     let need_build = match (mtime(&cache), mtime(&stock)) {
         (None, _) => true,
         (Some(c), Some(s)) => s > c,
         (Some(_), None) => false, // no stock to compare; keep what we have
     };
     if need_build {
+        std::fs::create_dir_all(&cache_dir).ok()?;
+        // Materialize the embedded patcher next to the cache, then run it. Passing
+        // CLAUDE_BIN pins the source to the stock we resolved above.
+        let script = cache_dir.join("patch-claude-maxq.py");
+        std::fs::write(&script, MAXQ_PATCHER).ok()?;
         let ok = std::process::Command::new("python3")
             .arg(&script)
             .arg(MAX_Q.to_string())
             .arg(MAX_A.to_string())
             .arg(&cache)
+            .env("CLAUDE_BIN", &stock)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -403,6 +424,20 @@ fn patched_claude_bin() -> Option<std::path::PathBuf> {
         }
     }
     cache.is_file().then_some(cache)
+}
+
+/// First `claude` on `PATH`, resolved to an absolute path (via `command -v`).
+fn which_claude() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v claude")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
 }
 
 fn mtime(p: &Path) -> Option<std::time::SystemTime> {

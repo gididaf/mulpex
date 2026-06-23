@@ -469,21 +469,25 @@ teach the hub rules and the zero-assumptions planning discipline (see *The coord
 The cap on `AskUserQuestion` — max 4 questions per call, max 4 options per question — is a
 hardcoded Zod schema bound **baked into Claude Code's compiled JS bundle**. There is no flag,
 env var, `--settings` key, or MCP mechanism to change it; byte-patching the binary is the only
-lever. The user's shell already does this: `MAX_Q`/`MAX_A` env vars make their `claude` zsh
-function build (via `~/.local/bin/patch-claude-maxq.py`) and run a *patched* copy with the
-bounds raised, cached under `~/.cache/claude-patched/claude-q<q>a<a>` and rebuilt when Claude
-Code auto-updates.
+lever. The patcher (`assets/patch-claude-maxq.py`) rewrites the `.max(4)` bounds (+ the tool's
+description strings) in a *copy* of the binary, byte-length-preserving so no Mach-O offsets
+shift, then re-signs it ad-hoc. It's **vendored from the public `claude-more-questions` project
+(MIT, same author)** and **embedded into the Mulpex binary** via `include_str!`
+(`MAXQ_PATCHER` in `term_session.rs`), so Mulpex carries its own copy — no separate install
+required.
 
-`portable-pty` execs the binary directly and bypasses that zsh function, so `term_session.rs`
-replicates it: `patched_claude_bin` resolves `~/.cache/claude-patched/claude-q10a10`, building
-it on demand with the same patch script (rebuilding when the stock `~/.local/bin/claude` is
-newer), and `claude_command` spawns it. The caps are fixed at `MAX_Q = 10` / `MAX_A = 10`. It
-**fails soft**: if the patch script is missing (e.g. another machine), `python3` fails, or no
-usable binary results, it falls back to plain `claude` with the stock caps — Mulpex still
-works. The matching `PLANNING_RULES` system-prompt note tells the model the caps are raised so
-it actually uses them. (This is tied to the user's machine setup; it is *not* portable to
-other users without that patch script — a candidate for a Rust-native port if Mulpex is ever
-shipped widely.)
+`portable-pty` execs the binary directly, so `term_session.rs` does the patching itself:
+`patched_claude_bin` resolves `~/.cache/claude-patched/claude-q10a10` (the **same cache** the
+`claude-more-questions` CLI uses, so they share builds), and if it's missing or older than the
+stock binary it writes the embedded `MAXQ_PATCHER` to the cache dir and runs it (`python3 …
+10 10 <cache>`, with `CLAUDE_BIN` pinned to the resolved stock so the freshness check and the
+copy use the same source). `claude_command` then spawns the patched copy. The caps are fixed at
+`MAX_Q = 10` / `MAX_A = 10`. It **fails soft** — non-macOS, no `claude` found on PATH, or a
+failed build/sign all fall back to plain `claude` with the stock caps, so Mulpex always works.
+The matching `PLANNING_RULES` system-prompt note tells the model the caps are raised so it
+actually uses them. Because the patcher is embedded, this now works on **any macOS machine**
+with `python3` + `codesign` + a native `claude` install — not just a machine that pre-installed
+the patch script. (Still macOS-only: the patcher needs `codesign` and the Mach-O native build.)
 
 ## Teardown / no orphans (important)
 
