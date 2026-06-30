@@ -30,10 +30,29 @@ pub fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
         }
-        KeyCode::Enter => out.push(b'\r'),
+        // Shift+Enter inserts a newline (`\n`) instead of submitting (`\r`),
+        // matching vanilla Claude Code. Plain Enter still submits. We can't rely
+        // on the terminal to disambiguate these (it sends a bare CR), so we
+        // encode the distinction ourselves from the Shift modifier crossterm
+        // reports (available under the Kitty protocol Mulpex enables).
+        KeyCode::Enter => {
+            if m.contains(KeyModifiers::SHIFT) {
+                out.push(b'\n');
+            } else {
+                out.push(b'\r');
+            }
+        }
         KeyCode::Tab => out.push(b'\t'),
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
-        KeyCode::Backspace => out.push(0x7f),
+        // Backspace sends DEL; Option/Alt+Backspace sends ESC+DEL, the
+        // readline "delete previous word" sequence (so Option+Backspace erases
+        // a whole word in Claude Code, as it does in a native terminal).
+        KeyCode::Backspace => {
+            if alt {
+                out.push(0x1b);
+            }
+            out.push(0x7f);
+        }
         KeyCode::Esc => out.push(0x1b),
 
         KeyCode::Left => out.extend_from_slice(&csi_letter(b'D', m)),
