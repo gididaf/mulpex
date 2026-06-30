@@ -345,6 +345,12 @@ fn is_word_char(c: char) -> bool {
 const MAX_Q: u32 = 10;
 const MAX_A: u32 = 10;
 
+/// Revision of the embedded patcher's *output*. It is part of the cache filename,
+/// so bumping it abandons every previously-cached binary. Bump whenever the
+/// patcher logic changes in a way that could make an older cached build untrusted
+/// (e.g. a fix for a patch that used to silently produce an unpatched copy).
+const PATCH_REV: u32 = 1;
+
 /// The patcher that raises the caps, **vendored** from the public
 /// `claude-more-questions` project (MIT) and embedded into the Mulpex binary so
 /// no separate install is needed — see `assets/patch-claude-maxq.py`. It rewrites
@@ -356,12 +362,14 @@ const MAXQ_PATCHER: &str = include_str!("../assets/patch-claude-maxq.py");
 /// a hardcoded Zod bound baked into Claude Code's compiled JS bundle — no
 /// flag/env/setting changes them, so byte-patching the binary is the only lever.
 /// We run a q=10/a=10 patched copy, built on demand and cached under
-/// `~/.cache/claude-patched/` (the same cache the `claude-more-questions` CLI uses,
-/// so they share builds; rebuilt whenever Claude Code auto-updates). The patch
-/// script is vendored + embedded (`MAXQ_PATCHER`), so this needs no prior install
-/// and works on any macOS machine with `python3` + `codesign` + a native `claude`.
-/// Falls back to plain `claude` if anything is unavailable (non-macOS, no `claude`
-/// found, build fails), so Mulpex always works — just with the stock caps.
+/// `~/.cache/claude-patched/` (keyed by caps + `PATCH_REV`, and rebuilt whenever
+/// Claude Code auto-updates). The patch script is vendored + embedded
+/// (`MAXQ_PATCHER`), so this needs no prior install and works on any macOS machine
+/// with `python3` + `codesign` + a native `claude`. The patcher writes atomically
+/// and only bumps the cap (description text is best-effort), so a Claude bundle
+/// reshape degrades to stock caps instead of poisoning the cache. Falls back to
+/// plain `claude` if anything is unavailable (non-macOS, no `claude` found, build
+/// fails), so Mulpex always works — just with the stock caps.
 fn claude_command() -> CommandBuilder {
     match patched_claude_bin() {
         Some(bin) => CommandBuilder::new(bin),
@@ -392,7 +400,11 @@ fn patched_claude_bin() -> Option<std::path::PathBuf> {
     };
 
     let cache_dir = home.join(".cache/claude-patched");
-    let cache = cache_dir.join(format!("claude-q{MAX_Q}a{MAX_A}"));
+    // The PATCH_REV suffix means a cached binary built by an OLDER patcher (which
+    // could have silently cached an unpatched copy) is never reused — we rebuild
+    // under the new name instead. The embedded patcher writes atomically and only
+    // publishes on success, so a present cache file here is always a good build.
+    let cache = cache_dir.join(format!("claude-q{MAX_Q}a{MAX_A}r{PATCH_REV}"));
 
     // Rebuild when the cached copy is missing or older than the stock binary
     // (e.g. Claude Code auto-updated). `metadata` follows symlinks, so a symlinked
