@@ -56,6 +56,14 @@ struct Selection {
     word_pivot: Option<((u16, u16), (u16, u16))>,
 }
 
+/// An in-progress instance rename: a small modal text input opened with Ctrl+R.
+/// `target` is the instance id being named; `input` is the current buffer. On
+/// commit an empty buffer clears the name (falls back to the auto task line).
+struct RenameEdit {
+    target: usize,
+    input: String,
+}
+
 /// How often to re-read the per-instance hook state files. Most state changes
 /// coincide with PTY output (which already triggers a redraw), but the idle
 /// `Notification` can fire with no output, so we poll as a backstop.
@@ -180,6 +188,13 @@ pub struct App {
     pub show_messages: bool,
     /// Scroll offset (lines from the top) of the message reader while open.
     pub msg_scroll: u16,
+    /// The open rename modal (Ctrl+R), if any. While set it captures all keys.
+    rename: Option<RenameEdit>,
+    /// Custom per-instance names (id → name) set via Ctrl+R. When present, a
+    /// name overrides the auto task line in the sidebar; cleared → task shows
+    /// again. Persisted alongside the session ids so a renamed instance keeps
+    /// its name across restarts.
+    names: HashMap<usize, String>,
     dirty: Arc<AtomicBool>,
     next_id: usize,
     center_cols: u16,
@@ -268,7 +283,8 @@ impl App {
         let store = SessionStore::new(&project_dir);
         let mut instances: Vec<TermSession> = Vec::new();
         let mut worked: HashSet<usize> = HashSet::new();
-        for session_id in store.load() {
+        let mut names: HashMap<usize, String> = HashMap::new();
+        for (session_id, name) in store.load() {
             let id = instances.len() + 1;
             if let Ok(session) = TermSession::spawn(
                 id,
@@ -282,6 +298,9 @@ impl App {
                 true,
             ) {
                 worked.insert(id);
+                if let Some(name) = name {
+                    names.insert(id, name);
+                }
                 instances.push(session);
             }
         }
@@ -328,6 +347,8 @@ impl App {
             should_quit: false,
             show_messages: false,
             msg_scroll: 0,
+            rename: None,
+            names,
             state_dir,
             settings_path,
             statuses: HashMap::new(),
@@ -352,13 +373,13 @@ impl App {
     /// Write the set of worked-on instances' session ids to the per-project
     /// store, preserving sidebar order, so the next launch can restore them.
     fn persist_sessions(&self) {
-        let ids: Vec<String> = self
+        let sessions: Vec<(&str, Option<&str>)> = self
             .instances
             .iter()
             .filter(|s| self.worked.contains(&s.id()))
-            .map(|s| s.session_id().to_string())
+            .map(|s| (s.session_id(), self.names.get(&s.id()).map(String::as_str)))
             .collect();
-        self.store.save(&ids);
+        self.store.save(&sessions);
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
@@ -539,6 +560,47 @@ impl App {
         self.tasks.get(&id).map(String::as_str).filter(|t| !t.is_empty())
     }
 
+    /// This instance's custom name (set via Ctrl+R), if any. When present it
+    /// overrides the auto task line in the sidebar.
+    pub fn name_of(&self, id: usize) -> Option<&str> {
+        self.names.get(&id).map(String::as_str).filter(|n| !n.is_empty())
+    }
+
+    /// The open rename modal as `(target instance id, current buffer)`, or
+    /// `None` when it isn't open. Drives the Ctrl+R popup.
+    pub fn rename_prompt(&self) -> Option<(usize, &str)> {
+        self.rename.as_ref().map(|e| (e.target, e.input.as_str()))
+    }
+
+    /// Open the rename modal for the focused instance, pre-filled with its
+    /// current name (so an existing name can be edited, not just replaced).
+    fn open_rename(&mut self) {
+        if let Some(session) = self.instances.get(self.active) {
+            let target = session.id();
+            let input = self.names.get(&target).cloned().unwrap_or_default();
+            self.rename = Some(RenameEdit { target, input });
+        }
+    }
+
+    /// Commit the rename: a non-empty (trimmed) buffer sets the name; an empty
+    /// one clears it, so the sidebar falls back to the auto task line. Persists
+    /// so the change survives a restart.
+    fn commit_rename(&mut self) {
+        if let Some(edit) = self.rename.take() {
+            let name = edit.input.trim().to_string();
+            if name.is_empty() {
+                self.names.remove(&edit.target);
+            } else {
+                self.names.insert(edit.target, name);
+            }
+            self.persist_sessions();
+        }
+    }
+
+    fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
+
     /// Total queued hub messages across all instances' inboxes (for the info pane).
     pub fn pending_messages(&self) -> usize {
         self.pending_messages
@@ -590,7 +652,11 @@ impl App {
                     continue;
                 };
                 if !live.contains(&id) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    // A closed instance's inbox: bounce any messages it never read
+                    // back to their live senders (so nothing is silently lost —
+                    // including a message that slipped in during the brief window
+                    // between the process dying and this reap), then remove it.
+                    bounce_dead_inbox(&self.state_dir, id, &entry.path(), &live);
                     continue;
                 }
                 pending += std::fs::read_dir(entry.path()).map(|d| d.flatten().count()).unwrap_or(0);
@@ -683,6 +749,35 @@ impl App {
 
         let m = key.modifiers;
 
+        // While the rename modal is open it captures all keys: type to edit,
+        // Enter commits, Esc cancels, Backspace deletes, Ctrl+U clears. Nothing
+        // forwards to Claude — it's a modal text input.
+        if self.rename.is_some() {
+            match key.code {
+                KeyCode::Esc => self.cancel_rename(),
+                KeyCode::Enter => self.commit_rename(),
+                KeyCode::Backspace => {
+                    if let Some(e) = self.rename.as_mut() {
+                        e.input.pop();
+                    }
+                }
+                KeyCode::Char('u') if m.contains(KeyModifiers::CONTROL) => {
+                    if let Some(e) = self.rename.as_mut() {
+                        e.input.clear();
+                    }
+                }
+                KeyCode::Char(c)
+                    if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(e) = self.rename.as_mut() {
+                        e.input.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // While the full-screen message reader is open it captures all keys: it
         // closes on Esc/q/Ctrl+M and scrolls on the arrows / PageUp-Down. Nothing
         // is forwarded to Claude — it's a read-only overlay.
@@ -720,6 +815,13 @@ impl App {
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') => {
                     self.spawn_instance();
+                    return;
+                }
+                // Ctrl+R → rename the focused instance. Decodes cleanly as
+                // Char('r')+CONTROL in both legacy and Kitty modes (0x12, no
+                // collision with a named key), so it works everywhere.
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.open_rename();
                     return;
                 }
                 // Ctrl+]  → next. With the Kitty protocol it arrives as ']';
@@ -1029,9 +1131,11 @@ impl App {
             None => old_active.min(self.instances.len() - 1),
         };
 
-        // A closed instance is forgotten: drop its id from the worked set and
-        // re-persist so it won't be restored next launch.
+        // A closed instance is forgotten: drop its id from the worked set (and
+        // its custom name) and re-persist so it won't be restored next launch.
         self.worked.retain(|id| self.instances.iter().any(|s| s.id() == *id));
+        self.names
+            .retain(|id, _| self.instances.iter().any(|s| s.id() == *id));
         self.persist_sessions();
         // Keep the hub's peer list in sync with the surviving instances.
         self.write_live_instances();
@@ -1112,6 +1216,70 @@ fn unescape_msg(s: &str) -> String {
     out
 }
 
+/// Bounce the undelivered messages in a closed instance's `inbox` back to their
+/// senders, then remove the dir. Mulpex is the liveness authority, so this is the
+/// one place that can tell a sender its message never reached a peer that closed:
+/// for each message from a still-live sender, drop a non-delivery notice into
+/// that sender's inbox (surfaced by the same unread-mail nudge as any hub
+/// message). This closes the race where a `hub_send` slips in after the
+/// recipient's process died but before this reap — that message is in
+/// `inbox/<dead>` here and gets bounced — as well as the plain case of closing an
+/// instance that still had unread mail. Returns the number of messages bounced.
+fn bounce_dead_inbox(state_dir: &Path, dead_id: usize, inbox: &Path, live: &HashSet<usize>) -> usize {
+    let mut bounced = 0usize;
+    if let Ok(entries) = std::fs::read_dir(inbox) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if file.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some((from, body)) = std::fs::read_to_string(&file).ok().and_then(|c| {
+                let v: serde_json::Value = serde_json::from_str(&c).ok()?;
+                let from = v.get("from").and_then(|x| x.as_u64())? as usize;
+                let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                Some((from, body))
+            }) else {
+                continue;
+            };
+            // Only bounce to a live sender other than the closed instance itself —
+            // never bounce a bounce into a dead inbox.
+            if from == dead_id || !live.contains(&from) {
+                continue;
+            }
+            let snippet: String = body.chars().take(80).collect();
+            let ellipsis = if body.chars().count() > 80 { "…" } else { "" };
+            let notice = format!(
+                "[Mulpex hub — automated] Your message to claude #{dead_id} was NOT delivered: \
+                 that instance closed before reading it. Original: \"{snippet}{ellipsis}\""
+            );
+            let dir = state_dir.join("inbox").join(from.to_string());
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let payload = serde_json::json!({
+                    "from": dead_id, "ts": now_secs(), "body": notice,
+                });
+                if std::fs::write(
+                    dir.join(format!("{}.json", persist::new_uuid())),
+                    payload.to_string(),
+                )
+                .is_ok()
+                {
+                    bounced += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(inbox);
+    bounced
+}
+
+/// Current unix time in seconds — for stamping a bounced non-delivery notice.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Parse a lock file written by `hook.rs` into `(holder instance id, locked
 /// path)`. Returns `None` if either field is missing/unparseable.
 fn read_lock(file: &Path) -> Option<(usize, PathBuf)> {
@@ -1186,6 +1354,57 @@ mod tests {
     #[test]
     fn read_messages_missing_file_is_empty() {
         assert!(read_messages(Path::new("/no/such/mulpex.log"), 10).is_empty());
+    }
+
+    #[test]
+    fn bounce_returns_undelivered_mail_to_live_senders() {
+        let state = std::env::temp_dir().join(format!("mulpex-bouncetest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let dead_inbox = state.join("inbox").join("3");
+        std::fs::create_dir_all(&dead_inbox).unwrap();
+        // Two messages sat unread in closed #3's inbox: one from live #1, one from
+        // a since-gone #9. Plus a stray non-json file that must be ignored.
+        std::fs::write(dead_inbox.join("a.json"), r#"{"from":1,"ts":10,"body":"hold off on auth.rs"}"#).unwrap();
+        std::fs::write(dead_inbox.join("b.json"), r#"{"from":9,"ts":11,"body":"ping"}"#).unwrap();
+        std::fs::write(dead_inbox.join("notes.txt"), "ignore me").unwrap();
+
+        let live: HashSet<usize> = [1usize, 2].into_iter().collect();
+        let n = bounce_dead_inbox(&state, 3, &dead_inbox, &live);
+
+        // Only the message from the live sender (#1) is bounced; #9 is gone.
+        assert_eq!(n, 1);
+        // The dead inbox is removed.
+        assert!(!dead_inbox.exists());
+        // #1 got exactly one non-delivery notice mentioning #3 and the original.
+        let inbox1 = state.join("inbox").join("1");
+        let files: Vec<_> = std::fs::read_dir(&inbox1).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(files[0].path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["from"].as_u64(), Some(3));
+        let text = v["body"].as_str().unwrap();
+        assert!(text.contains("#3") && text.contains("NOT delivered"), "{text}");
+        assert!(text.contains("hold off on auth.rs"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn bounce_skips_when_sender_also_gone() {
+        let state = std::env::temp_dir().join(format!("mulpex-bouncetest2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let dead_inbox = state.join("inbox").join("3");
+        std::fs::create_dir_all(&dead_inbox).unwrap();
+        std::fs::write(dead_inbox.join("a.json"), r#"{"from":9,"ts":10,"body":"hi"}"#).unwrap();
+
+        // #9 (the sender) is not live → nothing to bounce, inbox still removed.
+        let live: HashSet<usize> = [1usize].into_iter().collect();
+        let n = bounce_dead_inbox(&state, 3, &dead_inbox, &live);
+        assert_eq!(n, 0);
+        assert!(!dead_inbox.exists());
+        assert!(!state.join("inbox").join("9").exists());
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
 

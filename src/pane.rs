@@ -52,12 +52,24 @@ pub fn render_instances(f: &mut Frame, area: Rect, app: &App, focused: bool) {
                     Span::styled(format!("claude #{}", session.id()), name_style),
                     Span::styled(format!("  {}", word), base.fg(dot_color).add_modifier(Modifier::DIM)),
                 ])];
-                // Below the name: what this instance is currently working on
-                // (re-summarized from its latest prompt each turn), word-wrapped
-                // across up to 3 lines so it's legible at a glance — not a hard
-                // mid-word cut. Indented 4 to sit under "claude #N".
-                if let Some(task) = app.task_of(session.id()) {
-                    let text_width = (area.width as usize).saturating_sub(2 + 4);
+                // Below the name: either the user's custom name (Ctrl+R), which
+                // overrides everything, or — falling back — what this instance is
+                // currently working on (re-summarized from its latest prompt each
+                // turn). Word-wrapped across up to 3 lines so it's legible at a
+                // glance — not a hard mid-word cut. Indented 4 to sit under
+                // "claude #N". A custom name reads as a deliberate label (bright,
+                // bold, non-italic); the auto task stays dim italic.
+                let text_width = (area.width as usize).saturating_sub(2 + 4);
+                if let Some(name) = app.name_of(session.id()) {
+                    for line in wrap_words(name, text_width, 3) {
+                        rows.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                } else if let Some(task) = app.task_of(session.id()) {
                     for line in wrap_words(task, text_width, 3) {
                         rows.push(Line::from(Span::styled(
                             format!("    {}", line),
@@ -106,6 +118,9 @@ pub fn render_bottom_bar(f: &mut Frame, area: Rect) {
     let line = Line::from(vec![
         Span::styled(" Ctrl+T", key),
         Span::styled(" new", dim),
+        sep(),
+        Span::styled("Ctrl+R", key),
+        Span::styled(" rename", dim),
         sep(),
         Span::styled("Ctrl+]", key),
         Span::styled(" next", dim),
@@ -362,6 +377,46 @@ pub fn render_message_log(f: &mut Frame, area: Rect, app: &App) {
     let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
     let scroll = app.msg_scroll.min(max_scroll);
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+}
+
+/// The rename modal (Ctrl+R): a small centered box with a single text input.
+/// `target` is the instance id being named; `input` is the current buffer. A
+/// block cursor trails the text. Committed by the caller on Enter, cancelled on
+/// Esc; an empty buffer clears the name (falls back to the auto task line).
+pub fn render_rename(f: &mut Frame, area: Rect, target: usize, input: &str) {
+    let w = area.width.saturating_sub(4).clamp(20, 60);
+    let h = 5u16.min(area.height).max(3);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title(format!(" Rename claude #{target} "));
+    let inner = rect.inner(Margin::new(1, 1));
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            input.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█", Style::default().fg(Color::Cyan)),
+    ])];
+    if inner.height >= 3 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter save · Esc cancel · empty clears the name",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Word-wrap one logical line to `width` columns, hard-breaking any word longer

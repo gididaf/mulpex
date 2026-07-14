@@ -73,10 +73,14 @@ impl SessionStore {
         }
     }
 
-    /// Load saved session ids for this project, in order. Returns empty on any
-    /// error, if there is no store yet, or if the recorded project path doesn't
-    /// match (guards against a hash collision clobbering another project).
-    pub fn load(&self) -> Vec<String> {
+    /// Load saved sessions for this project, in order, each as
+    /// `(session id, optional custom name)`. Returns empty on any error, if
+    /// there is no store yet, or if the recorded project path doesn't match
+    /// (guards against a hash collision clobbering another project).
+    ///
+    /// Each line is `<uuid>` optionally followed by `\t<name>` — so files
+    /// written before names existed (bare uuids) still load, with `None`.
+    pub fn load(&self) -> Vec<(String, Option<String>)> {
         let Ok(content) = std::fs::read_to_string(&self.path) else {
             return Vec::new();
         };
@@ -92,22 +96,91 @@ impl SessionStore {
         lines
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(String::from)
+            .map(|l| {
+                let mut parts = l.splitn(2, '\t');
+                let id = parts.next().unwrap_or("").to_string();
+                let name = parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from);
+                (id, name)
+            })
+            .filter(|(id, _)| !id.is_empty())
             .collect()
     }
 
-    /// Persist `session_ids` (in order) for this project. Best-effort: any I/O
+    /// Persist `sessions` (in order) for this project, each as its session id
+    /// plus an optional custom name (`<uuid>\t<name>`). Best-effort: any I/O
     /// failure is silently ignored.
-    pub fn save(&self, session_ids: &[String]) {
+    pub fn save(&self, sessions: &[(&str, Option<&str>)]) {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut out = format!("# {}\n", self.project_dir.display());
-        for id in session_ids {
+        for (id, name) in sessions {
             out.push_str(id);
+            // A name shares the line after a tab; strip tabs/newlines so it
+            // can't corrupt the one-record-per-line format.
+            if let Some(n) = name {
+                let n = n.replace(['\t', '\n', '\r'], " ");
+                if !n.trim().is_empty() {
+                    out.push('\t');
+                    out.push_str(n.trim());
+                }
+            }
             out.push('\n');
         }
         let _ = std::fs::write(&self.path, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_load_round_trips_ids_and_names() {
+        let dir = std::env::temp_dir().join(format!("mulpex-persisttest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::new(&dir);
+
+        // A tab/newline in a name is sanitized to spaces so the line format holds.
+        store.save(&[
+            ("uuid-a", Some("editor")),
+            ("uuid-b", None),
+            ("uuid-c", Some("weird\tname\nhere")),
+        ]);
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0], ("uuid-a".to_string(), Some("editor".to_string())));
+        assert_eq!(loaded[1], ("uuid-b".to_string(), None));
+        assert_eq!(loaded[2].0, "uuid-c");
+        assert_eq!(loaded[2].1.as_deref(), Some("weird name here"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_legacy_bare_uuid_lines() {
+        // Files written before names existed are just `# dir` + bare uuids.
+        let dir = std::env::temp_dir().join(format!("mulpex-legacytest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::new(&dir);
+        if let Some(parent) = store.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&store.path, format!("# {}\nuuid-1\nuuid-2\n", dir.display())).unwrap();
+
+        let loaded = store.load();
+        assert_eq!(
+            loaded,
+            vec![
+                ("uuid-1".to_string(), None),
+                ("uuid-2".to_string(), None),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

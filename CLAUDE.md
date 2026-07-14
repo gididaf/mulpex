@@ -55,6 +55,14 @@ it auto-resumes them with their prior conversations (see *Session persistence*).
 ### Keybindings
 
 - **Ctrl+T** — new Claude instance (in the project dir)
+- **Ctrl+R** — rename the focused instance: opens a small modal text input whose value
+  **overrides the gray auto-task line** beneath that instance (rendered as a bright bold
+  label instead of dim italic). Type to edit (pre-filled with the current name), **Enter**
+  saves, **Esc** cancels, **Ctrl+U** clears the buffer; committing an **empty** buffer
+  removes the name so the auto-task line shows again. Names are **persisted** alongside the
+  session ids (`<uuid>\t<name>` in the per-project store), so a renamed instance keeps its
+  name across restarts, and dropped when the instance is closed. Works in both legacy and
+  Kitty modes (`Ctrl+R` = `0x12`, decoded as `Char('r')+CONTROL` with no named-key collision).
 - **Ctrl+]** — focus next instance (wraps)
 - **Ctrl+[** — focus previous instance (wraps) — *Kitty protocol only, see below*
 - **Ctrl+M** — open/close the full-screen cross-instance message reader (↑↓/PageUp-Down/wheel
@@ -126,8 +134,10 @@ saving any conversation content ourselves.
   readable tail of the project path plus a stable **FNV-1a** hash of the full path (unique,
   bounded length, stable across rebuilds — deliberately *not* `DefaultHasher`, whose output
   isn't stable). The file's first line is `# <project dir>` for collision verification;
-  remaining lines are session UUIDs in sidebar order. `App::persist_sessions` rewrites it
-  whenever the worked set changes (new hook fired, or `reap_dead` drops a closed instance).
+  remaining lines are session UUIDs in sidebar order, each optionally carrying that instance's
+  custom name after a tab (`<uuid>\t<name>`, from Ctrl+R — bare-uuid lines from before names
+  existed still load). `App::persist_sessions` rewrites it whenever the worked set (or a name)
+  changes (new hook fired, a rename committed, or `reap_dead` drops a closed instance).
 - **Closed = forgotten.** When an instance exits, `reap_dead` prunes it from `worked` and
   re-persists, so it won't come back next launch. Sessions that fail to `--resume` (e.g. the
   transcript was cleaned up after 30 days) simply don't restore and self-heal: they're pruned
@@ -231,6 +241,10 @@ handler **fails soft**. Tools:
 - `hub_set_focus` — publish *my* current task (refines the auto-captured prompt).
 - `hub_file_owner` — who holds a path, and what they're working on.
 - `hub_send` / `hub_inbox` — message another instance (or `all`), and read my mailbox.
+  `hub_send` **validates the recipient against the live set**: a specific `to` that isn't a
+  running instance (it has closed) returns an `isError` result and delivers nothing, rather
+  than faking success into an inbox no one reads (which Mulpex then reaps). `all` fans out to
+  the live peers only. See *Peer-departure awareness*.
 
 **Awareness plumbing:** the `UserPromptSubmit` hook (`mulpex hook userpromptsubmit`)
 auto-captures the prompt as the instance's baseline task (`state_dir/tasks/<id>`) and injects
@@ -255,6 +269,36 @@ close the gap, both keyed on the unread count (`mcp::unread_for`, = files under 
   *before* the block decision): the continuation re-acquires (via `edit_guard`) anything it
   actually edits, so holding locks across the block would only add contention — a peer could
   time out waiting on a lock this instance is no longer using.
+
+**Peer-departure awareness (don't respect a ghost).** When an instance closes (say #3),
+Mulpex reaps its on-disk state — `write_live_instances` drops it from `state_dir/instances`,
+and `refresh_locks`/`refresh_hub` reclaim its locks / task / inbox — so anything that reads
+the *live* set (`hub_instances`, `hub_file_owner`, `hub_send`) is immediately correct. But a
+surviving instance may still **believe** #3 is alive: it learned so from the peer snapshot
+injected at *its* last `UserPromptSubmit`, and (for a single-prompt/autonomous instance) that
+never re-fires — so mid-turn it keeps messaging, waiting on, or deferring to a peer that's
+gone. Two things close this gap:
+- **`hub_send` rejects a closed recipient** (above), so the moment the instance *acts* on the
+  stale belief it's corrected with an error instead of silently succeeding.
+- **Bounce-on-reap closes the race.** There's a brief window between a peer's process dying and
+  `reap_dead` rewriting `state_dir/instances`; a `hub_send` in that window still sees the peer
+  live and writes into its inbox. So when `refresh_hub` reaps a closed instance's `inbox/<id>`
+  it no longer silently deletes it — `App::bounce_dead_inbox` first returns every undelivered
+  message to its (still-live) sender as an automated "*your message to #N was NOT delivered — it
+  closed before reading it*" notice (which the sender sees via the normal unread-mail nudge),
+  then removes the dir. Since the raced message is sitting in `inbox/<dead>` at reap time, it's
+  bounced too — so no message is ever silently lost. This also covers the plain case of closing
+  an instance that still had unread mail. Bounces only go to live senders (never a bounce into
+  another dead inbox); unit-tested in `app.rs`.
+- **A mid-turn "peer closed" nudge** on `mulpex hook posttooluse`, mirroring the unread-mail
+  nudge. `userpromptsubmit` seeds a per-instance baseline of the peers this turn knows about
+  (`state_dir/peers/<id>`, a space-separated id list — in a `peers/` subdir so App's
+  integer-named state scans ignore it); `posttooluse` diffs it against `mcp::peer_ids` each
+  tool call and, when a baseline peer has vanished, injects a one-line "claude #N has closed —
+  disregard any coordination involving it" note, then rewrites the baseline to the current set
+  so each departure nudges **once**. New peers (a `Ctrl+T` mid-turn) fold into the baseline
+  silently — only closures are reported. Both nudges share the single PostToolUse
+  `additionalContext` (a hook emits one decision), so they're combined when they coincide.
 Standing **hub rules** are injected with `--append-system-prompt` — two consts in
 `term_session.rs`, joined and passed as one prompt:
 - `HUB_RULES` — teaches each instance it's one of several parallel Claudes, that locks are
@@ -284,6 +328,8 @@ history/<hash>       last editor of a file (awareness notes)
 tasks/<id>           one line: instance's current task
 inbox/<id>/<uuid>    a message JSON for instance <id> (deleted when read via hub_inbox)
 inbox/<id>.notified  high-water mark of the unread count we last nudged about (dedup)
+peers/<id>           space-separated ids of the peers this instance last knew live; diffed
+                     each PostToolUse to nudge once when a known peer closes (dedup)
 messages.log         append-only TSV "ts\tfrom\tto\tbody" — the PERSISTENT conversation
                      feed (survives reads; powers the Messages pane + Ctrl+M reader)
 waiting/<id>         "<basename>\t<holder>" while blocked waiting on a lock (⏳ indicator)
@@ -401,20 +447,26 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   pipeline (`worked`, `persist_sessions`, restore in `App::new`), and the **hub mirror**:
   `locks`/`tasks`/`pending_messages`/`waiting`/`messages` maps, `refresh_locks`/`refresh_hub`/
   `refresh_messages` (`read_messages` tails `messages.log`), `write_live_instances` (the peer
-  list), dead-instance reaping, and the `show_messages`/`msg_scroll` state for the Ctrl+M reader
-  (see *The coordination hub*).
+  list), dead-instance reaping (incl. `bounce_dead_inbox`, which returns a closed instance's
+  undelivered mail to its senders instead of dropping it), and the `show_messages`/`msg_scroll` state for the Ctrl+M reader
+  (see *The coordination hub*). Also owns the **rename** state: the `names` map (id → custom
+  name, persisted via `persist_sessions` and pruned in `reap_dead`) and the `rename: Option`
+  modal edited by `open_rename`/`commit_rename`/`cancel_rename` (Ctrl+R).
 - `hook.rs` — the `mulpex hook` subcommand: the file-locking enforcement (`pretooluse` →
   `edit_guard`/`read_guard`/`bash_guard` with the `acquire_or_wait`/`wait_until_free` loops,
   the `lock_token`/`lock_is_stale` heartbeat helpers driving the `LOCK_IDLE` idle-lease, and
   `allow_contended` — the never-deny fallback that proceeds with a stale-read note),
-  `posttooluse` (status `working` + mid-turn unread-mail nudge, deduped via `<id>.notified`),
+  `posttooluse` (status `working` + mid-turn nudges: unread mail via `<id>.notified` **and**
+  closed peers via `departed_peers`/`peers/<id>`, combined into one `additionalContext`),
   `stop` (block the stop while mail is unread, else release locks + write `waiting`), and
-  `userpromptsubmit` (capture task from the payload's `prompt` field + inject peer snapshot).
-  `Ctx::from_env` + the `read_field`/`canonical_target`/`now` helpers are shared with `mcp.rs`.
+  `userpromptsubmit` (capture task from the payload's `prompt` field + inject peer snapshot +
+  `seed_seen_peers` for the departure baseline). `Ctx::from_env` + the
+  `read_field`/`canonical_target`/`now` helpers are shared with `mcp.rs`.
 - `mcp.rs` — the `mulpex mcp` subcommand: the stdio JSON-RPC coordination-hub server and its
-  five `hub_*` tools, plus `peers_context`/`unread_for` (used by the hooks). `hub_send` also
-  appends to the persistent `messages.log`. Reads the shared `state_dir` files; no new crates
-  beyond `serde_json`.
+  five `hub_*` tools, plus `peers_context`/`peer_ids`/`unread_for` (used by the hooks).
+  `hub_send` validates a specific recipient against the live set (rejects a closed instance)
+  and also appends to the persistent `messages.log`. Reads the shared `state_dir` files; no
+  new crates beyond `serde_json`.
 - `persist.rs` — session persistence: `new_uuid` (RFC-4122 v4 from `/dev/urandom`, reused for
   message ids) and `SessionStore` (per-project `~/.mulpex/sessions/<key>.txt`). `fnv1a`
   (pub(crate)) keys both the session store filename and the lock/history hashes.
@@ -436,16 +488,17 @@ thread, and composite that buffer into the pane — the same job tmux/iTerm2 do 
   `center_inner_size`/`center_inner_rect` (relative to the middle band) drive PTY size + mouse
   mapping.
 - `pane.rs` — renderers: `render_top_bar` (project), `render_bottom_bar` (just the key legend
-  now), `render_instances` (status dot + each instance's task line, word-wrapped across up to
-  3 lines via `wrap_words` — unit-tested), `render_info` (the hub view: Locks / Waiting ⏳ /
-  Messages feed with unread count + snippets), and `render_message_log` (the full-screen
-  Ctrl+M reader: full bodies, word-wrapped, newest first).
+  now), `render_instances` (status dot + each instance's custom name **or** — falling back —
+  its auto task line, word-wrapped across up to 3 lines via `wrap_words` — unit-tested),
+  `render_info` (the hub view: Locks / Waiting ⏳ / Messages feed with unread count +
+  snippets), `render_message_log` (the full-screen Ctrl+M reader: full bodies, word-wrapped,
+  newest first), and `render_rename` (the Ctrl+R rename modal: a small centered text input).
 
 ## Keyboard model (decided)
 
 - **Direct combos, no leader key.** Mulpex reserves a *minimal* set of combos; everything
-  else forwards to Claude. Reserved: **Ctrl+Q** (quit), **Ctrl+T** (new), **Ctrl+]** (next),
-  **Ctrl+[** (prev, Kitty-only), **Ctrl+M** (message reader, Kitty-only).
+  else forwards to Claude. Reserved: **Ctrl+Q** (quit), **Ctrl+T** (new), **Ctrl+R** (rename),
+  **Ctrl+]** (next), **Ctrl+[** (prev, Kitty-only), **Ctrl+M** (message reader, Kitty-only).
 - Raw mode means Mulpex gets every Ctrl/Alt/Fn/arrow/letter key first; macOS ⌘ combos stay
   owned by the terminal emulator (iTerm2) and cannot be intercepted by any app.
 - Future: optionally enable the Kitty keyboard protocol on the outer terminal for richer

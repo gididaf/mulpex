@@ -117,6 +117,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.show_messages {
         pane::render_message_log(f, f.area(), app);
     }
+
+    // The rename modal (Ctrl+R) overlays everything when open.
+    if let Some((target, input)) = app.rename_prompt() {
+        pane::render_rename(f, f.area(), target, input);
+    }
 }
 
 /// Overlay the drag-selection highlight onto the already-rendered center pane by

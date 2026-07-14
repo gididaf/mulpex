@@ -463,36 +463,100 @@ fn release_my_locks(ctx: &Ctx) {
 }
 
 /// Handle a PostToolUse event: keep the sidebar status `working` (preserving the
-/// old `printf` hook), and — the moment new hub mail has arrived *mid-turn* —
-/// inject a one-line nudge so the instance reads it without waiting for its turn
-/// to end. Deduped via the `<id>.notified` high-water mark so a single message
-/// nudges once, not on every subsequent tool call.
+/// old `printf` hook), and inject a mid-turn nudge (once) when either (a) new hub
+/// mail has arrived, or (b) a peer this instance knew about has closed — so it
+/// stops messaging / waiting on / deferring to an instance that's gone. Both are
+/// deduped: mail via the `<id>.notified` high-water mark, departures via the
+/// `peers/<id>` baseline (see `departed_peers`). At most one nudge is emitted per
+/// tool call (a hook can print only one decision), so the notes are combined.
 fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
 
+    let mut notes: Vec<String> = Vec::new();
+
+    // (a) New hub mail arrived mid-turn?
     let unread = crate::mcp::unread_for(ctx, ctx.instance);
     let marker = notified_marker(ctx);
     let last: usize = read_field_or_line(&marker)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if unread > last {
-        let reason = format!(
-            "[Mulpex hub] You have {unread} unread message(s) from other instances — call \
+        notes.push(format!(
+            "You have {unread} unread message(s) from other instances — call \
              mcp__mulpex__hub_inbox to read them (a peer may be coordinating a change that \
              affects your work)."
-        );
-        let out = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": reason,
-            }
-        });
-        println!("{out}");
+        ));
     }
     // Track the high-water mark (whether it rose or fell, e.g. after a hub_inbox
     // read cleared it) so each new message nudges exactly once.
     let _ = std::fs::write(&marker, unread.to_string());
+
+    // (b) Did a peer this instance knew about close mid-turn?
+    let departed = departed_peers(ctx);
+    if !departed.is_empty() {
+        notes.push(departed_nudge(&departed));
+    }
+
+    if !notes.is_empty() {
+        let out = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": format!("[Mulpex hub] {}", notes.join("\n\n")),
+            }
+        });
+        println!("{out}");
+    }
     Ok(())
+}
+
+/// A one-line nudge naming the instances that have just closed, told to the
+/// surviving instance so it drops any coordination that involved them.
+fn departed_nudge(ids: &[usize]) -> String {
+    let list = ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ");
+    let verb = if ids.len() == 1 { "has" } else { "have" };
+    format!(
+        "Instance(s) claude {list} {verb} closed and are no longer running. Disregard any \
+         earlier coordination, waiting, or plans that involve them — they can't reply or act, \
+         and their file locks are released. Call mcp__mulpex__hub_instances if you need the \
+         current instance list."
+    )
+}
+
+/// This instance's "known live peers" baseline, kept in a `peers/` subdir so the
+/// App's integer-named state scans (status files, `live_ids` fallback) never pick
+/// it up. Diffing it against the current live peers detects a peer closing.
+fn seen_peers_file(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir.join("peers").join(ctx.id_str())
+}
+
+/// Reset this instance's known-peers baseline to the current live peers. Called
+/// at prompt submit (right after the model receives a fresh peer snapshot), so a
+/// mid-turn departure is measured against exactly what the model was told.
+fn seed_seen_peers(ctx: &Ctx) {
+    write_seen_peers(ctx, &crate::mcp::peer_ids(ctx));
+}
+
+/// Diff the stored known-peers baseline against the current live peers: return
+/// the ids that have since vanished (closed), and reset the baseline to the
+/// current set so each departure is nudged exactly once. New peers (spawned this
+/// turn) are folded into the baseline silently — only closures are reported.
+fn departed_peers(ctx: &Ctx) -> Vec<usize> {
+    let prev: Vec<usize> = read_field_or_line(&seen_peers_file(ctx))
+        .map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+        .unwrap_or_default();
+    let current = crate::mcp::peer_ids(ctx);
+    let departed: Vec<usize> = prev.into_iter().filter(|id| !current.contains(id)).collect();
+    write_seen_peers(ctx, &current);
+    departed
+}
+
+fn write_seen_peers(ctx: &Ctx, ids: &[usize]) {
+    let file = seen_peers_file(ctx);
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = ids.iter().map(usize::to_string).collect::<Vec<_>>().join(" ");
+    let _ = std::fs::write(&file, body);
 }
 
 /// Handle a UserPromptSubmit event: (a) mark this instance `working` (preserving
@@ -525,6 +589,10 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
         });
         println!("{out}");
     }
+
+    // Baseline the peers this turn starts knowing about, so the PostToolUse hook
+    // can nudge if any of them close before this turn ends.
+    seed_seen_peers(ctx);
     Ok(())
 }
 

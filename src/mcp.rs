@@ -218,11 +218,25 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
     };
 
     let recipients: Vec<usize> = if to_raw.eq_ignore_ascii_case("all") {
-        live_ids(ctx).into_iter().filter(|&id| id != ctx.instance).collect()
+        peer_ids(ctx)
     } else {
         let id: usize = to_raw.parse().map_err(|_| "'to' must be a number or \"all\"")?;
+        // Refuse to "deliver" to an instance that isn't running: it has closed, so
+        // the message would rot in an inbox no live instance reads (Mulpex reaps a
+        // dead recipient's inbox). Tell the sender plainly instead of faking
+        // success — this is what stops instances messaging a peer that's gone.
+        if !live_ids(ctx).contains(&id) {
+            return Err(format!(
+                "claude #{id} is not a running instance — it has closed, so it can't receive \
+                 messages and nothing was sent. Call mcp__mulpex__hub_instances to see who is \
+                 still active."
+            ));
+        }
         vec![id]
     };
+    if recipients.is_empty() {
+        return Ok(json!({ "ok": false, "note": "no other instances are running right now" }).to_string());
+    }
 
     let mut delivered = Vec::new();
     for to in recipients {
@@ -304,6 +318,13 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
         ));
     }
     Some(s)
+}
+
+/// Live *peer* ids — every live instance except this one. Used by `hub_send`
+/// (the `all` fan-out and recipient validation) and by the hook's departed-peer
+/// detection (`hook::departed_peers`).
+pub(crate) fn peer_ids(ctx: &Ctx) -> Vec<usize> {
+    live_ids(ctx).into_iter().filter(|&id| id != ctx.instance).collect()
 }
 
 /// Live instance ids. Authoritative source is `state_dir/instances` (written by
