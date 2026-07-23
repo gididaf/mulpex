@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mulpex",
+  "version": "0.1.0",
+  "identifier": "com.mulpex.app",
+  "build": {
+    "beforeDevCommand": "cargo build -p mulpex-helper && npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bash scripts/bundle-helper.sh && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Mulpex",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 800,
+        "minHeight": 500,
+        "titleBarStyle": "Visible"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "externalBin": ["binaries/mulpex-helper"],
+    "icon": [
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

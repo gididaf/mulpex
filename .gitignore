@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Node / Vite
+/node_modules
+/dist
+
+# Tauri generated
+/src-tauri/gen
+# Staged sidecar binaries (rebuilt by scripts/bundle-helper.sh)
+/src-tauri/binaries
+
+# macOS
+.DS_Store

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mulpex-core",
+    "crates/mulpex-helper",
+    "src-tauri",
+]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

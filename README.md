@@ -1,0 +1,88 @@
+# Mulpex
+
+**A native macOS desktop app that runs multiple live, parallel Claude Code sessions side by
+side — all working in the *same* project directory and coordinating through a shared hub so
+they never clobber each other's files.**
+
+This is the desktop successor to the original terminal-UI mulpex (the ratatui/crossterm terminal
+version, preserved in this repo's git history). It sheds every terminal-only workaround — no
+iTerm2, no Ctrl-key minefield, no Kitty-protocol hacks — and uses a real window with native ⌘
+menu shortcuts.
+
+```
+ project · /path/to/project                                  ← top bar
+┌──────────────┬───────────────────────────────────────────┐
+│ instances    │                                            │
+│ (status +    │         Claude Code                        │
+│  task/name)  │         (real xterm.js terminal)           │
+├──────────────┤                                            │
+│ hub          │                                            │
+│ (locks,      │                                            │
+│  waiting,    │                                            │
+│  messages)   │                                            │
+└──────────────┴───────────────────────────────────────────┘
+ ⌘T new · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M messages  ← status bar
+```
+
+## What it does
+
+- **Multiple Claude sessions, one project.** Each runs as a real `claude` process on its own
+  PTY, rendered by xterm.js. Add (⌘T), switch (⌘1–9 / ⌘[ ⌘]), rename (⌘R), close (⌘W).
+- **Coordination hub.** Parallel Claudes in the same directory are kept consistent by a
+  file-locking coordinator (a `PreToolUse` hook: edits/reads to a file another instance is
+  writing simply *wait*, then proceed — never a hard deny, zero model tokens) plus an inner MCP
+  server (`mcp__mulpex__*` tools: see peers, publish your task, message another instance).
+- **Idle wake.** An instance notices and acts on a hub message from a peer *even while it's
+  sitting idle* between your prompts: on startup it arms a persistent background listener on its
+  inbox (via the `Monitor` tool) and wakes itself when mail arrives, tagging the self-triggered
+  turn (`⟳ hub message from #N →`) so you can tell it wasn't your prompt.
+- **Shared-tree safety.** Every instance shares one working tree (not a git worktree each), so
+  each is told via its system prompt to treat tree-wide/destructive git ops (`reset --hard`,
+  `checkout .`, `clean`, `stash`, branch switch, `rebase`) as dangerous — check the hub and
+  coordinate or ask before running them. Instances are also held to a zero-assumptions planning
+  discipline (verify assumptions via `AskUserQuestion` before implementing).
+- **Session persistence.** The sessions you worked on are remembered per project and
+  auto-resume (`claude --resume`) when you reopen that project.
+- **Open a project** via the picker / recent-projects list — no terminal needed.
+
+## Architecture
+
+A Cargo workspace + a Svelte/Vite frontend:
+
+- **`crates/mulpex-core`** — the headless, UI-independent coordination core, ported verbatim
+  from the old TUI: the file-locking hook (`hook`), the MCP hub server (`mcp`), session
+  persistence (`persist`), and the `--settings` / `--mcp-config` templates (`config`).
+- **`crates/mulpex-helper`** — a tiny binary (`hook <event>` / `mcp`) that each child `claude`
+  invokes by absolute path. Kept separate from the GUI so it stays small and fast to exec (a
+  hook forks on every tool call).
+- **`src-tauri`** — the Tauri app: PTY hosting (`pty.rs`), state + reap/persist/hub-read
+  (`state.rs`), commands (`commands.rs`), the 200 ms poll loop that emits hub updates
+  (`hub.rs`), the native menu (`menu.rs`), and project selection (`project.rs`).
+- **`src/`** — the Svelte frontend. xterm.js **is** the terminal emulator (one `Terminal` per
+  session, kept alive while hidden); the backend is a raw byte pipe. Sidebar + hub panel render
+  from the emitted `hub-update` snapshot.
+
+See `CLAUDE.md` for the detailed design.
+
+## Develop
+
+Requires Rust and Node. Mulpex launches whatever `claude` you have installed (resolved via
+`PATH`) — no binary patching.
+
+```sh
+npm install
+npm run tauri dev      # builds mulpex-helper, starts Vite, launches the app
+```
+
+## Build
+
+```sh
+npm run tauri build    # produces Mulpex.app under target/release/bundle/macos/
+```
+
+> **Helper signing (already wired).** For the packaged `.app`, `mulpex-helper` must ship
+> **inside the signed bundle** (`Contents/MacOS/`) or the child `claude` hooks fail-open
+> silently. This is handled: `scripts/bundle-helper.sh` stages it as a triple-suffixed
+> `bundle.externalBin` sidecar (run from `beforeBuildCommand`), so Tauri places and signs it in
+> the bundle. In `tauri dev` it's resolved beside the app binary in `target/debug/`, so dev
+> needs no extra step. Bundle target is `app` only (no `.dmg`) — see `tauri.conf.json`.

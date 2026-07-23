@@ -1,0 +1,50 @@
+:root {
+  /* Palette mirroring the old ratatui chrome. */
+  --bg: #0d0d0f;
+  --bg-elev: #16161a;
+  --bg-sidebar: #111114;
+  --border: #2a2a30;
+  --border-focus: #56b6c2;
+  --text: #e6e6e6;
+  --text-dim: #8a8a94;
+  --text-faint: #5c6370;
+  --accent: #56b6c2;
+  --label: #e5c07b;
+  --dot-working: #e5c07b;
+  --dot-ready: #98c379;
+  --dot-needs: #e06c75;
+  --sidebar-w: 20rem;
+
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Give xterm's viewport room; the pane sizes it. */
+.xterm {
+  height: 100%;
+  padding: 4px 6px;
+}
+.xterm .xterm-viewport {
+  overflow-y: auto;
+}
