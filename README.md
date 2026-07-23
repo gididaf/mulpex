@@ -4,6 +4,12 @@
 side — all working in the *same* project directory and coordinating through a shared hub so
 they never clobber each other's files.**
 
+[![Download for macOS](https://img.shields.io/badge/Download-Mulpex.dmg-0a84ff?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/gididaf/mulpex/releases/latest)
+&nbsp;
+[![Latest release](https://img.shields.io/github/v/release/gididaf/mulpex?style=for-the-badge&label=version)](https://github.com/gididaf/mulpex/releases/latest)
+
+macOS 11+ · Apple Silicon · requires the `claude` CLI · one-time right-click → Open (unsigned). See [**Install**](#install).
+
 This is the desktop successor to the original terminal-UI mulpex (the ratatui/crossterm terminal
 version, preserved in this repo's git history). It sheds every terminal-only workaround — no
 iTerm2, no Ctrl-key minefield, no Kitty-protocol hacks — and uses a real window with native ⌘
