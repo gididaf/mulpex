@@ -17,6 +17,7 @@
         "height": 820,
         "minWidth": 800,
         "minHeight": 500,
+        "maximized": true,
         "titleBarStyle": "Visible"
       }
     ],

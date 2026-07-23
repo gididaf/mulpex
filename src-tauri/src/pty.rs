@@ -29,6 +29,11 @@ substantial task).\n\
 anyone) is currently editing it and why.\n\
 - mcp__mulpex__hub_send / mcp__mulpex__hub_inbox — message another instance, and read messages \
 sent to you.\n\
+- mcp__mulpex__hub_spawn — start NEW instances, each seeded with its own task that it begins \
+immediately. Use this to fan work out in parallel (e.g. one instance per ticket/item). It \
+returns the new instances' ids; each is told you spawned it and will hub_send its result back \
+to you when done. Max 8 per call — for more, call it again in batches, and prefer spawning only \
+as many as the work genuinely needs.\n\
 IMPORTANT — file locks are AUTOMATIC and you do not manage them: while another instance is \
 editing a file, your edit to it simply WAITS and then goes through on its own as soon as they \
 finish (their lock releases when their turn ends). So just make your edit normally — if it \
@@ -60,12 +65,18 @@ INCOMING MESSAGES (hub listener) — To be woken when another instance messages 
 you are idle between my prompts, you run a persistent background listener on your inbox. TO ARM \
 IT: call the Monitor tool (if it is a deferred tool, load it first via ToolSearch with query \
 select:Monitor) with persistent set to true and this EXACT command: \
-INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; mkdir -p \"$INBOX\"; \
+INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=\"$MULPEX_STATE_DIR/armed\"; \
+mkdir -p \"$INBOX\" \"$ARMED\"; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; \
 prev=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d ' '); while true; do \
 cur=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d ' '); \
 if [ \"$cur\" -gt \"$prev\" ]; then echo \"mulpex: $((cur - prev)) new hub message(s)\"; fi; \
 prev=$cur; sleep 1; done\n\
-Mulpex will ask you to arm this at the start of a session — do it right away, then just wait. \
+WHEN TO ARM: as soon as you start working. You are NOT prompted to arm it by a separate startup \
+turn; instead, on your first turn Mulpex injects a hidden reminder (and repeats it each turn ONLY \
+until the listener is armed). When you see that reminder, arm the Monitor QUIETLY as part of the \
+same turn — do not make arming your whole response and do not announce it beyond a brief mention — \
+then carry on with whatever I asked. The `touch` in the command above is what records that you \
+are armed, so the reminder stops. \
 Once armed, a peer message shows up as a Monitor event whose line starts with \"mulpex:\" \
 (for example \"mulpex: 1 new hub message(s)\") — that is a peer message arriving, NOT something \
 I typed. When it happens, handle it immediately and autonomously: (1) call \
@@ -76,8 +87,7 @@ asked a question, or would want confirmation) — never send a bare acknowledgem
 causes needless back-and-forth; (4) because that turn was triggered by the hub and not by me, \
 START your visible response with a marker line exactly of the form \"⟳ hub message from \
 #<sender> →\" (fill in the sender's instance number) so that when I look at your pane I can tell \
-you acted on a peer message rather than on my prompt. If Mulpex asks you at the start of a \
-session to start your hub listener, do so right away — that is what arms this wake mechanism.";
+you acted on a peer message rather than on my prompt.";
 
 /// User-mandated zero-assumptions planning discipline (see old term_session.rs).
 const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
@@ -87,16 +97,35 @@ verify those assumptions with the user FIRST, so the resulting plan or implement
 perfectly aligned with their requirements — aim for zero unverified assumptions. Do not silently \
 pick a default on anything that could reasonably go more than one way; ask.";
 
-/// One-shot prompt Mulpex injects into a fresh session's PTY (once `claude` is up)
-/// to trigger arming the hub listener. The full procedure + exact Monitor command
-/// live in `HUB_RULES` (append-system-prompt), so this stays a short one-liner —
-/// keeping the visible startup turn compact. MUST begin with `MULPEX_SENTINEL`
-/// (`mulpex_core::MULPEX_SENTINEL`, "[mulpex:hub]") so the `UserPromptSubmit` hook
-/// skips it for the sidebar task, and MUST stay a single line so it submits as one
-/// prompt.
-const HUB_LISTENER_BOOTSTRAP: &str = "[mulpex:hub] Arm your hub listener now, exactly as \
-described under \"INCOMING MESSAGES\" in your instructions (the persistent Monitor on your \
-inbox), then reply \"hub listener armed\" and wait for my next message.";
+/// A task another instance handed this one at spawn (`hub_spawn`): who assigned it
+/// and the work to do. When present, the fresh session's one-shot injected prompt
+/// kicks off the task immediately (see `spawn_prompt`). Listener arming is NOT part
+/// of this — every instance arms its listener from the `UserPromptSubmit` hook on
+/// its first turn (see `hook.rs`), so a normal instance gets no injected prompt at
+/// all and starts clean.
+pub struct SpawnTask {
+    pub parent_id: usize,
+    pub task: String,
+}
+
+/// The one-shot task prompt injected into a `hub_spawn` child's PTY once `claude`
+/// is up: its assignment plus a report-back-to-spawner instruction. Returns `None`
+/// for a normal (non-spawned) instance — which gets NO injected prompt and starts
+/// clean; its hub listener is armed later by the `UserPromptSubmit` hook. Kept to a
+/// SINGLE line (the task's whitespace is collapsed, never truncated — the child
+/// needs the full task text) and prefixed with the `[mulpex:hub]` sentinel so the
+/// hook skips it for the sidebar task (the child is auto-named from the task).
+fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
+    let t = task?;
+    let task = t.task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let parent = t.parent_id;
+    Some(format!(
+        "[mulpex:hub] Begin the following task, which was assigned to you by claude #{parent}: \
+         {task} Work on it autonomously through to completion. When you finish — or if you get \
+         blocked and need input — use mcp__mulpex__hub_send to send claude #{parent} a concise \
+         summary of the outcome."
+    ))
+}
 
 /// Where a session's PTY output goes. Before the frontend has created its xterm
 /// and attached a `Channel`, output is buffered so a restored (`--resume`d)
@@ -172,6 +201,7 @@ impl Session {
         state_dir: &Path,
         session_id: &str,
         resume: bool,
+        initial_task: Option<SpawnTask>,
     ) -> anyhow::Result<Self> {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -252,12 +282,13 @@ impl Session {
             });
         }
 
-        // A2 bootstrap: once `claude` is up and its initial paint has settled, inject
-        // a one-shot prompt telling it to arm its hub listener (see
-        // `HUB_LISTENER_BOOTSTRAP`). Re-fired on every spawn/`--resume` (a restart
-        // kills the previous Monitor), so an instance is always listening for peer
-        // messages even while idle. Runs in its own thread so `spawn` returns now.
-        {
+        // Task injection (`hub_spawn` children only): once `claude` is up and its
+        // initial paint has settled, type the child's assigned task in as its first
+        // prompt (see `spawn_prompt`). A NORMAL instance gets `None` here and no
+        // injection — it starts clean; its hub listener is armed from the
+        // `UserPromptSubmit` hook on the user's first real turn. Runs in its own
+        // thread so `spawn` returns now.
+        if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
             let writer = Arc::clone(&writer);
             let alive = Arc::clone(&alive);
             thread::spawn(move || {
@@ -285,7 +316,7 @@ impl Session {
                 // unsent. Sending the Enter on its own, once the paste-coalescing
                 // window has closed, registers as a real Enter keypress and fires it.
                 if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(HUB_LISTENER_BOOTSTRAP.as_bytes());
+                    let _ = w.write_all(prompt.as_bytes());
                     let _ = w.flush();
                 }
                 thread::sleep(Duration::from_millis(400));

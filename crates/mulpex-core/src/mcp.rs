@@ -17,6 +17,7 @@
 //! - `hub_file_owner` — who holds a given path, and what they're working on
 //! - `hub_send` — leave a message for another instance (or `all`)
 //! - `hub_inbox` — read (and clear) the messages addressed to me
+//! - `hub_spawn` — start new instances, each seeded with a task, and get their ids
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -88,7 +89,11 @@ fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The five hub tools, as MCP tool definitions.
+/// Most instances one `hub_spawn` call may create — a batch is fine, a flood is
+/// not (each new instance is a full `claude` process sharing this working tree).
+const MAX_SPAWN_PER_CALL: usize = 8;
+
+/// The six hub tools, as MCP tool definitions.
 fn tool_defs() -> Value {
     let empty = json!({ "type": "object", "properties": {} });
     json!([
@@ -132,6 +137,21 @@ fn tool_defs() -> Value {
             "description": "Read and clear the messages other instances have sent you. Returns each message's sender and body.",
             "inputSchema": empty,
         },
+        {
+            "name": "hub_spawn",
+            "description": "Start one or more NEW Claude instances in this same project, each seeded with its own task that it begins working on immediately and autonomously. Use this to fan work out — e.g. fetch a list of tickets/items and spawn one instance per item to handle it in parallel. Each new instance is a full sibling on the coordination hub; it is told you are its spawner and will hub_send its result back to you when done. Returns the new instances' ids so you can track them (hub_instances) or message them (hub_send). Max 8 per call — for more, call again in batches.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "One task per new instance to create. Each string is the full assignment that instance will start on (e.g. one ticket's title + details).",
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
     ])
 }
 
@@ -148,6 +168,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_file_owner" => Ok(hub_file_owner(ctx, &args)),
         "hub_send" => hub_send(ctx, &args),
         "hub_inbox" => Ok(hub_inbox(ctx)),
+        "hub_spawn" => hub_spawn(ctx, &args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -282,6 +303,83 @@ fn hub_inbox(ctx: &Ctx) -> String {
         .map(|(ts, from, body)| json!({ "from": from, "ts": ts, "message": body }))
         .collect();
     json!({ "messages": out }).to_string()
+}
+
+/// Queue new task-seeded instances for Mulpex to spawn. The MCP helper can't
+/// create sessions itself (Mulpex owns the PTYs), so it drops a request file in
+/// `state_dir/spawn/` and waits briefly for the poll loop to spawn them and write
+/// back the assigned ids. If the response doesn't arrive in time the spawn is
+/// still queued — the caller is told to discover the new instances via
+/// `hub_instances`.
+fn hub_spawn(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let tasks: Vec<String> = match args.get("tasks") {
+        // Normal shape: an array of task strings, one per new instance.
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|t| t.as_str())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        // Be forgiving if a single task arrives as a bare string.
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        _ => {
+            return Err("missing 'tasks' — provide an array of task strings, one per new \
+                        instance to create."
+                .into())
+        }
+    };
+    if tasks.is_empty() {
+        return Err("'tasks' is empty — provide at least one non-empty task string.".into());
+    }
+    if tasks.len() > MAX_SPAWN_PER_CALL {
+        return Err(format!(
+            "too many instances requested at once: {} (max {MAX_SPAWN_PER_CALL} per call). \
+             Spawn in smaller batches — call hub_spawn again for the rest once these are under way.",
+            tasks.len()
+        ));
+    }
+
+    let spawn_dir = ctx.state_dir.join("spawn");
+    std::fs::create_dir_all(&spawn_dir).map_err(|e| format!("could not queue spawn: {e}"))?;
+    let token = new_uuid();
+    let body = json!({ "from": ctx.instance, "ts": now(), "tasks": tasks });
+    std::fs::write(spawn_dir.join(format!("{token}.json")), body.to_string())
+        .map_err(|e| format!("could not queue spawn: {e}"))?;
+
+    // Poll for the poll-loop's response (assigned ids). ~6s cap; the loop ticks
+    // every 200ms and writes the `.done` file in the tick it processes the request.
+    let done = spawn_dir.join(format!("{token}.done"));
+    for _ in 0..60 {
+        if let Ok(content) = std::fs::read_to_string(&done) {
+            let _ = std::fs::remove_file(&done);
+            let ids: Vec<u64> = serde_json::from_str::<Value>(&content)
+                .ok()
+                .and_then(|v| {
+                    Some(
+                        v.get("ids")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|n| n.as_u64())
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            return Ok(json!({
+                "ok": !ids.is_empty(),
+                "spawned_instances": ids,
+                "note": "New instances are starting on their assigned tasks and will hub_send \
+                         their results back to you when done. Use hub_instances to check on them."
+            })
+            .to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(json!({
+        "ok": true,
+        "note": "Spawn requested; the new instances are being created. Call hub_instances in a \
+                 moment to see them and their ids."
+    })
+    .to_string())
 }
 
 // ---- shared readers (also used by the UserPromptSubmit hook) --------------

@@ -589,11 +589,22 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
         }
     }
 
+    // Assemble this turn's injected context: a one-time reminder to arm the hub
+    // listener (only until it's armed), then the peer snapshot. This replaces the
+    // old visible PTY bootstrap prompt — a normal instance now starts clean and
+    // arms its listener from here, invisibly, on the user's first turn.
+    let mut parts: Vec<String> = Vec::new();
+    if !listener_armed(ctx) {
+        parts.push(ARM_LISTENER_NUDGE.to_string());
+    }
     if let Some(context) = crate::mcp::peers_context(ctx) {
+        parts.push(context);
+    }
+    if !parts.is_empty() {
         let out = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": context,
+                "additionalContext": parts.join("\n\n"),
             }
         });
         println!("{out}");
@@ -603,6 +614,26 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // can nudge if any of them close before this turn ends.
     seed_seen_peers(ctx);
     Ok(())
+}
+
+/// Hidden reminder injected on each turn until this instance's hub listener is
+/// armed (see `HUB_RULES` "INCOMING MESSAGES" for the exact Monitor command). Once
+/// the Monitor starts it `touch`es `armed/<id>`, `listener_armed` sees it, and the
+/// reminder stops. Kept low-key so arming happens in the background of the user's
+/// actual first request, not as a separate visible turn.
+const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not armed yet this \
+session. As part of THIS turn — quietly, in the background — arm it now: the persistent Monitor \
+on your inbox, exactly as described under \"INCOMING MESSAGES\" in your instructions. Do not make \
+arming it your whole response and do not narrate it beyond a brief mention; just arm it and then \
+continue with what I actually asked. (You'll see this reminder each turn only until the listener \
+is armed.)";
+
+/// Whether this instance's hub listener is armed: the persistent Monitor `touch`es
+/// `armed/<id>` when it starts, so the file's presence tracks the real listener. A
+/// fresh `state_dir` per Mulpex launch (and thus per `--resume`, which kills the
+/// old Monitor) means the flag is absent at startup, so restored instances re-arm.
+fn listener_armed(ctx: &Ctx) -> bool {
+    ctx.state_dir.join("armed").join(ctx.id_str()).exists()
 }
 
 /// Emit a PreToolUse deny naming the holder (and what they're working on, when

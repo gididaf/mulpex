@@ -26,6 +26,10 @@ pub fn start(app: AppHandle) {
                 continue;
             };
             let removed = core.reap_dead();
+            // Fulfil any `hub_spawn` requests instances left on disk (creates
+            // task-seeded siblings). New sessions must be published so the frontend
+            // builds their xterms, same as a reap republishes after removals.
+            let spawned = core.process_spawn_requests();
             core.refresh_worked();
             let snap = core.hub_snapshot();
             let sessions = core.session_infos();
@@ -34,7 +38,7 @@ pub fn start(app: AppHandle) {
             for id in &removed {
                 let _ = app.emit("session-exited", id);
             }
-            if !removed.is_empty() {
+            if !removed.is_empty() || spawned {
                 let _ = app.emit("sessions-changed", &sessions);
             }
             if last.as_ref() != Some(&snap) {

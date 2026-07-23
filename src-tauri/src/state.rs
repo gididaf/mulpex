@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use mulpex_core::config::{HOOK_SETTINGS_JSON, MCP_CONFIG_JSON};
 use mulpex_core::persist::{self, SessionStore};
 
-use crate::pty::Session;
+use crate::pty::{Session, SpawnTask};
 use crate::snapshot::{
     BootstrapInfo, HubSnapshot, LockEntry, MsgEntry, SessionInfo, Status, StatusEntry, TaskEntry,
     WaitEntry,
@@ -69,7 +69,7 @@ impl Core {
             state_dir.join("mcp.json"),
             MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &helper),
         )?;
-        for sub in ["locks", "history", "tasks", "inbox", "waiting"] {
+        for sub in ["locks", "history", "tasks", "inbox", "waiting", "spawn", "armed"] {
             std::fs::create_dir_all(state_dir.join(sub))?;
         }
 
@@ -88,6 +88,7 @@ impl Core {
                 &state_dir,
                 &session_id,
                 true,
+                None,
             ) {
                 worked.insert(id);
                 if let Some(name) = name {
@@ -108,6 +109,7 @@ impl Core {
                 &state_dir,
                 &session_id,
                 false,
+                None,
             )?;
             sessions.push(first);
         }
@@ -156,9 +158,41 @@ impl Core {
             .collect()
     }
 
-    /// Spawn a fresh Claude in the project dir and focus it. Ports
-    /// `App::spawn_instance`; returns the new session's info.
+    /// Spawn a fresh Claude in the project dir and focus it (⌘T / the frontend
+    /// `create_session` command). Ports `App::spawn_instance`.
     pub fn spawn_instance(&mut self) -> anyhow::Result<SessionInfo> {
+        self.spawn_with(None, true)
+    }
+
+    /// Spawn a fresh Claude that starts immediately on `task`, assigned by
+    /// `parent_id` (an instance's `hub_spawn` call, dispatched by the poll loop).
+    /// The child is auto-named from the task so the sidebar labels it, is told its
+    /// parent (so it can report back via `hub_send`), and is NOT focused — the user
+    /// stays on their current pane while children appear in the sidebar.
+    pub fn spawn_instance_with_task(
+        &mut self,
+        parent_id: usize,
+        task: String,
+    ) -> anyhow::Result<SessionInfo> {
+        let name = name_from_task(&task);
+        let info = self.spawn_with(Some(SpawnTask { parent_id, task }), false)?;
+        if let Some(name) = name {
+            self.names.insert(info.id, name.clone());
+            return Ok(SessionInfo {
+                id: info.id,
+                name: Some(name),
+            });
+        }
+        Ok(info)
+    }
+
+    /// Shared spawn path: allocate an id, spawn the session (optionally with an
+    /// initial task), append it, optionally focus it, and republish the peer list.
+    fn spawn_with(
+        &mut self,
+        initial_task: Option<SpawnTask>,
+        focus: bool,
+    ) -> anyhow::Result<SessionInfo> {
         let id = self.next_id;
         let session_id = persist::new_uuid();
         let session = Session::spawn(
@@ -170,12 +204,73 @@ impl Core {
             &self.state_dir,
             &session_id,
             false,
+            initial_task,
         )?;
         self.next_id += 1;
         self.sessions.push(session);
-        self.active = self.sessions.len() - 1;
+        if focus {
+            self.active = self.sessions.len() - 1;
+        }
         self.write_live_instances();
         Ok(SessionInfo { id, name: None })
+    }
+
+    /// Fulfil `hub_spawn` requests instances left on disk: for each `spawn/*.json`
+    /// request, spawn one session per task, write the assigned ids back to a
+    /// `<uuid>.done` file (the waiting MCP tool reads it), and delete the request.
+    /// Returns whether any session was created (so the poll loop re-emits the
+    /// session list). Runs single-threaded in the poll loop, so id allocation and
+    /// the response handshake are race-free.
+    pub fn process_spawn_requests(&mut self) -> bool {
+        let dir = self.state_dir.join("spawn");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        let mut requests: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+            .collect();
+        requests.sort();
+
+        let mut spawned_any = false;
+        for req in requests {
+            let Ok(content) = std::fs::read_to_string(&req) else {
+                let _ = std::fs::remove_file(&req);
+                continue;
+            };
+            let parsed: Option<(usize, Vec<String>)> = serde_json::from_str::<serde_json::Value>(
+                &content,
+            )
+            .ok()
+            .and_then(|v| {
+                let from = v.get("from").and_then(|x| x.as_u64())? as usize;
+                let tasks = v
+                    .get("tasks")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .filter(|t| !t.trim().is_empty())
+                    .collect::<Vec<_>>();
+                Some((from, tasks))
+            });
+            let _ = std::fs::remove_file(&req);
+            let Some((from, tasks)) = parsed else { continue };
+
+            let mut ids = Vec::new();
+            for task in tasks {
+                if let Ok(info) = self.spawn_instance_with_task(from, task) {
+                    ids.push(info.id);
+                    spawned_any = true;
+                }
+            }
+            // Response the waiting `hub_spawn` reads: the ids it should return.
+            if let Some(stem) = req.file_stem().and_then(|s| s.to_str()) {
+                let done = serde_json::json!({ "ids": ids }).to_string();
+                let _ = std::fs::write(dir.join(format!("{stem}.done")), done);
+            }
+        }
+        spawned_any
     }
 
     /// Find a session by id.
@@ -432,6 +527,20 @@ impl Core {
 }
 
 // ---- module helpers (ported from app.rs) ----
+
+/// A short sidebar label derived from a spawned instance's task: collapse
+/// whitespace and cap the length. `None` for an all-whitespace task.
+fn name_from_task(task: &str) -> Option<String> {
+    let one_line = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return None;
+    }
+    let mut s: String = one_line.chars().take(48).collect();
+    if one_line.chars().count() > 48 {
+        s.push('…');
+    }
+    Some(s)
+}
 
 /// Parse a lock file into `(holder id, locked path)`.
 fn read_lock(file: &Path) -> Option<(usize, PathBuf)> {

@@ -140,13 +140,19 @@
       listen<string>("menu", (e) => handleMenu(e.payload)),
       listen<HubSnapshot>("hub-update", (e) => applyHub(e.payload)),
       listen<number>("session-exited", (e) => terminals.dispose(e.payload)),
-      listen<SessionInfo[]>("sessions-changed", (e) => {
+      listen<SessionInfo[]>("sessions-changed", async (e) => {
         sessions.set(e.payload);
         const cur = get(activeId);
         if (!e.payload.some((s) => s.id === cur)) {
           const first = e.payload[0]?.id ?? null;
           activeId.set(first);
           if (first != null) selectSession(first);
+        } else {
+          // Added sessions (e.g. hub_spawn children) mount hidden without a focus
+          // change; once their xterms exist, refit brings them — and their PTYs,
+          // spawned at the default size — to the shared geometry.
+          await tick();
+          terminals.refit();
         }
       }),
     );

@@ -119,22 +119,48 @@ against the *local* hub:
   line only when new message files appear (seeded to the current count, so only post-arm
   arrivals fire). Each such line is a wake event the Claude Code runtime injects as a new turn —
   even while the instance is idle waiting for the user.
-- **Bootstrap (`pty.rs`, "A2"):** only the agent can arm its *own* Monitor, and a `--resume`
-  restart kills the previous one — so Mulpex injects a one-shot prompt (`HUB_LISTENER_BOOTSTRAP`)
-  into the PTY on **every** spawn, once `claude`'s initial paint has settled (a reader-thread
-  readiness gate: first output seen, then ≥600 ms quiet, hard cap 8 s; the submitting Enter is
-  sent as a **separate** write ~400 ms later, or `claude` treats the burst as a paste and the
-  trailing `\r` becomes a literal newline instead of submitting). To keep the visible startup
-  turn compact, the *trigger* is one short line; the full arming procedure + exact Monitor
-  command live in `HUB_RULES` (append-system-prompt, which also carries the wake→act contract so
-  it survives compaction). The trigger begins with `mulpex_core::MULPEX_SENTINEL` (`[mulpex:hub]`)
-  so the `UserPromptSubmit` hook skips it for the sidebar task (else the plumbing text would show
-  up as the instance's "task").
+- **Arming (hook-driven, no injected prompt):** only the agent can arm its *own* Monitor, and a
+  `--resume` restart kills the previous one — but instead of typing a visible bootstrap prompt
+  into the PTY (which looked ugly/confusing on every spawn and resume), a normal instance now
+  **starts completely clean** and arms its listener from the **`UserPromptSubmit` hook** on the
+  user's first turn. The hook (`hook.rs::userpromptsubmit`) injects `ARM_LISTENER_NUDGE` as hidden
+  `additionalContext` — a low-key "arm your listener quietly as part of this turn" reminder — but
+  only while `listener_armed(ctx)` is false, i.e. while `state_dir/armed/<id>` is absent. The
+  Monitor command in `HUB_RULES` **`touch`es that flag as its first action**, so the flag tracks
+  the *real* Monitor: once armed the reminder stops; if arming was missed it re-injects next turn
+  (self-healing). Because `state_dir` is fresh per Mulpex launch (hence per `--resume`), the flag
+  is absent at startup, so restored instances re-arm on their first prompt. The full arming
+  procedure + exact Monitor command still live in `HUB_RULES` (append-system-prompt, so the wake→act
+  contract survives compaction). *(`hub_spawn` children are the one case that still gets an injected
+  PTY prompt — their assigned task — via `pty.rs::spawn_prompt`; they arm the listener from the
+  same hook on that first turn.)*
 - **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
   autonomously, replies to the sender only when it adds value (no bare acks), and prefixes the
   self-triggered turn with a `⟳ hub message from #<sender> →` marker so the human can tell it
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
+
+## Spawning instances (`hub_spawn`)
+
+An instance can create new task-seeded siblings — e.g. fetch a list of tickets and spawn one
+instance per ticket. The MCP helper runs in a **separate process** from Tauri and can't create
+sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the poll loop:
+
+- **Request:** `hub_spawn({tasks: [...]})` writes `state_dir/spawn/<token>.json`
+  (`{from, tasks, ts}`), capped at `MAX_SPAWN_PER_CALL` (8) so a 50-item list can't fork 50
+  `claude`s at once, then **polls** for `<token>.done` (~6 s) to return the assigned ids.
+- **Fulfilment:** the 200 ms poll loop calls `Core::process_spawn_requests()` (`state.rs`), which
+  for each task spawns a session via `spawn_instance_with_task(parent_id, task)`, writes the ids
+  to `<token>.done`, and — if anything spawned — emits `sessions-changed` so the frontend builds
+  the new xterms (the existing reap path already republishes on removal; added sessions ride the
+  same event via `TerminalPane`'s keyed `{#each}`).
+- **Seeding + link:** the child's one-shot PTY prompt (`pty.rs::spawn_prompt`) is just the task:
+  start it, then `hub_send` a summary back to the spawner when done (listener arming is *not* in
+  this prompt — it comes from the `UserPromptSubmit` hook like every instance). Still
+  `[mulpex:hub]`-sentinel-prefixed (skips the sidebar task-capture) and a single line (task
+  whitespace collapsed). The child is **auto-named** `name_from_task(task)` so the sidebar labels
+  it, and is **not** focused — the user stays on their pane while children appear. Recursion is
+  inherent (children also have `hub_spawn`); only the per-call cap bounds a single call.
 
 ## Shared-tree guardrail
 
@@ -150,7 +176,7 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
 
 - Both crates + the Tauri app compile clean; `svelte-check` + `vite build` clean.
 - The whole coordination hub works **end-to-end through `mulpex-helper`**: MCP `initialize` /
-  `tools/list` (all 5 `hub_*` tools), `hub_send`→`hub_inbox` delivery + `messages.log`,
+  `tools/list` (all 6 `hub_*` tools), `hub_send`→`hub_inbox` delivery + `messages.log`,
   `userpromptsubmit` task capture + peer snapshot, and `pretooluse` `O_EXCL` lock acquisition
   with a canonical-path + heartbeat token.
 - **Run as a GUI and bundled.** `npm run tauri dev` and `tauri build` (→ signed `Mulpex.app`
