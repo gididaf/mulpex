@@ -153,5 +153,14 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `tools/list` (all 5 `hub_*` tools), `hub_send`→`hub_inbox` delivery + `messages.log`,
   `userpromptsubmit` task capture + peer snapshot, and `pretooluse` `O_EXCL` lock acquisition
   with a canonical-path + heartbeat token.
-- **Not yet run as a GUI** (`npm run tauri dev`) or bundled (`tauri build`) — see the verification
-  section of the plan and the bundling note above.
+- **Run as a GUI and bundled.** `npm run tauri dev` and `tauri build` (→ signed `Mulpex.app`
+  with the `mulpex-helper` sidecar inside `Contents/MacOS/`) both work; multi-instance spawn,
+  focus-switch, resize, and session `--resume` verified in the window.
+- **Idle-wake hub listener verified live.** Two instances armed their listeners at startup; a
+  `hub_send` from one woke the idle peer via its Monitor event (no injected prompt line), which
+  read its inbox and replied — round-trip confirmed both directions, with the `⟳` marker and a
+  clean sidebar (the sentinel + `<task-notification>` task-capture skips work).
+
+## Last Synced Commit
+
+`1fadc63e9d9cc1ea5f756ebe684a05b43485d897` — 2026-07-23
