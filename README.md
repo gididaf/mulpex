@@ -108,4 +108,5 @@ npm run tauri build    # produces Mulpex.app under target/release/bundle/macos/
 > silently. This is handled: `scripts/bundle-helper.sh` stages it as a triple-suffixed
 > `bundle.externalBin` sidecar (run from `beforeBuildCommand`), so Tauri places and signs it in
 > the bundle. In `tauri dev` it's resolved beside the app binary in `target/debug/`, so dev
-> needs no extra step. Bundle target is `app` only (no `.dmg`) — see `tauri.conf.json`.
+> needs no extra step. Bundle targets are `app` and `dmg` — `tauri build` produces both
+> `Mulpex.app` and `Mulpex_<version>_aarch64.dmg` (see `tauri.conf.json`).

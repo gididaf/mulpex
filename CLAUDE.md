@@ -47,15 +47,18 @@ must be tiny and fast to exec. It links only `mulpex-core` (~1.8 MB vs the ~29 M
 absolute path is substituted for `__MULPEX_BIN__` in the config templates when a project opens
 (`state.rs::Core::open`).
 
-### Bundling the helper (do before shipping a `.app`)
+### Bundling the helper (wired)
 
-The dev flow needs nothing (helper sits beside the app in `target/`). For `tauri build`, add
-`mulpex-helper` as a **signed sidecar** so it lands in `Contents/MacOS/` *and is signed with the
-bundle* — otherwise Gatekeeper SIGKILLs it and **every hook fails-open silently** (no
-coordination, no error). Set `bundle.externalBin` in `tauri.conf.json` and provide the
-triple-suffixed binary (`mulpex-helper-aarch64-apple-darwin`) via a pre-build step, or bundle it
-under `Contents/Resources/` and adjust `resolve_helper_path`. **Not yet wired** — `beforeBuildCommand`
-currently just builds the helper into `target/release/`.
+The dev flow needs nothing (helper sits beside the app in `target/`). For `tauri build`,
+`mulpex-helper` ships as a **signed sidecar** so it lands in `Contents/MacOS/` *and is signed with
+the bundle* — otherwise Gatekeeper SIGKILLs it and **every hook fails-open silently** (no
+coordination, no error). This is **wired**: `bundle.externalBin` is `["binaries/mulpex-helper"]`
+in `tauri.conf.json`, and `beforeBuildCommand` runs `scripts/bundle-helper.sh`, which builds the
+helper in release and copies it to `src-tauri/binaries/mulpex-helper-<target-triple>` (the
+suffix Tauri expects). Tauri strips the suffix, places it at `Contents/MacOS/mulpex-helper`, and
+signs it with the app. Bundle `targets` are `["app", "dmg"]`, so `tauri build` produces both
+`Mulpex.app` and `Mulpex_<version>_aarch64.dmg`. Verified: the built `.app` has the signed helper
+beside the main binary.
 
 ## Data flow
 
@@ -182,11 +185,17 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
 - **Run as a GUI and bundled.** `npm run tauri dev` and `tauri build` (→ signed `Mulpex.app`
   with the `mulpex-helper` sidecar inside `Contents/MacOS/`) both work; multi-instance spawn,
   focus-switch, resize, and session `--resume` verified in the window.
-- **Idle-wake hub listener verified live.** Two instances armed their listeners at startup; a
-  `hub_send` from one woke the idle peer via its Monitor event (no injected prompt line), which
-  read its inbox and replied — round-trip confirmed both directions, with the `⟳` marker and a
-  clean sidebar (the sentinel + `<task-notification>` task-capture skips work).
+- **Idle-wake hub listener verified live.** A `hub_send` from one instance woke the idle peer via
+  its Monitor event (no injected prompt line), which read its inbox and replied — round-trip
+  confirmed both directions, with the `⟳` marker and a clean sidebar (the sentinel +
+  `<task-notification>` task-capture skips work).
+- **Clean-start arming verified live.** A normal instance opened to an empty prompt (no bootstrap
+  turn) and armed its Monitor invisibly from the `UserPromptSubmit` hook on the user's first
+  message; the `armed/<id>` flag stopped the reminder on later turns.
+- **`hub_spawn` verified live.** An instance spawned a task-seeded sibling that appeared in the
+  sidebar auto-named, armed its own listener on its injected first turn, ran its task, and
+  `hub_send`'d its result back to the spawner.
 
 ## Last Synced Commit
 
-`1fadc63e9d9cc1ea5f756ebe684a05b43485d897` — 2026-07-23
+`2a696fea64f106fa54ca7f2de086cfabe1e00f76` — 2026-07-23
