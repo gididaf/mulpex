@@ -64,6 +64,23 @@ A Cargo workspace + a Svelte/Vite frontend:
 
 See `CLAUDE.md` for the detailed design.
 
+## Install
+
+**Requirements:** macOS 11+, and the [Claude Code CLI](https://code.claude.com) installed and
+logged in (`claude` must be on your `PATH`) — Mulpex launches your own `claude`.
+
+1. Download `Mulpex_<version>_aarch64.dmg` from the [latest release](https://github.com/gididaf/mulpex/releases/latest).
+2. Open the DMG and drag **Mulpex** into **Applications**.
+3. The first launch is blocked by Gatekeeper because the app isn't notarized — this is expected.
+   **Right-click Mulpex → Open**, then click **Open** in the dialog (only needed once). If macOS
+   still refuses, run:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Mulpex.app
+   ```
+
+> The build is **ad-hoc signed, not notarized**, so the one-time Gatekeeper step above is
+> required. (A notarized build would install with no warning — not set up yet.)
+
 ## Develop
 
 Requires Rust and Node. Mulpex launches whatever `claude` you have installed (resolved via
