@@ -1,8 +1,9 @@
 # Mulpex
 
 **A native macOS desktop app that runs multiple live, parallel Claude Code sessions side by
-side — all working in the *same* project directory and coordinating through a shared hub so
-they never clobber each other's files.**
+side. Open several projects at once and switch between them instantly; within each project the
+sessions share one directory and coordinate through a hub so they never clobber each other's
+files.**
 
 [![Download for macOS](https://img.shields.io/badge/Download-Mulpex.dmg-0a84ff?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/gididaf/mulpex/releases/latest)
 &nbsp;
@@ -16,6 +17,7 @@ iTerm2, no Ctrl-key minefield, no Kitty-protocol hacks — and uses a real windo
 menu shortcuts.
 
 ```
+[ Cloud ▾ ][ API ][ Docs ]  +                               ← project tabs (⌘P switcher)
  project · /path/to/project                                  ← top bar
 ┌──────────────┬───────────────────────────────────────────┐
 │ instances    │                                            │
@@ -32,7 +34,11 @@ menu shortcuts.
 
 ## What it does
 
-- **Multiple Claude sessions, one project.** Each runs as a real `claude` process on its own
+- **Multiple projects at once.** Open several projects side by side — a persistent tab bar, a
+  **⌘P** fuzzy quick-switcher, or **drag a folder** onto the window. Each project keeps its own
+  isolated coordination hub and its sessions running in the background; Mulpex reopens everything
+  you had open on the next launch. Close a project with ⌘⇧W, cycle with ⌘⇧[ ⌘⇧].
+- **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘1–9 / ⌘[ ⌘]), rename (⌘R), close (⌘W).
 - **Coordination hub.** Parallel Claudes in the same directory are kept consistent by a
   file-locking coordinator (a `PreToolUse` hook: edits/reads to a file another instance is
@@ -49,7 +55,8 @@ menu shortcuts.
   discipline (verify assumptions via `AskUserQuestion` before implementing).
 - **Session persistence.** The sessions you worked on are remembered per project and
   auto-resume (`claude --resume`) when you reopen that project.
-- **Open a project** via the picker / recent-projects list — no terminal needed.
+- **Open a project** via the picker / recent-projects list, the `+` tab, ⌘P, or drag-and-drop —
+  no terminal needed.
 
 ## Architecture
 
@@ -61,12 +68,14 @@ A Cargo workspace + a Svelte/Vite frontend:
 - **`crates/mulpex-helper`** — a tiny binary (`hook <event>` / `mcp`) that each child `claude`
   invokes by absolute path. Kept separate from the GUI so it stays small and fast to exec (a
   hook forks on every tool call).
-- **`src-tauri`** — the Tauri app: PTY hosting (`pty.rs`), state + reap/persist/hub-read
-  (`state.rs`), commands (`commands.rs`), the 200 ms poll loop that emits hub updates
-  (`hub.rs`), the native menu (`menu.rs`), and project selection (`project.rs`).
+- **`src-tauri`** — the Tauri app: PTY hosting (`pty.rs`), the `Workspace` of open projects with
+  per-project reap/persist/hub-read (`state.rs`), commands (`commands.rs`), the 200 ms poll loop
+  that emits handle-scoped hub updates over every project (`hub.rs`), the native menu (`menu.rs`),
+  and project selection + open-set persistence (`project.rs`).
 - **`src/`** — the Svelte frontend. xterm.js **is** the terminal emulator (one `Terminal` per
-  session, kept alive while hidden); the backend is a raw byte pipe. Sidebar + hub panel render
-  from the emitted `hub-update` snapshot.
+  session, kept alive while hidden — across all open projects); the backend is a raw byte pipe.
+  The tab bar / ⌘P palette switch projects; sidebar + hub panel render from the active project's
+  `hub-update` snapshot.
 
 See `CLAUDE.md` for the detailed design.
 

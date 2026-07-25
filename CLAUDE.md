@@ -22,17 +22,21 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config  (copied verbatim
 crates/mulpex-helper/ bin: `hook <event>` / `mcp` dispatch → mulpex-core
 src-tauri/            the Tauri app (Rust backend)
   src/pty.rs          Session = one claude on a PTY, streaming to a frontend Channel
-  src/state.rs        Core (open project + sessions + scratch dir); reap/persist/hub-read
-  src/commands.rs     #[tauri::command] surface
-  src/hub.rs          200ms poll loop → emits hub-update / session-exited / sessions-changed
+  src/state.rs        Workspace = N open projects (Vec<Core> + active handle); each
+                      Core = one project + sessions + its OWN scratch dir; reap/persist/hub-read
+  src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
+  src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
+                      session-exited / sessions-changed (+ projects-changed)
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
-  src/project.rs      recent-projects list (~/.mulpex/recents.txt)
-  src/snapshot.rs     serde types shared with the frontend
+  src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
+  src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
 src/                  Svelte/Vite frontend
-  lib/terminals.ts    TerminalManager: one xterm per session, alive-while-hidden, central resize
+  lib/terminals.ts    TerminalManager: one xterm per session keyed by (project,id),
+                      alive-while-hidden across ALL projects, central resize
   lib/ipc.ts          typed command/event/channel wrappers
-  lib/stores.ts       reactive sidebar/hub state (PTY bytes bypass this)
-  lib/components/*     TopBar, InstanceList, HubPanel, TerminalPane/View, MessageReader, Rename…
+  lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
+  lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
+                      TerminalPane/View, MessageReader, Rename…
 ```
 
 ## The helper (why it's a separate binary)
@@ -69,38 +73,74 @@ beside the main binary.
 - **frontend → PTY:** `send_bytes(id, data)` from xterm `onData` (UTF-8 encoded). The one manual
   key carve-out is **Shift+Enter → `\n`** (`attachCustomKeyEventHandler`); `macOptionIsMeta`
   covers Option word-motions.
-- **hub state:** the 200 ms poll reads the scratch-dir files into a `HubSnapshot` and emits it on
-  change; the sidebar/hub panel are a reactive projection. Reaping (with `bounce_dead_inbox`,
-  peer-list rewrite, persistence) is **single-sourced in the poll loop** — an explicit ⌘W close
-  just `kill()`s and lets the next reap emit `session-exited`, identical to a self-exit.
+- **hub state:** the 200 ms poll walks **every open project**, reads each one's scratch-dir files
+  into a `HubSnapshot`, and emits a **handle-scoped** `hub-update {handle, snapshot}` on change;
+  the frontend keys it into that project's slice, and the sidebar/hub panel are a reactive
+  projection of the *active* project. Reaping (with `bounce_dead_inbox`, peer-list rewrite,
+  persistence) is **single-sourced in the poll loop** — an explicit ⌘W close just `kill()`s and
+  lets the next reap emit `session-exited {handle, id}`, identical to a self-exit.
+
+## Multiple projects (Workspace)
+
+Mulpex hosts **several projects at once in one window** and switches between them instantly. The
+single `Core` is now one of N owned by a `Workspace` (`state.rs`: `Mutex<Workspace>` replacing
+`Mutex<Option<Core>>`), each with a **monotonic `ProjectHandle`** (never reused after close, so a
+stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<pid>/<handle>/`.
+
+- **Hub isolation is free:** the hub is scoped entirely by `MULPEX_STATE_DIR`, passed per session
+  in `pty.rs::Session::spawn`, so a per-project `state_dir` isolates each project's hub with no
+  other change — instances only coordinate with peers in the *same* project. Instance ids stay
+  per-project (each numbers 1,2,3…), so every session command carries a `projectHandle` and every
+  hub event is handle-scoped; `(handle, id)` disambiguates.
+- **Commands:** `bootstrap()` (replaces `current_project`) returns a `WorkspaceInfo { projects,
+  active }`; `open_project` dedups canonically (re-activates if already open) and emits
+  `projects-changed`; `close_project` tears the project down + re-picks the active neighbor;
+  `switch_project` sets the active handle. Session cmds (`attach/create/close/rename/send_bytes/
+  resize/focus_session`, `get_hub_snapshot`) all take `projectHandle`.
+- **Frontend:** `stores.ts` holds a `Map<handle, ProjectState>` + `activeProjectHandle`; the
+  classic `sessions/statuses/tasks/hub/activeId/project` stores are **derived read-only
+  projections of the active project**, so the sidebar/hub components are unchanged. Navigation is a
+  persistent **`ProjectTabBar`** (click / `+` open / ✕ close / unread badge) plus a **`⌘P`
+  `CommandPalette`** fuzzy switcher. **Drag-and-drop** a folder onto the window opens it
+  (`getCurrentWebview().onDragDropEvent`). `TerminalManager` keys xterms by `(handle,id)` and keeps
+  **every project's** terminals alive while hidden; exactly one is visible globally.
+- **Persistence:** the open-project set is saved to `~/.mulpex/open.txt` (distinct from
+  `recents.txt`) on open/close; on launch every project reopens (`--resume`).
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘1–9/⌘[ ⌘]/⌘O/⌘Q) are intercepted by the menu
-before xterm; Claude never uses ⌘, so there's zero collision. Everything else (arrows, Ctrl+C,
-Esc, Shift+Enter) flows straight to the focused terminal. Copy/paste/select-all are predefined
-Edit-menu items macOS routes to the focused xterm textarea.
+Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘1–9/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
+**⌘⇧] / ⌘⇧[** next/prev project) are intercepted by the menu before xterm; Claude never uses ⌘,
+so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu accelerator — it's
+handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
+Everything else (arrows, Ctrl+C, Esc, Shift+Enter) flows straight to the focused terminal.
+Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused xterm textarea.
 
 ## Terminals kept alive while hidden
 
-All sessions' xterms are stacked absolutely in `TerminalPane`; the focused one is
-`visibility: visible`, the rest `visibility: hidden` (**never** `display:none`, which would
-zero their size and break `fit()`). Hidden terminals keep receiving `term.write()`, so
-background Claudes keep rendering. Geometry is central: a `ResizeObserver` on the pane fits the
-visible terminal, then applies the same `cols/rows` to every session + the backend PTYs (all
-PTYs share one size, as the TUI did). **WebGL** is attached only to the focused terminal (browser
-caps live GL contexts) and disposed on blur.
+`TerminalPane` stacks the xterms of **every session across every open project** absolutely (keyed
+`(handle,id)`); exactly one — the active project's active session — is `visibility: visible`, all
+the rest `visibility: hidden` (**never** `display:none`, which would zero their size and break
+`fit()`). Hidden terminals (including whole background *projects*) keep receiving `term.write()`,
+so background Claudes keep rendering. Geometry is central: a `ResizeObserver` on the pane fits the
+visible terminal, then applies the same `cols/rows` to every session + backend PTY (all PTYs share
+one size, as the TUI did) — `refit` issues one `resize_session(handle,…)` per open project so
+background projects aren't left at spawn size. **WebGL** is attached only to the one globally
+visible terminal (browser caps live GL contexts) and disposed on blur / project switch.
 
 ## Lifecycle
 
-- **Startup:** frontend calls `current_project()`; if none, shows the picker (recents +
-  `@tauri-apps/plugin-dialog` folder picker) → `open_project(path)` builds `Core` (scratch dir,
-  config files, restore/spawn sessions), returns `BootstrapInfo`; the frontend builds one xterm
-  per session and `attach_session`es each.
+- **Startup:** `lib.rs::setup()` reopens **every project in `open.txt`** (each builds its `Core` —
+  scratch dir, config files, restore/spawn sessions — before the window paints; output buffers
+  pre-attach). The frontend then calls `bootstrap()` → `WorkspaceInfo`, builds one xterm per
+  session of each project, `attach_session`es each, and activates `active`. With no open projects
+  it shows the picker (recents + `@tauri-apps/plugin-dialog` folder picker); opening one goes
+  through `open_project(path)`.
 - **Teardown:** handled in `lib.rs` via `RunEvent` (managed-state `Drop` isn't guaranteed on
-  exit). Window close → `app.exit(0)` → `ExitRequested` → `Core::teardown()` kills every process
-  group (`killpg` SIGHUP→SIGKILL→wait) **then** removes the scratch dir. This is the "no orphaned
-  claude" guarantee.
+  exit). Window close → `app.exit(0)` → `ExitRequested` → `Workspace::teardown_all()` kills
+  **every project's** process groups (`killpg` SIGHUP→SIGKILL→wait) **then** removes the whole
+  scratch root. This is the "no orphaned claude" guarantee, now across all projects. `open.txt` is
+  **not** touched on teardown, so the set survives to next launch.
 
 ## claude binary
 
@@ -167,7 +207,8 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
 
 ## Shared-tree guardrail
 
-All instances share one working directory and one git checkout (not a worktree per instance), so
+All instances **of a given project** share one working directory and one git checkout (not a
+worktree per instance; separate projects are separate trees), so
 a tree-wide git op by one (`reset --hard`, `checkout .`/`restore .`, `clean`, `stash`, branch
 switch, `rebase`/`revert`) or any bulk-destructive command wipes every other instance's
 uncommitted work. `HUB_RULES` (the append-system-prompt) tells each instance to treat these as
@@ -195,7 +236,12 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
 - **`hub_spawn` verified live.** An instance spawned a task-seeded sibling that appeared in the
   sidebar auto-named, armed its own listener on its injected first turn, ran its task, and
   `hub_send`'d its result back to the spawner.
+- **Multi-project (v0.4.0).** `cargo build`/`clippy` + `svelte-check` + `vite build` clean; the
+  app boots to the picker with no open projects (fresh `open.txt`) and no panic, with the
+  drag-drop listener registered. Released as `v0.4.0` with a signed `Mulpex_0.4.0_aarch64.dmg`.
+  The interactive flows (tab/⌘P switching, per-project hub isolation, restore-all, dedup,
+  no-orphans) are covered by the plan's verification checklist and want a live GUI to exercise.
 
 ## Last Synced Commit
 
-`2a696fea64f106fa54ca7f2de086cfabe1e00f76` — 2026-07-23
+`bc903ca3ba1761280f973171b67511c24a799d09` — 2026-07-25
