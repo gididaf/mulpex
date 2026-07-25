@@ -2,14 +2,14 @@
   import { onMount, onDestroy } from "svelte";
   import { terminals } from "../terminals";
 
-  let { id }: { id: number } = $props();
+  let { handle, id }: { handle: number; id: number } = $props();
   let el: HTMLDivElement;
 
   onMount(() => {
-    terminals.create(id, el);
+    terminals.create(handle, id, el);
   });
   onDestroy(() => {
-    terminals.dispose(id);
+    terminals.dispose(handle, id);
   });
 </script>
 

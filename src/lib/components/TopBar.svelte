@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { project } from "../stores";
+  import { activeProject } from "../stores";
 </script>
 
 <header class="top">
   <span class="label">project</span>
-  <span class="name">{$project?.project_name ?? ""}</span>
-  <span class="path">{$project?.project_dir ?? ""}</span>
+  <span class="name">{$activeProject?.name ?? ""}</span>
+  <span class="path">{$activeProject?.dir ?? ""}</span>
 </header>
 
 <style>

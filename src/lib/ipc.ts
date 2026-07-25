@@ -5,6 +5,9 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 export type Status = "working" | "waiting" | "needs";
 
+/** Stable id for one open project; matches the Rust `ProjectHandle` (u64). */
+export type ProjectHandle = number;
+
 export interface SessionInfo {
   id: number;
   name: string | null;
@@ -41,43 +44,84 @@ export interface HubSnapshot {
   pending_messages: number;
 }
 export interface BootstrapInfo {
+  handle: ProjectHandle;
   project_dir: string;
   project_name: string;
   sessions: SessionInfo[];
   active: number;
 }
+export interface WorkspaceInfo {
+  projects: BootstrapInfo[];
+  active: ProjectHandle | null;
+}
 
-export const currentProject = () =>
-  invoke<BootstrapInfo | null>("current_project");
+// Scoped event payloads (mirror snapshot.rs).
+export interface HubUpdateEvent {
+  handle: ProjectHandle;
+  snapshot: HubSnapshot;
+}
+export interface SessionsChangedEvent {
+  handle: ProjectHandle;
+  sessions: SessionInfo[];
+}
+export interface SessionExitedEvent {
+  handle: ProjectHandle;
+  id: number;
+}
+
+/** Every open project + active handle, for the initial paint. */
+export const bootstrap = () => invoke<WorkspaceInfo>("bootstrap");
 
 export const listRecentProjects = () =>
   invoke<string[]>("list_recent_projects");
 
+/** Open (or re-activate) a project; returns its bootstrap info. */
 export const openProject = (path: string) =>
   invoke<BootstrapInfo>("open_project", { path });
 
+/** Close a project (kills its sessions); returns the new workspace. */
+export const closeProject = (projectHandle: ProjectHandle) =>
+  invoke<WorkspaceInfo>("close_project", { projectHandle });
+
+/** Make a project the active one on the backend. */
+export const switchProject = (projectHandle: ProjectHandle) =>
+  invoke<void>("switch_project", { projectHandle });
+
 /** Bind a session's PTY output stream (base64 chunks) to its xterm. */
-export const attachSession = (id: number, channel: Channel<string>) =>
-  invoke<void>("attach_session", { id, channel });
+export const attachSession = (
+  projectHandle: ProjectHandle,
+  id: number,
+  channel: Channel<string>,
+) => invoke<void>("attach_session", { projectHandle, id, channel });
 
-export const createSession = () => invoke<SessionInfo>("create_session");
+export const createSession = (projectHandle: ProjectHandle) =>
+  invoke<SessionInfo>("create_session", { projectHandle });
 
-export const closeSession = (id: number) =>
-  invoke<void>("close_session", { id });
+export const closeSession = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("close_session", { projectHandle, id });
 
-export const renameSession = (id: number, name: string) =>
-  invoke<void>("rename_session", { id, name });
+export const renameSession = (
+  projectHandle: ProjectHandle,
+  id: number,
+  name: string,
+) => invoke<void>("rename_session", { projectHandle, id, name });
 
-export const sendBytes = (id: number, data: Uint8Array) =>
-  invoke<void>("send_bytes", { id, data });
+export const sendBytes = (
+  projectHandle: ProjectHandle,
+  id: number,
+  data: Uint8Array,
+) => invoke<void>("send_bytes", { projectHandle, id, data });
 
-export const resizeSession = (cols: number, rows: number) =>
-  invoke<void>("resize_session", { cols, rows });
+export const resizeSession = (
+  projectHandle: ProjectHandle,
+  cols: number,
+  rows: number,
+) => invoke<void>("resize_session", { projectHandle, cols, rows });
 
-export const focusSession = (id: number) =>
-  invoke<void>("focus_session", { id });
+export const focusSession = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("focus_session", { projectHandle, id });
 
-export const getHubSnapshot = () =>
-  invoke<HubSnapshot | null>("get_hub_snapshot");
+export const getHubSnapshot = (projectHandle: ProjectHandle) =>
+  invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
 export { Channel };

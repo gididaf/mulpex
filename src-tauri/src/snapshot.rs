@@ -4,6 +4,11 @@
 
 use serde::Serialize;
 
+/// A stable, monotonically-allocated id for one open project. Never reused after a
+/// project closes, so a stale frontend reference resolves to "no such project"
+/// rather than aliasing a newly-opened one. Serializes to a JS number.
+pub type ProjectHandle = u64;
+
 /// What a Claude instance is doing, derived from its lifecycle hooks. Serializes
 /// to the lowercase word the frontend maps to a status-dot color.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -89,13 +94,43 @@ pub struct TaskEntry {
     pub task: String,
 }
 
-/// What `bootstrap` returns so the frontend can build one xterm per restored
-/// session and paint the shell.
+/// One open project as the frontend needs it to build a tab + one xterm per
+/// restored session.
 #[derive(Clone, Serialize)]
 pub struct BootstrapInfo {
+    pub handle: ProjectHandle,
     pub project_dir: String,
     pub project_name: String,
     pub sessions: Vec<SessionInfo>,
     /// Index into `sessions` of the initially focused instance.
     pub active: usize,
+}
+
+/// What `bootstrap` returns (and `projects-changed` carries): every open project
+/// plus which one is active. Replaces the single-project startup payload.
+#[derive(Clone, Serialize)]
+pub struct WorkspaceInfo {
+    pub projects: Vec<BootstrapInfo>,
+    pub active: Option<ProjectHandle>,
+}
+
+/// `hub-update` event payload, now scoped to the project it describes.
+#[derive(Clone, Serialize)]
+pub struct HubUpdate {
+    pub handle: ProjectHandle,
+    pub snapshot: HubSnapshot,
+}
+
+/// `sessions-changed` event payload, scoped to its project.
+#[derive(Clone, Serialize)]
+pub struct SessionsChanged {
+    pub handle: ProjectHandle,
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// `session-exited` event payload, scoped to its project.
+#[derive(Clone, Serialize)]
+pub struct SessionExited {
+    pub handle: ProjectHandle,
+    pub id: usize,
 }

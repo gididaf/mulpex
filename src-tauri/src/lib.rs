@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
-use state::AppState;
+use state::{AppState, Workspace};
 
 /// Resolve the absolute path of the `mulpex-helper` binary, which sits beside the
 /// app executable in both `tauri dev` (`target/<profile>/`) and the bundled
@@ -31,16 +31,23 @@ fn resolve_helper_path() -> PathBuf {
 fn is_forwarded(id: &str) -> bool {
     matches!(
         id,
-        "open_project" | "new_session" | "close_session" | "rename" | "messages" | "next" | "prev"
+        "open_project"
+            | "close_project"
+            | "next_project"
+            | "prev_project"
+            | "new_session"
+            | "close_session"
+            | "rename"
+            | "messages"
+            | "next"
+            | "prev"
     ) || id.starts_with("focus_")
 }
 
-/// Kill every session's process group and remove the scratch dir. Idempotent, so
-/// running it on both window-close and exit is safe.
+/// Kill every project's session process groups and remove the scratch root.
+/// Idempotent, so running it on both window-close and exit is safe.
 fn teardown(app: &tauri::AppHandle) {
-    if let Some(core) = app.state::<AppState>().core.lock().unwrap().as_mut() {
-        core.teardown();
-    }
+    app.state::<AppState>().ws.lock().unwrap().teardown_all();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -49,7 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            core: Mutex::new(None),
+            ws: Mutex::new(Workspace::new()),
             helper_path: resolve_helper_path(),
         })
         .menu(menu::build)
@@ -60,9 +67,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::current_project,
+            commands::bootstrap,
             commands::list_recent_projects,
             commands::open_project,
+            commands::close_project,
+            commands::switch_project,
             commands::attach_session,
             commands::create_session,
             commands::close_session,
@@ -73,6 +82,21 @@ pub fn run() {
             commands::get_hub_snapshot,
         ])
         .setup(|app| {
+            // Restore every project that was open when Mulpex last quit, each
+            // spawning its sessions (--resume). Output buffers pre-attach, so the
+            // frontend's `bootstrap` sees them ready and they paint on first frame.
+            {
+                let state = app.state::<AppState>();
+                let helper = state.helper_path.clone();
+                let mut ws = state.ws.lock().unwrap();
+                for dir in project::list_open() {
+                    // open_or_focus dedups + skips non-dirs; a failed open is skipped.
+                    let _ = ws.open_or_focus(&dir, &helper);
+                }
+                ws.active = ws.projects.first().map(|c| c.handle);
+                // Drop any dirs that no longer exist / failed to open from the set.
+                ws.persist_open();
+            }
             hub::start(app.handle().clone());
             Ok(())
         })

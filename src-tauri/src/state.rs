@@ -15,8 +15,8 @@ use mulpex_core::persist::{self, SessionStore};
 
 use crate::pty::{Session, SpawnTask};
 use crate::snapshot::{
-    BootstrapInfo, HubSnapshot, LockEntry, MsgEntry, SessionInfo, Status, StatusEntry, TaskEntry,
-    WaitEntry,
+    BootstrapInfo, HubSnapshot, LockEntry, MsgEntry, ProjectHandle, SessionInfo, Status,
+    StatusEntry, TaskEntry, WaitEntry, WorkspaceInfo,
 };
 
 /// Default PTY geometry a session is spawned at; the frontend fits + resizes it
@@ -27,15 +27,138 @@ const DEFAULT_ROWS: u16 = 32;
 /// How many of the most recent hub messages we surface in the feed.
 const MSG_FEED_MAX: usize = 200;
 
-/// Tauri-managed state. `core` is `None` until a project is opened; `helper_path`
-/// is the absolute path of the `mulpex-helper` binary the hooks/MCP invoke.
+/// Tauri-managed state. The `Workspace` holds every open project (0..N);
+/// `helper_path` is the absolute path of the `mulpex-helper` binary the hooks/MCP
+/// invoke.
 pub struct AppState {
-    pub core: Mutex<Option<Core>>,
+    pub ws: Mutex<Workspace>,
     pub helper_path: PathBuf,
+}
+
+/// All open projects in tab order, which one is active, and the per-process scratch
+/// root (`temp/mulpex-<pid>`) each project's isolated `state_dir` hangs under.
+pub struct Workspace {
+    pub projects: Vec<Core>,
+    pub active: Option<ProjectHandle>,
+    pub next_handle: ProjectHandle,
+    pub state_root: PathBuf,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workspace {
+    pub fn new() -> Self {
+        Self {
+            projects: Vec::new(),
+            active: None,
+            next_handle: 1,
+            state_root: std::env::temp_dir().join(format!("mulpex-{}", std::process::id())),
+        }
+    }
+
+    fn alloc_handle(&mut self) -> ProjectHandle {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        h
+    }
+
+    pub fn project(&self, h: ProjectHandle) -> Option<&Core> {
+        self.projects.iter().find(|c| c.handle == h)
+    }
+
+    pub fn project_mut(&mut self, h: ProjectHandle) -> Option<&mut Core> {
+        self.projects.iter_mut().find(|c| c.handle == h)
+    }
+
+    /// The handle of an already-open project at `canon` (canonicalized dir), if any.
+    fn find_by_dir(&self, canon: &Path) -> Option<ProjectHandle> {
+        self.projects
+            .iter()
+            .find(|c| c.project_dir.as_path() == canon)
+            .map(|c| c.handle)
+    }
+
+    /// Open `path` as a project and make it active. If it's already open (compared
+    /// canonically), just re-activate it. Returns `(handle, newly_opened)`. Does NOT
+    /// persist the open-set or emit — the caller does. Canonicalizes so `/foo`,
+    /// `/foo/`, and symlinks unify, matching `MULPEX_PROJECT_DIR` in pty.rs.
+    pub fn open_or_focus(
+        &mut self,
+        path: &str,
+        helper_path: &Path,
+    ) -> anyhow::Result<(ProjectHandle, bool)> {
+        let dir = PathBuf::from(path);
+        if !dir.is_dir() {
+            anyhow::bail!("not a directory: {path}");
+        }
+        let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+        if let Some(h) = self.find_by_dir(&canon) {
+            self.active = Some(h);
+            return Ok((h, false));
+        }
+        let handle = self.alloc_handle();
+        let state_dir = self.state_root.join(handle.to_string());
+        let core = Core::open(handle, canon, helper_path, state_dir)?;
+        self.projects.push(core);
+        self.active = Some(handle);
+        Ok((handle, true))
+    }
+
+    /// Close a project: tear its sessions down (kills PGs, removes its state_dir),
+    /// remove it, and re-pick the active project (the neighbor that shifts into its
+    /// slot, else the last, else `None`).
+    pub fn close_project(&mut self, h: ProjectHandle) {
+        let Some(pos) = self.projects.iter().position(|c| c.handle == h) else {
+            return;
+        };
+        let mut core = self.projects.remove(pos);
+        core.teardown();
+        if self.active == Some(h) {
+            self.active = self
+                .projects
+                .get(pos)
+                .or_else(|| self.projects.last())
+                .map(|c| c.handle);
+        }
+    }
+
+    /// Snapshot for the frontend: every open project + the active handle.
+    pub fn workspace_info(&self) -> WorkspaceInfo {
+        WorkspaceInfo {
+            projects: self.projects.iter().map(Core::bootstrap_info).collect(),
+            active: self.active,
+        }
+    }
+
+    /// Persist the open-project set (canonical dirs, tab order) so the next launch
+    /// reopens them.
+    pub fn persist_open(&self) {
+        let dirs: Vec<String> = self
+            .projects
+            .iter()
+            .map(|c| c.project_dir.display().to_string())
+            .collect();
+        crate::project::save_open(&dirs);
+    }
+
+    /// Kill every project's process groups and remove the whole scratch root. The
+    /// "no orphaned claude" guarantee, now across all projects.
+    pub fn teardown_all(&mut self) {
+        for core in &mut self.projects {
+            core.teardown();
+        }
+        self.projects.clear();
+        let _ = std::fs::remove_dir_all(&self.state_root);
+    }
 }
 
 /// One open project and everything backing its live Claude sessions.
 pub struct Core {
+    pub handle: ProjectHandle,
     pub project_dir: PathBuf,
     pub project_name: String,
     pub sessions: Vec<Session>,
@@ -52,12 +175,17 @@ pub struct Core {
 }
 
 impl Core {
-    /// Open `project_dir`: create the scratch dir, write the `--settings` /
+    /// Open `project_dir` under its own isolated `state_dir` (so its hub is scoped
+    /// to just this project): create the scratch dir, write the `--settings` /
     /// `--mcp-config` files (pointing hooks + MCP at `helper_path`), and restore
     /// the sessions worked on last time (spawning each with `--resume`), or start
     /// one fresh. Ports `App::new`.
-    pub fn open(project_dir: PathBuf, helper_path: &Path) -> anyhow::Result<Self> {
-        let state_dir = std::env::temp_dir().join(format!("mulpex-{}", std::process::id()));
+    pub fn open(
+        handle: ProjectHandle,
+        project_dir: PathBuf,
+        helper_path: &Path,
+        state_dir: PathBuf,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&state_dir)?;
         let settings_path = state_dir.join("settings.json");
         let helper = helper_path.to_string_lossy();
@@ -121,6 +249,7 @@ impl Core {
             .unwrap_or_else(|| project_dir.display().to_string());
 
         let core = Self {
+            handle,
             project_dir,
             project_name,
             sessions,
@@ -140,6 +269,7 @@ impl Core {
     /// `BootstrapInfo` for the frontend to build one xterm per session.
     pub fn bootstrap_info(&self) -> BootstrapInfo {
         BootstrapInfo {
+            handle: self.handle,
             project_dir: self.project_dir.display().to_string(),
             project_name: self.project_name.clone(),
             sessions: self.session_infos(),

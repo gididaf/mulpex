@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { rename, sessions } from "../stores";
+  import { rename, projects, patchProject } from "../stores";
   import { renameSession } from "../ipc";
   import { terminals } from "../terminals";
   import { get } from "svelte/store";
@@ -21,10 +21,15 @@
     const r = get(rename);
     if (!r) return;
     const name = value.trim();
-    await renameSession(r.id, name);
-    sessions.update((l) =>
-      l.map((s) => (s.id === r.id ? { ...s, name: name || null } : s)),
-    );
+    await renameSession(r.handle, r.id, name);
+    const p = get(projects).get(r.handle);
+    if (p) {
+      patchProject(r.handle, {
+        sessions: p.sessions.map((s) =>
+          s.id === r.id ? { ...s, name: name || null } : s,
+        ),
+      });
+    }
     rename.set(null);
     terminals.refocus();
   }

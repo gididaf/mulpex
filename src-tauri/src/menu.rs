@@ -25,9 +25,18 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .quit()
         .build()?;
 
-    // File: open a project, new/close session.
+    // File: open/close a project, project navigation, new/close session.
     let open_project = MenuItemBuilder::with_id("open_project", "Open Project…")
         .accelerator("Cmd+O")
+        .build(app)?;
+    let close_project = MenuItemBuilder::with_id("close_project", "Close Project")
+        .accelerator("Cmd+Shift+W")
+        .build(app)?;
+    let next_project = MenuItemBuilder::with_id("next_project", "Next Project")
+        .accelerator("Cmd+Shift+]")
+        .build(app)?;
+    let prev_project = MenuItemBuilder::with_id("prev_project", "Previous Project")
+        .accelerator("Cmd+Shift+[")
         .build(app)?;
     let new_session = MenuItemBuilder::with_id("new_session", "New Session")
         .accelerator("Cmd+T")
@@ -37,6 +46,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .build(app)?;
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&open_project)
+        .item(&close_project)
+        .separator()
+        .item(&next_project)
+        .item(&prev_project)
         .separator()
         .item(&new_session)
         .item(&close_session)
