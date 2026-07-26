@@ -71,8 +71,11 @@ beside the main binary.
   sessions paint immediately on `--resume`), output is **buffered** and flushed on
   `attach_session` — race-free under the sink mutex.
 - **frontend → PTY:** `send_bytes(id, data)` from xterm `onData` (UTF-8 encoded). The one manual
-  key carve-out is **Shift+Enter → `\n`** (`attachCustomKeyEventHandler`); `macOptionIsMeta`
-  covers Option word-motions.
+  key carve-out is **Shift+Enter / Option+Enter → `\x1b\r`** (`attachCustomKeyEventHandler`) —
+  Claude Code's newline is **meta-Return**, the same sequence `/terminal-setup` installs for VS
+  Code (`sendSequence "\x1b\r"`) and Terminal.app ("Use Option as Meta"). A bare `\n` (what this
+  sent until v0.4.2) is *ignored* by Claude's input handler, so Shift+Enter silently did nothing.
+  `macOptionIsMeta` covers Option word-motions.
 - **hub state:** the 200 ms poll walks **every open project**, reads each one's scratch-dir files
   into a `HubSnapshot`, and emits a **handle-scoped** `hub-update {handle, snapshot}` on change;
   the frontend keys it into that project's slice, and the sidebar/hub panel are a reactive
