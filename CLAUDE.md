@@ -114,8 +114,8 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
   classic `sessions/statuses/tasks/hub/activeId/project` stores are **derived read-only
   projections of the active project**, so the sidebar/hub components are unchanged. Navigation is a
   persistent **`ProjectTabBar`** (click / `+` open / ✕ close / unread badge) plus a **`⌘P`
-  `CommandPalette`** fuzzy switcher. **Drag-and-drop** a folder onto the window opens it
-  (`getCurrentWebview().onDragDropEvent`). `TerminalManager` keys xterms by `(handle,id)` and keeps
+  `CommandPalette`** fuzzy switcher (drag-and-drop no longer opens projects — see
+  **Dropped paths** below). `TerminalManager` keys xterms by `(handle,id)` and keeps
   **every project's** terminals alive while hidden; exactly one is visible globally.
 - **Persistence:** the open-project set is saved to `~/.mulpex/open.txt` (distinct from
   `recents.txt`) on open/close; on launch every project reopens (`--resume`).
@@ -128,6 +128,35 @@ so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu
 handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
 Everything else (arrows, Ctrl+C, Esc, Shift+Enter) flows straight to the focused terminal.
 Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused xterm textarea.
+
+## Dropped paths
+
+Dropping a file or folder on the window **types its absolute path at the focused session's
+prompt** (`App.svelte::dropPaths`) — space-separated for a multi-drop, trailing space, nothing
+submitted. It no longer opens the drop as a project; that's ⌘O / the `+` tab / ⌘P. The one
+fallback is "nowhere to type": with no active session (the picker, or a project at zero sessions)
+a drop still goes to `openOrFocusProject`, and the backend rejects non-directories.
+
+Two non-obvious constraints, both of which this had to be built around:
+
+- **Tauri owns the drop.** `dragDropEnabled` defaults to **true**, so the webview converts the
+  native OS drop into an `onDragDropEvent` and the DOM never fires `drop` — xterm cannot see it,
+  so that handler is the only place a drop can be honoured. (xterm.js has no built-in
+  path-insertion either; dragging a file to get its path is *emulator* behavior from
+  Terminal.app/iTerm, so it had to be written by hand regardless of which layer got the event.)
+  The event is also **window-wide**, not per-element: a drop on the sidebar or tab bar is
+  indistinguishable from one on the terminal.
+- **`shellQuote` is three-branch, and the third is about the PTY, not the shell.** Bare for inert
+  paths, `'…'` with `'\''` splicing otherwise, and ANSI-C `$'…'` when the path contains control
+  characters. That last branch exists because these bytes are *typed into Claude's prompt*: a
+  literal `\n` in a filename (legal on macOS) would submit the message halfway through the path.
+  `$'…'` keeps the wire bytes CR/LF-free while still round-tripping to the real name.
+
+The old behavior was a **silent** failure worth remembering as a pattern: the handler passed every
+dropped path to `openOrFocusProject`, a file hit `state.rs`'s `bail!("not a directory")`, and that
+message landed in `openError` — which renders *only inside the picker*, off-screen whenever a
+project is open. Same shape as the Finder-launch `claude`-not-found bug: a real error with nowhere
+to appear.
 
 ## Terminals kept alive while hidden
 
@@ -298,7 +327,26 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `\r` was the submit. Also worth knowing: Claude requests the **kitty keyboard protocol** and
   **modifyOtherKeys** at startup (visible in the PTY capture); xterm.js answers neither, so it
   can never disambiguate Shift+Enter on its own — the manual carve-out is mandatory.
+- **Dropped paths (v0.4.5).** `shellQuote` was verified by round-tripping 17 adversarial paths
+  (spaces, quotes, backticks, `$HOME`, `;rm -rf`, globs, unicode, backslashes, tab/CR/LF/ESC/BEL/
+  DEL, and a mixed quote+newline+backslash case) through **real bash**: each yields exactly one
+  argument equal to the original, a 17-path multi-drop splits back into 17, and no emitted text
+  contains CR or LF (the invariant that stops a filename from submitting the prompt). Then
+  confirmed live in the reinstalled `.app` by the user. `svelte-check` + `vite build` clean.
+
+## Known open bug — scratch root leaks on quit
+
+Measured while restarting for the v0.4.5 test: after `osascript -e 'tell application "Mulpex" to
+quit'`, **every `claude` was dead (zero orphans, so the `killpg` half of `teardown_all()` ran) but
+the whole `temp/mulpex-<pid>/` tree survived intact** — all 5 project state dirs, 88 entries. The
+documented guarantee is kill-then-`remove_dir_all` of the scratch root, and only the first half
+happened.
+
+Only the **Apple Event** quit path was measured; ⌘Q and the window close button are untested here,
+and the code routes window-close through `app.exit(0)` → `ExitRequested`, which an Apple Event quit
+may bypass entirely. Impact is mild (abandoned temp dirs per launch, eventually reaped by macOS),
+but it *is* a violated invariant. Worth checking all three quit paths against `RunEvent`.
 
 ## Last Synced Commit
 
-`06eb86ba15aace013632c8c53b13bf4a6c8860b9` — 2026-07-26
+`6d0109dc676d4445ec4d7473554a04a5d188a972` — 2026-07-26

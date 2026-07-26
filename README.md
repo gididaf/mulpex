@@ -34,8 +34,8 @@ menu shortcuts.
 
 ## What it does
 
-- **Multiple projects at once.** Open several projects side by side — a persistent tab bar, a
-  **⌘P** fuzzy quick-switcher, or **drag a folder** onto the window. Each project keeps its own
+- **Multiple projects at once.** Open several projects side by side — a persistent tab bar and a
+  **⌘P** fuzzy quick-switcher. Each project keeps its own
   isolated coordination hub and its sessions running in the background; Mulpex reopens everything
   you had open on the next launch. Close a project with ⌘⇧W, cycle with ⌘⇧[ ⌘⇧].
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
@@ -57,8 +57,11 @@ menu shortcuts.
   discipline (verify assumptions via `AskUserQuestion` before implementing).
 - **Session persistence.** The sessions you worked on are remembered per project and
   auto-resume (`claude --resume`) when you reopen that project.
-- **Open a project** via the picker / recent-projects list, the `+` tab, ⌘P, or drag-and-drop —
-  no terminal needed.
+- **Drag a file in to reference it.** Drop a file or folder anywhere on the window and its
+  absolute path is typed at the prompt — quoted if it needs it, nothing submitted — so you can
+  hand Claude a path without typing it out. Multiple files land space-separated.
+- **Open a project** via the picker / recent-projects list, the `+` tab, or ⌘P — no terminal
+  needed.
 
 ## Architecture
 
