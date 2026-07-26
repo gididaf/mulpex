@@ -137,6 +137,13 @@ submitted. It no longer opens the drop as a project; that's ⌘O / the `+` tab /
 fallback is "nowhere to type": with no active session (the picker, or a project at zero sessions)
 a drop still goes to `openOrFocusProject`, and the backend rejects non-directories.
 
+**Files and folders behave identically, deliberately** — this matches **Claude Code's own
+drag-and-drop**, where dragging either into the terminal adds its path. The v0.4.0
+drag-a-folder-to-open-a-project gesture was a Mulpex-only invention that shadowed the standard
+behavior; a directory is a normal argument to hand Claude, and project-opening already has three
+dedicated entry points. Don't "restore" the old gesture without asking — matching stock
+Claude Code is the intent, not an oversight.
+
 Two non-obvious constraints, both of which this had to be built around:
 
 - **Tauri owns the drop.** `dragDropEnabled` defaults to **true**, so the webview converts the
