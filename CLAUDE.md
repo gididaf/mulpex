@@ -266,7 +266,16 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   drag-drop listener registered. Released as `v0.4.0` with a signed `Mulpex_0.4.0_aarch64.dmg`.
   The interactive flows (tab/⌘P switching, per-project hub isolation, restore-all, dedup,
   no-orphans) are covered by the plan's verification checklist and want a live GUI to exercise.
+- **Finder-launch fix (v0.4.1).** The bundled `.app` was exercised under a Finder-equivalent
+  environment (`env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`): `claude` resolves out of
+  `~/.local/bin` via `claude_bin::merged_path()`, renders in color (`TERM=xterm-256color`), and
+  the picker shows the not-found banner when the CLI is genuinely unreachable. Released as
+  `v0.4.1`.
+- **Shift+Enter (v0.4.2).** Fixed at the source level — the handler sent a bare `\n`, which
+  Claude ignores; it now sends `\x1b\r`, the same sequence `/terminal-setup` installs for VS
+  Code / Terminal.app / Alacritty (confirmed by reading those code paths in the installed
+  `claude` binary). `svelte-check` + `vite build` clean; wants a keypress in a live GUI.
 
 ## Last Synced Commit
 
-`bc903ca3ba1761280f973171b67511c24a799d09` — 2026-07-25
+`06eb86ba15aace013632c8c53b13bf4a6c8860b9` — 2026-07-26

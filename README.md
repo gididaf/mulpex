@@ -40,6 +40,8 @@ menu shortcuts.
   you had open on the next launch. Close a project with ⌘⇧W, cycle with ⌘⇧[ ⌘⇧].
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘1–9 / ⌘[ ⌘]), rename (⌘R), close (⌘W).
+  Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
+  needed.
 - **Coordination hub.** Parallel Claudes in the same directory are kept consistent by a
   file-locking coordinator (a `PreToolUse` hook: edits/reads to a file another instance is
   writing simply *wait*, then proceed — never a hard deny, zero model tokens) plus an inner MCP
