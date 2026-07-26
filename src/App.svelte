@@ -120,19 +120,21 @@
     }
   }
 
-  // Shell-safe rendering of a dropped path. Bare when it only contains
-  // characters no shell touches, else single-quoted with embedded quotes
-  // spliced ('\'') — the one form that needs no escaping table.
+  // Wire form of a dropped path: backslash-escape everything a shell would act
+  // on. This is what Terminal.app/iTerm insert when you drag a file in, so the
+  // prompt reads `/Users/me/My\ File.csv` — matching stock Claude Code — rather
+  // than a quote-wrapped path. Characters ≥ U+0080 are left bare; real
+  // terminals don't escape unicode and a backslash there just reads as noise.
   //
-  // Control characters take the third branch for a reason that has nothing to
-  // do with the shell: these bytes are *typed into Claude's prompt*, so a
-  // literal \n or \r inside a filename (legal on macOS) would submit the
-  // message halfway through the path. ANSI-C quoting keeps the wire bytes
-  // printable while still round-tripping to the real name.
-  function shellQuote(path: string): string {
-    if (/^[A-Za-z0-9_@%+:,./=-]+$/.test(path)) return path;
+  // Control characters take the other branch: they have no printable backslash
+  // form, and a literal \n or \r on the wire would submit the message halfway
+  // through the path. ANSI-C `$'…'` keeps the bytes CR/LF-free while still
+  // round-tripping to the real name.
+  function escapePath(path: string): string {
     if (!/[\x00-\x1f\x7f]/.test(path))
-      return `'${path.replace(/'/g, `'\\''`)}'`;
+      return path.replace(/[^\w@%+:,./=-]/g, (c) =>
+        c.charCodeAt(0) < 0x80 ? "\\" + c : c,
+      );
     const esc = path
       .replace(/\\/g, "\\\\")
       .replace(/'/g, "\\'")
@@ -146,8 +148,24 @@
   }
 
   /**
-   * A drop types the absolute path(s) at the focused session's prompt — files
+   * A drop puts the absolute path(s) at the focused session's prompt — files
    * and folders alike, since a folder is a legitimate argument to hand Claude.
+   *
+   * The paths go over as a single **bracketed paste** (`ESC[200~ … ESC[201~`),
+   * not as typed keystrokes, because that is the channel Claude Code inspects
+   * for attachments: a pasted image path becomes an `[Image #N]` attachment it
+   * can actually see, while a non-image path stays as text. Typed keystrokes
+   * get no such treatment — measured, that was the whole reason dropping a
+   * screenshot only ever produced a path string. One paste holding every
+   * dropped path is the right shape: Claude extracts each image and leaves the
+   * rest as text.
+   *
+   * The trailing space goes *inside* the paste, which looks wrong and isn't:
+   * a space typed after `ESC[201~` **wipes the prompt** for any non-image path
+   * (measured — the path renders, then Claude erases the line; presumably the
+   * keystroke races its async paste handling). Inside the markers both text
+   * paths and image attachments survive.
+   *
    * With no session to type into (the picker, or a project sitting at zero
    * sessions) a drop falls back to opening the path as a project; the backend
    * rejects non-directories.
@@ -160,8 +178,10 @@
       for (const path of paths) openOrFocusProject(path);
       return;
     }
-    const text = paths.map(shellQuote).join(" ") + " ";
-    sendBytes(h, id, new TextEncoder().encode(text));
+    const body = paths.map(escapePath).join(" ");
+    // One write: split across reads, Claude can consume a lone ESC and lose
+    // the paste framing (same hazard as the Shift+Enter carve-out).
+    sendBytes(h, id, new TextEncoder().encode(`\x1b[200~${body} \x1b[201~`));
     terminals.refocus();
   }
 
