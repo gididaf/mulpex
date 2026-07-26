@@ -131,11 +131,18 @@ Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused
 
 ## Dropped paths
 
-Dropping a file or folder on the window **types its absolute path at the focused session's
-prompt** (`App.svelte::dropPaths`) — space-separated for a multi-drop, trailing space, nothing
-submitted. It no longer opens the drop as a project; that's ⌘O / the `+` tab / ⌘P. The one
-fallback is "nowhere to type": with no active session (the picker, or a project at zero sessions)
-a drop still goes to `openOrFocusProject`, and the backend rejects non-directories.
+Dropping a file or folder on the window puts its absolute path **at the focused session's prompt**
+(`App.svelte::dropPaths`) — space-separated for a multi-drop, nothing submitted. It no longer opens
+the drop as a project; that's ⌘O / the `+` tab / ⌘P. The one fallback is "nowhere to type": with no
+active session (the picker, or a project at zero sessions) a drop still goes to
+`openOrFocusProject`, and the backend rejects non-directories.
+
+**The paths go over as one bracketed paste (`ESC[200~ … ESC[201~`), not as typed keystrokes** —
+this is load-bearing, not incidental framing. Paste is the channel Claude Code inspects for
+attachments: a **pasted** image path becomes an `[Image #N]` attachment the instance can actually
+*see*, while the identical path *typed* stays inert text. That one byte-level difference is the
+whole reason dropping a screenshot used to yield nothing but a string. One paste holding every
+dropped path is the correct shape — Claude extracts each image and leaves non-images as text.
 
 **Files and folders behave identically, deliberately** — this matches **Claude Code's own
 drag-and-drop**, where dragging either into the terminal adds its path. The v0.4.0
@@ -153,11 +160,18 @@ Two non-obvious constraints, both of which this had to be built around:
   Terminal.app/iTerm, so it had to be written by hand regardless of which layer got the event.)
   The event is also **window-wide**, not per-element: a drop on the sidebar or tab bar is
   indistinguishable from one on the terminal.
-- **`shellQuote` is three-branch, and the third is about the PTY, not the shell.** Bare for inert
-  paths, `'…'` with `'\''` splicing otherwise, and ANSI-C `$'…'` when the path contains control
-  characters. That last branch exists because these bytes are *typed into Claude's prompt*: a
-  literal `\n` in a filename (legal on macOS) would submit the message halfway through the path.
-  `$'…'` keeps the wire bytes CR/LF-free while still round-tripping to the real name.
+- **`escapePath` backslash-escapes; it does not quote.** Anything a shell would act on gets a
+  `\`, which is what Terminal.app/iTerm insert on a drag — so the prompt reads
+  `/Users/me/My\ File.csv`, matching stock Claude Code, rather than a quote-wrapped path.
+  Characters ≥ U+0080 stay **bare**: real terminals don't escape unicode. The one exception is
+  ANSI-C `$'…'` for control characters, which is a *PTY* concern rather than a shell one — a
+  literal `\n` in a filename (legal on macOS) would submit the message halfway through the path,
+  and `$'…'` keeps the wire bytes CR/LF-free while round-tripping to the real name.
+- **The trailing space belongs INSIDE the paste markers.** It looks misplaced and isn't: a space
+  written *after* `ESC[201~` **wipes the prompt** for any non-image path — the path renders and
+  Claude then erases the line, presumably the keystroke racing its async paste handling. Images
+  are unaffected by it, so testing only an image drop passes this bug straight through. Measured;
+  don't "tidy" the space back outside.
 
 The old behavior was a **silent** failure worth remembering as a pattern: the handler passed every
 dropped path to `openOrFocusProject`, a file hit `state.rs`'s `bail!("not a directory")`, and that
@@ -340,6 +354,14 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   argument equal to the original, a 17-path multi-drop splits back into 17, and no emitted text
   contains CR or LF (the invariant that stops a filename from submitting the prompt). Then
   confirmed live in the reinstalled `.app` by the user. `svelte-check` + `vite build` clean.
+- **Bracketed-paste drops (v0.4.6).** The `[Image #N]` mechanism was found by measurement, not
+  docs: driving a real `claude` over a PTY (`pyte`, typing only, never submitting) shows a *typed*
+  image path stays plain text while the *same* path inside `ESC[200~ … ESC[201~` becomes
+  `[Image #1]`. The app's exact `dropPaths` bytes were then replayed against a fresh `claude` per
+  case — image, image-with-space, two images, csv-with-spaces, image+csv — all correct. The
+  trailing-space-outside-the-markers bug was caught by this matrix and *only* by its non-image
+  rows. 19 adversarial paths re-checked through real bash (one argument each, unicode bare, no
+  CR/LF). `svelte-check` + `vite build` clean.
 
 ## Known open bug — scratch root leaks on quit
 
@@ -356,4 +378,4 @@ but it *is* a violated invariant. Worth checking all three quit paths against `R
 
 ## Last Synced Commit
 
-`6d0109dc676d4445ec4d7473554a04a5d188a972` — 2026-07-26
+`6367db7da469ceb58ee249bd8e946a26167806bc` — 2026-07-26

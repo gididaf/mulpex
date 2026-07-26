@@ -58,8 +58,10 @@ menu shortcuts.
 - **Session persistence.** The sessions you worked on are remembered per project and
   auto-resume (`claude --resume`) when you reopen that project.
 - **Drag a file in to reference it.** Drop a file or folder anywhere on the window and its
-  absolute path is typed at the prompt — quoted if it needs it, nothing submitted — so you can
-  hand Claude a path without typing it out. Multiple files land space-separated.
+  absolute path lands at the prompt — escaped if it needs it, nothing submitted — so you can hand
+  Claude a path without typing it out. Multiple files land space-separated. **Drop an image and
+  Claude sees the image**, not just its path (it becomes an `[Image #N]` attachment), exactly as in
+  Claude Code's own terminal.
 - **Open a project** via the picker / recent-projects list, the `+` tab, or ⌘P — no terminal
   needed.
 
