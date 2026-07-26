@@ -1,6 +1,6 @@
 [package]
 name = "mulpex"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Multiple coordinated Claude Code sessions in a native desktop app"
 default-run = "mulpex"

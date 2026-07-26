@@ -144,11 +144,19 @@ visible terminal (browser caps live GL contexts) and disposed on blur / project 
 ## Lifecycle
 
 - **Startup:** `lib.rs::setup()` reopens **every project in `open.txt`** (each builds its `Core` —
-  scratch dir, config files, restore/spawn sessions — before the window paints; output buffers
+  scratch dir, config files, restore sessions — before the window paints; output buffers
   pre-attach). The frontend then calls `bootstrap()` → `WorkspaceInfo`, builds one xterm per
   session of each project, `attach_session`es each, and activates `active`. With no open projects
   it shows the picker (recents + `@tauri-apps/plugin-dialog` folder picker); opening one goes
   through `open_project(path)`.
+- **No project ever auto-starts a `claude`.** `Core::open` restores what was worked on last time
+  and stops there — with nothing to restore the project opens with **zero sessions** and waits for
+  ⌘T. Because startup restore and `open_project` share that one path, a freshly added project
+  behaves the same as a restored one. Zero sessions was already a supported state (⌘W on the last
+  session produces it): `active` stays `0` and indexes nothing, `bootstrap_info` gives the frontend
+  `activeSessionId: null`, `selectProject` calls `terminals.focus(handle, -1)` so no terminal is
+  visible, and `TerminalPane` shows its "press ⌘T" empty state. Guarded by
+  `state.rs::tests::open_with_nothing_to_restore_spawns_no_session`.
 - **Teardown:** handled in `lib.rs` via `RunEvent` (managed-state `Drop` isn't guaranteed on
   exit). Window close → `app.exit(0)` → `ExitRequested` → `Workspace::teardown_all()` kills
   **every project's** process groups (`killpg` SIGHUP→SIGKILL→wait) **then** removes the whole

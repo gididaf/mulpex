@@ -178,8 +178,9 @@ impl Core {
     /// Open `project_dir` under its own isolated `state_dir` (so its hub is scoped
     /// to just this project): create the scratch dir, write the `--settings` /
     /// `--mcp-config` files (pointing hooks + MCP at `helper_path`), and restore
-    /// the sessions worked on last time (spawning each with `--resume`), or start
-    /// one fresh. Ports `App::new`.
+    /// the sessions worked on last time (spawning each with `--resume`). If there
+    /// is nothing to restore the project opens **empty** — no `claude` is started
+    /// until the user asks for one with ⌘T. Ports `App::new`.
     pub fn open(
         handle: ProjectHandle,
         project_dir: PathBuf,
@@ -226,22 +227,14 @@ impl Core {
             }
         }
 
-        if sessions.is_empty() {
-            let session_id = persist::new_uuid();
-            let first = Session::spawn(
-                1,
-                &project_dir,
-                DEFAULT_ROWS,
-                DEFAULT_COLS,
-                &settings_path,
-                &state_dir,
-                &session_id,
-                false,
-                None,
-            )?;
-            sessions.push(first);
-        }
-
+        // Deliberately no fallback spawn: a project with nothing to restore opens
+        // with **zero** sessions and waits for the user to press ⌘T. Opening a
+        // project should not start a `claude` the user didn't ask for. This is the
+        // single path for both startup restore and newly opened projects, so they
+        // behave identically. Zero sessions is an already-supported state (closing
+        // the last session with ⌘W produces it): `active` stays 0 and indexes
+        // nothing, `bootstrap_info` yields `activeSessionId: null`, the frontend
+        // hides every terminal and `TerminalPane` shows its ⌘T empty state.
         let next_id = sessions.len() + 1;
         let project_name = project_dir
             .file_name()
@@ -810,4 +803,38 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opening a project must never start a `claude` the user didn't ask for.
+    /// With nothing to restore the project comes up empty and waits for ⌘T.
+    #[test]
+    fn open_with_nothing_to_restore_spawns_no_session() {
+        let root = std::env::temp_dir().join(format!("mulpex-open-test-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        // Point the session store at a throwaway HOME so we never read (or write)
+        // the real ~/.mulpex/sessions and accidentally restore a live project.
+        std::env::set_var("HOME", root.join("home"));
+
+        let core = Core::open(
+            1,
+            project_dir,
+            Path::new("/nonexistent/mulpex-helper"),
+            root.join("state"),
+        )
+        .expect("open should succeed with no sessions to restore");
+
+        assert!(
+            core.sessions.is_empty(),
+            "opening a project spawned {} session(s); it must wait for ⌘T",
+            core.sessions.len()
+        );
+        assert_eq!(core.next_id, 1, "first ⌘T should hand out instance id 1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
