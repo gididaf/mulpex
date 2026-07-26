@@ -16,6 +16,7 @@
     closeSession,
     focusSession,
     getHubSnapshot,
+    sendBytes,
     type BootstrapInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
@@ -117,6 +118,51 @@
       openError = e instanceof Error ? e.message : String(e);
       console.error("open project failed:", e);
     }
+  }
+
+  // Shell-safe rendering of a dropped path. Bare when it only contains
+  // characters no shell touches, else single-quoted with embedded quotes
+  // spliced ('\'') — the one form that needs no escaping table.
+  //
+  // Control characters take the third branch for a reason that has nothing to
+  // do with the shell: these bytes are *typed into Claude's prompt*, so a
+  // literal \n or \r inside a filename (legal on macOS) would submit the
+  // message halfway through the path. ANSI-C quoting keeps the wire bytes
+  // printable while still round-tripping to the real name.
+  function shellQuote(path: string): string {
+    if (/^[A-Za-z0-9_@%+:,./=-]+$/.test(path)) return path;
+    if (!/[\x00-\x1f\x7f]/.test(path))
+      return `'${path.replace(/'/g, `'\\''`)}'`;
+    const esc = path
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'")
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t")
+      .replace(/[\x00-\x1f\x7f]/g, (c) =>
+        "\\" + c.charCodeAt(0).toString(8).padStart(3, "0"),
+      );
+    return `$'${esc}'`;
+  }
+
+  /**
+   * A drop types the absolute path(s) at the focused session's prompt — files
+   * and folders alike, since a folder is a legitimate argument to hand Claude.
+   * With no session to type into (the picker, or a project sitting at zero
+   * sessions) a drop falls back to opening the path as a project; the backend
+   * rejects non-directories.
+   */
+  function dropPaths(paths: string[]) {
+    if (!paths.length) return;
+    const h = get(activeProjectHandle);
+    const id = h == null ? null : (get(projects).get(h)?.activeSessionId ?? null);
+    if (h == null || id == null) {
+      for (const path of paths) openOrFocusProject(path);
+      return;
+    }
+    const text = paths.map(shellQuote).join(" ") + " ";
+    sendBytes(h, id, new TextEncoder().encode(text));
+    terminals.refocus();
   }
 
   async function pickAndOpen() {
@@ -252,11 +298,12 @@
         await tick();
         terminals.refit();
       }),
-      // Drag a folder onto the window to open it as a project.
+      // Drop files/folders onto the window to type their paths at the prompt.
+      // Tauri's webview-level drag-drop (`dragDropEnabled`, on by default)
+      // swallows the native drop before the DOM sees it, so xterm never gets a
+      // `drop` event and this handler is the only place a drop can be honoured.
       getCurrentWebview().onDragDropEvent((ev) => {
-        if (ev.payload.type === "drop") {
-          for (const path of ev.payload.paths) openOrFocusProject(path);
-        }
+        if (ev.payload.type === "drop") dropPaths(ev.payload.paths);
       }),
     );
 
