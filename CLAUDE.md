@@ -144,11 +144,33 @@ visible terminal (browser caps live GL contexts) and disposed on blur / project 
 
 ## claude binary
 
-Mulpex launches the **user's stock `claude`**, resolved via `PATH` (`pty.rs::claude_command`) —
-no byte-patching, no re-signing. (The deprecated TUI shipped a `patch-claude-maxq.py` hack that
-raised the `AskUserQuestion` caps to 10/10; that was intentionally dropped so instances behave
-exactly like a plain `claude`. The matching "you may ask up to 10 questions/options" NOTE was
-removed from `PLANNING_RULES` too — only the zero-assumptions planning discipline remains.)
+Mulpex launches the **user's stock `claude`** (`pty.rs::claude_command`) — no byte-patching, no
+re-signing. (The deprecated TUI shipped a `patch-claude-maxq.py` hack that raised the
+`AskUserQuestion` caps to 10/10; that was intentionally dropped so instances behave exactly like a
+plain `claude`. The matching "you may ask up to 10 questions/options" NOTE was removed from
+`PLANNING_RULES` too — only the zero-assumptions planning discipline remains.)
+
+### Finding it from a GUI launch (`claude_bin.rs`)
+
+A bundle launched from **Finder inherits LaunchServices' environment, not a login shell's** —
+`PATH` is the bare `/usr/bin:/bin:/usr/sbin:/sbin` and there is no `TERM`/`LANG`. `tauri dev`
+hides this completely by inheriting the terminal's env, so both consequences only ever appeared
+in the shipped `.app`:
+
+- **`claude` was unfindable** (the installer puts it in `~/.local/bin`), so a bare
+  `CommandBuilder::new("claude")` failed to spawn → `Core::open` errored → `open_project`
+  returned `Err` → the frontend swallowed it in a `console.error`. Clicking a project did
+  *nothing*, silently. `claude_bin::merged_path()` now rebuilds the real `PATH` — a
+  `$SHELL -lic` probe (5 s timeout, killed on overrun; the only way to see nvm/asdf/volta) then a
+  fallback list of known install dirs — resolves `claude` to an **absolute path**, and passes the
+  same `PATH` to the child so *its* Bash tool finds `node`/`git`/Homebrew. Cached in a `OnceLock`,
+  warmed on a background thread in `setup()` so nothing pays the probe inline.
+- **Output was monochrome** — neither `portable_pty` nor `pty.rs` set `TERM`. The child talks to
+  **xterm.js**, so we declare that emulator rather than inherit whatever started Mulpex:
+  `TERM=xterm-256color` + `COLORTERM=truecolor`, plus `LANG` only when absent.
+
+Failure is now visible rather than swallowed: a `claude_status` command backs a **picker banner**
+when the CLI is missing, and `open_project` errors render inline in the picker.
 
 ## Hub listener — idle wake (A2)
 
