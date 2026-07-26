@@ -8,6 +8,7 @@
   import {
     bootstrap,
     listRecentProjects,
+    claudeStatus,
     openProject,
     closeProject,
     switchProject,
@@ -16,6 +17,7 @@
     focusSession,
     getHubSnapshot,
     type BootstrapInfo,
+    type ClaudeStatus,
     type HubUpdateEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
@@ -53,6 +55,8 @@
 
   let recents: string[] = $state([]);
   let ready = $state(false);
+  let claude: ClaudeStatus | null = $state(null);
+  let openError: string | null = $state(null);
 
   /** Build one project's UI state + xterms, then activate it if asked. */
   async function bootstrapProject(info: BootstrapInfo, makeActive: boolean) {
@@ -104,9 +108,13 @@
       return;
     }
     try {
+      openError = null;
       const info = await openProject(path);
       await bootstrapProject(info, true);
     } catch (e) {
+      // Surfaced in the picker: this is how a missing `claude` used to present
+      // itself as the app silently ignoring the click.
+      openError = e instanceof Error ? e.message : String(e);
       console.error("open project failed:", e);
     }
   }
@@ -265,6 +273,9 @@
         recents = await listRecentProjects();
       }
       ready = true;
+      // Non-blocking: the probe shells out to the login shell, so let the UI
+      // paint first. Only matters for the picker's banner.
+      claude = await claudeStatus();
     })();
 
     return () => {
@@ -313,7 +324,13 @@
     <RenameDialog />
   {/if}
 {:else if ready}
-  <ProjectPicker {recents} onpick={pickAndOpen} onopen={openOrFocusProject} />
+  <ProjectPicker
+    {recents}
+    {claude}
+    error={openError}
+    onpick={pickAndOpen}
+    onopen={openOrFocusProject}
+  />
 {/if}
 
 <style>

@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use tauri::ipc::Channel;
 
+use crate::claude_bin;
+
 /// Standing hub instructions injected into every instance via
 /// `--append-system-prompt` (see the old term_session.rs — unchanged).
 const HUB_RULES: &str = "You are one of several parallel Claude Code instances that Mulpex is \
@@ -214,7 +216,7 @@ impl Session {
             pixel_height: 0,
         })?;
 
-        let mut cmd = claude_command();
+        let mut cmd = claude_command()?;
         cmd.arg("--dangerously-skip-permissions");
         if resume {
             cmd.arg("--resume");
@@ -403,10 +405,42 @@ impl Drop for Session {
 
 // ---- claude binary resolution ----
 
-/// Launch whatever `claude` the user has installed, resolved via `PATH`, with no
-/// modifications — the exact binary they'd get from a stock `claude` invocation.
-fn claude_command() -> CommandBuilder {
-    CommandBuilder::new("claude")
+/// Launch whatever `claude` the user has installed, with no modifications — the
+/// exact binary they'd get from a stock `claude` invocation.
+///
+/// Resolved to an **absolute path** rather than left as a bare name: a
+/// Finder-launched bundle inherits only LaunchServices' default `PATH`, which
+/// omits `~/.local/bin` where the installer puts `claude` (see `claude_bin`).
+/// The same reconstructed `PATH` is handed to the child so tools it runs
+/// (`node`, `git`, Homebrew) resolve as they do in the user's terminal.
+fn claude_command() -> anyhow::Result<CommandBuilder> {
+    let bin = claude_bin::resolve_claude().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Claude Code CLI not found. Mulpex launches your own `claude`, but no `claude` \
+             executable was found on your PATH (searched: {}). Install it from \
+             https://code.claude.com, then reopen Mulpex.",
+            claude_bin::merged_path()
+        )
+    })?;
+    let mut cmd = CommandBuilder::new(bin);
+    cmd.env("PATH", claude_bin::merged_path());
+
+    // The child talks to **xterm.js**, not to whatever terminal (if any) started
+    // Mulpex — so describe that emulator explicitly rather than inheriting.
+    // `portable_pty` sets no TERM of its own, and a Finder-launched bundle has
+    // none in its environment, which makes `claude` render monochrome. Under
+    // `tauri dev` the terminal's own TERM leaked in and hid this.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
+    // Same story for the locale: terminals export LANG, LaunchServices doesn't,
+    // and without it child tools can fall back to ASCII. Only filled in when
+    // genuinely absent, so a user's real locale is never overridden.
+    if std::env::var_os("LANG").is_none() {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
+
+    Ok(cmd)
 }
 
 /// Standard base64 (no line breaks) — dependency-free, for streaming PTY bytes

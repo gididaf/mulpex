@@ -1,6 +1,7 @@
 //! Tauri app wiring: managed state, command surface, native menu + event
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
+mod claude_bin;
 mod commands;
 mod hub;
 mod menu;
@@ -69,6 +70,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::list_recent_projects,
+            commands::claude_status,
             commands::open_project,
             commands::close_project,
             commands::switch_project,
@@ -82,6 +84,15 @@ pub fn run() {
             commands::get_hub_snapshot,
         ])
         .setup(|app| {
+            // Warm the `claude` lookup off-thread: it shells out to the user's
+            // login shell (up to a 5s timeout) to reconstruct the PATH a
+            // Finder-launched bundle doesn't inherit. Caching it here means the
+            // first project open — and the `claude_status` probe — hit a
+            // populated OnceLock instead of paying the shell spawn inline.
+            std::thread::spawn(|| {
+                let _ = claude_bin::resolve_claude();
+            });
+
             // Restore every project that was open when Mulpex last quit, each
             // spawning its sessions (--resume). Output buffers pre-attach, so the
             // frontend's `bootstrap` sees them ready and they paint on first frame.

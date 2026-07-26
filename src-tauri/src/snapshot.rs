@@ -114,6 +114,16 @@ pub struct WorkspaceInfo {
     pub active: Option<ProjectHandle>,
 }
 
+/// Result of the startup `claude_status` probe: whether the user's `claude` CLI
+/// was found, and the `PATH` we looked along (shown in the error so the user can
+/// see what we searched).
+#[derive(Clone, Serialize)]
+pub struct ClaudeStatus {
+    pub found: bool,
+    pub path: Option<String>,
+    pub searched_path: String,
+}
+
 /// `hub-update` event payload, now scoped to the project it describes.
 #[derive(Clone, Serialize)]
 pub struct HubUpdate {

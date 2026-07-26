@@ -55,6 +55,12 @@ export interface WorkspaceInfo {
   active: ProjectHandle | null;
 }
 
+export interface ClaudeStatus {
+  found: boolean;
+  path: string | null;
+  searched_path: string;
+}
+
 // Scoped event payloads (mirror snapshot.rs).
 export interface HubUpdateEvent {
   handle: ProjectHandle;
@@ -74,6 +80,9 @@ export const bootstrap = () => invoke<WorkspaceInfo>("bootstrap");
 
 export const listRecentProjects = () =>
   invoke<string[]>("list_recent_projects");
+
+/** Whether the user's `claude` CLI was found (checked once, at startup). */
+export const claudeStatus = () => invoke<ClaudeStatus>("claude_status");
 
 /** Open (or re-activate) a project; returns its bootstrap info. */
 export const openProject = (path: string) =>

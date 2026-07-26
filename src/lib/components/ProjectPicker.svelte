@@ -1,10 +1,18 @@
 <script lang="ts">
+  import type { ClaudeStatus } from "../ipc";
+
   let {
     recents,
+    claude,
+    error,
     onpick,
     onopen,
   }: {
     recents: string[];
+    /** null until the startup probe answers. */
+    claude: ClaudeStatus | null;
+    /** Last open-project failure, shown inline instead of dying in the console. */
+    error: string | null;
     onpick: () => void;
     onopen: (path: string) => void;
   } = $props();
@@ -12,12 +20,37 @@
   function base(p: string): string {
     return p.split("/").filter(Boolean).pop() ?? p;
   }
+
+  let missingClaude = $derived(claude !== null && !claude.found);
 </script>
 
 <div class="picker">
   <div class="card">
     <h1>Mulpex</h1>
     <p class="tag">Coordinated parallel Claude Code sessions</p>
+
+    {#if missingClaude}
+      <div class="alert">
+        <strong>Claude Code CLI not found</strong>
+        <p>
+          Mulpex runs your own <code>claude</code>, but no <code>claude</code>
+          executable was found. Install it from
+          <a href="https://code.claude.com" target="_blank" rel="noreferrer"
+            >code.claude.com</a
+          >, make sure <code>claude --version</code> works in Terminal, then
+          restart Mulpex.
+        </p>
+        <details>
+          <summary>Where Mulpex looked</summary>
+          <pre>{claude?.searched_path.split(":").join("\n")}</pre>
+        </details>
+      </div>
+    {:else if error}
+      <div class="alert">
+        <strong>Couldn't open that project</strong>
+        <pre>{error}</pre>
+      </div>
+    {/if}
 
     {#if recents.length}
       <div class="section">Recent projects</div>
@@ -59,6 +92,42 @@
   .tag {
     margin: 0.25rem 0 1rem;
     color: var(--text-dim);
+  }
+  .alert {
+    margin-bottom: 1rem;
+    padding: 0.7rem 0.8rem;
+    background: color-mix(in srgb, var(--danger, #ff6b6b) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger, #ff6b6b) 45%, transparent);
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }
+  .alert p {
+    margin: 0.35rem 0 0;
+    color: var(--text-dim);
+    line-height: 1.45;
+  }
+  .alert code {
+    font-size: 0.8em;
+    padding: 0 0.2em;
+    background: var(--bg-sidebar);
+    border-radius: 3px;
+  }
+  .alert details {
+    margin-top: 0.5rem;
+    color: var(--text-faint);
+  }
+  .alert summary {
+    cursor: pointer;
+    font-size: 0.78rem;
+  }
+  .alert pre {
+    margin: 0.4rem 0 0;
+    max-height: 9rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.72rem;
+    color: var(--text-faint);
   }
   .section {
     color: var(--label);

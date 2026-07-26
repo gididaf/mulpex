@@ -7,7 +7,9 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::project;
-use crate::snapshot::{BootstrapInfo, HubSnapshot, ProjectHandle, SessionInfo, WorkspaceInfo};
+use crate::snapshot::{
+    BootstrapInfo, ClaudeStatus, HubSnapshot, ProjectHandle, SessionInfo, WorkspaceInfo,
+};
 use crate::state::{AppState, Core};
 
 /// Every open project + the active handle, for the frontend's initial paint.
@@ -22,6 +24,28 @@ pub fn bootstrap(state: State<AppState>) -> WorkspaceInfo {
 #[tauri::command]
 pub fn list_recent_projects() -> Vec<String> {
     project::list_recent()
+}
+
+/// Whether the user's `claude` CLI could be located, and where.
+///
+/// The frontend calls this on startup: without it, a missing `claude` surfaces
+/// only as every `open_project` failing, which used to look like the app simply
+/// ignoring the click. See `claude_bin` for why a GUI launch can miss a `claude`
+/// that works fine in the user's terminal.
+#[tauri::command]
+pub fn claude_status() -> ClaudeStatus {
+    match crate::claude_bin::resolve_claude() {
+        Some(p) => ClaudeStatus {
+            found: true,
+            path: Some(p.to_string_lossy().into_owned()),
+            searched_path: crate::claude_bin::merged_path().to_string(),
+        },
+        None => ClaudeStatus {
+            found: false,
+            path: None,
+            searched_path: crate::claude_bin::merged_path().to_string(),
+        },
+    }
 }
 
 /// Open `path` as a project (or re-activate it if already open), record it in
