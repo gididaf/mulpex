@@ -72,10 +72,20 @@ beside the main binary.
   `attach_session` — race-free under the sink mutex.
 - **frontend → PTY:** `send_bytes(id, data)` from xterm `onData` (UTF-8 encoded). The one manual
   key carve-out is **Shift+Enter / Option+Enter → `\x1b\r`** (`attachCustomKeyEventHandler`) —
-  Claude Code's newline is **meta-Return**, the same sequence `/terminal-setup` installs for VS
-  Code (`sendSequence "\x1b\r"`) and Terminal.app ("Use Option as Meta"). A bare `\n` (what this
-  sent until v0.4.2) is *ignored* by Claude's input handler, so Shift+Enter silently did nothing.
+  meta-Return, the sequence `/terminal-setup` installs for VS Code (`sendSequence "\x1b\r"`) and
+  Terminal.app ("Use Option as Meta"). Claude accepts a bare `\n` too; ESC+CR is preferred only
+  because it's the documented one. Both bytes must reach the PTY in **one write** (`send_bytes`
+  → `write_all`): split across reads, Claude consumes the lone ESC and the CR then submits.
   `macOptionIsMeta` covers Option word-motions.
+
+  **The handler must call `e.preventDefault()`** — this is the whole fix, not the byte choice.
+  Returning `false` makes xterm bail out of `_keyDown` *before* setting `_keyDownHandled`, and it
+  does not cancel the event on that path. The browser therefore still fires `keypress`, and
+  xterm's `_keyPress` (which short-circuits only on `_keyDownHandled`) turns charCode 13 into a
+  `\r`. So the PTY got our newline **and then a submit** — the newline was inserted and the
+  message sent in the same keystroke, which is what "Shift+Enter sends the message" was. The
+  `keypress` arm of the handler is a second line of defence. Option+Enter accidentally worked
+  throughout, because `_keyPress` already ignores keys with `altKey` set.
 - **hub state:** the 200 ms poll walks **every open project**, reads each one's scratch-dir files
   into a `HubSnapshot`, and emits a **handle-scoped** `hub-update {handle, snapshot}` on change;
   the frontend keys it into that project's slice, and the sidebar/hub panel are a reactive
@@ -271,10 +281,15 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `~/.local/bin` via `claude_bin::merged_path()`, renders in color (`TERM=xterm-256color`), and
   the picker shows the not-found banner when the CLI is genuinely unreachable. Released as
   `v0.4.1`.
-- **Shift+Enter (v0.4.2).** Fixed at the source level — the handler sent a bare `\n`, which
-  Claude ignores; it now sends `\x1b\r`, the same sequence `/terminal-setup` installs for VS
-  Code / Terminal.app / Alacritty (confirmed by reading those code paths in the installed
-  `claude` binary). `svelte-check` + `vite build` clean; wants a keypress in a live GUI.
+- **Shift+Enter (v0.4.3).** *v0.4.2 changed the byte and did not fix it* — the byte was never the
+  problem. Measured, not guessed, two ways: (1) driving the real `claude` on a Python PTY with
+  `pyte` rendering the prompt box shows `\n`, `\x1b\r`, `\x1b[13;2u` and `\x1b\n` **all** insert a
+  newline, so the original `\n` was fine; (2) driving the real `@xterm/xterm` build under jsdom
+  and replaying the browser's keydown→keypress contract reproduces the bug exactly — the old
+  handler emits `[27,13]` *and then* a stray `[13]`, the new one emits only `[27,13]`. The stray
+  `\r` was the submit. Also worth knowing: Claude requests the **kitty keyboard protocol** and
+  **modifyOtherKeys** at startup (visible in the PTY capture); xterm.js answers neither, so it
+  can never disambiguate Shift+Enter on its own — the manual carve-out is mandatory.
 
 ## Last Synced Commit
 

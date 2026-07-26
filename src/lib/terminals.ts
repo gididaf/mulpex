@@ -101,15 +101,29 @@ class TerminalManager {
       sendBytes(handle, id, encoder.encode(data));
     });
     // The one carve-out: Shift+Enter (and Option+Enter) insert a newline instead
-    // of submitting. Claude Code's newline is **ESC + CR** (meta-Return), not a
-    // bare LF — that's exactly what `/terminal-setup` installs elsewhere (VS Code
-    // `sendSequence` "\x1b\r", Terminal.app "Use Option as Meta"). A lone 0x0a is
-    // ignored by its input handler, so Shift+Enter did nothing.
+    // of submitting. We send ESC+CR — meta-Return, what `/terminal-setup` installs
+    // for VS Code / Terminal.app / Alacritty (a bare \n also works, but this is the
+    // sequence Claude documents). The two bytes cross the IPC in one write, which
+    // matters: split across reads, the ESC is consumed alone and the CR submits.
+    //
+    // `preventDefault()` is load-bearing. Returning false makes xterm bail out of
+    // `_keyDown` *before* it sets `_keyDownHandled`, and it never calls
+    // preventDefault itself on that path — so the browser goes on to fire
+    // `keypress`, and xterm's `_keyPress` (which only short-circuits on
+    // `_keyDownHandled`) turns charCode 13 into a `\r` and submits the message.
+    // That extra `\r` was the actual bug: our newline byte arrived, and Claude
+    // then got a submit right behind it. Cancelling the event suppresses the
+    // keypress entirely; the `keypress` arm below is a second line of defence.
+    const isNewlineKey = (e: KeyboardEvent): boolean =>
+      e.key === "Enter" && (e.shiftKey || e.altKey);
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type === "keydown" && e.key === "Enter" && (e.shiftKey || e.altKey)) {
+      if (e.type === "keydown" && isNewlineKey(e)) {
+        e.preventDefault();
+        e.stopPropagation();
         sendBytes(handle, id, new Uint8Array([0x1b, 0x0d]));
         return false;
       }
+      if (e.type === "keypress" && isNewlineKey(e)) return false;
       return true;
     });
 

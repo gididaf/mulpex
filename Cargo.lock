@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "mulpex"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "mulpex-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "mulpex-helper"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "mulpex-core",
