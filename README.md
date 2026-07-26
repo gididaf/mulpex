@@ -9,7 +9,7 @@ files.**
 &nbsp;
 [![Latest release](https://img.shields.io/github/v/release/gididaf/mulpex?style=for-the-badge&label=version)](https://github.com/gididaf/mulpex/releases/latest)
 
-macOS 11+ · Apple Silicon · requires the `claude` CLI · one-time right-click → Open (unsigned). See [**Install**](#install).
+macOS 11+ · Apple Silicon · requires the `claude` CLI · unsigned, so one `xattr` command after download. See [**Install**](#install).
 
 This is the desktop successor to the original terminal-UI mulpex (the ratatui/crossterm terminal
 version, preserved in this repo's git history). It sheds every terminal-only workaround — no
@@ -86,15 +86,17 @@ logged in (`claude` must be on your `PATH`) — Mulpex launches your own `claude
 
 1. Download `Mulpex_<version>_aarch64.dmg` from the [latest release](https://github.com/gididaf/mulpex/releases/latest).
 2. Open the DMG and drag **Mulpex** into **Applications**.
-3. The first launch is blocked by Gatekeeper because the app isn't notarized — this is expected.
-   **Right-click Mulpex → Open**, then click **Open** in the dialog (only needed once). If macOS
-   still refuses, run:
+3. Clear the download quarantine flag (one time), then open Mulpex normally:
    ```sh
    xattr -dr com.apple.quarantine /Applications/Mulpex.app
    ```
 
-> The build is **ad-hoc signed, not notarized**, so the one-time Gatekeeper step above is
-> required. (A notarized build would install with no warning — not set up yet.)
+> **"Mulpex is damaged and can't be opened. You should move it to the Trash."**
+> The download is fine — this is Gatekeeper, not corruption. The build is **ad-hoc signed and not
+> notarized**, and macOS reports any downloaded app it can't verify with that (misleading) wording.
+> Run the `xattr` command above and it opens. Right-click → Open does *not* clear this on recent
+> macOS versions; the `xattr` step is the reliable one. A notarized build would install with no
+> warning — that needs a paid Apple Developer account and isn't set up.
 
 ## Develop
 
