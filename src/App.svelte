@@ -414,12 +414,18 @@
   />
 {/if}
 
-<!-- Outside both branches: an update is equally relevant with a project open and
-     sitting on the picker, and the card is fixed-position so it needs no slot in
-     either layout. -->
-{#if ready}
-  <UpdateBanner />
-{/if}
+<!-- Outside both branches AND ungated by `ready`: an update is equally relevant
+     with a project open and sitting on the picker, and the card is fixed-position
+     so it needs no slot in either layout.
+
+     `ready` deliberately does NOT gate this. It flips only after bootstrap has
+     walked every open project and built + attached an xterm for every session,
+     serially — so with several projects restoring, the startup check would finish
+     early and the banner still sit invisible for as long as that took. Measured:
+     with zero projects the banner is up ~6s after launch; with three projects it
+     was late enough to look like the launch check had simply not run. The card
+     owns nothing that bootstrap provides, so it has no reason to wait for it. -->
+<UpdateBanner />
 
 <style>
   .shell {
