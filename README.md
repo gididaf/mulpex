@@ -110,6 +110,13 @@ logged in (`claude` must be on your `PATH`) — Mulpex launches your own `claude
 > macOS versions; the `xattr` step is the reliable one. A notarized build would install with no
 > warning — that needs a paid Apple Developer account and isn't set up.
 
+**You only do that once.** From then on Mulpex updates itself: it checks at launch and every six
+hours (or on demand via **Mulpex ▸ Check for Updates…**), and a new version raises a card with an
+**Update & Restart** button that downloads, verifies, installs and relaunches. No second `xattr`
+— that flag is set by the *browser* that downloads a file, and the in-app updater doesn't go
+through one. If sessions are mid-turn it says so and asks before restarting; sessions come back
+via `--resume`.
+
 ## Develop
 
 Requires Rust and Node. Mulpex launches whatever `claude` you have installed (resolved via
@@ -123,8 +130,27 @@ npm run tauri dev      # builds mulpex-helper, starts Vite, launches the app
 ## Build
 
 ```sh
-npm run tauri build    # produces Mulpex.app under target/release/bundle/macos/
+npm run tauri:build    # Mulpex.app + .dmg + the signed updater artifacts
 ```
+
+> **Use `tauri:build`, not `tauri build`.** With `createUpdaterArtifacts` on, the bundler needs the
+> minisign key in `TAURI_SIGNING_PRIVATE_KEY` or it compiles the whole release and *then* fails at
+> the signing step. The `tauri:build` script reads it from `~/.mulpex/updater.key`.
+
+## Release
+
+```sh
+npm run release              # or: npm run release -- --dry-run
+```
+
+Bump `version` in `src-tauri/tauri.conf.json` **and** `src-tauri/Cargo.toml` (the script refuses a
+mismatch), commit, then run it: builds and signs, writes `latest.json`, and publishes the DMG,
+`Mulpex.app.tar.gz`, its `.sig` and `latest.json` to a GitHub release. All four must be on the same
+release — the in-app updater reads `latest.json` from `/releases/latest/download/`.
+
+> **Back up `~/.mulpex/updater.key`.** It signs every update, and installs only accept updates
+> signed by the key matching the pubkey compiled into them. Lose it and the only path back is a new
+> keypair plus a manual DMG reinstall by every user.
 
 > **Helper signing (already wired).** For the packaged `.app`, `mulpex-helper` must ship
 > **inside the signed bundle** (`Contents/MacOS/`) or the child `claude` hooks fail-open

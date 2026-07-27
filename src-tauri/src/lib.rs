@@ -42,6 +42,7 @@ fn is_forwarded(id: &str) -> bool {
             | "messages"
             | "next"
             | "prev"
+            | "check_updates"
     ) || id.starts_with("project_")
 }
 
@@ -56,6 +57,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             ws: Mutex::new(Workspace::new()),
             helper_path: resolve_helper_path(),
@@ -82,6 +84,7 @@ pub fn run() {
             commands::resize_session,
             commands::focus_session,
             commands::get_hub_snapshot,
+            commands::restart_app,
         ])
         .setup(|app| {
             // Warm the `claude` lookup off-thread: it shells out to the user's
@@ -100,6 +103,9 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 let helper = state.helper_path.clone();
                 let mut ws = state.ws.lock().unwrap();
+                // Before creating ours, collect the scratch roots of Mulpex
+                // processes that died without running teardown.
+                ws.sweep_stale_state_roots();
                 for dir in project::list_open() {
                     // open_or_focus dedups + skips non-dirs; a failed open is skipped.
                     let _ = ws.open_or_focus(&dir, &helper);
@@ -123,7 +129,19 @@ pub fn run() {
         } => {
             app.exit(0);
         }
-        RunEvent::ExitRequested { .. } => {
+        // BOTH arms are required, and neither subsumes the other. `ExitRequested`
+        // is only reachable through `app.exit()` (the window-close arm above, and
+        // `AppHandle::restart()`); ⌘Q and an Apple-Event `quit` go straight to
+        // Cocoa's `NSApplication terminate:`, which tao turns into
+        // `applicationWillTerminate:` → `Event::LoopDestroyed` → `RunEvent::Exit`.
+        // Matching only `ExitRequested` meant teardown never ran on either of
+        // those, leaking the whole scratch root (measured: ⌘Q and AppleScript quit
+        // both left `temp/mulpex-<pid>` intact; window-close cleaned up). The
+        // `claude`s still died there — but from the PTY hangup, not from our
+        // `killpg`, so anything they'd backgrounded outside the foreground process
+        // group was orphaned. `teardown` is idempotent; the window-close path fires
+        // both events and runs it twice.
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => {
             teardown(app);
         }
         _ => {}

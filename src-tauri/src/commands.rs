@@ -189,6 +189,28 @@ pub fn focus_session(state: State<AppState>, project_handle: ProjectHandle, id: 
     }
 }
 
+/// Relaunch Mulpex — the second half of applying an update, called once the
+/// updater has swapped the bundle on disk.
+///
+/// This deliberately does NOT use `@tauri-apps/plugin-process`'s `relaunch`: we
+/// need the restart to run our teardown, which only happens if the restart fires
+/// `RunEvent::ExitRequested`/`Exit` on the way out. That routes through `lib.rs`'s
+/// handler, so every project's `claude` process group is killed and the scratch
+/// root removed before the new binary starts — without it an update would orphan
+/// process groups and leak a scratch dir on every single release.
+///
+/// `request_restart`, NOT `restart`: `AppHandle::restart` documents that when it
+/// is called *on the main thread* it "cannot guarantee the delivery of those
+/// events, so we skip them" and re-execs immediately — which would silently skip
+/// teardown. Whether a command body lands on the main thread is Tauri's
+/// scheduling choice, not ours (measured today: it does not, and the events do
+/// fire), so relying on it would be a latent bug one runtime update away.
+/// `request_restart` always goes through `request_exit(RESTART_EXIT_CODE)`.
+#[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    app.request_restart()
+}
+
 /// A project's current hub snapshot for the initial HubPanel paint (thereafter
 /// pushed via the scoped `hub-update` event from the poll loop).
 #[tauri::command]

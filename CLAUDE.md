@@ -35,8 +35,10 @@ src/                  Svelte/Vite frontend
                       alive-while-hidden across ALL projects, central resize
   lib/ipc.ts          typed command/event/channel wrappers
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
+  lib/updater.ts      update check/download/apply + the cross-project busy-session count
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename…
+                      TerminalPane/View, MessageReader, Rename, UpdateBanner…
+scripts/release.sh    signed build → latest.json → gh release (see Auto-update)
 ```
 
 ## The helper (why it's a separate binary)
@@ -442,19 +444,104 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   show the session count (`0` with no sessions, no badges), the hub panel shows only `MESSAGES`
   when quiet, and the sidebar divider sits at 72%. The red `needs` and amber unread badges are
   **build-verified only** — producing them needs a background project actually asking a question.
+- **Quit paths / scratch-root leak.** All four measured before and after against a real bundle on
+  an isolated `HOME` (`scratchpad/measure-quit.sh`); see the teardown section for the table. The
+  startup sweep collected the 12 dirs the bug had already accumulated.
+- **Auto-update, end to end, against a local endpoint.** Two real bundles (0.4.6 and 0.4.7) built
+  with the endpoint repointed at `127.0.0.1:8787`, the 0.4.7 update artifacts served by
+  `python3 -m http.server`, and the 0.4.6 app run against them: banner appeared with the right
+  version and notes, the click downloaded + signature-verified + swapped the bundle
+  (**0.4.6 → 0.4.7 on disk**), the old process exited, a new one came up, and **the old scratch
+  root was removed** — teardown ran on the update restart. No GitHub release was involved. Run
+  **twice**: once on `AppHandle::restart` (which passed, showing the command body does not land on
+  the main thread today) and again on `request_restart`, which is what ships.
+  Three harness notes for next time: the `dangerousInsecureTransportProtocol` flag is required for
+  an `http://` test endpoint (test builds only); **the buttons are unreachable from System
+  Events** — AX can't enumerate into the WKWebView and `click at` fails with -25204, so the click
+  has to be a real `CGEvent` post (`scratchpad/click.swift`) at coordinates read off a screenshot;
+  and **gate that click on the test app actually being frontmost, by pid**. A CGEvent goes to
+  whatever is under the point, so an un-gated click lands in whatever app is in front (here, the
+  user's terminal) — and `tell application "Mulpex" to activate` resolves *by name*, so it can
+  raise or launch the installed `/Applications` bundle instead of the one under test.
+- **The release pipeline** was proven by `scripts/release.sh --dry-run`: signed `.tar.gz` + `.sig`
+  and a well-formed `latest.json`, without publishing. That dry run is what caught the
+  `TAURI_SIGNING_PRIVATE_KEY` naming trap.
 
-## Known open bug — scratch root leaks on quit
+## Auto-update
 
-Measured while restarting for the v0.4.5 test: after `osascript -e 'tell application "Mulpex" to
-quit'`, **every `claude` was dead (zero orphans, so the `killpg` half of `teardown_all()` ran) but
-the whole `temp/mulpex-<pid>/` tree survived intact** — all 5 project state dirs, 88 entries. The
-documented guarantee is kill-then-`remove_dir_all` of the scratch root, and only the first half
-happened.
+`tauri-plugin-updater` against the repo's GitHub releases. Checked at launch and every **6 h**
+(`updater.ts::CHECK_INTERVAL_MS`), plus **Mulpex ▸ Check for Updates…** on demand; an available
+version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
 
-Only the **Apple Event** quit path was measured; ⌘Q and the window close button are untested here,
-and the code routes window-close through `app.exit(0)` → `ExitRequested`, which an Apple Event quit
-may bypass entirely. Impact is mild (abandoned temp dirs per launch, eventually reaped by macOS),
-but it *is* a violated invariant. Worth checking all three quit paths against `RunEvent`.
+- **The `.dmg` is not the update channel.** The updater consumes `Mulpex.app.tar.gz` + `.sig`
+  (emitted by `bundle.createUpdaterArtifacts`), verifies the minisign signature against the
+  `plugins.updater.pubkey` compiled into the app, and swaps the bundle in place. The DMG stays the
+  first-install channel only. All four artifacts must land on the **same** GitHub release —
+  `latest.json` is fetched from `/releases/latest/download/`, which resolves to the newest
+  *published, non-prerelease* release, so a draft ships an update nobody can see.
+- **`xattr -dr com.apple.quarantine` does not come back.** `com.apple.quarantine` is written by
+  the *downloading* app (a browser, via LaunchServices); the updater fetches over the app's own
+  HTTP client, so nothing sets the xattr and the extracted bundle inherits none. Gatekeeper's
+  first-launch assessment only fires on quarantined bundles. One manual `xattr` on the first DMG
+  install, never again. Ad-hoc signing (what `tauri build` does here — `Signature=adhoc`,
+  `TeamIdentifier=not set`) stays fine: there is no cert continuity to break.
+- **Restart goes through `AppHandle::request_restart`** (`commands::restart_app`), not
+  `plugin-process`'s `relaunch` and **not `AppHandle::restart`**. The restart has to fire
+  `ExitRequested`/`Exit` on the way out, because that is what runs teardown — otherwise every
+  update orphans process groups and leaks a scratch dir. `relaunch()` doesn't fire them at all,
+  and `restart()` only *sometimes* does: its own docs say that called **on the main thread** it
+  "cannot guarantee the delivery of those events, so we skip them" and re-execs immediately.
+  Whether a command body runs on the main thread is Tauri's scheduling choice — measured today it
+  is *not*, and `restart()` did fire the events and did tear down correctly, so this is a bug that
+  would have stayed invisible until a runtime upgrade moved the thread. `request_restart` always
+  routes through `request_exit(RESTART_EXIT_CODE)`. The leak fix below is a prerequisite for all
+  of this, not a nicety.
+- **Busy guard.** `updater.ts::busySessionCount()` counts `working` (mid-turn) and `needs`
+  (stopped on a question) across **every open project**, not just the visible one; non-zero parks
+  the banner in a `confirming` state naming the count. `waiting` sessions don't count — `--resume`
+  restores those intact.
+- **Automatic checks are silent on failure; manual ones aren't.** A laptop on flaky wifi must not
+  accumulate error banners nobody asked for, but a menu-item check that silently did nothing would
+  read as broken. Same function, `manual` flag.
+- **Releasing:** `npm run release` (`scripts/release.sh`) — preflights the key, the
+  tauri.conf.json/Cargo.toml version agreement, a clean tree and an unused tag; builds; writes
+  `latest.json`; `gh release create`s all four artifacts. `--dry-run` builds and writes the JSON
+  without publishing.
+- **The signing-key gotcha, which costs a full release compile to rediscover:** `tauri signer
+  generate` prints `TAURI_SIGNING_PRIVATE_KEY_PATH`, but the v2 bundler reads **only**
+  `TAURI_SIGNING_PRIVATE_KEY` (contents or path). With just the `_PATH` form set, the build runs to
+  completion, emits the `.tar.gz`, and *then* dies with "A public key has been found, but no
+  private key". Both `release.sh` and the `tauri:build` npm script export the key contents. The key
+  lives at `~/.mulpex/updater.key` (0600, no password) and is **not** in the repo — lose it and no
+  existing install can ever accept another update; the only recovery is a new keypair plus a manual
+  DMG reinstall by every user.
+
+## Teardown fires on TWO RunEvents (the fixed scratch-root leak)
+
+`lib.rs` matches **`RunEvent::ExitRequested | RunEvent::Exit`**, and dropping either arm
+re-opens a measured bug. `ExitRequested` is only reachable through `app.exit()` — i.e. the
+window-close arm and `AppHandle::restart()`. **⌘Q and an Apple-Event `quit` never touch it:**
+they go to Cocoa's `NSApplication terminate:`, which tao turns into `applicationWillTerminate:` →
+`AppState::exit()` → `Event::LoopDestroyed`, and tauri-runtime-wry maps *that* to
+`RunEvent::Exit`. Matching only `ExitRequested` meant teardown never ran on the two quit paths a
+human actually uses.
+
+The old diagnosis in this file inverted the evidence: it read "every `claude` was dead" as proof
+the `killpg` half ran and only `remove_dir_all` failed. **Neither half ran.** The children died
+from the PTY hangup when the process exited — which kills the foreground process group only, so
+anything an instance had backgrounded was orphaned, exactly the case `killpg` exists for.
+
+Measured before/after on an isolated `HOME` with one empty project (`scratchpad/measure-quit.sh`):
+AppleScript quit and ⌘Q both **leaked** the whole `temp/mulpex-<pid>/` tree and both are now
+**clean**; window-close was clean throughout; the Quit *menu item* is clean too. `teardown` is
+idempotent, so window-close firing both events and running it twice is fine.
+
+**Second layer: `Workspace::sweep_stale_state_roots()`**, run in `setup()` before the new root is
+created. No shutdown hook can cover Force Quit, `kill -9`, a crash or a power loss, so each launch
+also collects `temp/mulpex-<pid>` dirs whose pid is no longer alive (`libc::kill(pid, 0)`, with
+`EPERM` counting as alive). It errs toward *keeping*: a recycled pid just defers that dir to a
+later launch, whereas deleting a live Mulpex's root would break its running hub. This is what
+finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 

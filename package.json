@@ -8,12 +8,15 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key})\" tauri build",
+    "release": "bash scripts/release.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/xterm": "^5.5.0"

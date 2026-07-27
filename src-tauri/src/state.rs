@@ -145,6 +145,42 @@ impl Workspace {
         crate::project::save_open(&dirs);
     }
 
+    /// Remove scratch roots belonging to Mulpex processes that are no longer
+    /// running. `teardown_all` covers every *graceful* exit; this is the backstop
+    /// for the exits no code of ours runs on at all — Force Quit, `kill -9`, a
+    /// crash, a power loss — so `temp/` can't accumulate one `mulpex-<pid>` tree
+    /// per launch. Errs toward keeping: a recycled pid now owned by an unrelated
+    /// process reads as alive and just defers that dir to a later launch, whereas
+    /// deleting a *live* Mulpex's scratch root would break its running hub.
+    pub fn sweep_stale_state_roots(&self) {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == self.state_root || !path.is_dir() {
+                continue;
+            }
+            // `mulpex-<pid>` only — the unit tests' `mulpex-open-test-<uuid>` dirs
+            // fail the parse and are left alone.
+            let Some(pid) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("mulpex-"))
+                .and_then(|n| n.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            // kill(pid, 0) probes for existence without signalling: 0 => alive,
+            // EPERM => alive but another user's, ESRCH => gone.
+            let alive = unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !alive {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+
     /// Kill every project's process groups and remove the whole scratch root. The
     /// "no orphaned claude" guarantee, now across all projects.
     pub fn teardown_all(&mut self) {

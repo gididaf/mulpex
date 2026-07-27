@@ -133,4 +133,9 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
+/** Relaunch the app through `AppHandle::restart` — the only restart path that
+ * runs teardown (kills every project's `claude` process group, removes the
+ * scratch root) before re-execing. Used to apply a downloaded update. */
+export const restartApp = () => invoke<void>("restart_app");
+
 export { Channel };

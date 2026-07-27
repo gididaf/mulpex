@@ -13,8 +13,13 @@ use tauri::{AppHandle, Runtime};
 /// Build the full menu. Item ids match the strings the frontend switches on.
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // App menu (Mulpex): About + Quit (⌘Q → triggers our RunEvent teardown).
+    // No accelerator: the periodic check is the normal path, this is the manual
+    // "is there one right now?" escape hatch, and every free ⌘-key is worth more
+    // to a terminal app than to a menu item you use twice a month.
+    let check_updates = MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
     let app_menu = SubmenuBuilder::new(app, "Mulpex")
         .about(None)
+        .item(&check_updates)
         .separator()
         .services()
         .separator()

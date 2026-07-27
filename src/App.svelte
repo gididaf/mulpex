@@ -46,6 +46,8 @@
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
+  import UpdateBanner from "./lib/components/UpdateBanner.svelte";
+  import { checkForUpdate, startUpdateChecks } from "./lib/updater";
   import BottomBar from "./lib/components/BottomBar.svelte";
   import InstanceList from "./lib/components/InstanceList.svelte";
   import HubPanel from "./lib/components/HubPanel.svelte";
@@ -265,6 +267,11 @@
       case "messages":
         showMessages.update((v) => !v);
         break;
+      case "check_updates":
+        // Manual: reports "up to date" and network errors too, unlike the
+        // periodic check which stays silent on both.
+        await checkForUpdate(true);
+        break;
       case "next":
         cycle(1);
         break;
@@ -332,6 +339,10 @@
     const onResize = () => terminals.refit();
     window.addEventListener("resize", onResize);
 
+    // Check at startup, then every 6h. Silent unless something is actually
+    // available — a failed check never surfaces on this path.
+    const stopUpdateChecks = startUpdateChecks();
+
     (async () => {
       const ws = await bootstrap();
       if (ws.projects.length) {
@@ -349,6 +360,7 @@
 
     return () => {
       window.removeEventListener("resize", onResize);
+      stopUpdateChecks();
       unlisteners.forEach((p) => p.then((f) => f()));
     };
   });
@@ -400,6 +412,13 @@
     onpick={pickAndOpen}
     onopen={openOrFocusProject}
   />
+{/if}
+
+<!-- Outside both branches: an update is equally relevant with a project open and
+     sitting on the picker, and the card is fixed-position so it needs no slot in
+     either layout. -->
+{#if ready}
+  <UpdateBanner />
 {/if}
 
 <style>
