@@ -43,6 +43,10 @@ menu shortcuts.
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W).
   Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
   needed.
+- **Right-to-left text renders correctly.** Hebrew and Arabic read in the right order, mixed with
+  English on the same line — no setting to turn on. Most terminals (and anything drawing the grid
+  on a GPU, VS Code's included) show RTL mirrored, because a cell grid puts character *n* in
+  column *n*; Mulpex renders rows as real text so the browser's BiDi engine reorders them.
 - **Coordination hub.** Parallel Claudes in the same directory are kept consistent by a
   file-locking coordinator (a `PreToolUse` hook: edits/reads to a file another instance is
   writing simply *wait*, then proceed — never a hard deny, zero model tokens) plus an inner MCP

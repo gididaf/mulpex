@@ -227,8 +227,8 @@ background projects aren't left at spawn size.
 
 ## RTL (Hebrew/Arabic) — two separate fixes, both load-bearing
 
-Terminals use xterm's **DOM renderer**. The WebGL addon was removed in v0.4.7 and **must not come
-back for speed** — it draws one glyph quad per cell, so column *n* always gets character *n* and
+Terminals use xterm's **DOM renderer**. The WebGL addon was removed for this fix and **must not
+come back for speed** — it draws one glyph quad per cell, so column *n* always gets character *n* and
 RTL text renders mirrored (Hebrew read backwards). The DOM renderer emits each styled run as a
 `<span>` of real text and the **browser's own BiDi engine** reorders it for free. Measured, same
 frame through the app's xterm 5.5.0 in headless Chrome: DOM → `שלום זאת בדיקה`, WebGL →
@@ -429,6 +429,19 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   trailing-space-outside-the-markers bug was caught by this matrix and *only* by its non-image
   rows. 19 adversarial paths re-checked through real bash (one argument each, unicode bare, no
   CR/LF). `svelte-check` + `vite build` clean.
+- **RTL / Hebrew.** Both halves measured rather than eyeballed (see **RTL** above), then
+  confirmed **live in the installed `.app`**: a session started with ⌘T and Hebrew typed into it
+  renders words *and* letters in reading order, including a mixed Hebrew/English line. The
+  intermediate state is the instructive one — after only the WebGL removal the letters were right
+  and the words still ran left-to-right, and *that* was invisible to screenshot-reading; it took
+  per-character `getBoundingClientRect` to see which end was which.
+- **⌘1–9 → projects.** Verified live by driving the installed app with System Events: ⌘3 selects
+  the third tab (`dream-email`), matching `ProjectTabBar` order. Menu accelerators only exist in
+  the built app, so this cannot be checked from `vite build` alone.
+- **Tab counts / hub panel / sidebar split.** Verified by screenshotting the installed app: tabs
+  show the session count (`0` with no sessions, no badges), the hub panel shows only `MESSAGES`
+  when quiet, and the sidebar divider sits at 72%. The red `needs` and amber unread badges are
+  **build-verified only** — producing them needs a background project actually asking a question.
 
 ## Known open bug — scratch root leaks on quit
 
@@ -445,4 +458,4 @@ but it *is* a violated invariant. Worth checking all three quit paths against `R
 
 ## Last Synced Commit
 
-`6367db7da469ceb58ee249bd8e946a26167806bc` — 2026-07-26
+`9b10d8c5c08f3b13ab96e11e76e4326a5b0339dd` — 2026-07-27
