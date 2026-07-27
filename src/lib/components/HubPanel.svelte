@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { hub, showMessages } from "../stores";
+  import { hub, sessions, showMessages } from "../stores";
 
   function fileName(p: string): string {
     return p.split("/").filter(Boolean).pop() ?? p;
@@ -7,23 +7,14 @@
 </script>
 
 <div class="hub">
-  <section>
-    <div class="label">Locks</div>
-    {#if $hub && $hub.locks.length}
-      {#each $hub.locks as l (l.path)}
-        <div class="line">
-          <span class="file" title={l.path}>{fileName(l.path)}</span>
-          <span class="holder">#{l.holder}</span>
-        </div>
-      {/each}
-    {:else}
-      <div class="empty">none</div>
-    {/if}
-  </section>
-
-  <section>
-    <div class="label">Waiting</div>
-    {#if $hub && $hub.waiting.length}
+  <!-- Locks and Waiting are anomaly-only: they render nothing at all — not even a
+       header — while empty. Locks release at *turn* boundaries, so with one session
+       they're always that session's own files, and a permanent "none" readout just
+       trains the eye to skip the panel. Contention is also flagged where you're
+       already looking: a ⏳ on the blocked session's row in InstanceList. -->
+  {#if $hub && $hub.waiting.length}
+    <section>
+      <div class="label">Waiting</div>
       {#each $hub.waiting as w (w.id)}
         <div class="line">
           <span class="holder">#{w.id}</span>
@@ -31,10 +22,20 @@
           <span class="holder">→ #{w.holder}</span>
         </div>
       {/each}
-    {:else}
-      <div class="empty">none</div>
-    {/if}
-  </section>
+    </section>
+  {/if}
+
+  {#if $hub && $hub.locks.length && $sessions.length > 1}
+    <section>
+      <div class="label">Locks</div>
+      {#each $hub.locks as l (l.path)}
+        <div class="line">
+          <span class="file" title={l.path}>{fileName(l.path)}</span>
+          <span class="holder">#{l.holder}</span>
+        </div>
+      {/each}
+    </section>
+  {/if}
 
   <section class="grow">
     <button class="label as-button" onclick={() => showMessages.set(true)}>

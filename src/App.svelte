@@ -272,10 +272,12 @@
         cycle(-1);
         break;
       default:
-        if (id.startsWith("focus_")) {
-          const n = parseInt(id.slice("focus_".length), 10);
-          const s = get(sessions)[n - 1];
-          if (s) selectSession(s.id);
+        // ⌘1–⌘9 → the Nth open project, in tab-bar order (the projects Map's
+        // insertion order, which is what ProjectTabBar renders).
+        if (id.startsWith("project_")) {
+          const n = parseInt(id.slice("project_".length), 10);
+          const h2 = [...get(projects).keys()][n - 1];
+          if (h2 != null && h2 !== h) selectProject(h2);
         }
     }
   }
@@ -415,10 +417,18 @@
   .sidebar {
     grid-area: side;
     display: grid;
-    grid-template-rows: 45% 55%;
+    /* The hub panel is half its old share (55% → 28%): messages are reference
+       material, the session list is what you steer with. */
+    grid-template-rows: 72% 28%;
     min-height: 0;
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border);
+  }
+  /* Both rows scroll independently. Without min-height:0 a grid item's auto
+     minimum lets it grow past its track instead of overflowing, and the
+     `overflow-y: auto` inside InstanceList/HubPanel never engages. */
+  .sidebar > :global(*) {
+    min-height: 0;
   }
   .pane {
     grid-area: pane;

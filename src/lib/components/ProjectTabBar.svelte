@@ -1,5 +1,15 @@
 <script lang="ts">
-  import { projects, activeProjectHandle, type ProjectHandle } from "../stores";
+  import {
+    projects,
+    activeProjectHandle,
+    type ProjectHandle,
+    type ProjectState,
+  } from "../stores";
+
+  /** Sessions in this project whose claude has stopped to ask the user something. */
+  function needsCount(p: ProjectState): number {
+    return p.sessions.filter((s) => p.statuses.get(s.id) === "needs").length;
+  }
 
   let {
     onselect,
@@ -16,11 +26,38 @@
 
 <div class="tabs">
   {#each list as p (p.handle)}
+    {@const needs = needsCount(p)}
     <div class="tab" class:active={p.handle === $activeProjectHandle}>
       <button class="label" title={p.dir} onclick={() => onselect(p.handle)}>
         <span class="name">{p.name}</span>
+        <!-- Total sessions, always shown (0 included — "nothing running here" is
+             information too). The two badges are counts of things wanting you:
+             red = sessions asking a question, amber = unread hub messages. -->
+        <span
+          class="count"
+          title="{p.sessions.length} session{p.sessions.length === 1 ? '' : 's'}"
+          >{p.sessions.length}</span
+        >
+        {#if needs > 0}
+          <span
+            class="badge needs"
+            title="{needs} session{needs === 1 ? '' : 's'} need{needs === 1
+              ? 's'
+              : ''} you"
+          >
+            {needs}
+          </span>
+        {/if}
         {#if p.hub && p.hub.pending_messages > 0}
-          <span class="badge">{p.hub.pending_messages}</span>
+          <span
+            class="badge unread"
+            title="{p.hub.pending_messages} unread hub message{p.hub
+              .pending_messages === 1
+              ? ''
+              : 's'}"
+          >
+            {p.hub.pending_messages}
+          </span>
         {/if}
       </button>
       <button
@@ -84,16 +121,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .count {
+    flex: none;
+    color: var(--text-faint);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .tab.active .count {
+    color: var(--text-dim);
+    font-weight: 400;
+  }
   .badge {
     flex: none;
     min-width: 1.1rem;
     padding: 0 0.25rem;
     text-align: center;
-    background: var(--dot-needs);
-    color: #2a0a0d;
     border-radius: 0.7rem;
     font-size: 0.66rem;
     font-weight: 700;
+  }
+  /* Two different asks, two different colors — a red pill must never be ambiguous
+     between "a claude is blocked on you" and "you have mail". */
+  .badge.needs {
+    background: var(--dot-needs);
+    color: #2a0a0d;
+  }
+  .badge.unread {
+    background: var(--label);
+    color: #2a2005;
   }
   .x {
     flex: none;

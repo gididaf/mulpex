@@ -4,6 +4,21 @@
   const activeLabel = $derived(
     $activeId != null ? `claude #${$activeId}` : "no active session",
   );
+
+  /** Every accelerator the app has, session group then project group. */
+  const HINTS: Array<{ keys: string; label: string } | "sep"> = [
+    { keys: "⌘T", label: "new" },
+    { keys: "⌘W", label: "close" },
+    { keys: "⌘R", label: "rename" },
+    { keys: "⌘[ ⌘]", label: "session" },
+    { keys: "⌘M", label: "messages" },
+    "sep",
+    { keys: "⌘1–9", label: "project" },
+    { keys: "⌘P", label: "switcher" },
+    { keys: "⌘⇧[ ⌘⇧]", label: "cycle" },
+    { keys: "⌘O", label: "open" },
+    { keys: "⌘⇧W", label: "close project" },
+  ];
 </script>
 
 <footer class="bottom">
@@ -18,7 +33,15 @@
   {#if $notice}
     <span class="notice">{$notice}</span>
   {:else}
-    <span class="hint">⌘T new · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M messages</span>
+    <span class="hint">
+      {#each HINTS as h}
+        {#if h === "sep"}
+          <span class="divider"></span>
+        {:else}
+          <span class="pair"><kbd>{h.keys}</kbd>{h.label}</span>
+        {/if}
+      {/each}
+    </span>
   {/if}
 </footer>
 
@@ -48,9 +71,34 @@
   .notice {
     color: var(--dot-ready);
   }
+  /* The old single faint string was #5c6370 on #16161a — ~3:1, under the 4.5:1
+     readable floor. Keys are full-strength text on a chip, labels --text-dim. */
   .hint {
-    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
     overflow: hidden;
-    text-overflow: ellipsis;
+  }
+  .pair {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    color: var(--text-dim);
+    flex: 0 0 auto;
+  }
+  .hint kbd {
+    font: inherit;
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 3px;
+    padding: 0 0.25rem;
+  }
+  .divider {
+    flex: 0 0 auto;
+    width: 1px;
+    align-self: stretch;
+    margin: 0.15rem 0;
+    background: var(--border);
   }
 </style>

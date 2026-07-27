@@ -4,12 +4,21 @@
 //
 // This module is imperative and owns its DOM subtree; Svelte never renders into
 // a terminal's container after `open()`.
+//
+// The DOM renderer is DELIBERATE — do not re-add the WebGL addon for speed. WebGL
+// draws one glyph quad per cell, so column n always gets character n and RTL text
+// (Hebrew/Arabic) renders mirrored; the DOM renderer emits each styled run as a
+// span of real text, which the browser's own BiDi engine reorders for free.
+// Measured: the same frame through xterm 5.5.0 renders "שלום זאת בדיקה" under the
+// DOM renderer and "הקידב תאז םולש" under WebGL. (xterm itself has zero BiDi code —
+// `grep -c bidi` on the bundle is 0 — so the browser is the only implementation
+// available to us.) Caveat: reordering is per styled run, so a color change
+// mid-phrase still breaks ordering at that seam, and the caret is column-based.
 
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Channel, attachSession, sendBytes, resizeSession } from "./ipc";
 
@@ -54,7 +63,6 @@ interface Entry {
   term: Terminal;
   fit: FitAddon;
   container: HTMLElement;
-  webgl?: WebglAddon;
 }
 
 /** Composite key: instance ids are per-project, so (handle, id) disambiguates. */
@@ -135,14 +143,12 @@ class TerminalManager {
     const entry: Entry = { handle, id, term, fit, container };
     this.entries.set(key, entry);
     container.style.visibility = key === this.activeKey ? "visible" : "hidden";
-    if (key === this.activeKey) this.attachWebgl(entry);
   }
 
   dispose(handle: number, id: number): void {
     const key = keyOf(handle, id);
     const e = this.entries.get(key);
     if (!e) return;
-    e.webgl?.dispose();
     e.term.dispose();
     this.entries.delete(key);
   }
@@ -160,34 +166,11 @@ class TerminalManager {
   focus(handle: number, id: number): void {
     this.activeKey = keyOf(handle, id);
     for (const [ekey, e] of this.entries) {
-      const visible = ekey === this.activeKey;
-      e.container.style.visibility = visible ? "visible" : "hidden";
-      if (visible) {
-        this.attachWebgl(e);
-      } else if (e.webgl) {
-        // Free the GPU context (browsers cap live WebGL contexts).
-        e.webgl.dispose();
-        e.webgl = undefined;
-      }
+      e.container.style.visibility = ekey === this.activeKey ? "visible" : "hidden";
     }
     const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
     this.refit();
     if (e) e.term.focus();
-  }
-
-  private attachWebgl(e: Entry): void {
-    if (e.webgl) return;
-    try {
-      const addon = new WebglAddon();
-      addon.onContextLoss(() => {
-        addon.dispose();
-        e.webgl = undefined;
-      });
-      e.term.loadAddon(addon);
-      e.webgl = addon;
-    } catch {
-      // WebGL unavailable → xterm's default DOM renderer is fine.
-    }
   }
 
   /** Measure the visible terminal and bring every terminal + all backend PTYs to

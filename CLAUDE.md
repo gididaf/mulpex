@@ -113,7 +113,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 - **Frontend:** `stores.ts` holds a `Map<handle, ProjectState>` + `activeProjectHandle`; the
   classic `sessions/statuses/tasks/hub/activeId/project` stores are **derived read-only
   projections of the active project**, so the sidebar/hub components are unchanged. Navigation is a
-  persistent **`ProjectTabBar`** (click / `+` open / ✕ close / unread badge) plus a **`⌘P`
+  persistent **`ProjectTabBar`** (click / `+` open / ✕ close) plus a **`⌘P`
   `CommandPalette`** fuzzy switcher (drag-and-drop no longer opens projects — see
   **Dropped paths** below). `TerminalManager` keys xterms by `(handle,id)` and keeps
   **every project's** terminals alive while hidden; exactly one is visible globally.
@@ -122,10 +122,17 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘1–9/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
+Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
 **⌘⇧] / ⌘⇧[** next/prev project) are intercepted by the menu before xterm; Claude never uses ⌘,
 so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu accelerator — it's
 handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
+
+**⌘1–⌘9 select the Nth open *project*, not the Nth session** (menu ids `project_<n>`, File menu).
+Projects are the top-level thing you switch between — sessions have ⌘[ / ⌘] and the sidebar — and
+⌘N-selects-a-tab is the browser/terminal convention the tab bar already implies. The index is the
+`projects` Map's insertion order, which is exactly what `ProjectTabBar` renders, so ⌘3 is always
+the third visible tab.
+
 Everything else (arrows, Ctrl+C, Esc, Shift+Enter) flows straight to the focused terminal.
 Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused xterm textarea.
 
@@ -179,6 +186,34 @@ message landed in `openError` — which renders *only inside the picker*, off-sc
 project is open. Same shape as the Finder-launch `claude`-not-found bug: a real error with nowhere
 to appear.
 
+## What a project tab shows
+
+Name + **session count** (always, `0` included — "nothing running here" is information) + two
+count badges, each for a different ask, so a colored pill is never ambiguous: **red =
+sessions in `needs`** (a claude stopped to ask *you* something) and **amber = unread hub
+messages** (`hub.pending_messages`). Both hide at zero. The needs count is the gap this closes —
+a background project blocked on a question used to look identical to an idle one, findable only by
+switching tabs, even though `ProjectState.statuses` had the answer all along. ⌘1–9 selects a tab
+(see **Keyboard**).
+
+## Hub panel is anomaly-only
+
+The sidebar's hub panel shows **Waiting** and **Locks** only when they're non-empty — no header,
+no `none` placeholder — leaving **Messages** as the only permanent section. Locks release at *turn*
+boundaries (`hook.rs::release_my_locks` on Stop), not per tool call, so with a single session in a
+project the lock list is always that session's own files: a permanent three-section "none / none /
+none" readout is noise that teaches the eye to skip the panel, so the one time contention *does*
+happen you don't see it. Locks are additionally suppressed at `sessions.length <= 1` (nothing can
+contend with you). Waiting sorts above Locks — the blocked instance is the headline, the lock is
+the explanation — and contention is flagged a second time where you're already looking, as a ⏳ on
+the blocked session's row in `InstanceList`. Don't "restore" the empty-state sections.
+
+The sidebar splits **72% session list / 28% hub panel** (was 45/55 — messages are reference
+material, the session list is what you steer with). Both rows scroll independently, which needs
+`min-height: 0` on the grid items (`.sidebar > :global(*)` in `App.svelte`): without it a grid
+item's *auto* minimum lets it grow past its track and the children's `overflow-y: auto` never
+engages.
+
 ## Terminals kept alive while hidden
 
 `TerminalPane` stacks the xterms of **every session across every open project** absolutely (keyed
@@ -188,8 +223,40 @@ the rest `visibility: hidden` (**never** `display:none`, which would zero their 
 so background Claudes keep rendering. Geometry is central: a `ResizeObserver` on the pane fits the
 visible terminal, then applies the same `cols/rows` to every session + backend PTY (all PTYs share
 one size, as the TUI did) — `refit` issues one `resize_session(handle,…)` per open project so
-background projects aren't left at spawn size. **WebGL** is attached only to the one globally
-visible terminal (browser caps live GL contexts) and disposed on blur / project switch.
+background projects aren't left at spawn size.
+
+## RTL (Hebrew/Arabic) — two separate fixes, both load-bearing
+
+Terminals use xterm's **DOM renderer**. The WebGL addon was removed in v0.4.7 and **must not come
+back for speed** — it draws one glyph quad per cell, so column *n* always gets character *n* and
+RTL text renders mirrored (Hebrew read backwards). The DOM renderer emits each styled run as a
+`<span>` of real text and the **browser's own BiDi engine** reorders it for free. Measured, same
+frame through the app's xterm 5.5.0 in headless Chrome: DOM → `שלום זאת בדיקה`, WebGL →
+`הקידב תאז םולש` (the reported bug, reproduced). xterm has **no BiDi of its own** (`grep -c
+"bidi\|rtl"` on `lib/xterm.js` is 0), so the browser is the only implementation available; a
+`unicode-bidi: plaintext` CSS override on the rows changes nothing (already the default behavior),
+and `direction: rtl` flips the box-drawing borders and is unusable. Dropping the addon also
+deleted the GL-context juggling (attach-on-focus / dispose-on-blur, since browsers cap live
+contexts) and cut ~100 kB from the JS bundle.
+
+**That alone only fixed the letters.** Words still ran left-to-right, because xterm's DOM renderer
+injects `.xterm-rows span { display: inline-block }` — and an inline-block is an **atomic** inline
+box, which the BiDi algorithm treats as one opaque object. It can reorder text *inside* a span but
+never *across* spans, and Claude Code colors words individually (`<span>Opus</span><span>
+</span><span>5</span>…`), so a Hebrew sentence became one span per word: letters right, words
+mirrored-wrong. `src/styles.css` overrides it with `display: inline !important` (`!important` is
+required — the injected rule is more specific and lands in `<head>` later). Measured on a 7-span
+row: `inline-block` → first word leftmost; `inline` → whole run mirrored, correct. `inline` rather
+than `display: contents` on purpose — the span keeps its box, so background colors, the block
+cursor and wide-char widths still paint (CJK/emoji x-positions verified byte-identical).
+
+How this was found, for the next RTL bug: a Python `pty.fork()` harness drove a real `claude`,
+typed the sentence keystroke-by-keystroke and captured the raw bytes; those bytes were replayed
+into the app's own xterm in headless Chrome, and **each character's x-position was measured** with
+`Range.getBoundingClientRect` rather than eyeballed — reading Hebrew out of a screenshot is
+useless here, because transcribing it silently re-applies BiDi and hides which end is which.
+
+Residual limit: the caret is still column-based, so it can sit visually off inside an RTL run.
 
 ## Lifecycle
 

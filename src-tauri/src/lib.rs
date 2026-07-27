@@ -42,7 +42,7 @@ fn is_forwarded(id: &str) -> bool {
             | "messages"
             | "next"
             | "prev"
-    ) || id.starts_with("focus_")
+    ) || id.starts_with("project_")
 }
 
 /// Kill every project's session process groups and remove the scratch root.

@@ -48,3 +48,21 @@ button {
 .xterm .xterm-viewport {
   overflow-y: auto;
 }
+
+/* RTL: let BiDi reorder ACROSS a row's spans, not just inside each one.
+ *
+ * xterm's DOM renderer injects `.xterm-rows span { display: inline-block }`, and an
+ * inline-block is an *atomic* inline box — the Unicode BiDi algorithm treats it as a
+ * single opaque object, so it can only reorder text within one span. Claude Code
+ * colors words individually, which splits a row into one span per word, so a Hebrew
+ * sentence came out with each word's letters correct but the words themselves left to
+ * right. Measured, one row of "שלום זאת בדיקה" as 7 spans:
+ *   inline-block → visual ❯ שלום זאת בדיקה   (first word leftmost — wrong)
+ *   inline       → visual ❯ בדיקה זאת שלום   (mirrored as one run — correct)
+ * `inline` (not `display: contents`) keeps the span's box, so background colors, the
+ * block cursor and wide-character widths still paint — verified identical x-positions
+ * for CJK/emoji rows. `!important` is required: the renderer's injected rule has
+ * higher specificity and lands in <head> after this file. */
+.xterm-rows span {
+  display: inline !important;
+}

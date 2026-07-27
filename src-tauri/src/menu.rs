@@ -44,12 +44,22 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let close_session = MenuItemBuilder::with_id("close_session", "Close Session")
         .accelerator("Cmd+W")
         .build(app)?;
-    let file_menu = SubmenuBuilder::new(app, "File")
+    let mut file_builder = SubmenuBuilder::new(app, "File")
         .item(&open_project)
         .item(&close_project)
         .separator()
         .item(&next_project)
         .item(&prev_project)
+        .separator();
+    // ⌘1–⌘9 switch to the Nth open project (tab-bar order), matching the
+    // browser/terminal convention where ⌘N selects a tab.
+    for n in 1..=9u8 {
+        let item = MenuItemBuilder::with_id(format!("project_{n}"), format!("Project {n}"))
+            .accelerator(format!("Cmd+{n}"))
+            .build(app)?;
+        file_builder = file_builder.item(&item);
+    }
+    let file_menu = file_builder
         .separator()
         .item(&new_session)
         .item(&close_session)
@@ -79,21 +89,14 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let prev = MenuItemBuilder::with_id("prev", "Previous Session")
         .accelerator("Cmd+[")
         .build(app)?;
-    let mut session_builder = SubmenuBuilder::new(app, "Session")
+    // Sessions are navigated with ⌘[ / ⌘] only — ⌘1–9 belong to projects.
+    let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&rename)
         .item(&messages)
         .separator()
         .item(&next)
         .item(&prev)
-        .separator();
-    // ⌘1–⌘9 focus the Nth session.
-    for n in 1..=9u8 {
-        let item = MenuItemBuilder::with_id(format!("focus_{n}"), format!("Focus Session {n}"))
-            .accelerator(format!("Cmd+{n}"))
-            .build(app)?;
-        session_builder = session_builder.item(&item);
-    }
-    let session_menu = session_builder.build()?;
+        .build()?;
 
     // Window: standard minimize/zoom.
     let window_menu = SubmenuBuilder::new(app, "Window")

@@ -37,9 +37,10 @@ menu shortcuts.
 - **Multiple projects at once.** Open several projects side by side — a persistent tab bar and a
   **⌘P** fuzzy quick-switcher. Each project keeps its own
   isolated coordination hub and its sessions running in the background; Mulpex reopens everything
-  you had open on the next launch. Close a project with ⌘⇧W, cycle with ⌘⇧[ ⌘⇧].
+  you had open on the next launch. Jump straight to a tab with ⌘1–9, close a project with ⌘⇧W,
+  cycle with ⌘⇧[ ⌘⇧].
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
-  PTY, rendered by xterm.js. Add (⌘T), switch (⌘1–9 / ⌘[ ⌘]), rename (⌘R), close (⌘W).
+  PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W).
   Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
   needed.
 - **Coordination hub.** Parallel Claudes in the same directory are kept consistent by a
