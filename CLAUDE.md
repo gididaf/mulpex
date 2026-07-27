@@ -466,6 +466,16 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
 - **The release pipeline** was proven by `scripts/release.sh --dry-run`: signed `.tar.gz` + `.sig`
   and a well-formed `latest.json`, without publishing. That dry run is what caught the
   `TAURI_SIGNING_PRIVATE_KEY` naming trap.
+- **Auto-update confirmed in production, by the user**, on the real GitHub endpoint: an installed
+  v0.4.7 offered v0.4.8, applied it, and relaunched — no Gatekeeper prompt and no second `xattr`,
+  which is the claim that mattered. Each published release is additionally checked by re-fetching
+  the tarball GitHub actually serves and comparing its SHA-256 to the signed local one, so a
+  mismatched or truncated asset can't sit there verifying against nothing.
+- **The launch-time check** was verified separately, because "no banner at startup" had two very
+  different possible causes (silent failure vs. still in flight). Running the *published* 0.4.7
+  against the real endpoint under an isolated `HOME` with no projects, screenshotting at 6/15/30/50 s
+  and never touching the menu: banner present at 6 s. That ruled out the check and pointed at the
+  `ready` gate above.
 
 ## Auto-update
 
@@ -503,6 +513,16 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
 - **Automatic checks are silent on failure; manual ones aren't.** A laptop on flaky wifi must not
   accumulate error banners nobody asked for, but a menu-item check that silently did nothing would
   read as broken. Same function, `manual` flag.
+- **The banner is NOT gated on `ready`** — don't "tidy" it back inside that block. `ready` flips
+  only after `bootstrap()` has walked every open project and built + attached an xterm for every
+  session, serially, so with several projects restoring, the launch check finishes early and the
+  card would sit invisible for as long as bootstrap took. That is exactly what the first user
+  report of "the banner only appears if I click Check for Updates" was: the check had worked
+  fine. Measured against the real endpoint, with zero projects the banner is up ~6 s after
+  launch. The card is fixed-position and owns nothing bootstrap provides.
+- **Shipped in v0.4.7**, which by construction had to be installed by hand — it is the release
+  that *adds* the updater, so nothing older could deliver it. v0.4.8 was a deliberate no-op
+  release published to exercise the real path end to end.
 - **Releasing:** `npm run release` (`scripts/release.sh`) — preflights the key, the
   tauri.conf.json/Cargo.toml version agreement, a clean tree and an unused tag; builds; writes
   `latest.json`; `gh release create`s all four artifacts. `--dry-run` builds and writes the JSON
@@ -545,4 +565,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`9b10d8c5c08f3b13ab96e11e76e4326a5b0339dd` — 2026-07-27
+`a3ece5017324eeec6a6480bb452e1e1b7caa7c3c` — 2026-07-27
