@@ -231,6 +231,13 @@ amber unread badge, and the hub-panel/status-strip unread readouts.
   teaches the eye wrong. It's also the click target for muting a session **without focusing it**
   (unmuted rows show a 🔊 only on hover, so it stays reachable without adding noise).
 
+**A new menu item is not wired until `lib.rs::is_forwarded` lists its id.** That function is an
+*allowlist* — `on_menu_event` drops anything not in it — so a new item builds, appears in the menu,
+shows its accelerator, and (for a `CheckMenuItem`) even ticks itself on click, while the frontend
+never hears a thing. Nothing fails: no error, no log line, no compiler complaint. Both `mute` and
+`minimize` shipped in that state and were caught only by driving the real app. This is the same
+shape as the other silent failures in this file — a real event with nowhere to arrive.
+
 ## What a project tab shows
 
 Name + **session count** (always, `0` included — "nothing running here" is information) + two
@@ -515,6 +522,20 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   which is the claim that mattered. Each published release is additionally checked by re-fetching
   the tarball GitHub actually serves and comparing its SHA-256 to the signed local one, so a
   mismatched or truncated asset can't sit there verifying against nothing.
+- **Mute (⌘M).** Exercised against a real running app on an isolated `HOME` with three restored
+  sessions. Menu shape read out of the **accessibility API** rather than a screenshot (`Mute
+  Session` key=M mods=0, `Messages` key=M mods=1, `Minimize` key=missing) — AX reaches the menu bar
+  even though it can't enter the WKWebView. Then: ⌘M dims/sinks/marks and ⌘M again restores the row
+  to its original slot with dot and status back and the tick cleared; ⌘] from #3 lands on the muted
+  #2 at the bottom rather than wrapping to #1, which is the case where visible order and creation
+  order actually differ; the store file writes the awkward `<uuid>\t\tmuted` row and the mute comes
+  back after a restart. **Badge exclusion was measured by forging the hook state files** — writing
+  `needs` into `state_dir/<id>` and dropping files into `inbox/<id>/` is exactly what the hook and
+  a peer's `hub_send` do, so the UI sees genuine input: with two sessions in `needs` and 3 unread,
+  the tab read red **1** / amber **1** and the strip `1 unread`. Plus 13 assertions on
+  `displayOrder`/`needsCount`/`unreadCount` driven through the real `stores.ts`, and 3 `persist.rs`
+  tests including both pre-mute file formats. **Not verified:** clicking the row's 🔇 without
+  selecting it first — the keyboard path proves the handler, only the hit target is untested.
 - **The launch-time check** was verified separately, because "no banner at startup" had two very
   different possible causes (silent failure vs. still in flight). Running the *published* 0.4.7
   against the real endpoint under an isolated `HOME` with no projects, screenshotting at 6/15/30/50 s
@@ -609,4 +630,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`a3ece5017324eeec6a6480bb452e1e1b7caa7c3c` — 2026-07-27
+`244a95f214821634e173db3b9de285c9159e3515` — 2026-07-27
