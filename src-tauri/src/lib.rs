@@ -39,7 +39,9 @@ fn is_forwarded(id: &str) -> bool {
             | "new_session"
             | "close_session"
             | "rename"
+            | "mute"
             | "messages"
+            | "minimize"
             | "next"
             | "prev"
             | "check_updates"
@@ -80,6 +82,8 @@ pub fn run() {
             commands::create_session,
             commands::close_session,
             commands::rename_session,
+            commands::set_session_muted,
+            commands::set_mute_menu_checked,
             commands::send_bytes,
             commands::resize_session,
             commands::focus_session,

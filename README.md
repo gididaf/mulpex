@@ -29,7 +29,7 @@ menu shortcuts.
 │  waiting,    │                                            │
 │  messages)   │                                            │
 └──────────────┴───────────────────────────────────────────┘
- ⌘T new · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M messages  ← status bar
+ ⌘T new · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M mute      ← status bar
 ```
 
 ## What it does
@@ -43,6 +43,9 @@ menu shortcuts.
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W).
   Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
   needed.
+- **Mute a session (⌘M)** when you don't want to hear from it. It keeps running and keeps
+  coordinating — it just stops competing for your attention: dimmed, sunk to the bottom of the
+  sidebar, and dropped from every badge, including its project tab's. Persists across restarts.
 - **Right-to-left text renders correctly.** Hebrew and Arabic read in the right order, mixed with
   English on the same line — no setting to turn on. Most terminals (and anything drawing the grid
   on a GPU, VS Code's included) show RTL mirrored, because a cell grid puts character *n* in

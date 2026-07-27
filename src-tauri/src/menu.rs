@@ -7,8 +7,34 @@
 //! Custom items carry a stable id; `on_menu_event` (wired in `lib.rs`) forwards
 //! the id to the frontend as a `menu` event, which performs the action.
 
-use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::menu::{
+    CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+};
 use tauri::{AppHandle, Runtime};
+
+/// Id of the "Mute Session" check item, shared with the command that ticks it.
+pub const MUTE_ITEM_ID: &str = "mute";
+
+/// Tick or untick "Mute Session" so the menu reflects the focused session.
+///
+/// `Menu::get` only looks at the menu's own children, and the item lives inside
+/// the Session submenu, so this walks one level down. Best-effort: a missing menu
+/// (no window yet) just does nothing.
+pub fn set_mute_checked<R: Runtime>(app: &AppHandle<R>, checked: bool) {
+    let Some(menu) = app.menu() else { return };
+    let Ok(items) = menu.items() else { return };
+    for item in items {
+        let Some(submenu) = item.as_submenu() else {
+            continue;
+        };
+        if let Some(found) = submenu.get(MUTE_ITEM_ID) {
+            if let Some(check) = found.as_check_menuitem() {
+                let _ = check.set_checked(checked);
+            }
+            return;
+        }
+    }
+}
 
 /// Build the full menu. Item ids match the strings the frontend switches on.
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -81,12 +107,20 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&PredefinedMenuItem::select_all(app, None)?)
         .build()?;
 
-    // Session: rename, message reader, focus navigation.
+    // Session: rename, mute, message reader, focus navigation.
     let rename = MenuItemBuilder::with_id("rename", "Rename Session…")
         .accelerator("Cmd+R")
         .build(app)?;
-    let messages = MenuItemBuilder::with_id("messages", "Messages")
+    // A check item so the menu reports the *active* session's state; the
+    // frontend keeps the tick in sync via `set_mute_menu_checked` whenever the
+    // focus or the flag changes.
+    let mute = CheckMenuItemBuilder::with_id(MUTE_ITEM_ID, "Mute Session")
         .accelerator("Cmd+M")
+        .checked(false)
+        .build(app)?;
+    // Messages moved off ⌘M to make room for mute (⌘⇧M).
+    let messages = MenuItemBuilder::with_id("messages", "Messages")
+        .accelerator("Cmd+Shift+M")
         .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
@@ -97,15 +131,22 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Sessions are navigated with ⌘[ / ⌘] only — ⌘1–9 belong to projects.
     let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&rename)
+        .item(&mute)
         .item(&messages)
         .separator()
         .item(&next)
         .item(&prev)
         .build()?;
 
-    // Window: standard minimize/zoom.
+    // Window: standard minimize/zoom. Minimize is a *custom* item rather than the
+    // predefined one because muda hard-binds that to ⌘M with no way to override
+    // the accelerator — and ⌘M is Mute Session here. Two items on one key means
+    // the earlier menu (Session) silently wins while the Window menu goes on
+    // advertising ⌘M, so this trades the shortcut for a menu that doesn't lie.
+    // The item still minimizes; the frontend handles the id.
+    let minimize = MenuItemBuilder::with_id("minimize", "Minimize").build(app)?;
     let window_menu = SubmenuBuilder::new(app, "Window")
-        .item(&PredefinedMenuItem::minimize(app, None)?)
+        .item(&minimize)
         .item(&PredefinedMenuItem::maximize(app, None)?)
         .separator()
         .item(&PredefinedMenuItem::close_window(app, None)?)

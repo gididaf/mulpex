@@ -42,10 +42,59 @@ export const activeProject = derived(
   ([$p, $h]) => ($h != null ? ($p.get($h) ?? null) : null),
 );
 
+// ---- mute: display order + the badge counts that must exclude muted ----
+
+/**
+ * Sidebar order: unmuted first, muted sunk to the bottom, each group keeping its
+ * creation order. `Array.prototype.sort` is required to be stable, so a plain
+ * key sort is enough — a muted instance keeps its place relative to other muted
+ * ones, and unmuting drops it straight back where it came from.
+ *
+ * This is the single source of the visible order: ⌘[ / ⌘] cycle through *this*
+ * list, so what you see is what you cycle.
+ */
+export function displayOrder(list: SessionInfo[]): SessionInfo[] {
+  return [...list].sort((a, b) => Number(a.muted) - Number(b.muted));
+}
+
+/** Ids muted in this project — the set every badge count subtracts. */
+function mutedIds(p: ProjectState): Set<number> {
+  return new Set(p.sessions.filter((s) => s.muted).map((s) => s.id));
+}
+
+/** Sessions of `p` stopped on a question, muted ones excluded (the tab's red badge). */
+export function needsCount(p: ProjectState): number {
+  return p.sessions.filter((s) => !s.muted && p.statuses.get(s.id) === "needs")
+    .length;
+}
+
+/**
+ * Unread hub messages in `p`, muted recipients excluded (the tab's amber badge,
+ * and the same number the hub panel and status strip show).
+ *
+ * `pending_messages` is a project-wide total, so the muted share has to come off
+ * it via the per-recipient `pending` breakdown. The message *log* is untouched —
+ * mute silences the count that pulls your eye, not the record of what happened.
+ */
+export function unreadCount(p: ProjectState): number {
+  if (!p.hub) return 0;
+  if (!p.sessions.some((s) => s.muted)) return p.hub.pending_messages;
+  const muted = mutedIds(p);
+  const silenced = p.hub.pending
+    .filter((e) => muted.has(e.id))
+    .reduce((n, e) => n + e.count, 0);
+  return Math.max(0, p.hub.pending_messages - silenced);
+}
+
 // ---- classic single-project projections (read-only) of the active project ----
 
-/** Ordered live sessions of the active project. */
-export const sessions = derived(activeProject, (p) => p?.sessions ?? []);
+/** Live sessions of the active project, in sidebar order (muted last). */
+export const sessions = derived(activeProject, (p) =>
+  p ? displayOrder(p.sessions) : [],
+);
+
+/** Unread hub messages in the active project, muted recipients excluded. */
+export const unread = derived(activeProject, (p) => (p ? unreadCount(p) : 0));
 /** id → status word, active project. */
 export const statuses = derived(
   activeProject,
@@ -121,6 +170,20 @@ export function setSessionsFor(
   patchProject(handle, { sessions });
 }
 
+/** Flip one session's muted flag locally (the backend persists it separately;
+ *  mute doesn't go through the `sessions-changed` event). */
+export function setSessionMutedLocal(
+  handle: ProjectHandle,
+  id: number,
+  muted: boolean,
+): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  patchProject(handle, {
+    sessions: p.sessions.map((s) => (s.id === id ? { ...s, muted } : s)),
+  });
+}
+
 /** Apply a hub snapshot to one project (also derives its statuses + tasks maps). */
 export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   patchProject(handle, {
@@ -139,7 +202,7 @@ export function findByDir(dir: string): ProjectState | undefined {
 
 // ---- UI-only stores ----
 
-/** Whether the ⌘M message reader panel is open. */
+/** Whether the ⌘⇧M message reader panel is open. */
 export const showMessages = writable(false);
 
 /** Whether the ⌘P project quick-switcher overlay is open. */

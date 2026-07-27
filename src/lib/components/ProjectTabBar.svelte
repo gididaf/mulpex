@@ -2,14 +2,10 @@
   import {
     projects,
     activeProjectHandle,
+    needsCount,
+    unreadCount,
     type ProjectHandle,
-    type ProjectState,
   } from "../stores";
-
-  /** Sessions in this project whose claude has stopped to ask the user something. */
-  function needsCount(p: ProjectState): number {
-    return p.sessions.filter((s) => p.statuses.get(s.id) === "needs").length;
-  }
 
   let {
     onselect,
@@ -26,7 +22,12 @@
 
 <div class="tabs">
   {#each list as p (p.handle)}
+    <!-- Both badge counts exclude muted sessions (stores.ts) — muting is meant to
+         quiet a project you're deliberately not watching, so a muted instance
+         must not keep the tab lit up. The plain session count still counts
+         everything: it says what's here, not what wants you. -->
     {@const needs = needsCount(p)}
+    {@const unread = unreadCount(p)}
     <div class="tab" class:active={p.handle === $activeProjectHandle}>
       <button class="label" title={p.dir} onclick={() => onselect(p.handle)}>
         <span class="name">{p.name}</span>
@@ -48,15 +49,12 @@
             {needs}
           </span>
         {/if}
-        {#if p.hub && p.hub.pending_messages > 0}
+        {#if unread > 0}
           <span
             class="badge unread"
-            title="{p.hub.pending_messages} unread hub message{p.hub
-              .pending_messages === 1
-              ? ''
-              : 's'}"
+            title="{unread} unread hub message{unread === 1 ? '' : 's'}"
           >
-            {p.hub.pending_messages}
+            {unread}
           </span>
         {/if}
       </button>

@@ -11,6 +11,9 @@ export type ProjectHandle = number;
 export interface SessionInfo {
   id: number;
   name: string | null;
+  /** Muted (⌘M): dimmed, sorted last, and left out of every attention badge.
+   *  Purely presentational — the instance runs and coordinates as normal. */
+  muted: boolean;
 }
 export interface StatusEntry {
   id: number;
@@ -35,6 +38,10 @@ export interface MsgEntry {
   body: string;
   ts: number;
 }
+export interface PendingEntry {
+  id: number;
+  count: number;
+}
 export interface HubSnapshot {
   statuses: StatusEntry[];
   tasks: TaskEntry[];
@@ -42,6 +49,8 @@ export interface HubSnapshot {
   waiting: WaitEntry[];
   messages: MsgEntry[];
   pending_messages: number;
+  /** Per-recipient breakdown of `pending_messages`; empty inboxes omitted. */
+  pending: PendingEntry[];
 }
 export interface BootstrapInfo {
   handle: ProjectHandle;
@@ -114,6 +123,17 @@ export const renameSession = (
   id: number,
   name: string,
 ) => invoke<void>("rename_session", { projectHandle, id, name });
+
+/** Mute/unmute a session (⌘M or the sidebar 🔇); persists across restarts. */
+export const setSessionMuted = (
+  projectHandle: ProjectHandle,
+  id: number,
+  muted: boolean,
+) => invoke<void>("set_session_muted", { projectHandle, id, muted });
+
+/** Tick/untick the "Mute Session" menu item for the focused session. */
+export const setMuteMenuChecked = (checked: boolean) =>
+  invoke<void>("set_mute_menu_checked", { checked });
 
 export const sendBytes = (
   projectHandle: ProjectHandle,

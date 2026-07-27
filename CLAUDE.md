@@ -124,10 +124,24 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
+Native macOS menu accelerators (⌘T/⌘W/⌘R/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
 **⌘⇧] / ⌘⇧[** next/prev project) are intercepted by the menu before xterm; Claude never uses ⌘,
 so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu accelerator — it's
 handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
+
+**⌘M is Mute Session; the message reader moved to ⌘⇧M.** ⌘M has a *third* claimant nobody
+declares: muda hard-binds `PredefinedMenuItem::minimize` to ⌘M and exposes no accelerator setter.
+Two items on one key means the earlier menu silently wins (the app already ships that collision —
+File ▸ Close Session and Window ▸ Close Window both claim ⌘W), which would leave the Window menu
+advertising a ⌘M that mutes. So **Minimize is a custom item with no accelerator**, handled in
+`App.svelte` via `getCurrentWindow().minimize()`. Don't "restore" the predefined one.
+
+Mute is a **`CheckMenuItem`**, and muda flips a check item's own state *before* dispatching the
+event — so the tick has to be pushed back from the frontend (`set_mute_menu_checked` →
+`menu::set_mute_checked`, which walks one level into the Session submenu because `Menu::get` only
+searches direct children). `App.svelte::syncMuteMenu` dedups that IPC call, since its trigger
+re-runs on every 200 ms hub poll; the one `force` case is a ⌘M with no session focused, where muda
+has ticked an item we never wrote and the dedup would otherwise never clear it.
 
 **⌘1–⌘9 select the Nth open *project*, not the Nth session** (menu ids `project_<n>`, File menu).
 Projects are the top-level thing you switch between — sessions have ⌘[ / ⌘] and the sidebar — and
@@ -188,12 +202,42 @@ message landed in `openError` — which renders *only inside the picker*, off-sc
 project is open. Same shape as the Finder-launch `claude`-not-found bug: a real error with nowhere
 to appear.
 
+## Muted sessions (⌘M)
+
+A muted instance **keeps running and keeps coordinating** — same PTY, same inbox, same peer list,
+same `hub_instances` entry. Mute is purely a statement about how loudly the *sidebar* may talk
+about it, and it's deliberately not a hub concept: nothing in `mulpex-core` knows the flag exists.
+Concretely it: dims the row, **sinks it below the unmuted ones**, drops its status dot, its status
+word and its ⏳, and removes it from **every attention count** — the tab's red `needs` badge, the
+amber unread badge, and the hub-panel/status-strip unread readouts.
+
+- **Ordering is one function**, `stores.ts::displayOrder` — a stable sort on `Number(muted)`, so
+  each group keeps creation order and unmuting drops a session straight back where it came from.
+  It feeds both the sidebar and ⌘[ / ⌘], so what you see is what you cycle. `TerminalPane` is
+  unaffected (absolute stacking; order is meaningless there).
+- **The unread badge needed a backend change.** `pending_messages` is one project-wide total, and
+  "how much of this is mail for a muted instance" isn't answerable from a total — so the poll loop
+  now also emits a per-recipient `pending: Vec<PendingEntry>` breakdown, and `unreadCount`
+  subtracts the muted share. The **message log itself is untouched**: mute silences the count that
+  pulls your eye, not the record of what happened.
+- **Persisted per project**, alongside the custom name, as a third tab-separated field in
+  `~/.mulpex/sessions/<key>.txt` (`<uuid>[\t<name>[\tmuted]]`). Both older formats still load — a
+  bare uuid and a `<uuid>\t<name>` line — and a muted-but-unnamed instance writes the name column
+  empty so the flag stays in field three. Covered by three `persist.rs` tests.
+- **Muting never moves focus**, and the muted terminal stays visible and typeable. Mute means "stop
+  shouting at me", not "I'm done with this one".
+- **The 🔇 is not decoration.** A dimmed, dot-less, status-less row would otherwise read as *dead*
+  rather than *silenced* — same failure the empty hub-panel sections had, an ambiguous readout that
+  teaches the eye wrong. It's also the click target for muting a session **without focusing it**
+  (unmuted rows show a 🔊 only on hover, so it stays reachable without adding noise).
+
 ## What a project tab shows
 
 Name + **session count** (always, `0` included — "nothing running here" is information) + two
 count badges, each for a different ask, so a colored pill is never ambiguous: **red =
 sessions in `needs`** (a claude stopped to ask *you* something) and **amber = unread hub
-messages** (`hub.pending_messages`). Both hide at zero. The needs count is the gap this closes —
+messages**. Both hide at zero, and **both exclude muted sessions** (see above) — the plain session
+count does not, because it says what's *here*, not what wants you. The needs count is the gap this closes —
 a background project blocked on a question used to look identical to an idle one, findable only by
 switching tabs, even though `ProjectState.statuses` had the answer all along. ⌘1–9 selects a tab
 (see **Keyboard**).

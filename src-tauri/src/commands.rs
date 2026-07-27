@@ -146,6 +146,28 @@ pub fn rename_session(
     }
 }
 
+/// Mute or unmute a session (⌘M / the sidebar's 🔇). Presentation only — the
+/// instance is untouched; only how the sidebar and tab badges treat it changes.
+#[tauri::command]
+pub fn set_session_muted(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    muted: bool,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
+        core.set_muted(id, muted);
+    }
+}
+
+/// Sync the "Mute Session" menu tick to the focused session's state. Called by
+/// the frontend whenever focus or the flag moves — the menu has no view of which
+/// session is active, so the tick has to be pushed to it.
+#[tauri::command]
+pub fn set_mute_menu_checked(app: AppHandle, checked: bool) {
+    crate::menu::set_mute_checked(&app, checked);
+}
+
 /// Forward raw bytes to a session's PTY (from xterm `onData`).
 #[tauri::command]
 pub fn send_bytes(

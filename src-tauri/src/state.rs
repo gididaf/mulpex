@@ -15,7 +15,8 @@ use mulpex_core::persist::{self, SessionStore};
 
 use crate::pty::{Session, SpawnTask};
 use crate::snapshot::{
-    BootstrapInfo, HubSnapshot, LockEntry, MsgEntry, ProjectHandle, SessionInfo, Status,
+    BootstrapInfo, HubSnapshot, LockEntry, MsgEntry, PendingEntry, ProjectHandle, SessionInfo,
+    Status,
     StatusEntry, TaskEntry, WaitEntry, WorkspaceInfo,
 };
 
@@ -205,6 +206,10 @@ pub struct Core {
     pub store: SessionStore,
     /// Custom per-instance names (id → name), persisted alongside session ids.
     pub names: HashMap<usize, String>,
+    /// Muted instance ids (⌘M), persisted alongside session ids. Presentation
+    /// only — a muted instance runs and coordinates exactly like any other; the
+    /// frontend just dims it, sorts it last, and leaves it out of the badges.
+    pub muted: HashSet<usize>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -242,7 +247,8 @@ impl Core {
         let mut sessions: Vec<Session> = Vec::new();
         let mut worked: HashSet<usize> = HashSet::new();
         let mut names: HashMap<usize, String> = HashMap::new();
-        for (session_id, name) in store.load() {
+        let mut muted: HashSet<usize> = HashSet::new();
+        for saved in store.load() {
             let id = sessions.len() + 1;
             if let Ok(session) = Session::spawn(
                 id,
@@ -251,13 +257,16 @@ impl Core {
                 DEFAULT_COLS,
                 &settings_path,
                 &state_dir,
-                &session_id,
+                &saved.session_id,
                 true,
                 None,
             ) {
                 worked.insert(id);
-                if let Some(name) = name {
+                if let Some(name) = saved.name {
                     names.insert(id, name);
+                }
+                if saved.muted {
+                    muted.insert(id);
                 }
                 sessions.push(session);
             }
@@ -288,6 +297,7 @@ impl Core {
             settings_path,
             store,
             names,
+            muted,
             worked,
         };
         core.persist_sessions();
@@ -313,6 +323,7 @@ impl Core {
             .map(|s| SessionInfo {
                 id: s.id,
                 name: self.names.get(&s.id).cloned(),
+                muted: self.muted.contains(&s.id),
             })
             .collect()
     }
@@ -340,6 +351,7 @@ impl Core {
             return Ok(SessionInfo {
                 id: info.id,
                 name: Some(name),
+                muted: false,
             });
         }
         Ok(info)
@@ -371,7 +383,11 @@ impl Core {
             self.active = self.sessions.len() - 1;
         }
         self.write_live_instances();
-        Ok(SessionInfo { id, name: None })
+        Ok(SessionInfo {
+            id,
+            name: None,
+            muted: false,
+        })
     }
 
     /// Fulfil `hub_spawn` requests instances left on disk: for each `spawn/*.json`
@@ -449,6 +465,19 @@ impl Core {
         self.persist_sessions();
     }
 
+    /// Mute or unmute an instance (⌘M / the sidebar's 🔇). Persists so it
+    /// survives restart, like a rename. Nothing else changes: the `claude` keeps
+    /// running, keeps its inbox, and stays in the peer list — mute is entirely a
+    /// statement about how loudly the *sidebar* should talk about it.
+    pub fn set_muted(&mut self, id: usize, muted: bool) {
+        if muted {
+            self.muted.insert(id);
+        } else {
+            self.muted.remove(&id);
+        }
+        self.persist_sessions();
+    }
+
     /// Close an instance by id: kill its process group. Removal, focus-fixing,
     /// persistence, peer-list rewrite and mail-bounce all happen uniformly on the
     /// next `reap_dead` pass (which also emits `session-exited`), so an explicit
@@ -505,6 +534,7 @@ impl Core {
         };
         self.worked.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.names.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
+        self.muted.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.persist_sessions();
         self.write_live_instances();
         removed
@@ -588,8 +618,11 @@ impl Core {
         }
         tasks.sort_by_key(|e| e.id);
 
-        // Inboxes: count queued, bounce dead recipients' undelivered mail.
+        // Inboxes: count queued, bounce dead recipients' undelivered mail. The
+        // per-instance counts ride along with the total so the frontend can
+        // subtract a muted instance's mail out of the unread badges.
         let mut pending = 0usize;
+        let mut pending_by_id: Vec<PendingEntry> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("inbox")) {
             for entry in entries.flatten() {
                 let Some(id) = entry.file_name().to_str().and_then(|n| n.parse::<usize>().ok())
@@ -600,11 +633,16 @@ impl Core {
                     bounce_dead_inbox(&self.state_dir, id, &entry.path(), &live);
                     continue;
                 }
-                pending += std::fs::read_dir(entry.path())
+                let count = std::fs::read_dir(entry.path())
                     .map(|d| d.flatten().count())
                     .unwrap_or(0);
+                pending += count;
+                if count > 0 {
+                    pending_by_id.push(PendingEntry { id, count });
+                }
             }
         }
+        pending_by_id.sort_by_key(|e| e.id);
 
         // Waiting indicators (prune dead).
         let mut waiting: Vec<WaitEntry> = Vec::new();
@@ -643,20 +681,20 @@ impl Core {
             waiting,
             messages,
             pending_messages: pending,
+            pending: pending_by_id,
         }
     }
 
-    /// Persist the worked-on sessions' ids (+ names), preserving order.
+    /// Persist the worked-on sessions' ids (+ names + mute), preserving order.
     fn persist_sessions(&self) {
-        let sessions: Vec<(&str, Option<&str>)> = self
+        let sessions: Vec<persist::SavedSession> = self
             .sessions
             .iter()
             .filter(|s| self.worked.contains(&s.id))
-            .map(|s| {
-                (
-                    s.session_id.as_str(),
-                    self.names.get(&s.id).map(String::as_str),
-                )
+            .map(|s| persist::SavedSession {
+                session_id: s.session_id.clone(),
+                name: self.names.get(&s.id).cloned(),
+                muted: self.muted.contains(&s.id),
             })
             .collect();
         self.store.save(&sessions);

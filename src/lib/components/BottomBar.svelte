@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { sessions, activeId, hub, notice } from "../stores";
+  import { sessions, activeId, notice, unread } from "../stores";
 
   const activeLabel = $derived(
     $activeId != null ? `claude #${$activeId}` : "no active session",
@@ -11,7 +11,8 @@
     { keys: "⌘W", label: "close" },
     { keys: "⌘R", label: "rename" },
     { keys: "⌘[ ⌘]", label: "session" },
-    { keys: "⌘M", label: "messages" },
+    { keys: "⌘M", label: "mute" },
+    { keys: "⌘⇧M", label: "messages" },
     "sep",
     { keys: "⌘1–9", label: "project" },
     { keys: "⌘P", label: "switcher" },
@@ -25,9 +26,9 @@
   <span class="active">{activeLabel}</span>
   <span class="sep">·</span>
   <span class="count">{$sessions.length} running</span>
-  {#if $hub && $hub.pending_messages > 0}
+  {#if $unread > 0}
     <span class="sep">·</span>
-    <span class="pending">{$hub.pending_messages} unread</span>
+    <span class="pending">{$unread} unread</span>
   {/if}
   <span class="spacer"></span>
   {#if $notice}

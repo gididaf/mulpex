@@ -4,6 +4,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open as openFolder } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
 
   import {
     bootstrap,
@@ -17,6 +18,8 @@
     focusSession,
     getHubSnapshot,
     sendBytes,
+    setSessionMuted,
+    setMuteMenuChecked,
     type BootstrapInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
@@ -38,7 +41,9 @@
     setActiveProject,
     setActiveSession,
     setSessionsFor,
+    setSessionMutedLocal,
     applyHubFor,
+    displayOrder,
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
@@ -102,6 +107,49 @@
     focusSession(h, id);
     terminals.focus(h, id);
   }
+
+  /**
+   * Mute or unmute one session of the active project (⌘M, or the row's 🔇).
+   *
+   * Mute never moves focus: the muted session's terminal stays visible and
+   * typeable, its row just dims and sinks. Muting is a statement about how loudly
+   * the sidebar should talk about an instance, not about whether you're done
+   * with it.
+   */
+  function muteSession(id: number, muted: boolean) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    setSessionMutedLocal(h, id, muted);
+    setSessionMuted(h, id, muted); // persists; fire-and-forget
+    syncMuteMenu();
+  }
+
+  /** Push the focused session's muted state into the menu's check item — the
+   *  native menu has no view of which session is active.
+   *
+   *  Deduped: the trigger below re-runs on every hub poll that changes anything
+   *  (statuses churn at 200 ms), and the tick almost never moves with it.
+   *
+   *  `force` defeats the dedup for the one case where the item's real state and
+   *  our last-pushed value have diverged: muda ticks a check item *itself* before
+   *  firing the event, so a click that resolves to "no session to mute" leaves a
+   *  tick we never wrote and would otherwise never clear. */
+  let lastMuteChecked: boolean | null = null;
+  function syncMuteMenu(force = false) {
+    const cur = get(activeId);
+    const s = cur == null ? undefined : get(sessions).find((x) => x.id === cur);
+    const checked = s?.muted ?? false;
+    if (checked === lastMuteChecked && !force) return;
+    lastMuteChecked = checked;
+    setMuteMenuChecked(checked);
+  }
+
+  // Focus and the flag both move the tick, and both land here as a store change.
+  $effect(() => {
+    void $activeId;
+    void $sessions;
+    syncMuteMenu();
+  });
 
   /** Open a project by path, or focus it if already open (picker/+/palette/drop). */
   async function openOrFocusProject(path: string) {
@@ -211,11 +259,12 @@
     selectSession(info.id);
   }
 
-  /** Cycle sessions within the active project. */
+  /** Cycle sessions within the active project, in the order the sidebar shows
+   *  them — muted ones last. What you see is what you cycle. */
   function cycle(delta: number) {
     const h = get(activeProjectHandle);
     if (h == null) return;
-    const list = get(projects).get(h)?.sessions ?? [];
+    const list = displayOrder(get(projects).get(h)?.sessions ?? []);
     if (list.length === 0) return;
     const cur = get(activeId);
     const idx = list.findIndex((s) => s.id === cur);
@@ -264,8 +313,24 @@
         }
         break;
       }
+      case "mute": {
+        const cur = get(activeId);
+        if (h != null && cur != null) {
+          const s = get(sessions).find((x) => x.id === cur);
+          muteSession(cur, !s?.muted);
+        } else {
+          // Nothing focused: the check item already toggled itself on click, so
+          // put it back rather than leaving a tick with nothing behind it.
+          syncMuteMenu(true);
+        }
+        break;
+      }
       case "messages":
         showMessages.update((v) => !v);
+        break;
+      case "minimize":
+        // Custom item (muda hard-binds the predefined one to ⌘M, which is Mute).
+        await getCurrentWindow().minimize();
         break;
       case "check_updates":
         // Manual: reports "up to date" and network errors too, unlike the
@@ -377,7 +442,7 @@
     />
     <TopBar />
     <aside class="sidebar">
-      <InstanceList onselect={selectSession} />
+      <InstanceList onselect={selectSession} onmute={muteSession} />
       <HubPanel />
     </aside>
     <main class="pane">

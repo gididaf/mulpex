@@ -40,6 +40,10 @@ pub struct SessionInfo {
     pub id: usize,
     /// Custom name (from rename), if any — overrides the auto task line.
     pub name: Option<String>,
+    /// Muted (⌘M): the frontend dims its row, sinks it below the unmuted ones,
+    /// and drops it from every attention badge. Purely presentational — the
+    /// instance keeps running and stays a full hub peer.
+    pub muted: bool,
 }
 
 /// A locked file → holder, for the hub panel's Locks view.
@@ -80,6 +84,17 @@ pub struct HubSnapshot {
     pub messages: Vec<MsgEntry>,
     /// Total queued (unread) hub messages across all inboxes.
     pub pending_messages: usize,
+    /// Per-recipient breakdown of `pending_messages` (empty inboxes omitted).
+    /// The total alone can't answer "how much of this is mail for a *muted*
+    /// instance", which every unread badge has to subtract out.
+    pub pending: Vec<PendingEntry>,
+}
+
+/// Queued (unread) hub messages sitting in one instance's inbox.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct PendingEntry {
+    pub id: usize,
+    pub count: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]

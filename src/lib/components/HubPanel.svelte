@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { hub, sessions, showMessages } from "../stores";
+  import { hub, sessions, showMessages, unread } from "../stores";
 
   function fileName(p: string): string {
     return p.split("/").filter(Boolean).pop() ?? p;
@@ -39,8 +39,10 @@
 
   <section class="grow">
     <button class="label as-button" onclick={() => showMessages.set(true)}>
-      Messages{#if $hub && $hub.pending_messages > 0}
-        <span class="unread">({$hub.pending_messages} unread)</span>
+      <!-- The unread *count* excludes muted recipients, but the message list
+           below does not: mute silences the nag, not the record. -->
+      Messages{#if $unread > 0}
+        <span class="unread">({$unread} unread)</span>
       {/if}
     </button>
     {#if $hub && $hub.messages.length}
