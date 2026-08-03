@@ -6,9 +6,10 @@
 //! than rendered), reaping with `bounce_dead_inbox`, and teardown. The event loop
 //! that drove it lives in `hub.rs`; the command surface in `commands.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use mulpex_core::config::{HOOK_SETTINGS_JSON, MCP_CONFIG_JSON};
 use mulpex_core::persist::{self, SessionStore};
@@ -127,6 +128,25 @@ impl Workspace {
         }
     }
 
+    /// Reorder open projects to match `handles` (the tab bar's new left-to-right
+    /// order after a drag). Handles we don't know are ignored and projects the
+    /// caller omitted keep their relative order at the end, so a stale frontend
+    /// list can never drop a project off the tab bar.
+    ///
+    /// Tab order is also the persisted open-project order, so this is what makes a
+    /// drag survive relaunch — and what ⌘1–⌘9 index into.
+    pub fn reorder_projects(&mut self, handles: &[ProjectHandle]) {
+        let mut ordered: Vec<Core> = Vec::with_capacity(self.projects.len());
+        for h in handles {
+            if let Some(pos) = self.projects.iter().position(|c| c.handle == *h) {
+                ordered.push(self.projects.remove(pos));
+            }
+        }
+        ordered.append(&mut self.projects);
+        self.projects = ordered;
+        self.persist_open();
+    }
+
     /// Snapshot for the frontend: every open project + the active handle.
     pub fn workspace_info(&self) -> WorkspaceInfo {
         WorkspaceInfo {
@@ -213,6 +233,32 @@ pub struct Core {
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
+    /// `hub_spawn` batches still being drip-fed, one child per `SPAWN_STAGGER`.
+    /// See `process_spawn_requests`.
+    pending_spawns: VecDeque<PendingSpawn>,
+    /// When the last child was launched, so the drip-feed can pace itself without
+    /// ever sleeping inside the poll loop.
+    last_spawn_at: Option<Instant>,
+}
+
+/// Minimum gap between launching two `hub_spawn` children. Each `claude` cold
+/// start is heavy (node boot, MCP handshake, hook registration); firing a whole
+/// batch at once made them contend badly enough that none was ready to be typed
+/// into in time. Spacing them keeps each start fast enough to be usable.
+const SPAWN_STAGGER: Duration = Duration::from_millis(500);
+
+/// One in-flight `hub_spawn` batch. The request file is consumed immediately, but
+/// its children are launched across successive poll ticks — so the batch's state
+/// lives here until the last child is up and the `.done` response can be written.
+struct PendingSpawn {
+    /// Request filename stem; the `<token>.done` reply the caller polls for.
+    token: String,
+    /// Instance that asked for the spawn (each child is told who assigned it).
+    from: usize,
+    /// Tasks not yet launched.
+    remaining: VecDeque<String>,
+    /// Ids launched so far, reported together once the batch finishes.
+    ids: Vec<usize>,
 }
 
 impl Core {
@@ -299,6 +345,8 @@ impl Core {
             names,
             muted,
             worked,
+            pending_spawns: VecDeque::new(),
+            last_spawn_at: None,
         };
         core.persist_sessions();
         core.write_live_instances();
@@ -398,14 +446,17 @@ impl Core {
     /// the response handshake are race-free.
     pub fn process_spawn_requests(&mut self) -> bool {
         let dir = self.state_dir.join("spawn");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return false;
-        };
-        let mut requests: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-            .collect();
+        // A missing dir just means no NEW requests — an in-flight batch still has
+        // children left to drip-feed, so fall through rather than returning early.
+        let mut requests: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+                    .collect()
+            })
+            .unwrap_or_default();
         requests.sort();
 
         let mut spawned_any = false;
@@ -432,17 +483,42 @@ impl Core {
             let _ = std::fs::remove_file(&req);
             let Some((from, tasks)) = parsed else { continue };
 
-            let mut ids = Vec::new();
-            for task in tasks {
-                if let Ok(info) = self.spawn_instance_with_task(from, task) {
-                    ids.push(info.id);
-                    spawned_any = true;
+            // Queue the batch rather than launching it here: firing every child in
+            // one tick makes N `claude` cold starts fight for CPU, and a child that
+            // takes too long to paint its input box misses its task injection.
+            let Some(stem) = req.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            self.pending_spawns.push_back(PendingSpawn {
+                token: stem.to_string(),
+                from,
+                remaining: tasks.into(),
+                ids: Vec::new(),
+            });
+        }
+
+        // Drip-feed at most one child per tick, and only once `SPAWN_STAGGER` has
+        // elapsed since the last one. Never sleeps — this runs on the shared poll
+        // loop, so blocking here would stall every project's UI updates.
+        let due = self
+            .last_spawn_at
+            .is_none_or(|t| t.elapsed() >= SPAWN_STAGGER);
+        if due {
+            if let Some(mut batch) = self.pending_spawns.pop_front() {
+                if let Some(task) = batch.remaining.pop_front() {
+                    if let Ok(info) = self.spawn_instance_with_task(batch.from, task) {
+                        batch.ids.push(info.id);
+                        spawned_any = true;
+                    }
+                    self.last_spawn_at = Some(Instant::now());
                 }
-            }
-            // Response the waiting `hub_spawn` reads: the ids it should return.
-            if let Some(stem) = req.file_stem().and_then(|s| s.to_str()) {
-                let done = serde_json::json!({ "ids": ids }).to_string();
-                let _ = std::fs::write(dir.join(format!("{stem}.done")), done);
+                if batch.remaining.is_empty() {
+                    // Batch complete — hand the waiting `hub_spawn` its ids.
+                    let done = serde_json::json!({ "ids": batch.ids }).to_string();
+                    let _ = std::fs::write(dir.join(format!("{}.done", batch.token)), done);
+                } else {
+                    self.pending_spawns.push_front(batch);
+                }
             }
         }
         spawned_any

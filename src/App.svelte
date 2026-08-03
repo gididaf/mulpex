@@ -13,6 +13,7 @@
     openProject,
     closeProject,
     switchProject,
+    reorderProjects,
     createSession,
     closeSession,
     focusSession,
@@ -44,9 +45,11 @@
     setSessionMutedLocal,
     applyHubFor,
     displayOrder,
+    reorderProjects as reorderProjectsLocal,
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
+  import { initAttention } from "./lib/attention";
 
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
@@ -100,6 +103,19 @@
   }
 
   /** Focus a session within the active project. */
+  /**
+   * Commit a dragged tab order: reorder locally for an immediate repaint, then
+   * tell the backend, which persists it to `open.txt` so it survives relaunch.
+   *
+   * Tab order is also what ⌘1–⌘9 index into (see `handleMenu`), so a drag
+   * remaps those shortcuts too — intentionally, since they're documented as
+   * "the Nth open project, in tab-bar order".
+   */
+  function applyProjectOrder(order: ProjectHandle[]) {
+    reorderProjectsLocal(order);
+    reorderProjects(order);
+  }
+
   function selectSession(id: number) {
     const h = get(activeProjectHandle);
     if (h == null) return;
@@ -408,6 +424,19 @@
     // available — a failed check never surfaces on this path.
     const stopUpdateChecks = startUpdateChecks();
 
+    // Dock badge + "a claude needs you" notifications. Clicking a banner routes
+    // through the same select path as clicking the sidebar row, so it lands on
+    // the pane with the question rather than merely raising the window.
+    let stopAttention: (() => void) | null = null;
+    initAttention((handle, id) => {
+      selectProject(handle);
+      setActiveSession(handle, id);
+      focusSession(handle, id);
+      terminals.focus(handle, id);
+    }).then((stop) => {
+      stopAttention = stop;
+    });
+
     (async () => {
       const ws = await bootstrap();
       if (ws.projects.length) {
@@ -426,6 +455,7 @@
     return () => {
       window.removeEventListener("resize", onResize);
       stopUpdateChecks();
+      stopAttention?.();
       unlisteners.forEach((p) => p.then((f) => f()));
     };
   });
@@ -439,6 +469,7 @@
       onselect={selectProject}
       onclose={closeProjectHandle}
       onadd={pickAndOpen}
+      onreorder={applyProjectOrder}
     />
     <TopBar />
     <aside class="sidebar">

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core, dialog and opener access for the main window.",
+  "description": "Core, dialog, opener and notification access for the main window.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -11,6 +11,7 @@
     "core:menu:default",
     "dialog:default",
     "opener:default",
-    "updater:default"
+    "updater:default",
+    "notification:default"
   ]
 }

@@ -86,6 +86,18 @@ export function unreadCount(p: ProjectState): number {
   return Math.max(0, p.hub.pending_messages - silenced);
 }
 
+/**
+ * Claudes blocked on the user across **every** open project — the dock badge.
+ *
+ * Deliberately `needs` only, not `needs + waiting`: a finished (`waiting`)
+ * session isn't asking for anything, so counting it would leave the badge lit
+ * permanently and stop meaning "there is something for you to do". Muted
+ * sessions are excluded for the same reason the tab badges exclude them.
+ */
+export const blockedTotal = derived(projects, ($p) =>
+  [...$p.values()].reduce((n, p) => n + needsCount(p), 0),
+);
+
 // ---- classic single-project projections (read-only) of the active project ----
 
 /** Live sessions of the active project, in sidebar order (muted last). */
@@ -138,6 +150,27 @@ export function removeProject(handle: ProjectHandle): void {
     if (pos < 0) return a;
     const remaining = keys.filter((k) => k !== handle);
     return remaining[pos] ?? remaining[remaining.length - 1] ?? null;
+  });
+}
+
+/**
+ * Rearrange the tab order to `order` (a drag's new left-to-right handle list).
+ * A `Map`'s iteration order is insertion order and that *is* the tab order, so
+ * reordering means rebuilding the Map — there is no key to sort on.
+ *
+ * Handles missing from `order` are appended in their existing order rather than
+ * dropped, so a stale caller can never make a project vanish from the tab bar.
+ * Persisting the new order is the backend's job (`reorderProjects`).
+ */
+export function reorderProjects(order: ProjectHandle[]): void {
+  projects.update((m) => {
+    const next = new Map<ProjectHandle, ProjectState>();
+    for (const h of order) {
+      const p = m.get(h);
+      if (p) next.set(h, p);
+    }
+    for (const [h, p] of m) if (!next.has(h)) next.set(h, p);
+    return next;
   });
 }
 

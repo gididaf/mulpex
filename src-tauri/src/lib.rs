@@ -60,6 +60,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             ws: Mutex::new(Workspace::new()),
             helper_path: resolve_helper_path(),
@@ -78,6 +79,7 @@ pub fn run() {
             commands::open_project,
             commands::close_project,
             commands::switch_project,
+            commands::reorder_projects,
             commands::attach_session,
             commands::create_session,
             commands::close_session,

@@ -97,6 +97,14 @@ pub fn switch_project(state: State<AppState>, project_handle: ProjectHandle) {
     }
 }
 
+/// Commit a new tab order after the user drags a project tab. `handles` is the
+/// full left-to-right order; the backend is the source of truth for persistence,
+/// so this also rewrites `open.txt` (see `Workspace::reorder_projects`).
+#[tauri::command]
+pub fn reorder_projects(state: State<AppState>, handles: Vec<ProjectHandle>) {
+    state.ws.lock().unwrap().reorder_projects(&handles);
+}
+
 /// Bind a session's frontend terminal channel: flush any pre-attach output, then
 /// stream live PTY bytes (base64) to xterm. Called once per session after its
 /// xterm mounts.

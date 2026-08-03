@@ -7,7 +7,7 @@
 //! `claude` invocation (flags/env) and the process-group teardown.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -127,6 +127,54 @@ fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
          blocked and need input — use mcp__mulpex__hub_send to send claude #{parent} a concise \
          summary of the outcome."
     ))
+}
+
+/// How much of the tail of a child's PTY output we keep for readiness detection.
+/// Only needs to span the last repaint of the input box, so a few KB is plenty.
+const TAIL_CAP: usize = 8192;
+
+/// After this long we stop waiting for the input box to be positively identified
+/// and fall back to the old "painted then went quiet" heuristic. Cold starts get
+/// slow when several `claude`s boot at once, so this is generous.
+const READY_FALLBACK: Duration = Duration::from_secs(20);
+
+/// Hard ceiling on waiting for readiness — inject anyway past this. Deliberately
+/// far above any plausible cold start: an 8s cap here is what let six concurrent
+/// spawns each type into a TUI that had no input box yet, losing every task.
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How many times to type the task in before giving up. Each attempt is verified
+/// against the child's own status file, so a retry only happens when the previous
+/// attempt provably did not submit.
+const INJECT_ATTEMPTS: usize = 4;
+
+/// How long to wait for proof that an injected prompt actually submitted.
+const VERIFY_WINDOW: Duration = Duration::from_secs(6);
+
+/// Whether `claude`'s interactive input box appears in the recent PTY output.
+/// The TUI draws a rounded box (`╭` … `╰`) around the `>` prompt once it is ready
+/// to accept typing; before that the pane holds only startup banner text. Matched
+/// on the box-drawing characters rather than `>` alone, since `>` shows up in
+/// banner and MCP-startup lines too.
+///
+/// Best-effort only: a false negative just delays until the fallback, and a false
+/// positive is caught by `turn_started` verification and retried. Neither loses
+/// the task, which is why this can afford to key off TUI chrome that may change
+/// between `claude` versions.
+fn input_box_ready(tail: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(tail);
+    s.contains('╭') && s.contains('╰') && s.contains('>')
+}
+
+/// Whether the child has actually begun a turn. The `UserPromptSubmit` hook writes
+/// `working` into `state_dir/<id>` the instant a prompt is submitted (see
+/// `hook.rs::userpromptsubmit`), so this is positive proof the injected text was
+/// received — as opposed to being swallowed by a TUI that wasn't listening yet,
+/// which is indistinguishable from success by looking at the PTY alone.
+fn turn_started(state_dir: &Path, id: usize) -> bool {
+    std::fs::read_to_string(state_dir.join(id.to_string()))
+        .map(|s| s.trim() == "working")
+        .unwrap_or(false)
 }
 
 /// Where a session's PTY output goes. Before the frontend has created its xterm
@@ -260,12 +308,19 @@ impl Session {
         // has painted and then settled before typing into it.
         let saw_output = Arc::new(AtomicBool::new(false));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+        // Rolling tail of what the child has painted, so the injector can tell a
+        // drawn input box from a still-booting one. Only maintained for spawned
+        // children — a normal session never injects, so it pays nothing for this.
+        let out_tail: Option<Arc<Mutex<Vec<u8>>>> = initial_task
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(Vec::with_capacity(TAIL_CAP))));
 
         {
             let sink = Arc::clone(&sink);
             let alive = Arc::clone(&alive);
             let saw_output = Arc::clone(&saw_output);
             let last_activity = Arc::clone(&last_activity);
+            let out_tail = out_tail.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -276,6 +331,15 @@ impl Session {
                             saw_output.store(true, Ordering::Relaxed);
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
+                            }
+                            if let Some(tail) = &out_tail {
+                                if let Ok(mut t) = tail.lock() {
+                                    t.extend_from_slice(&buf[..n]);
+                                    let overflow = t.len().saturating_sub(TAIL_CAP);
+                                    if overflow > 0 {
+                                        t.drain(..overflow);
+                                    }
+                                }
                             }
                         }
                     }
@@ -293,7 +357,15 @@ impl Session {
         if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
             let writer = Arc::clone(&writer);
             let alive = Arc::clone(&alive);
+            let saw_output = Arc::clone(&saw_output);
+            let last_activity = Arc::clone(&last_activity);
+            let out_tail = out_tail.clone();
+            let state_dir: PathBuf = state_dir.to_path_buf();
             thread::spawn(move || {
+                // Phase 1 — wait for a *drawn input box*, not merely a quiet pane.
+                // A booting `claude` goes quiet for well over a second while it
+                // loads MCP servers, so "output then silence" alone mistakes a
+                // mid-startup lull for readiness.
                 let start = Instant::now();
                 loop {
                     thread::sleep(Duration::from_millis(150));
@@ -301,33 +373,75 @@ impl Session {
                         return; // died during startup — nothing to bootstrap
                     }
                     let elapsed = start.elapsed();
-                    if elapsed >= Duration::from_secs(8) {
-                        break; // cap: inject anyway rather than never
+                    let quiet = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
+
+                    let box_drawn = out_tail
+                        .as_ref()
+                        .and_then(|t| t.lock().ok().map(|t| input_box_ready(&t)))
+                        .unwrap_or(false);
+                    if box_drawn && quiet >= Duration::from_millis(300) {
+                        break;
                     }
-                    if saw_output.load(Ordering::Relaxed) && elapsed >= Duration::from_millis(700) {
-                        let quiet = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
-                        if quiet >= Duration::from_millis(600) {
-                            break; // UI painted then went quiet → ready for input
+                    // Fallback for a `claude` whose chrome we no longer recognise.
+                    if elapsed >= READY_FALLBACK
+                        && saw_output.load(Ordering::Relaxed)
+                        && quiet >= Duration::from_millis(600)
+                    {
+                        break;
+                    }
+                    if elapsed >= READY_TIMEOUT {
+                        break; // ceiling: try anyway rather than never
+                    }
+                }
+
+                // Phase 2 — type it in, then verify it actually submitted, and retry
+                // if it didn't. Verification is what makes this robust: readiness
+                // detection can be wrong, but a child that never flipped to `working`
+                // provably never received the prompt, so retrying is always correct.
+                for attempt in 0..INJECT_ATTEMPTS {
+                    if !alive.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if attempt > 0 {
+                        // Clear anything a partial earlier attempt left in the box so
+                        // retries can't concatenate into one garbled prompt.
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(b"\x15"); // Ctrl-U, kill line
+                            let _ = w.flush();
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    }
+
+                    // Deliver the prompt text, then submit with a SEPARATE Enter after
+                    // a short delay. `claude`'s input treats a fast byte burst as a
+                    // paste, and a `\r` at the tail of a paste becomes a literal
+                    // newline in the buffer rather than a submit — so the text would
+                    // sit in the box unsent. Sending the Enter on its own, once the
+                    // paste-coalescing window has closed, registers as a real Enter
+                    // keypress and fires it.
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = w.write_all(prompt.as_bytes());
+                        let _ = w.flush();
+                    }
+                    thread::sleep(Duration::from_millis(400));
+                    if !alive.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = w.write_all(b"\r");
+                        let _ = w.flush();
+                    }
+
+                    let deadline = Instant::now() + VERIFY_WINDOW;
+                    while Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(150));
+                        if !alive.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if turn_started(&state_dir, id) {
+                            return; // landed
                         }
                     }
-                }
-                // Deliver the prompt text, then submit with a SEPARATE Enter after a
-                // short delay. `claude`'s input treats a fast byte burst as a paste,
-                // and a `\r` at the tail of a paste becomes a literal newline in the
-                // buffer rather than a submit — so the text would sit in the box
-                // unsent. Sending the Enter on its own, once the paste-coalescing
-                // window has closed, registers as a real Enter keypress and fires it.
-                if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(prompt.as_bytes());
-                    let _ = w.flush();
-                }
-                thread::sleep(Duration::from_millis(400));
-                if !alive.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(b"\r");
-                    let _ = w.flush();
                 }
             });
         }

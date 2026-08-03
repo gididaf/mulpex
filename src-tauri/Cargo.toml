@@ -27,3 +27,4 @@ libc = "0.2"
 portable-pty = "0.9"
 mulpex-core = { path = "../crates/mulpex-core" }
 tauri-plugin-updater = "2.10.1"
+tauri-plugin-notification = "2.3.3"

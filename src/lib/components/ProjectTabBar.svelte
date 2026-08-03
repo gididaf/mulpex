@@ -11,25 +11,110 @@
     onselect,
     onclose,
     onadd,
+    onreorder,
   }: {
     onselect: (h: ProjectHandle) => void;
     onclose: (h: ProjectHandle) => void;
     onadd: () => void;
+    onreorder: (order: ProjectHandle[]) => void;
   } = $props();
 
   const list = $derived([...$projects.values()]);
+
+  // ---- drag to reorder ----
+  //
+  // Pointer events, not HTML5 drag-and-drop: Tauri's webview-level drag-drop is
+  // enabled (App.svelte relies on it for dropping folders onto the window), and
+  // it intercepts drags before the DOM sees them. Pointer capture also gives us
+  // the drag threshold below, which HTML5 DnD can't express.
+
+  /** Tab elements by index, for hit-testing the pointer against their midpoints. */
+  let tabEls: HTMLElement[] = [];
+  /** Index being dragged, or null when idle. */
+  let dragIdx = $state<number | null>(null);
+  /** Index it would land on — also drives the drop indicator. */
+  let overIdx = $state<number | null>(null);
+  /** True only once the pointer has moved past the threshold. */
+  let dragging = $state(false);
+  let startX = 0;
+  /** Swallow the click that ends a drag, so reordering never also switches tab. */
+  let suppressClick = false;
+
+  /** Which slot the pointer is over: first tab whose midpoint it hasn't passed. */
+  function indexAt(x: number): number {
+    for (let i = 0; i < list.length; i++) {
+      const r = tabEls[i]?.getBoundingClientRect();
+      if (r && x < r.left + r.width / 2) return i;
+    }
+    return list.length - 1;
+  }
+
+  function onPointerDown(e: PointerEvent, i: number) {
+    if (e.button !== 0) return; // left button only — right-click may open a menu
+    dragIdx = i;
+    startX = e.clientX;
+    dragging = false;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (dragIdx == null) return;
+    // A few px of slop: a plain click always wiggles slightly, and treating that
+    // as a drag would make tabs impossible to simply select.
+    if (!dragging && Math.abs(e.clientX - startX) < 4) return;
+    dragging = true;
+    overIdx = indexAt(e.clientX);
+  }
+
+  function onPointerUp() {
+    const from = dragIdx;
+    const to = overIdx;
+    const moved = dragging;
+    dragIdx = null;
+    overIdx = null;
+    dragging = false;
+    if (!moved) return;
+    suppressClick = true;
+    if (from == null || to == null || from === to) return;
+    const order = list.map((p) => p.handle);
+    const [h] = order.splice(from, 1);
+    order.splice(to, 0, h);
+    onreorder(order);
+  }
+
+  function selectUnlessDragged(h: ProjectHandle) {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    onselect(h);
+  }
 </script>
 
 <div class="tabs">
-  {#each list as p (p.handle)}
+  {#each list as p, i (p.handle)}
     <!-- Both badge counts exclude muted sessions (stores.ts) — muting is meant to
          quiet a project you're deliberately not watching, so a muted instance
          must not keep the tab lit up. The plain session count still counts
          everything: it says what's here, not what wants you. -->
     {@const needs = needsCount(p)}
     {@const unread = unreadCount(p)}
-    <div class="tab" class:active={p.handle === $activeProjectHandle}>
-      <button class="label" title={p.dir} onclick={() => onselect(p.handle)}>
+    <div
+      class="tab"
+      class:active={p.handle === $activeProjectHandle}
+      class:dragging={dragging && dragIdx === i}
+      class:drop-target={dragging && overIdx === i && dragIdx !== i}
+      bind:this={tabEls[i]}
+    >
+      <button
+        class="label"
+        title={p.dir}
+        onpointerdown={(e) => onPointerDown(e, i)}
+        onpointermove={onPointerMove}
+        onpointerup={onPointerUp}
+        onpointercancel={onPointerUp}
+        onclick={() => selectUnlessDragged(p.handle)}
+      >
         <span class="name">{p.name}</span>
         <!-- Total sessions, always shown (0 included — "nothing running here" is
              information too). The two badges are counts of things wanting you:
@@ -98,6 +183,21 @@
   .tab.active {
     border-color: var(--border-focus);
     background: var(--bg);
+  }
+  /* The tab under the cursor fades so it reads as "in hand"; the slot it would
+     drop into gets an accent edge. Deliberately no motion — tabs reflowing under
+     a moving cursor makes the target ambiguous. */
+  .tab.dragging {
+    opacity: 0.45;
+  }
+  .tab.drop-target {
+    box-shadow: inset 2px 0 0 var(--border-focus);
+  }
+  .label {
+    cursor: grab;
+  }
+  .tab.dragging .label {
+    cursor: grabbing;
   }
   .label {
     display: flex;

@@ -105,6 +105,11 @@ export const closeProject = (projectHandle: ProjectHandle) =>
 export const switchProject = (projectHandle: ProjectHandle) =>
   invoke<void>("switch_project", { projectHandle });
 
+/** Commit a new tab order after a drag. The backend persists it to `open.txt`,
+ *  so the arrangement survives relaunch (and ⌘1–⌘9 follow it). */
+export const reorderProjects = (handles: ProjectHandle[]) =>
+  invoke<void>("reorder_projects", { handles });
+
 /** Bind a session's PTY output stream (base64 chunks) to its xterm. */
 export const attachSession = (
   projectHandle: ProjectHandle,

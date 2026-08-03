@@ -249,6 +249,36 @@ a background project blocked on a question used to look identical to an idle one
 switching tabs, even though `ProjectState.statuses` had the answer all along. ⌘1–9 selects a tab
 (see **Keyboard**).
 
+**Tabs drag to reorder.** `ProjectTabBar` uses **pointer events, not HTML5 drag-and-drop** —
+Tauri's webview drag-drop is enabled (App.svelte needs it to drop folders onto the window) and
+intercepts drags before the DOM sees them; pointer capture also gives us the 4 px threshold that
+keeps a click from registering as a drag. Dropping calls `reorderProjects` in `stores.ts` (rebuilds
+the `Map`, since insertion order *is* tab order) and the `reorder_projects` command, which reorders
+`Workspace::projects` and re-runs `persist_open()` — so the arrangement survives relaunch. Tab
+order is also what ⌘1–9 index into, so a drag remaps them by design. Handles missing from the
+submitted order are appended rather than dropped, so a stale caller can't make a project vanish.
+
+## Attention: dock badge + notifications
+
+`attention.ts` surfaces blocked claudes when you're *not* looking at Mulpex, both keyed off
+`needs` (the status the `AskUserQuestion` / idle-prompt hooks write — see `config.rs`):
+
+- **Dock badge** — `blockedTotal` (`stores.ts`) sums `needsCount` across *all* open projects and
+  drives `setBadgeCount`. Zero must be passed as `undefined`, or the dock shows a literal "0".
+- **Notification** — one silent banner per claude at the moment it becomes blocked, only when the
+  window is unfocused. Clicking one raises the window and routes through the same select path as
+  clicking a sidebar row, landing you on the pane with the question (the project handle + session
+  id ride along in the notification's `extra`).
+
+Three deliberate choices. It tracks `needs` and **not** `waiting`: `waiting` only means a turn
+ended, which happens constantly and asks nothing of you — badging it would leave the dock lit
+permanently and stop meaning "there is something to do". Muted sessions are excluded, matching the
+tab badges. And the first sweep only *records* state (`primed`), because restored sessions can
+already be in `needs` at launch and a burst of stale banners would bury the live one.
+
+> `needs` fires less often than you'd guess: sessions run with `--dangerously-skip-permissions`, so
+> the `permission_prompt` matcher is effectively dead and `needs` means AskUserQuestion or idle.
+
 ## Hub panel is anomaly-only
 
 The sidebar's hub panel shows **Waiting** and **Locks** only when they're non-empty — no header,
@@ -406,10 +436,15 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   (`{from, tasks, ts}`), capped at `MAX_SPAWN_PER_CALL` (8) so a 50-item list can't fork 50
   `claude`s at once, then **polls** for `<token>.done` (~6 s) to return the assigned ids.
 - **Fulfilment:** the 200 ms poll loop calls `Core::process_spawn_requests()` (`state.rs`), which
-  for each task spawns a session via `spawn_instance_with_task(parent_id, task)`, writes the ids
-  to `<token>.done`, and — if anything spawned — emits `sessions-changed` so the frontend builds
-  the new xterms (the existing reap path already republishes on removal; added sessions ride the
-  same event via `TerminalPane`'s keyed `{#each}`).
+  consumes the request file into a `pending_spawns` queue and then **drip-feeds** it — at most one
+  child per tick, and no closer together than `SPAWN_STAGGER` (500 ms) — spawning each via
+  `spawn_instance_with_task(parent_id, task)`. `<token>.done` is written only once the batch's
+  last child is up, so the caller still gets every id in one reply. If anything spawned it emits
+  `sessions-changed` so the frontend builds the new xterms (the existing reap path already
+  republishes on removal; added sessions ride the same event via `TerminalPane`'s keyed
+  `{#each}`). The drip-feed **never sleeps** — this runs on the shared poll loop, so blocking
+  would stall every project's UI. Staggering exists because N simultaneous `claude` cold starts
+  contend hard enough to blow any injection deadline (see below).
 - **Seeding + link:** the child's one-shot PTY prompt (`pty.rs::spawn_prompt`) is just the task:
   start it, then `hub_send` a summary back to the spawner when done (listener arming is *not* in
   this prompt — it comes from the `UserPromptSubmit` hook like every instance). Still
@@ -417,6 +452,25 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   whitespace collapsed). The child is **auto-named** `name_from_task(task)` so the sidebar labels
   it, and is **not** focused — the user stays on their pane while children appear. Recursion is
   inherent (children also have `hub_spawn`); only the per-call cap bounds a single call.
+- **Injection is verified, not fire-and-forget** (`pty.rs`). Typing the task in requires the
+  child's input box to actually exist, and nothing about the PTY stream says so directly. The
+  injector therefore: (1) waits for a *drawn input box* — `input_box_ready` looks for the rounded
+  box chrome in a rolling `TAIL_CAP` tail of output — rather than for "painted then quiet", which
+  a mid-startup lull while MCP servers load imitates perfectly; (2) types the prompt, then sends
+  `\r` separately (a `\r` at the tail of a fast burst is treated as paste content, not a submit);
+  (3) **verifies** via `turn_started`, which reads the child's own `state_dir/<id>` status file —
+  the `UserPromptSubmit` hook writes `working` there the moment a prompt submits, so this is
+  positive proof the text landed; (4) retries up to `INJECT_ATTEMPTS`, clearing the box with
+  Ctrl-U first so partial attempts can't concatenate.
+
+  **Why it's built this way:** the original injector waited on a quiet-window heuristic with an
+  8 s hard cap, then typed regardless. That survived the one-child case but failed *every* child
+  of a six-way spawn — six concurrent cold starts all exceeded 8 s, so each typed into a TUI with
+  no input box and the bytes were dropped, leaving six idle instances with no task and no way to
+  recover (their hub listeners arm from the first turn, which never came, so even `hub_send`
+  couldn't reach them). Readiness detection alone would not be enough — it can always be wrong on
+  a future `claude` whose chrome differs — which is why verification plus retry is the part that
+  actually makes this robust, and why the readiness check can afford to key off TUI chrome.
 
 ## Shared-tree guardrail
 
