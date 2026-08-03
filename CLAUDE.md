@@ -279,6 +279,12 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 > `needs` fires less often than you'd guess: sessions run with `--dangerously-skip-permissions`, so
 > the `permission_prompt` matcher is effectively dead and `needs` means AskUserQuestion or idle.
 
+Banners come from **`tauri-plugin-notification`**, which needs *two* registrations to work — the
+plugin in `lib.rs` **and** `notification:default` in `src-tauri/capabilities/default.json`. Miss
+the capability and `sendNotification` is simply denied at runtime; the badge (a core window API)
+keeps working, so the failure looks like "notifications are flaky", not "notifications are off".
+Same allowlist shape as `lib.rs::is_forwarded` for menu ids.
+
 ## Hub panel is anomaly-only
 
 The sidebar's hub panel shows **Waiting** and **Locks** only when they're non-empty — no header,
@@ -434,7 +440,11 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
 
 - **Request:** `hub_spawn({tasks: [...]})` writes `state_dir/spawn/<token>.json`
   (`{from, tasks, ts}`), capped at `MAX_SPAWN_PER_CALL` (8) so a 50-item list can't fork 50
-  `claude`s at once, then **polls** for `<token>.done` (~6 s) to return the assigned ids.
+  `claude`s at once, then **polls** for `<token>.done` (~6 s) to return the assigned ids. That
+  window and `SPAWN_STAGGER` below are coupled: a full 8-task batch spends ~3.5 s in stagger
+  alone, so raising the stagger (or the cap) without raising the poll window turns a big batch
+  into the "spawn requested, call `hub_instances` in a moment" fallback reply — correct, but the
+  ids no longer come back in-line.
 - **Fulfilment:** the 200 ms poll loop calls `Core::process_spawn_requests()` (`state.rs`), which
   consumes the request file into a `pending_spawns` queue and then **drip-feeds** it — at most one
   child per tick, and no closer together than `SPAWN_STAGGER` (500 ms) — spawning each via
@@ -595,6 +605,13 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   against the real endpoint under an isolated `HOME` with no projects, screenshotting at 6/15/30/50 s
   and never touching the menu: banner present at 6 s. That ruled out the check and pointed at the
   `ready` gate above.
+- **Attention / tab drag / spawn injection (unreleased, post-v0.5.0).** `svelte-check` (120 files,
+  0 errors) and `cargo check` are clean at `6a6b653`. Whatever live exercise these got happened
+  before this doc entry existed — anything not recorded here should be treated as unconfirmed and
+  re-driven in the real app: the dock badge needs a claude actually in `needs`, a banner needs the
+  window unfocused *and* macOS notification permission granted for the bundle, and the injection
+  fix is only meaningfully tested by a multi-child `hub_spawn` (the one-child case passed under
+  the old code too — that's exactly why the bug shipped).
 
 ## Auto-update
 
@@ -684,4 +701,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`244a95f214821634e173db3b9de285c9159e3515` — 2026-07-27
+`6a6b65339024209c37877cd5bfaac6012a96e9e7` — 2026-08-03
