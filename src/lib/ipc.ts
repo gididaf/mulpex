@@ -8,12 +8,26 @@ export type Status = "working" | "waiting" | "needs";
 /** Stable id for one open project; matches the Rust `ProjectHandle` (u64). */
 export type ProjectHandle = number;
 
+/** What a session runs. Terminals share the list, the id space and every
+ *  (project, id)-keyed mechanism with instances. */
+export type SessionKind = "claude" | "shell";
+
 export interface SessionInfo {
   id: number;
   name: string | null;
   /** Muted (⌘M): dimmed, sorted last, and left out of every attention badge.
    *  Purely presentational — the instance runs and coordinates as normal. */
   muted: boolean;
+  kind: SessionKind;
+  /** A terminal whose shell has exited. Kept in the list (unlike a dead
+   *  instance, which is removed) so its output stays readable until closed. */
+  exited: boolean;
+  /** Why this instance never started, if it didn't (it died within seconds of
+   *  spawning). Such a row is kept rather than reaped so the reason stays on
+   *  screen. It is absent from `statuses`, so the sidebar MUST check this
+   *  before falling back to a status dot — the unknown-id default is "ready",
+   *  which would paint a dead session green. */
+  failed: string | null;
 }
 export interface StatusEntry {
   id: number;
@@ -120,8 +134,18 @@ export const attachSession = (
 export const createSession = (projectHandle: ProjectHandle) =>
   invoke<SessionInfo>("create_session", { projectHandle });
 
+/** Open a plain shell terminal (⌘⇧T) in the project dir. */
+export const createTerminal = (projectHandle: ProjectHandle) =>
+  invoke<SessionInfo>("create_terminal", { projectHandle });
+
 export const closeSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("close_session", { projectHandle, id });
+
+/** Commit a new sidebar order after a session-row drag. The backend persists it
+ *  to the session store, so the arrangement survives relaunch (and ⌘[ / ⌘]
+ *  follow it). */
+export const reorderSessions = (projectHandle: ProjectHandle, ids: number[]) =>
+  invoke<void>("reorder_sessions", { projectHandle, ids });
 
 export const renameSession = (
   projectHandle: ProjectHandle,

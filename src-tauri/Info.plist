@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist by the Tauri bundler, which picks this
+  file up automatically because it sits next to tauri.conf.json (the alternative
+  is bundle.macOS.infoPlist, which only takes a path to exactly this).
+
+  These are the TCC (Privacy) usage strings. macOS shows one when the app first
+  touches a protected folder — and a project directory is almost always inside
+  one, since ~/Documents is where people keep code. WITHOUT the matching key the
+  prompt appears with no reason attached, which reads as an app grabbing at your
+  files for nothing, so "Don't Allow" is the natural click.
+
+  Getting that answer is silent and total: the deny is recorded per bundle id in
+  the TCC database, macOS never asks twice, and every `claude` Mulpex spawns then
+  gets a cwd it cannot even getcwd() ("Operation not permitted"). Claude exits 1
+  within the same second, the poll loop reaps the session, and the row vanishes
+  from the sidebar about 100 ms after appearing. Nothing is logged and no error
+  surfaces anywhere in the app — it just looks like Claude refuses to start.
+  (Measured 2026-08-05: every project lived under ~/Documents, all 8 spawns on a
+  launch exited rc=1, and the same build opened a project in /private/tmp fine.)
+
+  A rebuild changes the ad-hoc signature, so macOS may re-ask on a new version —
+  which is exactly why the prompt needs to justify itself. These keys only supply
+  that text; they request nothing and grant nothing on their own.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Mulpex needs access to open project folders you keep in Documents and to run Claude Code sessions inside them.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Mulpex needs access to open project folders you keep on the Desktop and to run Claude Code sessions inside them.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Mulpex needs access to open project folders you keep in Downloads and to run Claude Code sessions inside them.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Mulpex needs access to open project folders on network volumes and to run Claude Code sessions inside them.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Mulpex needs access to open project folders on external drives and to run Claude Code sessions inside them.</string>
+</dict>
+</plist>

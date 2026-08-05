@@ -12,3 +12,6 @@
 
 # macOS
 .DS_Store
+
+# Local measurement harnesses and build/install logs (see CLAUDE.md)
+/scratchpad

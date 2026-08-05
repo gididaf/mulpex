@@ -1,42 +1,13 @@
 <script lang="ts">
-  import { hub, sessions, showMessages, unread } from "../stores";
-
-  function fileName(p: string): string {
-    return p.split("/").filter(Boolean).pop() ?? p;
-  }
+  import { hub, showMessages, unread } from "../stores";
 </script>
 
+<!-- Messages is the whole panel. Locks and Waiting used to render above it,
+     anomaly-only; both were dropped because neither is something the user
+     steers with. Contention is still surfaced where the eye already is — a ⏳
+     on the blocked session's row in InstanceList, which reads `$hub.waiting`
+     directly, so the snapshot still carries locks/waiting for that. -->
 <div class="hub">
-  <!-- Locks and Waiting are anomaly-only: they render nothing at all — not even a
-       header — while empty. Locks release at *turn* boundaries, so with one session
-       they're always that session's own files, and a permanent "none" readout just
-       trains the eye to skip the panel. Contention is also flagged where you're
-       already looking: a ⏳ on the blocked session's row in InstanceList. -->
-  {#if $hub && $hub.waiting.length}
-    <section>
-      <div class="label">Waiting</div>
-      {#each $hub.waiting as w (w.id)}
-        <div class="line">
-          <span class="holder">#{w.id}</span>
-          <span class="wait">⏳ {w.file}</span>
-          <span class="holder">→ #{w.holder}</span>
-        </div>
-      {/each}
-    </section>
-  {/if}
-
-  {#if $hub && $hub.locks.length && $sessions.length > 1}
-    <section>
-      <div class="label">Locks</div>
-      {#each $hub.locks as l (l.path)}
-        <div class="line">
-          <span class="file" title={l.path}>{fileName(l.path)}</span>
-          <span class="holder">#{l.holder}</span>
-        </div>
-      {/each}
-    </section>
-  {/if}
-
   <section class="grow">
     <button class="label as-button" onclick={() => showMessages.set(true)}>
       <!-- The unread *count* excludes muted recipients, but the message list
@@ -91,7 +62,6 @@
     color: var(--dot-needs);
     margin-left: 0.3rem;
   }
-  .line,
   .msg {
     display: flex;
     gap: 0.4rem;
@@ -99,22 +69,15 @@
     font-size: 0.76rem;
     margin-bottom: 2px;
   }
-  .file,
   .snippet {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-dim);
   }
-  .holder,
   .route {
     color: var(--accent);
     flex: none;
-  }
-  .wait {
-    color: var(--text-dim);
-  }
-  .snippet {
-    color: var(--text-dim);
   }
   .empty {
     color: var(--text-faint);

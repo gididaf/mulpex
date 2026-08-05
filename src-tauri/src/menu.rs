@@ -72,6 +72,9 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let new_session = MenuItemBuilder::with_id("new_session", "New Session")
         .accelerator("Cmd+T")
         .build(app)?;
+    let new_terminal = MenuItemBuilder::with_id("new_terminal", "New Terminal")
+        .accelerator("Cmd+Shift+T")
+        .build(app)?;
     let close_session = MenuItemBuilder::with_id("close_session", "Close Session")
         .accelerator("Cmd+W")
         .build(app)?;
@@ -93,6 +96,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let file_menu = file_builder
         .separator()
         .item(&new_session)
+        .item(&new_terminal)
         .item(&close_session)
         .build()?;
 

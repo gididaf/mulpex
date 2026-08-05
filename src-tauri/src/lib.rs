@@ -9,6 +9,7 @@ mod project;
 mod pty;
 mod snapshot;
 mod state;
+mod vtgrid;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -37,6 +38,7 @@ fn is_forwarded(id: &str) -> bool {
             | "next_project"
             | "prev_project"
             | "new_session"
+            | "new_terminal"
             | "close_session"
             | "rename"
             | "mute"
@@ -82,7 +84,9 @@ pub fn run() {
             commands::reorder_projects,
             commands::attach_session,
             commands::create_session,
+            commands::create_terminal,
             commands::close_session,
+            commands::reorder_sessions,
             commands::rename_session,
             commands::set_session_muted,
             commands::set_mute_menu_checked,

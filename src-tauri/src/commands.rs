@@ -133,11 +133,34 @@ pub fn create_session(
     core.spawn_instance().map_err(|e| e.to_string())
 }
 
-/// Close an instance (⌘W) — kills its process group and reaps.
+/// Open a plain shell terminal (⌘⇧T) in the given project and focus it.
+#[tauri::command]
+pub fn create_terminal(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> Result<SessionInfo, String> {
+    let mut ws = state.ws.lock().unwrap();
+    let core = ws.project_mut(project_handle).ok_or("no such project")?;
+    core.spawn_terminal(None, None, true).map_err(|e| e.to_string())
+}
+
+/// Close a session (⌘W) — kills its process group and reaps. Works for both
+/// kinds; for a terminal this is also what removes an already-exited row.
 #[tauri::command]
 pub fn close_session(state: State<AppState>, project_handle: ProjectHandle, id: usize) {
     if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
         core.close(id);
+    }
+}
+
+/// Commit a new sidebar order after the user drags a session row. `ids` is the
+/// full top-to-bottom order within that project; the backend is the source of
+/// truth for persistence, so this also rewrites the session store (see
+/// `Core::reorder_sessions`).
+#[tauri::command]
+pub fn reorder_sessions(state: State<AppState>, project_handle: ProjectHandle, ids: Vec<usize>) {
+    if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
+        core.reorder_sessions(&ids);
     }
 }
 

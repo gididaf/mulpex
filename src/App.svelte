@@ -14,7 +14,9 @@
     closeProject,
     switchProject,
     reorderProjects,
+    reorderSessions,
     createSession,
+    createTerminal,
     closeSession,
     focusSession,
     getHubSnapshot,
@@ -45,7 +47,9 @@
     setSessionMutedLocal,
     applyHubFor,
     displayOrder,
+    flashNotice,
     reorderProjects as reorderProjectsLocal,
+    reorderSessions as reorderSessionsLocal,
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
@@ -114,6 +118,21 @@
   function applyProjectOrder(order: ProjectHandle[]) {
     reorderProjectsLocal(order);
     reorderProjects(order);
+  }
+
+  /**
+   * Commit a dragged sidebar order: reorder locally for an immediate repaint,
+   * then tell the backend, which rewrites the session store so the arrangement
+   * survives relaunch (and echoes the same order back on the next poll).
+   *
+   * Sidebar order is also what ⌘[ / ⌘] cycle, so a drag remaps those too — the
+   * "what you see is what you cycle" rule the muted-sinking sort already follows.
+   */
+  function applySessionOrder(ids: number[]) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    reorderSessionsLocal(h, ids);
+    reorderSessions(h, ids);
   }
 
   function selectSession(id: number) {
@@ -268,7 +287,37 @@
   async function newSession() {
     const h = get(activeProjectHandle);
     if (h == null) return;
-    const info = await createSession(h);
+    let info;
+    try {
+      info = await createSession(h);
+    } catch (e) {
+      // Spawning can be refused before it starts — most often because macOS is
+      // withholding the project's folder from this app, which the backend
+      // checks for by name. Without this the rejection was unhandled and ⌘T
+      // simply did nothing at all, which is the failure it exists to explain.
+      flashNotice(`Could not start Claude: ${e}`, 8000);
+      return;
+    }
+    const p = get(projects).get(h);
+    setSessionsFor(h, [...(p?.sessions ?? []), info]);
+    await tick();
+    selectSession(info.id);
+  }
+
+  /** ⌘⇧T — open a plain shell terminal and focus it. (A terminal an *instance*
+   *  opens arrives via `sessions-changed` instead, and never steals focus.) */
+  async function newTerminal() {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    let info;
+    try {
+      info = await createTerminal(h);
+    } catch (e) {
+      // The picker's error line only renders when no project is open, so a
+      // failure here (no $SHELL, spawn refused) would otherwise be invisible.
+      flashNotice(`Could not open a terminal: ${e}`, 4000);
+      return;
+    }
     const p = get(projects).get(h);
     setSessionsFor(h, [...(p?.sessions ?? []), info]);
     await tick();
@@ -315,6 +364,9 @@
         break;
       case "new_session":
         if (h != null) await newSession();
+        break;
+      case "new_terminal":
+        if (h != null) await newTerminal();
         break;
       case "close_session": {
         const cur = get(activeId);
@@ -370,9 +422,28 @@
     }
   }
 
+  /**
+   * Commands chosen in ⌘P run through `handleMenu` — the same string-keyed switch
+   * the native menu feeds — so the palette owns no second implementation of any
+   * command and cannot drift from the menu.
+   *
+   * Closing the overlay drops keyboard focus, and most commands don't take it
+   * anywhere, so the terminal has to be handed it back. The exceptions are the
+   * commands whose whole job is to put focus somewhere else: `rename` and
+   * `messages` open their own focus-taking UI, and `open_project` opens a native
+   * folder dialog. Refocusing the terminal after those would fight them.
+   */
+  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project"]);
+  async function runPaletteAction(id: string) {
+    showPalette.set(false);
+    await handleMenu(id);
+    if (!PALETTE_KEEPS_FOCUS.has(id)) terminals.refocus();
+  }
+
   function onGlobalKey(e: KeyboardEvent) {
-    // ⌘P / Ctrl+P toggles the project quick-switcher. Not a menu accelerator, so it
-    // reaches the webview; preventDefault stops the browser print dialog.
+    // ⌘P / Ctrl+P toggles the command palette (projects, sessions, commands). Not a
+    // menu accelerator, so it reaches the webview; preventDefault stops the print
+    // dialog.
     if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
       if (get(projects).size > 0) showPalette.update((v) => !v);
@@ -473,7 +544,11 @@
     />
     <TopBar />
     <aside class="sidebar">
-      <InstanceList onselect={selectSession} onmute={muteSession} />
+      <InstanceList
+        onselect={selectSession}
+        onmute={muteSession}
+        onreorder={applySessionOrder}
+      />
       <HubPanel />
     </aside>
     <main class="pane">
@@ -483,14 +558,15 @@
   </div>
   {#if $showPalette}
     <CommandPalette
-      onselect={(h) => {
+      onproject={(h) => {
         showPalette.set(false);
         selectProject(h);
       }}
-      onopennew={() => {
+      onsession={(id) => {
         showPalette.set(false);
-        pickAndOpen();
+        selectSession(id);
       }}
+      onaction={runPaletteAction}
       onclose={() => showPalette.set(false)}
     />
   {/if}

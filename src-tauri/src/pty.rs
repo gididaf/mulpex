@@ -1,14 +1,19 @@
-//! One embedded Claude Code session on its own pseudo-terminal.
+//! One session on its own pseudo-terminal — either a Claude Code instance or a
+//! plain interactive shell (a "terminal", see `SessionKind`).
 //!
 //! Unlike the old TUI, we do **not** emulate the terminal here — xterm.js in the
 //! frontend is the emulator. The backend is a raw byte pipe: the PTY reader
 //! thread streams bytes to the session's frontend `Channel`, and keystrokes come
 //! back via `send`. We keep the parts that are genuinely terminal-agnostic: the
-//! `claude` invocation (flags/env) and the process-group teardown.
+//! process invocation (flags/env) and the process-group teardown.
+//!
+//! Shell sessions carry one extra thing: a `vtgrid::Recorder` that maintains a
+//! plain-text transcript on disk, because a claude instance lives in a different
+//! process and can only read a terminal's output through a file.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +22,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use tauri::ipc::Channel;
 
 use crate::claude_bin;
+use crate::vtgrid::Recorder;
 
 /// Standing hub instructions injected into every instance via
 /// `--append-system-prompt` (see the old term_session.rs — unchanged).
@@ -27,15 +33,44 @@ as MCP tools named mcp__mulpex__* . Use them to stay consistent with the other i
 holds locks on.\n\
 - mcp__mulpex__hub_set_focus — publish what YOU are working on (do this when you start a \
 substantial task).\n\
+- mcp__mulpex__hub_set_name — name YOUR OWN row in the user's sidebar, after the work you are \
+doing (2-5 words, in the language the user writes to you in). Do this once, early, as soon as you \
+know what the session is about — an unnamed row falls back to showing the user's last prompt \
+verbatim, which is long and goes stale. Rename again only if the work genuinely becomes something \
+else. If the user named this instance themselves, their name wins and yours is ignored.\n\
 - mcp__mulpex__hub_file_owner — before editing a file others might also touch, check who (if \
 anyone) is currently editing it and why.\n\
 - mcp__mulpex__hub_send / mcp__mulpex__hub_inbox — message another instance, and read messages \
-sent to you.\n\
+sent to you. Pass to: \"all\" instead of an instance number to broadcast to every other instance \
+at once. Whatever you send is mandatory reading for each recipient (an instance cannot finish a \
+turn holding unread mail), so broadcast only what genuinely concerns them all — for anything \
+narrower, name the one instance it affects.\n\
 - mcp__mulpex__hub_spawn — start NEW instances, each seeded with its own task that it begins \
 immediately. Use this to fan work out in parallel (e.g. one instance per ticket/item). It \
 returns the new instances' ids; each is told you spawned it and will hub_send its result back \
 to you when done. Max 8 per call — for more, call it again in batches, and prefer spawning only \
 as many as the work genuinely needs.\n\
+TERMINALS — Mulpex also hosts plain interactive shell terminals in this project, shown in its \
+sidebar next to the instances, and you can both create and drive them:\n\
+- mcp__mulpex__hub_terminal_open — open a NEW terminal, optionally starting a command in it. It \
+keeps running after the command finishes, so you can reuse it.\n\
+- mcp__mulpex__hub_terminal_send — type into a terminal: run a command, answer a prompt the \
+command asked, or send a control key (e.g. Ctrl-C to interrupt).\n\
+- mcp__mulpex__hub_terminal_read — read a terminal's output. Each read returns only what is NEW \
+since YOUR last read of it, so you can follow a long command without re-reading everything; it \
+can also wait for new output, and it tells you when a command you sent has finished and with \
+what exit code.\n\
+- mcp__mulpex__hub_terminal_close — close a terminal you no longer need. Do not close one the \
+user opened themselves without being asked to.\n\
+WHEN TO USE A TERMINAL instead of your own Bash tool: your Bash tool is request/response and \
+cannot hold a process, so use a terminal for anything LONG-RUNNING or INTERACTIVE — a dev \
+server, a watcher, `tail -f`, a REPL or database shell, a build you want to keep an eye on while \
+you do other work, or a command that will ask questions partway through. For a quick one-shot \
+command that returns promptly, just use Bash; opening a terminal for that is slower and clutters \
+the user's sidebar. Terminals are SHARED: the user opens their own with ⌘⇧T and your peer \
+instances can open theirs, and any of you can read or drive any of them — so a terminal is also \
+how you inspect a dev server the user started. They are listed by mcp__mulpex__hub_instances. \
+Terminals are NOT instances: they are shells, not agents, so never hub_send to a terminal id.\n\
 IMPORTANT — file locks are AUTOMATIC and you do not manage them: while another instance is \
 editing a file, your edit to it simply WAITS and then goes through on its own as soon as they \
 finish (their lock releases when their turn ends). So just make your edit normally — if it \
@@ -109,6 +144,64 @@ pub struct SpawnTask {
     pub parent_id: usize,
     pub task: String,
 }
+
+/// What is running on a session's PTY. The two kinds share every mechanism that
+/// keys off `(project, id)` — attach, input, resize, close, process-group
+/// teardown — and differ only in what gets launched and what the hub knows about
+/// it (a terminal is a shell, not an agent: it is never a messageable peer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionKind {
+    Claude,
+    Shell,
+}
+
+/// Everything kind-specific about a spawn, so `Session::spawn` takes one
+/// argument instead of a growing tail of claude-only ones.
+pub enum SpawnSpec<'a> {
+    Claude {
+        settings_path: &'a Path,
+        state_dir: &'a Path,
+        session_id: &'a str,
+        /// Reopen an existing session id rather than creating it.
+        resume: bool,
+        initial_task: Option<SpawnTask>,
+    },
+    Shell {
+        state_dir: &'a Path,
+        /// A command line to type in once the shell's prompt appears.
+        seed: Option<String>,
+    },
+}
+
+impl SpawnSpec<'_> {
+    fn kind(&self) -> SessionKind {
+        match self {
+            SpawnSpec::Claude { .. } => SessionKind::Claude,
+            SpawnSpec::Shell { .. } => SessionKind::Shell,
+        }
+    }
+}
+
+/// Where a shell terminal's plain-text transcript lives, inside the project's
+/// scratch dir. Both names contain a `.`, so they can never be mistaken for the
+/// bare-integer status files the hub scans for.
+pub fn terminal_log_path(state_dir: &Path, id: usize) -> PathBuf {
+    state_dir.join("terminals").join(format!("{id}.log"))
+}
+
+pub fn terminal_screen_path(state_dir: &Path, id: usize) -> PathBuf {
+    state_dir.join("terminals").join(format!("{id}.screen"))
+}
+
+/// How long to wait for a shell to paint its prompt before typing a seeded
+/// command in anyway. Nothing like `claude`'s cold start — a shell is up in
+/// milliseconds — so this is a backstop, not the expected path.
+const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the recorder publishes an unchanged-but-unpublished screen. The
+/// PTY reader thread only runs when there is output, so without this the final
+/// chunk of a burst (typically the shell prompt itself) would sit unpublished.
+const RECORDER_SETTLE: Duration = Duration::from_millis(200);
 
 /// The one-shot task prompt injected into a `hub_spawn` child's PTY once `claude`
 /// is up: its assignment plus a report-back-to-spawner instruction. Returns `None`
@@ -223,38 +316,44 @@ impl OutputSink {
     }
 }
 
-/// A live `claude` process on a PTY, streaming to one frontend terminal.
+/// A live `claude` or shell process on a PTY, streaming to one frontend terminal.
 pub struct Session {
     pub id: usize,
     pub session_id: String,
+    pub kind: SessionKind,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     alive: Arc<AtomicBool>,
     sink: Arc<OutputSink>,
+    /// Plain-text transcript on disk. Shell sessions only — it exists so a
+    /// claude in another process can read this terminal's output.
+    recorder: Option<Arc<Mutex<Recorder>>>,
+    /// The child's pid, captured at spawn so teardown still has it once the
+    /// process has gone.
+    child_pid: Option<libc::pid_t>,
+    /// Device number of this session's controlling terminal, latched once the
+    /// child is definitely up. `killpg` alone is not enough to tear a session
+    /// down — see `kill`.
+    tty_dev: Arc<AtomicU32>,
     rows: u16,
     cols: u16,
 }
 
 impl Session {
-    /// Spawn `claude` in `dir` on a PTY of `rows`x`cols`. Mirrors the old
-    /// `TermSession::spawn` invocation (flags/env), only the reader thread now
-    /// streams raw bytes to an `OutputSink` instead of a vt100 parser. `resume`
-    /// reopens an existing session id vs. creating it.
-    #[allow(clippy::too_many_arguments)]
+    /// Spawn `claude` or a shell in `dir` on a PTY of `rows`x`cols`. The reader
+    /// thread streams raw bytes to an `OutputSink` (and, for a shell, into a
+    /// `Recorder`); it never emulates the terminal — xterm.js does that.
     pub fn spawn(
         id: usize,
         dir: &Path,
         rows: u16,
         cols: u16,
-        settings_path: &Path,
-        state_dir: &Path,
-        session_id: &str,
-        resume: bool,
-        initial_task: Option<SpawnTask>,
+        spec: SpawnSpec,
     ) -> anyhow::Result<Self> {
         let rows = rows.max(1);
         let cols = cols.max(1);
+        let kind = spec.kind();
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(PtySize {
@@ -264,44 +363,92 @@ impl Session {
             pixel_height: 0,
         })?;
 
-        let mut cmd = claude_command()?;
-        cmd.arg("--dangerously-skip-permissions");
-        if resume {
-            cmd.arg("--resume");
-        } else {
-            cmd.arg("--session-id");
-        }
-        cmd.arg(session_id);
-        cmd.arg("--settings");
-        cmd.arg(settings_path);
-        cmd.arg("--mcp-config");
-        cmd.arg(state_dir.join("mcp.json"));
-        cmd.arg("--append-system-prompt");
-        cmd.arg(format!("{HUB_RULES}\n{PLANNING_RULES}"));
-        // Each mulpex-spawned `claude` is a genuine TOP-LEVEL session (Mulpex owns
-        // its `--session-id`), not a sub-session. If Mulpex itself was launched
-        // from inside another Claude Code session, that parent's
-        // `CLAUDE_CODE_CHILD_SESSION` marker would be inherited and Claude would
-        // disable transcript saving — which silently breaks our `--resume`
-        // persistence. Strip the inherited child markers so persistence always works.
-        cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
-        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
-        cmd.env("IS_SANDBOX", "1");
-        cmd.env("MULPEX_INSTANCE_ID", id.to_string());
-        cmd.env("MULPEX_STATE_DIR", state_dir);
-        cmd.env(
-            "MULPEX_PROJECT_DIR",
-            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
-        );
+        // One match resolves everything kind-specific: the command to run, the
+        // scratch dir, and the optional first thing to type in. Everything after
+        // this point is kind-agnostic.
+        let (mut cmd, state_dir, session_id, initial_task, seed) = match spec {
+            SpawnSpec::Claude {
+                settings_path,
+                state_dir,
+                session_id,
+                resume,
+                initial_task,
+            } => {
+                let mut cmd = claude_command()?;
+                cmd.arg("--dangerously-skip-permissions");
+                if resume {
+                    cmd.arg("--resume");
+                } else {
+                    cmd.arg("--session-id");
+                }
+                cmd.arg(session_id);
+                cmd.arg("--settings");
+                cmd.arg(settings_path);
+                cmd.arg("--mcp-config");
+                cmd.arg(state_dir.join("mcp.json"));
+                cmd.arg("--append-system-prompt");
+                cmd.arg(format!("{HUB_RULES}\n{PLANNING_RULES}"));
+                // Each mulpex-spawned `claude` is a genuine TOP-LEVEL session
+                // (Mulpex owns its `--session-id`), not a sub-session. If Mulpex
+                // itself was launched from inside another Claude Code session,
+                // that parent's `CLAUDE_CODE_CHILD_SESSION` marker would be
+                // inherited and Claude would disable transcript saving — which
+                // silently breaks our `--resume` persistence. Strip the inherited
+                // child markers so persistence always works.
+                cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
+                cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+                cmd.env("IS_SANDBOX", "1");
+                cmd.env("MULPEX_INSTANCE_ID", id.to_string());
+                cmd.env("MULPEX_STATE_DIR", state_dir);
+                cmd.env(
+                    "MULPEX_PROJECT_DIR",
+                    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+                );
+                (
+                    cmd,
+                    state_dir.to_path_buf(),
+                    session_id.to_string(),
+                    initial_task,
+                    None,
+                )
+            }
+            SpawnSpec::Shell { state_dir, seed } => (
+                shell_command()?,
+                state_dir.to_path_buf(),
+                // A terminal has no Claude session id, and nothing resumes it.
+                String::new(),
+                None,
+                seed.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            ),
+        };
         cmd.cwd(dir);
 
+        // A shell's transcript. Built before the child so the file exists the
+        // moment the terminal does — a read that races the first output should
+        // return "nothing yet", not a missing-file error.
+        let recorder = match kind {
+            SessionKind::Claude => None,
+            SessionKind::Shell => Some(Arc::new(Mutex::new(Recorder::new(
+                terminal_log_path(&state_dir, id),
+                terminal_screen_path(&state_dir, id),
+                rows,
+                cols,
+            )?))),
+        };
+
         let child = pair.slave.spawn_command(cmd)?;
+        let child_pid = child.process_id().map(|p| p as libc::pid_t);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let master = pair.master;
 
         let sink = Arc::new(OutputSink::new());
         let alive = Arc::new(AtomicBool::new(true));
+        // Latched by the reader thread on first output. It can't be read here:
+        // `spawn_command` has returned from the fork, but the child sets its
+        // controlling terminal in the forked half and may not have got there
+        // yet. First output is proof it has.
+        let tty_dev = Arc::new(AtomicU32::new(0));
         // Readiness signals for the one-shot hub-listener bootstrap: the reader
         // thread marks when `claude` first paints (`saw_output`) and when it last
         // emitted (`last_activity`), so the injector can wait until the initial UI
@@ -321,6 +468,8 @@ impl Session {
             let saw_output = Arc::clone(&saw_output);
             let last_activity = Arc::clone(&last_activity);
             let out_tail = out_tail.clone();
+            let recorder = recorder.clone();
+            let tty_dev = Arc::clone(&tty_dev);
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -328,9 +477,22 @@ impl Session {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             sink.push(&buf[..n]);
+                            if tty_dev.load(Ordering::Relaxed) == 0 {
+                                // The child has painted, so it definitely owns
+                                // the tty by now. Latched here so teardown still
+                                // knows the device after the child is gone.
+                                if let Some(dev) = child_pid.and_then(tty_dev_of) {
+                                    tty_dev.store(dev, Ordering::Relaxed);
+                                }
+                            }
                             saw_output.store(true, Ordering::Relaxed);
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
+                            }
+                            if let Some(rec) = &recorder {
+                                if let Ok(mut r) = rec.lock() {
+                                    r.push(&buf[..n]);
+                                }
                             }
                             if let Some(tail) = &out_tail {
                                 if let Ok(mut t) = tail.lock() {
@@ -344,7 +506,65 @@ impl Session {
                         }
                     }
                 }
+                // EOF on the master is the process's death certificate. Note we
+                // deliberately do NOT `wait()` the child here: leaving it a zombie
+                // keeps its pid unrecyclable, which is what makes the `killpg` in
+                // `Drop`/`teardown_all` safe for a terminal that may sit in the
+                // list for a long time after exiting.
+                if let Some(rec) = &recorder {
+                    if let Ok(mut r) = rec.lock() {
+                        r.finish();
+                    }
+                }
                 alive.store(false, Ordering::Relaxed);
+            });
+        }
+
+        // Publish the recorder's pending state on a timer. The reader thread only
+        // runs when there is output, so the last chunk of a burst — usually the
+        // shell prompt itself — would otherwise stay unpublished indefinitely.
+        if let Some(rec) = &recorder {
+            let rec = Arc::clone(rec);
+            let alive = Arc::clone(&alive);
+            thread::spawn(move || {
+                while alive.load(Ordering::Relaxed) {
+                    thread::sleep(RECORDER_SETTLE);
+                    if let Ok(mut r) = rec.lock() {
+                        r.settle();
+                    }
+                }
+            });
+        }
+
+        // A seeded terminal (`hub_terminal_open` with a command): type the command
+        // once the shell has printed its prompt. Unlike `claude`, a shell has no
+        // TUI to be "not listening yet" — waiting for first output plus a short
+        // settle is enough, and the tty's own input buffer covers the rest.
+        if let Some(seed) = seed {
+            let writer = Arc::clone(&writer);
+            let alive = Arc::clone(&alive);
+            let saw_output = Arc::clone(&saw_output);
+            let last_activity = Arc::clone(&last_activity);
+            thread::spawn(move || {
+                let start = Instant::now();
+                loop {
+                    thread::sleep(Duration::from_millis(80));
+                    if !alive.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let quiet = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
+                    if saw_output.load(Ordering::Relaxed) && quiet >= Duration::from_millis(150) {
+                        break;
+                    }
+                    if start.elapsed() >= SHELL_READY_TIMEOUT {
+                        break;
+                    }
+                }
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.write_all(seed.as_bytes());
+                    let _ = w.write_all(b"\r");
+                    let _ = w.flush();
+                }
             });
         }
 
@@ -448,12 +668,16 @@ impl Session {
 
         Ok(Self {
             id,
-            session_id: session_id.to_string(),
+            session_id,
+            kind,
             writer,
             master,
             child,
             alive,
             sink,
+            recorder,
+            child_pid,
+            tty_dev,
             rows,
             cols,
         })
@@ -473,7 +697,7 @@ impl Session {
         }
     }
 
-    /// Resize the PTY so Claude re-lays-out. No-op if unchanged.
+    /// Resize the PTY so the child re-lays-out. No-op if unchanged.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -488,15 +712,119 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
+        // The recorder's grid has to track the child's idea of the screen, or
+        // cursor-addressed redraws land on the wrong rows.
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.lock() {
+                r.resize(rows, cols);
+            }
+        }
+    }
+
+    pub fn is_shell(&self) -> bool {
+        self.kind == SessionKind::Shell
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// Kill the whole process group (see `Drop`) explicitly, for deterministic
-    /// teardown on app quit before the scratch dir is removed.
+    /// Write a line of Mulpex's own text into this session's pane.
+    ///
+    /// The pane is an xterm fed only by the PTY, so text the *app* wants to say
+    /// about a session has nowhere else to appear — and the one moment it has
+    /// something worth saying is when the child died before it was ever usable.
+    /// Routing it through the same sink means it lands after whatever the child
+    /// printed on its way out (an error of its own, usually) rather than
+    /// replacing it, and it works whether the frontend has attached yet or not:
+    /// a session that dies during startup restore does so long before its xterm
+    /// exists, and `Buffering` holds the notice until `attach_session` flushes.
+    pub fn notice(&self, text: &str) {
+        // CRLF, not LF: the PTY is in raw mode, so a bare newline moves down a
+        // row without returning to column 0 and the next line starts staircased
+        // under the end of this one.
+        self.sink.push(format!("\r\n{text}\r\n").as_bytes());
+    }
+}
+
+/// Why `dir` cannot be used as a working directory, in words for the user — or
+/// `None` if it is usable.
+///
+/// This exists because of a failure with no other symptom. macOS TCC protects
+/// `~/Documents`, `~/Desktop` and `~/Downloads`, and a bundle only gets in once
+/// the user allows it; a denial is recorded per bundle id and **never asked
+/// about again**. Mulpex still spawns `claude` with `cwd` set to the project,
+/// and the child then cannot even resolve its own directory:
+///
+/// ```text
+/// getcwd: cannot access parent directories: Operation not permitted
+/// ```
+///
+/// `claude` exits 1 within the same second, so the pane shows an error for
+/// roughly 100 ms and the session is gone — indistinguishable from "Claude
+/// refuses to start". Every project under `~/Documents` fails at once, which is
+/// most people's entire project list. Reading the directory is the same
+/// permission the child needs, so asking here answers the question before the
+/// spawn instead of after it.
+///
+/// Deliberately *not* called on the restore path: a blocked restore should still
+/// produce a session row that says why (see `Core::reap_dead`), whereas ⌘T can
+/// refuse up front and say so immediately.
+pub fn dir_access_error(dir: &Path) -> Option<String> {
+    match std::fs::read_dir(dir) {
+        Ok(_) => None,
+        Err(e) => Some(match e.kind() {
+            std::io::ErrorKind::PermissionDenied => format!(
+                "macOS is blocking access to {}.\n\
+                 Open System Settings ▸ Privacy & Security ▸ Files and Folders, \
+                 find Mulpex, and turn on the folder this project lives in \
+                 (or grant Full Disk Access), then try again.",
+                dir.display()
+            ),
+            std::io::ErrorKind::NotFound => {
+                format!("{} no longer exists.", dir.display())
+            }
+            _ => format!("{} cannot be opened: {e}", dir.display()),
+        }),
+    }
+}
+
+impl Session {
+
+    /// Tear the session down: everything attached to its terminal, then its
+    /// process group, then the direct child (reaped, so nothing is left
+    /// `<defunct>`). Called explicitly for deterministic teardown on app quit
+    /// before the scratch dir is removed, and again from `Drop`.
+    ///
+    /// **`killpg` alone is not enough, and the gap is only visible with a
+    /// shell.** A `claude` is a node process and does no job control, so
+    /// everything its Bash tool spawns inherits its process group and one
+    /// `killpg` reaches the lot. An interactive shell *does* do job control and
+    /// puts every job in its own process group, which `killpg(shell_pgid)`
+    /// cannot reach. A foreground job still dies — dropping the master hangs up
+    /// the tty's foreground group — but a backgrounded `cmd &` is in neither,
+    /// and measured, it survived both the close and app quit. Giving the shell a
+    /// grace period after SIGHUP so it could hup its own jobs does not fix it
+    /// (measured at 150 ms and 400 ms).
+    ///
+    /// So the sweep is by **controlling terminal**: every process still attached
+    /// to this session's tty, which is exactly its descendants and nothing else,
+    /// since the device is ours for as long as the master is open. That is also
+    /// what a terminal emulator does when you close a tab with jobs running.
     pub fn kill(&mut self) {
+        // Ours only while `self.master` is still open — which it is, since Drop
+        // runs this before dropping the fields. Once the device is released the
+        // kernel can hand the same number to someone else's pty.
+        let dev = self.tty_dev.load(Ordering::Relaxed);
+        let dev = if dev != 0 {
+            Some(dev)
+        } else {
+            self.child_pid.and_then(tty_dev_of)
+        };
+        if let Some(dev) = dev {
+            kill_tty_session(dev);
+        }
+
         if let Some(pid) = self.child.process_id() {
             let pgid = pid as libc::pid_t;
             unsafe {
@@ -508,6 +836,87 @@ impl Session {
         let _ = self.child.wait();
     }
 }
+
+/// The device number of `pid`'s controlling terminal, or `None` if it has none
+/// (or is gone). Still readable while the process is a zombie.
+#[cfg(target_os = "macos")]
+fn tty_dev_of(pid: libc::pid_t) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // NODEV is -1; 0 means "no controlling terminal".
+    if n == size && info.e_tdev != u32::MAX && info.e_tdev != 0 {
+        Some(info.e_tdev)
+    } else {
+        None
+    }
+}
+
+/// SIGKILL every process whose controlling terminal is `dev`.
+///
+/// Deliberately excludes this process: Mulpex launched from a terminal has a
+/// controlling tty of its own, and while that can never be one of our PTYs, the
+/// check costs nothing and makes the blast radius obvious.
+#[cfg(target_os = "macos")]
+fn kill_tty_session(dev: u32) {
+    let me = std::process::id() as libc::pid_t;
+    for pid in all_pids() {
+        if pid <= 0 || pid == me {
+            continue;
+        }
+        if tty_dev_of(pid) == Some(dev) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// `PROC_ALL_PIDS` from `<sys/proc_info.h>`; the `libc` crate exposes
+/// `proc_listpids` but not this constant.
+#[cfg(target_os = "macos")]
+const PROC_ALL_PIDS: u32 = 1;
+
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<libc::pid_t> {
+    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    let slot = std::mem::size_of::<libc::pid_t>() as libc::c_int;
+    // Headroom: processes can appear between sizing the buffer and filling it.
+    let cap = (bytes / slot) as usize + 64;
+    let mut pids = vec![0 as libc::pid_t; cap];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (cap * slot as usize) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    pids.truncate((bytes / slot) as usize);
+    pids
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tty_dev_of(_pid: libc::pid_t) -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kill_tty_session(_dev: u32) {}
 
 impl Drop for Session {
     fn drop(&mut self) {
@@ -537,6 +946,16 @@ fn claude_command() -> anyhow::Result<CommandBuilder> {
         )
     })?;
     let mut cmd = CommandBuilder::new(bin);
+    base_env(&mut cmd);
+    Ok(cmd)
+}
+
+/// The environment every PTY child needs, whichever program it is.
+fn base_env(cmd: &mut CommandBuilder) {
+    // A Finder-launched bundle inherits only LaunchServices' bare PATH, which
+    // omits `~/.local/bin`, Homebrew and every version manager. The child's own
+    // tools (`node`, `git`, whatever the user types in a shell) resolve through
+    // this, so it has to be the reconstructed one.
     cmd.env("PATH", claude_bin::merged_path());
 
     // The child talks to **xterm.js**, not to whatever terminal (if any) started
@@ -553,7 +972,36 @@ fn claude_command() -> anyhow::Result<CommandBuilder> {
     if std::env::var_os("LANG").is_none() {
         cmd.env("LANG", "en_US.UTF-8");
     }
+}
 
+/// The user's login shell, for a terminal session.
+///
+/// Deliberately not routed through `claude_command()`: that resolves the Claude
+/// CLI and *errors* when it's missing, and a plain terminal must not fail to
+/// open because `claude` isn't installed.
+fn shell_command() -> anyhow::Result<CommandBuilder> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        // A Finder-launched bundle has no SHELL either; same fallback the PATH
+        // probe uses.
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut cmd = CommandBuilder::new(&shell);
+    // `-l` alone is login-but-not-interactive: zsh would skip `.zshrc`, print no
+    // prompt, and treat the PTY as a script. Both flags are required.
+    cmd.arg("-l");
+    cmd.arg("-i");
+    base_env(&mut cmd);
+
+    // A terminal must NOT inherit a hub identity. `portable_pty` passes the
+    // parent environment through, so if Mulpex was itself launched from inside a
+    // Mulpex claude (the same scenario the `CLAUDE_CODE_CHILD_SESSION` removal
+    // above defends against), a `claude` the user then typed into this terminal
+    // would write status files under a *terminal's* id and corrupt the hub.
+    cmd.env_remove("MULPEX_INSTANCE_ID");
+    cmd.env_remove("MULPEX_STATE_DIR");
+    cmd.env_remove("MULPEX_PROJECT_DIR");
+    cmd.env_remove("IS_SANDBOX");
     Ok(cmd)
 }
 
@@ -581,4 +1029,65 @@ fn b64encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The preflight must actually recognise an unreadable directory, and say
+    /// something the user can act on.
+    ///
+    /// Driven against a real `chmod 000` directory rather than a mocked error,
+    /// because the whole point is the errno the filesystem really returns. This
+    /// is the same `PermissionDenied` macOS raises for a TCC-protected folder
+    /// the app has not been allowed into — the case that made every `claude`
+    /// exit 1 in under a second with nothing left on screen to explain it.
+    #[test]
+    fn an_unreadable_directory_is_reported_before_anything_is_spawned() {
+        let dir = std::env::temp_dir().join(format!("mulpex-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Readable: nothing to report, so a spawn goes ahead as normal.
+        assert!(
+            dir_access_error(&dir).is_none(),
+            "a perfectly good directory was reported as unusable"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let reason = dir_access_error(&dir);
+        // Root ignores the mode bits, so the denial cannot be staged there. Only
+        // that one case is excused — otherwise this must genuinely fire, or the
+        // test would pass without ever exercising the path it exists for.
+        // SAFETY: `geteuid` is a plain read of the calling process's euid.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if !is_root {
+            let reason = reason.expect("an unreadable directory was reported as usable");
+            assert!(
+                reason.contains("blocking access") && reason.contains("Privacy & Security"),
+                "the reason gives the user nothing to do about it: {reason}"
+            );
+            assert!(
+                reason.contains(&dir.display().to_string()),
+                "the reason does not say which folder: {reason}"
+            );
+        }
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that is simply gone must not be reported as a permission
+    /// problem — that would send the user into Settings to fix nothing.
+    #[test]
+    fn a_missing_directory_is_reported_as_missing() {
+        let dir = std::env::temp_dir().join("mulpex-definitely-not-here-8d3f1a");
+        let _ = std::fs::remove_dir_all(&dir);
+        let reason = dir_access_error(&dir).expect("a missing directory is not usable");
+        assert!(
+            reason.contains("no longer exists"),
+            "a missing directory was misreported: {reason}"
+        );
+    }
 }

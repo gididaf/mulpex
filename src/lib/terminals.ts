@@ -21,6 +21,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Channel, attachSession, sendBytes, resizeSession } from "./ipc";
+import type { SessionKind } from "./ipc";
 
 const THEME: ITheme = {
   background: "#0d0d0f",
@@ -80,8 +81,16 @@ class TerminalManager {
     return this.entries.has(keyOf(handle, id));
   }
 
-  /** Create the xterm for (handle, id) inside `container` and bind its PTY stream. */
-  create(handle: number, id: number, container: HTMLElement): void {
+  /** Create the xterm for (handle, id) inside `container` and bind its PTY stream.
+   *  `kind` gates only the Shift+Enter carve-out below — everything else is one
+   *  code path for both kinds, deliberately (the DOM-renderer / no-WebGL rule
+   *  that makes RTL work is not a Claude-specific concern). */
+  create(
+    handle: number,
+    id: number,
+    container: HTMLElement,
+    kind: SessionKind = "claude",
+  ): void {
     const key = keyOf(handle, id);
     if (this.entries.has(key)) return;
 
@@ -122,18 +131,24 @@ class TerminalManager {
     // That extra `\r` was the actual bug: our newline byte arrived, and Claude
     // then got a submit right behind it. Cancelling the event suppresses the
     // keypress entirely; the `keypress` arm below is a second line of defence.
+    //
+    // Claude sessions only. In a shell, Shift+Enter has no "insert a newline in
+    // my multi-line composer" meaning to rescue — ESC+CR there is meta-Return,
+    // which bash/zsh bind to something else entirely.
     const isNewlineKey = (e: KeyboardEvent): boolean =>
       e.key === "Enter" && (e.shiftKey || e.altKey);
-    term.attachCustomKeyEventHandler((e) => {
-      if (e.type === "keydown" && isNewlineKey(e)) {
-        e.preventDefault();
-        e.stopPropagation();
-        sendBytes(handle, id, new Uint8Array([0x1b, 0x0d]));
-        return false;
-      }
-      if (e.type === "keypress" && isNewlineKey(e)) return false;
-      return true;
-    });
+    if (kind === "claude") {
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === "keydown" && isNewlineKey(e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          sendBytes(handle, id, new Uint8Array([0x1b, 0x0d]));
+          return false;
+        }
+        if (e.type === "keypress" && isNewlineKey(e)) return false;
+        return true;
+      });
+    }
 
     // PTY output arrives base64-chunked over this session's channel.
     const channel = new Channel<string>();
@@ -143,6 +158,19 @@ class TerminalManager {
     const entry: Entry = { handle, id, term, fit, container };
     this.entries.set(key, entry);
     container.style.visibility = key === this.activeKey ? "visible" : "hidden";
+  }
+
+  /** An exited terminal stays visible and scrollable but stops accepting input.
+   *  Without this, typing into a dead shell is a silent no-op: the write lands
+   *  on a master with no slave, the EIO is swallowed backend-side, and nothing
+   *  tells the user why their keystrokes vanish. */
+  setExited(handle: number, id: number, exited: boolean): void {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return;
+    if (e.term.options.disableStdin !== exited) {
+      e.term.options.disableStdin = exited;
+      e.term.options.cursorBlink = !exited;
+    }
   }
 
   dispose(handle: number, id: number): void {

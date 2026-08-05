@@ -34,7 +34,17 @@ impl Status {
     }
 }
 
-/// One instance as the sidebar shows it.
+/// What a session runs. Terminals share the session list, the id space and every
+/// `(project, id)`-keyed mechanism with instances; they differ in what the hub
+/// knows about them (nothing) and how the sidebar draws them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    Claude,
+    Shell,
+}
+
+/// One session as the sidebar shows it.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct SessionInfo {
     pub id: usize,
@@ -44,6 +54,22 @@ pub struct SessionInfo {
     /// and drops it from every attention badge. Purely presentational — the
     /// instance keeps running and stays a full hub peer.
     pub muted: bool,
+    pub kind: SessionKind,
+    /// A terminal whose shell has exited. Unlike a dead instance it is *kept*,
+    /// so its output stays readable until it's explicitly closed — otherwise a
+    /// command's output would vanish the moment the command finished. Always
+    /// false for a Claude session, which is removed the instant it dies.
+    pub exited: bool,
+    /// Why this instance never started, if it didn't — it died within
+    /// `EARLY_DEATH_GRACE` of spawning. Such a row is kept rather than reaped,
+    /// so the reason survives on screen; without it the session appeared and
+    /// vanished in about 100 ms, telling the user nothing.
+    ///
+    /// The sidebar must key its status readout off this, because a failed
+    /// instance is deliberately absent from `statuses` and would otherwise fall
+    /// back to the unknown-id default and paint a green "ready" dot on a
+    /// session that is dead.
+    pub failed: Option<String>,
 }
 
 /// A locked file → holder, for the hub panel's Locks view.

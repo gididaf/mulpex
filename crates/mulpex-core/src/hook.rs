@@ -597,6 +597,9 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     if !listener_armed(ctx) {
         parts.push(ARM_LISTENER_NUDGE.to_string());
     }
+    if !instance_named(ctx) {
+        parts.push(AUTO_NAME_NUDGE.to_string());
+    }
     if let Some(context) = crate::mcp::peers_context(ctx) {
         parts.push(context);
     }
@@ -634,6 +637,32 @@ is armed.)";
 /// old Monitor) means the flag is absent at startup, so restored instances re-arm.
 fn listener_armed(ctx: &Ctx) -> bool {
     ctx.state_dir.join("armed").join(ctx.id_str()).exists()
+}
+
+/// Hidden reminder injected each turn until this instance has named its own
+/// sidebar row (`mcp__mulpex__hub_set_name`, which writes the `named/<id>` flag
+/// `instance_named` reads). Same self-healing shape as `ARM_LISTENER_NUDGE`.
+///
+/// Without a name a row falls back to showing the captured prompt, which is the
+/// user's *last request* verbatim — long, and wrong the moment the session moves
+/// on. Deliberately permission to *defer*: a first turn of "hi" or "what does
+/// this crate do?" has nothing to name a session after, and being re-asked next
+/// turn is cheaper than a row labelled after a throwaway question.
+const AUTO_NAME_NUDGE: &str = "[Mulpex hub] This instance has no sidebar name yet. As part of \
+THIS turn — quietly, in the background — call mcp__mulpex__hub_set_name with a short label for \
+the work you're starting: 2-5 words, in the same language I write to you in, naming the TASK (not \
+you, not the tool). Do not narrate it beyond a brief mention, and do not make it your whole \
+response; just name it and continue with what I actually asked. If this turn doesn't yet make \
+clear what the session is about, skip it — you'll be reminded next turn. (You'll see this \
+reminder only until the instance is named.)";
+
+/// Whether this instance has a sidebar name, i.e. `named/<id>` exists. The flag
+/// is written by `hub_set_name` (this instance naming itself), and by Mulpex when
+/// the *user* renames the row (⌘R) or when a restored session comes back with a
+/// name — so a name the user chose is never nudged over. A fresh `state_dir` per
+/// launch is why the restore case has to seed it explicitly, unlike `armed`.
+fn instance_named(ctx: &Ctx) -> bool {
+    crate::named_flag_path(&ctx.state_dir, ctx.instance).exists()
 }
 
 /// Emit a PreToolUse deny naming the holder (and what they're working on, when

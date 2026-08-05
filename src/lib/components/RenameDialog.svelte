@@ -7,6 +7,13 @@
   let value = $state(get(rename)?.value ?? "");
   let inputEl: HTMLInputElement | undefined = $state();
 
+  const subject = $derived.by(() => {
+    const r = $rename;
+    if (!r) return "";
+    const s = $projects.get(r.handle)?.sessions.find((x) => x.id === r.id);
+    return `${s?.kind === "shell" ? "term" : "claude"} #${r.id}`;
+  });
+
   $effect(() => {
     inputEl?.focus();
     inputEl?.select();
@@ -60,7 +67,7 @@
     onclick={(e) => e.stopPropagation()}
     onkeydown={() => {}}
   >
-    <div class="label">Rename claude #{$rename?.id}</div>
+    <div class="label">Rename {subject}</div>
     <input
       bind:this={inputEl}
       bind:value

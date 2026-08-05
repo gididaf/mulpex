@@ -57,6 +57,44 @@ export function displayOrder(list: SessionInfo[]): SessionInfo[] {
   return [...list].sort((a, b) => Number(a.muted) - Number(b.muted));
 }
 
+/**
+ * The slot a dragged sidebar row can actually land in: `to`, clamped to the
+ * dragged row's own group (the unmuted block, or the muted block below it).
+ *
+ * `list` is the *displayed* order — i.e. already through `displayOrder`.
+ *
+ * This exists because manual order and muted-sinking are composed, not
+ * alternatives: `displayOrder` runs on top of the arrangement a drag commits, so
+ * a drop across the mute boundary could never stick — the row would visibly snap
+ * back on release. Clamping keeps the drop indicator honest, and keeps the order
+ * `dragOrder` emits already-grouped (so re-applying `displayOrder` to it is the
+ * identity, and the frontend's optimistic repaint matches what the backend
+ * echoes back).
+ */
+export function clampToGroup(
+  list: SessionInfo[],
+  from: number,
+  to: number,
+): number {
+  const firstMuted = list.findIndex((s) => s.muted);
+  if (firstMuted < 0) return to; // nothing muted: the whole list is one group
+  return list[from]?.muted
+    ? Math.max(to, firstMuted)
+    : Math.min(to, firstMuted - 1);
+}
+
+/** The new top-to-bottom id order after dragging row `from` onto slot `to`. */
+export function dragOrder(
+  list: SessionInfo[],
+  from: number,
+  to: number,
+): number[] {
+  const ids = list.map((s) => s.id);
+  const [id] = ids.splice(from, 1);
+  ids.splice(clampToGroup(list, from, to), 0, id);
+  return ids;
+}
+
 /** Ids muted in this project — the set every badge count subtracts. */
 function mutedIds(p: ProjectState): Set<number> {
   return new Set(p.sessions.filter((s) => s.muted).map((s) => s.id));
@@ -201,6 +239,36 @@ export function setSessionsFor(
   sessions: SessionInfo[],
 ): void {
   patchProject(handle, { sessions });
+}
+
+/**
+ * Rearrange one project's sessions to `ids` (the sidebar's new top-to-bottom
+ * order after a drag), for an immediate repaint ahead of the backend's own
+ * reorder + `sessions-changed` echo.
+ *
+ * `p.sessions` is the *base* order; the sidebar shows `displayOrder(p.sessions)`,
+ * which sinks muted rows. `InstanceList` only ever emits an already-grouped
+ * order (drops are clamped inside a group), so re-applying `displayOrder` to
+ * what it sends is the identity and the two stay consistent.
+ *
+ * Ids missing from `ids` are appended in their existing order rather than
+ * dropped, so a stale caller can't make a session vanish — same contract as
+ * `reorderProjects`.
+ */
+export function reorderSessions(handle: ProjectHandle, ids: number[]): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  const seen = new Set<number>();
+  const next: SessionInfo[] = [];
+  for (const id of ids) {
+    const s = p.sessions.find((x) => x.id === id);
+    if (s && !seen.has(id)) {
+      seen.add(id);
+      next.push(s);
+    }
+  }
+  for (const s of p.sessions) if (!seen.has(s.id)) next.push(s);
+  patchProject(handle, { sessions: next });
 }
 
 /** Flip one session's muted flag locally (the backend persists it separately;

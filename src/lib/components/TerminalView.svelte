@@ -1,15 +1,31 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { terminals } from "../terminals";
+  import type { SessionKind } from "../ipc";
 
-  let { handle, id }: { handle: number; id: number } = $props();
+  let {
+    handle,
+    id,
+    kind,
+    exited,
+  }: {
+    handle: number;
+    id: number;
+    kind: SessionKind;
+    exited: boolean;
+  } = $props();
   let el: HTMLDivElement;
 
   onMount(() => {
-    terminals.create(handle, id, el);
+    terminals.create(handle, id, el, kind);
   });
   onDestroy(() => {
     terminals.dispose(handle, id);
+  });
+
+  // A terminal's shell can exit long after its xterm was created.
+  $effect(() => {
+    terminals.setExited(handle, id, exited);
   });
 </script>
 

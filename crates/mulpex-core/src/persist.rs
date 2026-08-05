@@ -57,6 +57,11 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    /// The file this store reads and writes.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Locate the store file for `project_dir`. The filename is a readable tail
     /// of the path plus a stable FNV-1a hash of the full path, so it is unique
     /// per project, bounded in length, and stable across Mulpex rebuilds.

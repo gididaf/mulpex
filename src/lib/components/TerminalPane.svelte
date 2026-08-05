@@ -11,7 +11,12 @@
   // is visible; the rest are visibility:hidden but keep rendering.
   const all = $derived(
     [...$projects.values()].flatMap((p) =>
-      p.sessions.map((s) => ({ handle: p.handle, id: s.id })),
+      p.sessions.map((s) => ({
+        handle: p.handle,
+        id: s.id,
+        kind: s.kind,
+        exited: s.exited,
+      })),
     ),
   );
   const activeEmpty = $derived(($activeProject?.sessions.length ?? 0) === 0);
@@ -27,10 +32,12 @@
 
 <div class="pane-inner" bind:this={paneEl}>
   {#each all as e (e.handle + " " + e.id)}
-    <TerminalView handle={e.handle} id={e.id} />
+    <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
   {/each}
   {#if activeEmpty}
-    <div class="empty">No active Claude — press ⌘T to start one</div>
+    <div class="empty">
+      Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
+    </div>
   {/if}
 </div>
 
