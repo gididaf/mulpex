@@ -989,8 +989,8 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   window unfocused *and* macOS notification permission granted for the bundle, and the injection
   fix is only meaningfully tested by a multi-child `hub_spawn` (the one-child case passed under
   the old code too — that's exactly why the bug shipped).
-- **Terminal sessions (unreleased).** Everything below the GUI is measured; the GUI itself is not
-  yet — see the gap at the end.
+- **Terminal sessions (shipped in v0.6.0).** Everything below the GUI is measured; the headline GUI
+  flows were driven too — see the two entries at the end.
   - **The grid, on real captured PTY bytes.** `cargo build` and `vite build` were recorded through
     a real pty at 32×120 (`TERM=xterm-256color`, the same shape a Mulpex terminal gives its child)
     and committed as fixtures. Replayed through `Screen`, cargo's **17** progress-bar repaints
@@ -1036,21 +1036,41 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   - `cargo test` (55: 33 app + 22 core) and `cargo clippy` clean — the only two clippy warnings are
     pre-existing (`hook.rs` needless-return, `persist.rs` items-after-test-module). No frontend
     change, so `svelte-check`/`vite build` were not re-run for the gap fixes.
-  - **Not verified:** anything requiring the real window — ⌘⇧T itself, the `term #N` row and its
-    `running`/`exited` readout, an instance-opened terminal appearing without stealing focus,
-    stdin going dead on an exited row, and RTL/colour inside a shell pane. The app has not been
-    rebuilt or relaunched (at the user's request), so treat all of that as unconfirmed. **The gap
-    fixes are in the same position**: they are measured through the helper binary, but the live
-    `/Applications/Mulpex.app` still runs the pre-fix helper until it is rebuilt.
-- **Session drag-to-reorder (unreleased).** The order math was driven through the **real
+  - **Driven in the real window (2026-08-05, v0.6.0 build).** ⌘⇧T opens a shell: the row renders
+    `$ term #N` with the `running` readout, the pane shows a real interactive prompt (zsh rc files
+    loaded, git branch in the prompt — proof of `-l -i`), and a typed `echo … && exit` leaves the
+    row **`exited` and still readable**, which is the whole point of keeping it. The app was
+    rebuilt and installed, so the gap fixes now run live too rather than only through the helper
+    binary.
+  - **Still not verified:** an instance-opened terminal appearing without stealing focus, stdin
+    going dead on an exited row, and RTL/colour inside a shell pane.
+- **Session drag-to-reorder (shipped in v0.6.0).** The order math was driven through the **real
   `stores.ts`** (transpiled, not re-implemented) — 27 assertions on `clampToGroup` / `dragOrder` /
   `displayOrder` / the `reorderSessions` mutator, including the invariant that every emitted order
   survives re-sorting by `displayOrder` unchanged, both clamp directions, and the never-drop
   contract. Backend: `reordering_sessions_keeps_focus_and_never_drops_one` against real sessions.
   `cargo test` (36: 34 pass, 2 pre-existing ignored) + `clippy` clean, `svelte-check` 120 files
-  0 errors, `vite build` clean. **Not verified:** the gesture itself — the app was deliberately not
-  rebuilt or relaunched, so the pointer/threshold/indicator behavior and the clamp *as felt* are
-  unconfirmed in a real window.
+  0 errors, `vite build` clean. **Not verified:** the gesture itself — the pointer/threshold/
+  indicator behavior and the clamp *as felt*. The v0.6.0 build is installed, so this can now simply
+  be driven; it just hasn't been.
+- **TCC / failed-start visibility (v0.6.0).** The diagnosis is in **macOS file access** above, with
+  the shim-captured `rc=1` and the `/private/tmp` control. The fixes were then driven in the real
+  window: a failed restore renders `⚠ claude #1 — failed to start` with `claude`'s own
+  `No conversation found with session ID: …` still on screen *above* Mulpex's explanation, and the
+  row is **kept** (the tab counts it) instead of vanishing; ⌘T on a `chmod 000` project refuses
+  before spawning, with the folder name and the Settings path in the notice. Backend: three tests,
+  two of them confirmed non-tautological by breaking the code — un-latching the failure mark fails
+  `a_kept_failed_instance_does_not_make_every_poll_do_work` on exactly its mtime assertion, which
+  is the "does work every 200 ms tick" regression this file already warns about. `dir_access_error`
+  is tested against a real `chmod 000` directory (only root is excused, so it cannot pass
+  vacuously).
+- **The v0.6.0 release artifact itself.** Signing was verified in the *published* tarball, not just
+  locally: re-fetched from GitHub, its SHA-256 matches the signed local build byte-for-byte, and
+  the `.app` inside reports `Identifier=com.mulpex.app`, `Sealed Resources version=2`, and passes
+  `codesign --verify --deep --strict` — where the published v0.5.0 fails all three. The same
+  artifact was installed and launched before publishing: it runs under the hardened runtime the
+  bundler adds (`flags=0x10002(adhoc,runtime)`), spawns `claude`, restores projects, and **kept its
+  TCC grant** across the swap.
 
 ## Auto-update
 
@@ -1068,8 +1088,11 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   the *downloading* app (a browser, via LaunchServices); the updater fetches over the app's own
   HTTP client, so nothing sets the xattr and the extracted bundle inherits none. Gatekeeper's
   first-launch assessment only fires on quarantined bundles. One manual `xattr` on the first DMG
-  install, never again. Ad-hoc signing (what `tauri build` does here — `Signature=adhoc`,
-  `TeamIdentifier=not set`) stays fine: there is no cert continuity to break.
+  install, never again. Ad-hoc signing (`Signature=adhoc`, `TeamIdentifier=not set`) stays fine
+  for *this*: there is no cert continuity to break. It is **not** fine for TCC, which is a separate
+  concern this bullet used to obscure — see **macOS file access** above. Through v0.5.0 `tauri
+  build` produced no bundle signature at all, and the resulting invalid signature plus random
+  per-build identifier is why folder permissions never persisted across updates.
 - **Restart goes through `AppHandle::request_restart`** (`commands::restart_app`), not
   `plugin-process`'s `relaunch` and **not `AppHandle::restart`**. The restart has to fire
   `ExitRequested`/`Exit` on the way out, because that is what runs teardown — otherwise every
@@ -1101,7 +1124,12 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
 - **Releasing:** `npm run release` (`scripts/release.sh`) — preflights the key, the
   tauri.conf.json/Cargo.toml version agreement, a clean tree and an unused tag; builds; writes
   `latest.json`; `gh release create`s all four artifacts. `--dry-run` builds and writes the JSON
-  without publishing.
+  without publishing — and because it skips the clean-tree and unused-tag checks, it is also how
+  you inspect a release build *before* committing. Use it: `release.sh` checks only that the
+  artifacts **exist**, never that the `.app` inside them is signed, which is exactly how the
+  unsigned bundles above shipped for five releases. Worth checking after publishing too — re-fetch
+  the served tarball, compare its SHA-256 to the local one, and run `codesign --verify --deep
+  --strict` on the `.app` inside it.
 - **The signing-key gotcha, which costs a full release compile to rediscover:** `tauri signer
   generate` prints `TAURI_SIGNING_PRIVATE_KEY_PATH`, but the v2 bundler reads **only**
   `TAURI_SIGNING_PRIVATE_KEY` (contents or path). With just the `_PATH` form set, the build runs to
@@ -1140,4 +1168,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`6a6b65339024209c37877cd5bfaac6012a96e9e7` — 2026-08-03
+`45442123527b9fbe55d0d153daa6d4aeba058069` — 2026-08-05

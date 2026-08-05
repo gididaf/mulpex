@@ -29,7 +29,7 @@ menu shortcuts.
 │  waiting,    │                                            │
 │  messages)   │                                            │
 └──────────────┴───────────────────────────────────────────┘
- ⌘T new · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M mute      ← status bar
+ ⌘T new · ⌘⇧T terminal · ⌘W close · ⌘R rename · ⌘[ ⌘] switch · ⌘M mute  ← status bar
 ```
 
 ## What it does
@@ -40,9 +40,17 @@ menu shortcuts.
   you had open on the next launch. Jump straight to a tab with ⌘1–9, close a project with ⌘⇧W,
   cycle with ⌘⇧[ ⌘⇧].
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
-  PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W).
+  PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W), and drag rows in
+  the sidebar to reorder them — that order is what ⌘[ ⌘] cycle through, and it survives a restart.
   Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
   needed.
+- **Terminal sessions (⌘⇧T).** A session can also be a plain interactive shell, in the same
+  sidebar and the same pane. Use it for the long-running and the interactive — a dev server, a
+  watcher, `tail -f`, a REPL — anything Claude's request/response Bash tool cannot hold open. They
+  are **shared**: your instances can open their own, and any of them can read or drive any
+  terminal, including one you started, so a Claude can watch your dev server's output and tell
+  when a command finished and with what exit code. A terminal that exits stays in the list with
+  its output still readable until you close it.
 - **Mute a session (⌘M)** when you don't want to hear from it. It keeps running and keeps
   coordinating — it just stops competing for your attention: dimmed, sunk to the bottom of the
   sidebar, and dropped from every badge, including its project tab's. Persists across restarts.
@@ -105,6 +113,14 @@ logged in (`claude` must be on your `PATH`) — Mulpex launches your own `claude
    ```sh
    xattr -dr com.apple.quarantine /Applications/Mulpex.app
    ```
+4. The first time you open a project, macOS asks for access to the folder it lives in (Documents,
+   Desktop or Downloads). **Click Allow.** Mulpex runs each `claude` *inside* your project
+   directory, so without it the session cannot start.
+
+> **Already clicked "Don't Allow"?** macOS records that and never asks again, so sessions fail to
+> start. Re-enable Mulpex under **System Settings ▸ Privacy & Security ▸ Files and Folders**, or
+> reset the prompt with `tccutil reset SystemPolicyDocumentsFolder com.mulpex.app` and reopen the
+> app. From v0.6.0 the answer sticks across updates; earlier builds were re-asked every time.
 
 > **"Mulpex is damaged and can't be opened. You should move it to the Trash."**
 > The download is fine — this is Gatekeeper, not corruption. The build is **ad-hoc signed and not
