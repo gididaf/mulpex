@@ -13,6 +13,7 @@ pub mod config;
 pub mod hook;
 pub mod mcp;
 pub mod persist;
+pub mod remote;
 pub mod termlog;
 
 /// Prefix marker on any prompt Mulpex itself injects into a `claude` session's

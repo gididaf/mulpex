@@ -242,6 +242,16 @@ pub struct Core {
     /// stays readable — so "dead" alone can't mean "remove", and this is what
     /// distinguishes the two. Removal still happens uniformly in `reap_dead`.
     closing: HashSet<usize>,
+    /// Remote terminals that have been given something and owe an answer.
+    ///
+    /// The idle backstop is meaningless without this. A remote claude sitting at
+    /// a fresh prompt, having never been asked anything, is *also* silent — so a
+    /// backstop keyed on silence alone fires the instant the TUI finishes
+    /// drawing and reports a finished turn that never started. Measured: the
+    /// first live run woke the driver 5.7 s in, before the task had even been
+    /// typed. An id is added when input is sent to it and removed when a wake is
+    /// delivered, so "quiet" only counts as "your turn" while an answer is owed.
+    remote_awaiting: HashSet<usize>,
     /// Ids restored from the store this run, and when they started.
     restored: HashMap<usize, Instant>,
     /// When each session was spawned, for `EARLY_DEATH_GRACE`. Covers every
@@ -432,6 +442,7 @@ impl Core {
             muted,
             worked,
             closing: HashSet::new(),
+            remote_awaiting: HashSet::new(),
             restored,
             started,
             failed: HashMap::new(),
@@ -790,6 +801,12 @@ impl Core {
                     ),
                     Some(s) => {
                         s.send(data.as_bytes());
+                        // Anything typed at a remote claude puts the ball in its
+                        // court, which is what arms the idle backstop. Sending
+                        // to an ordinary shell arms nothing.
+                        if mulpex_core::remote::RemoteMeta::read(&self.state_dir, id).is_some() {
+                            self.remote_awaiting.insert(id);
+                        }
                         (serde_json::json!({ "ok": true, "id": id }), false)
                     }
                     None => (
@@ -1166,6 +1183,9 @@ impl Core {
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
         let _ = std::fs::remove_file(terminal_mark_path(&self.state_dir, id));
+        // A remote terminal's token and seen-markers go with it: a recycled id
+        // must never inherit another terminal's identity.
+        mulpex_core::remote::forget_all(&self.state_dir, id);
         // Every reader's cursor into that terminal.
         let cursors = self.state_dir.join("terminals").join("cursors");
         if let Ok(entries) = std::fs::read_dir(&cursors) {
@@ -1176,6 +1196,127 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Watch every remote-claude terminal and turn "it's your turn" into a hub
+    /// message in the driver's inbox.
+    ///
+    /// This is the whole reason a remote peer can *initiate*. A remote claude has
+    /// no inbox, no instance id and no way to push — all it can do is print. So
+    /// the poll loop reads what it printed and writes the message on its behalf,
+    /// into the opener's inbox dir, which is precisely the directory that
+    /// instance's hub-listener Monitor is already watching. Nothing new wakes the
+    /// driver: the existing peer-message path does, unchanged.
+    ///
+    /// Two triggers, deliberately:
+    ///
+    /// - **The signal** the remote prints, which carries *why* it is calling.
+    /// - **Silence**, when it doesn't. A working `claude` animates its spinner
+    ///   continuously, so no output for `IDLE_TURN_END_MS` means its turn ended.
+    ///   This backstop exists because the signal is an instruction to a language
+    ///   model and instructions get skipped — and the failure mode without it is
+    ///   the bad kind: the driver waits forever and nothing looks broken.
+    ///
+    /// Both are deduped, so a marker sitting on a screen that never scrolls does
+    /// not re-fire every 200 ms.
+    pub fn process_remote_signals(&mut self) {
+        for (id, meta) in mulpex_core::remote::RemoteMeta::all(&self.state_dir) {
+            // The terminal is gone (closed, or exited and reaped): drop its
+            // records so a recycled id can never inherit another's token.
+            let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+                mulpex_core::remote::forget_all(&self.state_dir, id);
+                continue;
+            };
+            // Nothing to deliver to: the driver has closed. The remote keeps
+            // running — it is the user's terminal now — but nobody is listening.
+            if !self.sessions.iter().any(|s| s.id == meta.opener) {
+                continue;
+            }
+
+            let log_path = crate::pty::terminal_log_path(&self.state_dir, id);
+            let log_bytes = std::fs::read(&log_path).unwrap_or_default();
+            let log = String::from_utf8_lossy(
+                log_bytes
+                    .get(mulpex_core::termlog::HEADER_LEN..)
+                    .unwrap_or_default(),
+            )
+            .into_owned();
+            let screen =
+                std::fs::read_to_string(crate::pty::terminal_screen_path(&self.state_dir, id))
+                    .unwrap_or_default();
+            // Both channels, because a row only reaches the log once it scrolls
+            // off the top: a remote that answers briefly and sits there has its
+            // marker on screen and nowhere else.
+            let signal = mulpex_core::remote::find_signals(&log, &meta.token)
+                .into_iter()
+                .last()
+                .or_else(|| {
+                    mulpex_core::remote::find_signals(&screen, &meta.token)
+                        .into_iter()
+                        .last()
+                });
+
+            // Idleness comes from the log header the recorder maintains, not
+            // from the Session: the recorder is what actually sees the bytes.
+            let idle_ms = mulpex_core::termlog::parse_header(&log_bytes)
+                .map(|h| crate::vtgrid::now_ms().saturating_sub(h.last_out_ms))
+                .unwrap_or(0);
+            let quiet = session.is_alive()
+                && idle_ms >= mulpex_core::remote::IDLE_TURN_END_MS
+                && mulpex_core::remote::looks_like_claude_tui(&screen)
+                && !mulpex_core::remote::has_spinner(&screen);
+
+            let to_send = match signal {
+                Some(sig) => mulpex_core::remote::take_if_new(&self.state_dir, id, "watch", &sig)
+                    .then_some(sig),
+                // Silence only means "your turn" if the remote owes an answer.
+                None if quiet && self.remote_awaiting.contains(&id) => {
+                    Some(mulpex_core::remote::Signal {
+                        kind: mulpex_core::remote::Kind::Ended,
+                        summary: String::new(),
+                    })
+                }
+                _ => None,
+            };
+
+            let Some(sig) = to_send else { continue };
+            // The debt is settled: nothing further is owed until the driver
+            // speaks again, which is what stops one quiet period from waking it
+            // on every 200 ms tick.
+            self.remote_awaiting.remove(&id);
+            // A synthesised "it went quiet" must not out-shout a real signal that
+            // is about to arrive; a real one for the same turn supersedes it via
+            // the dedupe above.
+            let body = mulpex_core::remote::wake_body(id, &meta.ssh_target, &sig);
+            self.deliver_hub_message(meta.opener, id, &body);
+        }
+    }
+
+    /// Drop a message into an instance's inbox as if a peer had sent it.
+    ///
+    /// Writes the same shape `mcp::hub_send` writes, plus `from_terminal` so the
+    /// recipient is told a *terminal* is calling and not instance #N — replying
+    /// with `hub_send` to a terminal id would go nowhere.
+    fn deliver_hub_message(&self, to: usize, from_terminal: usize, body: &str) {
+        let dir = self.state_dir.join("inbox").join(to.to_string());
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = format!("{}-{}.json", ts, mulpex_core::persist::new_uuid());
+        let _ = std::fs::write(
+            dir.join(name),
+            serde_json::json!({
+                "from": 0,
+                "from_terminal": from_terminal,
+                "ts": ts,
+                "body": body,
+            })
+            .to_string(),
+        );
     }
 
     /// Mark instances "worked on" once their hook state file appears (a prompt
@@ -1671,19 +1812,19 @@ mod tests {
     /// test's store lands under another's HOME.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A `Core` on a throwaway HOME + scratch dir, for terminal tests. Returns
     /// the env guard first — hold it for the life of the test.
-    fn scratch_core(tag: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf, Core) {
+    pub(super) fn scratch_core(tag: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf, Core) {
         let guard = env_guard();
         let (root, core) = scratch_core_inner(tag);
         (guard, root, core)
     }
 
-    fn scratch_core_inner(tag: &str) -> (PathBuf, Core) {
+    pub(super) fn scratch_core_inner(tag: &str) -> (PathBuf, Core) {
         let root = std::env::temp_dir().join(format!("mulpex-{tag}-{}", persist::new_uuid()));
         let project_dir = root.join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -1786,7 +1927,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+    pub(super) fn wait_until(mut f: impl FnMut() -> bool) -> bool {
         for _ in 0..100 {
             if f() {
                 return true;
@@ -2507,6 +2648,277 @@ mod tests {
         core.process_terminal_requests();
         assert_eq!(reply(&t)["ok"], true);
         assert!(wait_until(|| core.reap_dead() == vec![id]));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Live end-to-end exercise of a remote claude peer, against a real machine.
+///
+/// `#[ignore]`d because it needs an ssh target with `claude` installed and burns
+/// real model turns on it. Run with:
+///
+/// ```text
+/// MULPEX_TEST_SSH=root@1.2.3.4 cargo test --lib remote_peer_live -- --ignored --nocapture
+/// ```
+///
+/// It is the only test that proves the *whole* chain rather than a piece of it:
+/// the ssh command line, the base64'd rules actually governing the remote, the
+/// remote emitting a marker the parser accepts, the recorder preserving that
+/// marker through a repainting TUI, and the watcher turning it into a message in
+/// the driver's inbox. Every link in that chain has already broken once in
+/// development.
+#[cfg(test)]
+mod remote_peer_live {
+    use super::*;
+    use mulpex_core::remote;
+
+    #[test]
+    #[ignore]
+    fn a_remote_claude_signals_home_and_wakes_its_driver() {
+        let Ok(target) = std::env::var("MULPEX_TEST_SSH") else {
+            eprintln!("set MULPEX_TEST_SSH to run this");
+            return;
+        };
+        let _env = tests::env_guard();
+        let (root, mut core) = tests::scratch_core_inner("remote-live");
+
+        // A stand-in for the driving instance: the watcher refuses to deliver to
+        // an opener that is no longer there, so one has to exist.
+        let driver = core.spawn_terminal(None, Some("driver".into()), false).unwrap();
+        eprintln!("driver session id = {}", driver.id);
+
+        let token = remote::new_token(driver.id, 42);
+        let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
+        let cmd = remote::ssh_command(&target, Some("/tmp/mpx-probe"), &rules_b64);
+        let remote_term = core
+            .spawn_terminal(Some(cmd), Some(format!("ssh {target}")), false)
+            .unwrap();
+        eprintln!("remote terminal id = {}, token = {token}", remote_term.id);
+
+        remote::RemoteMeta {
+            token: token.clone(),
+            ssh_target: target.clone(),
+            opener: driver.id,
+        }
+        .write(&core.state_dir, remote_term.id)
+        .unwrap();
+
+        // Wait for the remote TUI, exactly as `hub_remote_open` does.
+        let screen_path = crate::pty::terminal_screen_path(&core.state_dir, remote_term.id);
+        let mut ready = false;
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(500));
+            let screen = std::fs::read_to_string(&screen_path).unwrap_or_default();
+            if remote::looks_like_claude_tui(&screen) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "the remote claude's input box never appeared");
+        eprintln!("remote TUI is up");
+
+        let task = "Print the current working directory using pwd, then follow your signalling \
+                    instructions.";
+        // Text and Enter as SEPARATE writes — a `\r` on the tail of the same
+        // burst is swallowed as paste content and the task is never submitted.
+        // See `mcp::inject_task`; this is the shape that failed live.
+        let send = |core: &mut Core, data: &str| {
+            core.apply_terminal_request(
+                &serde_json::json!({ "op": "send", "from": driver.id, "id": remote_term.id,
+                                     "data": data })
+                .to_string(),
+            );
+        };
+        send(&mut core, task);
+        std::thread::sleep(Duration::from_millis(400));
+        send(&mut core, "\r");
+
+        // Now the real assertion: without anyone reading the terminal, a message
+        // must appear in the driver's inbox on its own.
+        let inbox = core.state_dir.join("inbox").join(driver.id.to_string());
+        let mut delivered = Vec::new();
+        for _ in 0..240 {
+            std::thread::sleep(Duration::from_millis(500));
+            core.process_remote_signals();
+            if let Ok(entries) = std::fs::read_dir(&inbox) {
+                delivered = entries
+                    .flatten()
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .collect();
+                if !delivered.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        let screen = std::fs::read_to_string(&screen_path).unwrap_or_default();
+        assert!(
+            !delivered.is_empty(),
+            "no wake reached the driver's inbox.\nfinal screen:\n{screen}"
+        );
+        let body = delivered.join("\n");
+        eprintln!("delivered:\n{body}");
+        assert!(
+            body.contains(&format!("terminal #{}", remote_term.id)),
+            "the wake does not name the terminal: {body}"
+        );
+        // The wake must be the remote's own signal, not the backstop: passing on
+        // the backstop would hide a broken marker contract completely, which is
+        // exactly how the first run of this test passed while proving nothing.
+        assert!(
+            body.contains("has FINISHED the work"),
+            "woken by the idle backstop rather than by a real signal — the remote \
+             did not emit a parseable marker: {body}"
+        );
+        assert!(
+            body.contains("hub_terminal_send"),
+            "the wake does not say how to reply: {body}"
+        );
+
+        // And the marker itself must never be shown back to a model.
+        let log = std::fs::read(crate::pty::terminal_log_path(&core.state_dir, remote_term.id))
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(
+            log.get(mulpex_core::termlog::HEADER_LEN..).unwrap_or_default(),
+        );
+        assert!(
+            !remote::strip_signals(&text, &token).contains(&token),
+            "the token survived stripping"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The remote-peer watcher, driven without a network: a real shell terminal
+/// stands in for the remote claude by printing what one would print.
+///
+/// Worth having alongside the live test because these run on every `cargo test`
+/// and cost nothing — and because both cases below are bugs that actually
+/// happened, one of which the live test could not have caught (it passed while
+/// proving nothing).
+#[cfg(test)]
+mod remote_watcher {
+    use super::tests::{scratch_core, wait_until};
+    use super::*;
+    use mulpex_core::remote;
+
+    const TOKEN: &str = "feedface";
+
+    /// A terminal the watcher believes is a remote claude, plus the driver it
+    /// reports to. `paint` is typed as the terminal's **seed**, not sent to it:
+    /// sending is what arms the idle backstop, so a test that set the scene by
+    /// sending could never observe the un-armed state.
+    fn remote_pair(core: &mut Core, paint: Option<String>) -> (usize, usize) {
+        let driver = core.spawn_terminal(None, Some("driver".into()), false).unwrap();
+        let term = core.spawn_terminal(paint, Some("remote".into()), false).unwrap();
+        remote::RemoteMeta {
+            token: TOKEN.to_string(),
+            ssh_target: "root@example.test".into(),
+            opener: driver.id,
+        }
+        .write(&core.state_dir, term.id)
+        .unwrap();
+        (driver.id, term.id)
+    }
+
+    fn inbox(core: &Core, id: usize) -> Vec<String> {
+        std::fs::read_dir(core.state_dir.join("inbox").join(id.to_string()))
+            .map(|e| {
+                e.flatten()
+                    .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn type_into(core: &mut Core, id: usize, data: &str) {
+        core.apply_terminal_request(
+            &serde_json::json!({ "op": "send", "from": 1, "id": id, "data": data }).to_string(),
+        );
+    }
+
+    /// A fake claude prompt: enough for `looks_like_claude_tui`, which is what
+    /// qualifies silence as "a turn ended" rather than "the ssh died".
+    fn fake_prompt() -> String {
+        format!(
+            "printf '%s\\n%s\\n' '{}' '❯ '",
+            "─".repeat(40)
+        )
+    }
+
+    #[test]
+    fn a_signal_wakes_the_driver_exactly_once() {
+        let (_env, root, mut core) = scratch_core("remote-signal");
+        let marker = format!("{} {TOKEN} done Fixed the auth bug{}", remote::SIG_OPEN, remote::SIG_CLOSE);
+        let (driver, term) = remote_pair(&mut core, Some(format!("printf '%s\n' '{marker}'")));
+
+        assert!(
+            wait_until(|| {
+                core.process_remote_signals();
+                !inbox(&core, driver).is_empty()
+            }),
+            "the marker never reached the driver's inbox"
+        );
+
+        let body = inbox(&core, driver).join("\n");
+        assert!(body.contains("has FINISHED"), "wrong kind reported: {body}");
+        assert!(body.contains("Fixed the auth bug"), "summary lost: {body}");
+        assert!(
+            body.contains(&format!("\"from_terminal\":{term}")),
+            "the sender is not tagged as a terminal: {body}"
+        );
+
+        // The marker stays on screen indefinitely; the wake must not repeat.
+        let before = inbox(&core, driver).len();
+        for _ in 0..10 {
+            core.process_remote_signals();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            inbox(&core, driver).len(),
+            before,
+            "the same signal woke the driver more than once"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bug the first live run hid behind a passing assertion: a remote that
+    /// has never been asked anything is silent too, so a backstop keyed on
+    /// silence alone reported a finished turn 5.7 s after launch — before the
+    /// task had even been typed.
+    #[test]
+    fn silence_is_only_a_wake_when_an_answer_is_owed() {
+        let (_env, root, mut core) = scratch_core("remote-idle");
+        let (driver, term) = remote_pair(&mut core, Some(fake_prompt()));
+
+        std::thread::sleep(Duration::from_millis(remote::IDLE_TURN_END_MS + 1_500));
+        for _ in 0..10 {
+            core.process_remote_signals();
+        }
+        assert!(
+            inbox(&core, driver).is_empty(),
+            "an idle remote that was never given anything woke its driver"
+        );
+
+        // Now it owes an answer, and the same silence must wake the driver.
+        type_into(&mut core, term, &format!("{}\r", fake_prompt()));
+        assert!(
+            wait_until(|| {
+                core.process_remote_signals();
+                !inbox(&core, driver).is_empty()
+            }),
+            "a remote that went quiet owing an answer never woke its driver"
+        );
+        assert!(
+            inbox(&core, driver).join("\n").contains("did not signal"),
+            "wrong backstop wording"
+        );
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

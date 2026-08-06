@@ -66,7 +66,7 @@ const HEADER_THROTTLE_MS: u64 = 100;
 const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 500;
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1161,5 +1161,75 @@ mod replays {
         assert!(log.contains("built in"));
         // Column-aligned output has to stay aligned to stay readable.
         assert!(log.contains("dist/index.html                   0.39 kB"), "{log}");
+    }
+}
+
+/// Replays of a real remote `claude` reached over ssh, recorded through a real
+/// pty at 32x120 against a live machine.
+///
+/// These pin the two facts the remote-peer feature is built on, both of which
+/// were found by measurement and neither of which is safe to assume:
+///
+/// 1. A remote claude does **not** take the alternate screen. If it did, the
+///    recorder would replace the entire session with `[full-screen program —
+///    output omitted]` and there would be no transcript to find a signal in —
+///    the feature would be impossible rather than merely broken.
+/// 2. Claude Code renders its output as **markdown**, so `__x__` is bold and its
+///    underscores are eaten before the bytes ever reach the terminal. That is
+///    why the signal delimiters are angle-bracket runs.
+#[cfg(test)]
+mod remote_claude_replays {
+    use super::*;
+
+    fn replay(raw: &[u8]) -> (String, String) {
+        let mut s = Screen::new(32, 120);
+        for chunk in raw.chunks(8192) {
+            s.feed(chunk);
+        }
+        let screen = s.screen_text();
+        s.flush_visible();
+        (s.out.clone(), screen)
+    }
+
+    #[test]
+    fn a_remote_claude_over_ssh_is_legible_to_the_recorder() {
+        let raw = include_bytes!("../tests/fixtures/remote-claude-ssh.bin");
+        assert!(
+            !raw.windows(7).any(|w| w == b"[?1049h"),
+            "the remote claude took the alternate screen — the transcript would be suppressed"
+        );
+
+        let (log, screen) = replay(raw);
+        let all = format!("{log}\n{screen}");
+        assert!(!log.contains('\u{1b}'), "escape sequences leaked into the log");
+        // Its actual work survives as readable text, spaces and all — the naive
+        // "strip the escapes" approach welds these words together, because the
+        // TUI positions each one with a cursor jump rather than a space.
+        assert!(
+            all.contains("Created /tmp/mpx-probe/hello.txt containing banana"),
+            "the remote's reply is not legible in the transcript"
+        );
+    }
+
+    /// The measurement that chose the marker syntax. `__MPX_TO_LOCAL__` was
+    /// asked for; `MPX_TO_LOCAL` is what arrived.
+    #[test]
+    fn markdown_eats_underscore_delimiters_but_not_angle_brackets() {
+        let (log, screen) = replay(include_bytes!("../tests/fixtures/remote-claude-ssh.bin"));
+        let all = format!("{log}\n{screen}");
+        assert!(
+            !all.contains("__MPX_TO_LOCAL__"),
+            "the underscore-delimited marker survived — this fixture no longer shows the bug"
+        );
+        assert!(
+            all.contains("MPX_TO_LOCAL done"),
+            "the remote did not emit the marker at all"
+        );
+
+        let (log, screen) = replay(include_bytes!("../tests/fixtures/remote-claude-markers.bin"));
+        let all = format!("{log}\n{screen}");
+        for survivor in ["<<<MPX done alpha>>>", "[[MPX done charlie]]", "MPX-SIGNAL done delta"] {
+            assert!(all.contains(survivor), "delimiter did not survive: {survivor}");
+        }
     }
 }

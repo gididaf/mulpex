@@ -50,6 +50,11 @@ pub fn start(app: AppHandle) {
                 // (an empty dir read) and it changes `session_infos`, so the diff
                 // below is what actually repaints the row.
                 core.process_name_requests();
+                // Remote claudes calling their driver back. Cheap when there are
+                // none (one empty dir read) and it must run every tick: this is
+                // the only path by which a machine on the other end of an ssh
+                // link can reach a local instance at all.
+                core.process_remote_signals();
                 core.refresh_worked();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on

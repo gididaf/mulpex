@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::hook::{canonical_target, now, read_field, Ctx};
+use crate::remote;
 use crate::persist::{fnv1a, new_uuid};
 use crate::termlog;
 
@@ -197,6 +198,19 @@ fn tool_defs() -> Value {
             },
         },
         {
+            "name": "hub_remote_open",
+            "description": "Start a Claude Code instance on ANOTHER MACHINE over ssh, in a Mulpex terminal, and coordinate with it. Use this when work has to happen on a remote server (a deploy, a staging box, anything that must run there rather than here). The remote instance is told it is being driven by you, works autonomously, and SIGNALS you when it finishes, gets blocked, or needs an answer — you are woken by a hub message, so do NOT sit polling it. Talk to it with hub_terminal_send and read it with hub_terminal_read, using the terminal id this returns. It is a terminal, NOT a hub instance: hub_send can never reach it. Requires working ssh key access to the target, and claude installed there.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ssh_target": { "type": "string", "description": "Where to ssh, e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. Key-based auth must already work — there is nowhere to type a password." },
+                    "cwd": { "type": "string", "description": "Directory ON THE REMOTE machine to start in (its project dir). Defaults to the login directory." },
+                    "task": { "type": "string", "description": "What the remote should do, sent once its prompt is ready. Include everything it needs: it cannot see your conversation, your files, or the user." },
+                },
+                "required": ["ssh_target"],
+            },
+        },
+        {
             "name": "hub_terminal_open",
             "description": "Open a NEW shell terminal in this project, shown in Mulpex's sidebar next to the instances, and optionally start a command in it. Unlike your Bash tool this is a real, persistent interactive shell: it keeps running after the command finishes, you can type into it again later (hub_terminal_send) and read its output at any time (hub_terminal_read). Use it for anything long-running or interactive — a dev server, a watcher, `tail -f`, a REPL or database shell, or a long build you want to keep an eye on while you do other work. For a quick command that returns promptly, just use Bash instead. Returns the new terminal's id.",
             "inputSchema": {
@@ -264,6 +278,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_send" => hub_send(ctx, &args),
         "hub_inbox" => Ok(hub_inbox(ctx)),
         "hub_spawn" => hub_spawn(ctx, &args),
+        "hub_remote_open" => hub_remote_open(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
@@ -725,6 +740,177 @@ fn terminal_request(ctx: &Ctx, body: Value) -> Result<Value, String> {
     Err("Mulpex did not respond — it may be shutting down.".to_string())
 }
 
+/// How long `hub_remote_open` will wait for the remote's TUI to appear before
+/// handing the caller back an un-seeded terminal.
+///
+/// A cold `claude` over ssh took ~5 s in the reference capture; 30 s is the same
+/// ceiling `hub_terminal_read`'s wait uses, chosen for the same reason (Claude
+/// Code's own per-tool timeout). Timing out is not a failure — the terminal is
+/// open and the caller is told to send the task itself.
+const REMOTE_READY_TIMEOUT_MS: u64 = 30_000;
+
+/// Open a terminal, ssh somewhere, and start a `claude` there that knows how to
+/// call back.
+///
+/// The launch is the *only* moment the peer rules can be attached — they ride in
+/// on `--append-system-prompt`, which is re-sent with every request and so
+/// survives both a long conversation and compaction. There is deliberately no
+/// way to adopt a remote claude someone started by hand: rules delivered as a
+/// typed message would drift out of context, which is the failure this design
+/// exists to avoid.
+fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let ssh_target = args
+        .get("ssh_target")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("missing 'ssh_target' — e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias.")?;
+    let cwd = args
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let task = args
+        .get("task")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let token = remote::new_token(ctx.instance, now_ms());
+    let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
+    let command = remote::ssh_command(ssh_target, cwd, &rules_b64);
+
+    // The seed carries NO completion marker. `; printf …` marks the end of a
+    // shell command, and this "command" is an interactive session that ends only
+    // when the remote claude quits — tracking it would report completion at
+    // exactly the wrong moment.
+    let reply = terminal_request(
+        ctx,
+        json!({
+            "op": "open",
+            "from": ctx.instance,
+            "seed": command,
+            "label": format!("ssh {ssh_target}"),
+        }),
+    )?;
+    let id = reply
+        .get("id")
+        .and_then(|x| x.as_u64())
+        .ok_or("Mulpex did not report the new terminal's id")? as usize;
+
+    remote::RemoteMeta {
+        token: token.clone(),
+        ssh_target: ssh_target.to_string(),
+        opener: ctx.instance,
+    }
+    .write(&ctx.state_dir, id)
+    .map_err(|e| format!("could not record the remote terminal: {e}"))?;
+
+    set_cursor(ctx, id, 0);
+    clear_mark(ctx, id);
+
+    // Wait for the remote's input box before typing the task in. This is the
+    // same problem `pty.rs` solves for spawned local instances, and for the same
+    // reason: nothing in the byte stream announces "the TUI is ready", and text
+    // typed before it is simply dropped — leaving a remote with no task and no
+    // way to be given one, since it never takes a first turn.
+    let mut ready = false;
+    if task.is_some() {
+        let deadline = now_ms() + REMOTE_READY_TIMEOUT_MS;
+        while now_ms() < deadline {
+            let screen = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
+                .unwrap_or_default();
+            if remote::looks_like_claude_tui(&screen) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if ready {
+            ready = inject_task(ctx, id, task.unwrap_or_default())?;
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "terminal_id": id,
+        "ssh_target": ssh_target,
+        "task_sent": task.is_some() && ready,
+        "task_delivered": task.is_some() && ready,
+        "note": match (task.is_some(), ready) {
+            (true, true) =>
+                "Remote claude started and your task was sent to it. It will signal when it is \
+                 done, blocked, or has a question — you will be woken with a hub message, so you \
+                 do NOT need to poll. To watch it anyway, use hub_terminal_read with wait_ms.",
+            (true, false) =>
+                "Terminal opened, but the task could not be confirmed as started — the remote's \
+                 prompt may not have appeared in time, or ssh may be asking something. Call \
+                 hub_terminal_read(id) to see what state it is in before re-sending.",
+            _ =>
+                "Remote claude is starting. Give it a task with hub_terminal_send; it will signal \
+                 when done, blocked, or asking, and you will be woken by a hub message.",
+        },
+    })
+    .to_string())
+}
+
+/// How many times to try getting a task into a remote claude's input box.
+const INJECT_ATTEMPTS: usize = 3;
+
+/// Type a task into a remote claude and confirm it actually started a turn.
+///
+/// Three things here are load-bearing, and all three were measured against the
+/// real remote rather than assumed:
+///
+/// 1. **The `\r` must be a separate write.** Sent as the tail of the same burst
+///    as the text, Claude Code treats it as *paste content* rather than as
+///    Enter: the task lands in the input box, sits there fully typed, and is
+///    never submitted. That is precisely what the first live run did — the
+///    driver then waited on a remote that had been given a task it had not read.
+///    `pty.rs` documents the same rule for locally spawned instances.
+/// 2. **Submission is verified, not assumed.** A remote that is still finishing
+///    its startup silently drops what it is given, so the reply is only honest
+///    if something confirms the turn began. The spinner is that proof: it
+///    animates continuously while a turn runs.
+/// 3. **A retry clears the box first** (Ctrl-U), or a half-landed attempt
+///    concatenates with the next one into gibberish.
+fn inject_task(ctx: &Ctx, id: usize, task: &str) -> Result<bool, String> {
+    for attempt in 0..INJECT_ATTEMPTS {
+        if attempt > 0 {
+            // Ctrl-U: discard whatever the previous attempt left behind.
+            terminal_request(
+                ctx,
+                json!({ "op": "send", "from": ctx.instance, "id": id, "data": "\x15" }),
+            )?;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        terminal_request(
+            ctx,
+            json!({ "op": "send", "from": ctx.instance, "id": id, "data": task }),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        terminal_request(
+            ctx,
+            json!({ "op": "send", "from": ctx.instance, "id": id, "data": "\r" }),
+        )?;
+
+        let deadline = now_ms() + 8_000;
+        while now_ms() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let screen = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
+                .unwrap_or_default();
+            // Either it is visibly working, or it already finished and said so —
+            // a very short turn can be over before the first poll.
+            let signalled = remote::RemoteMeta::read(&ctx.state_dir, id)
+                .is_some_and(|m| !remote::find_signals(&screen, &m.token).is_empty());
+            if remote::has_spinner(&screen) || signalled {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn hub_terminal_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // The command goes to the shell **verbatim** — collapsing its whitespace
     // silently rewrites a script before it ever runs. Only the sidebar *label*
@@ -1109,6 +1295,12 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let cursor = cursor_of(ctx, id);
     let first_read = cursor.is_none();
     let token = tracked_token(ctx, id);
+    // A remote claude is watched differently from a shell command: there is no
+    // exit code to wait for, and "finished" is something the remote says (or,
+    // when it forgets to, something its silence implies).
+    let remote_meta = remote::RemoteMeta::read(&ctx.state_dir, id);
+    let screen_path = terminals_dir(ctx).join(format!("{id}.screen"));
+    let read_screen = || std::fs::read_to_string(&screen_path).unwrap_or_default();
 
     // Blocking wait. What it waits *for* depends on whether a command of yours
     // is in flight: with one running, "something new" means that command
@@ -1131,15 +1323,32 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let mut waited_for = None;
     if wait_ms > 0 {
         let pending = token.filter(|&t| find_completion(&view.data, t).is_none());
-        waited_for = Some(if pending.is_some() { "completion" } else { "output" });
+        waited_for = Some(match (&remote_meta, pending.is_some()) {
+            (Some(_), _) => "remote_signal",
+            (None, true) => "completion",
+            (None, false) => "output",
+        });
         let deadline = now_ms() + wait_ms;
         while view.running {
-            let satisfied = match pending {
-                Some(t) => find_completion(&view.data, t).is_some(),
+            let satisfied = match (&remote_meta, pending) {
+                // Wait for the remote to hand the turn back: either it signals,
+                // or it falls silent, which for a claude means its spinner
+                // stopped animating and the turn is over. Waiting merely for
+                // *output* here would return on the first frame of its thinking
+                // animation, which is never what the caller meant.
+                (Some(m), _) => {
+                    let start = effective_start(&view);
+                    let slice = &view.data
+                        [((start - view.base) as usize).min(view.data.len())..];
+                    !remote::find_signals(slice, &m.token).is_empty()
+                        || !remote::find_signals(&read_screen(), &m.token).is_empty()
+                        || (view.total > start && view.idle_ms >= remote::IDLE_TURN_END_MS)
+                }
+                (None, Some(t)) => find_completion(&view.data, t).is_some(),
                 // Anything this reader has not seen counts — including output
                 // that arrived before the call. Waiting only for *further*
                 // growth would sit on output already in hand.
-                None => view.total > effective_start(&view),
+                (None, None) => view.total > effective_start(&view),
             };
             if satisfied {
                 break;
@@ -1164,6 +1373,21 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     };
     let slice = &view.data[((start - view.base) as usize).min(view.data.len())..];
     let text = strip_markers(slice);
+    // Take the signal from the log slice if it is there, else from the screen: a
+    // remote whose output has not yet scrolled has its marker on screen and
+    // nowhere else, and that is the common case for a short reply.
+    let signal = remote_meta.as_ref().and_then(|m| {
+        remote::find_signals(&text, &m.token)
+            .into_iter()
+            .last()
+            .or_else(|| remote::find_signals(&read_screen(), &m.token).into_iter().last())
+    });
+    // The marker is Mulpex's wire protocol. Showing it to the reader invites it
+    // to imitate it, and imitating it would let a local instance forge a wake.
+    let text = match &remote_meta {
+        Some(m) => remote::strip_signals(&text, &m.token),
+        None => text,
+    };
     // A first read of someone else's terminal returns the tail, not the whole
     // retained megabyte — but it says so, so the model knows it's mid-story.
     let (text, truncated) = tail_lines(&text, max_lines);
@@ -1174,10 +1398,11 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // `; printf '…__MPX_DONE_…' "$?"` plumbing. That matters more than it looks
     // — a caller working around history lag by prefixing `clear;` makes the
     // screen its primary channel.
-    let screen = strip_markers(
-        &std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
-            .unwrap_or_default(),
-    );
+    let screen = strip_markers(&read_screen());
+    let screen = match &remote_meta {
+        Some(m) => remote::strip_signals(&screen, &m.token),
+        None => screen,
+    };
 
     // A wait that timed out with nothing new must not consume anything: the
     // caller should be able to retry and still see it.
@@ -1197,6 +1422,26 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     if let Some(code) = finished {
         map.insert("command_finished".into(), json!(true));
         map.insert("exit_code".into(), json!(code));
+    }
+    if let Some(m) = &remote_meta {
+        map.insert("remote_claude".into(), json!(true));
+        map.insert("ssh_target".into(), json!(m.ssh_target));
+        match &signal {
+            Some(sig) => {
+                map.insert("remote_signal".into(), json!(sig.kind.as_str()));
+                map.insert("remote_summary".into(), json!(sig.summary));
+                remote::take_if_new(&ctx.state_dir, id, &ctx.instance.to_string(), sig);
+            }
+            // Silence is the other half of the answer: a claude that has stopped
+            // producing output has ended its turn, whether or not it remembered
+            // to say so.
+            None if view.idle_ms >= remote::IDLE_TURN_END_MS => {
+                map.insert("remote_idle".into(), json!(true));
+            }
+            None => {
+                map.insert("remote_working".into(), json!(true));
+            }
+        }
     }
     if first_read && !full {
         map.insert("first_read".into(), json!(true));
@@ -1355,7 +1600,20 @@ fn locks_by_holder(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
 }
 
 /// Read and remove every message addressed to `id`. Returns `(ts, from, body)`.
-fn take_inbox(ctx: &Ctx, id: usize) -> Vec<(u64, usize, String)> {
+/// A message's sender, as the recipient should see it.
+///
+/// Almost always a peer instance. The exception is a **remote claude**, which
+/// has no instance id at all — the app writes its wake on its behalf and tags it
+/// with the terminal it came from, so the recipient is never told to reply to a
+/// peer number that does not exist.
+fn sender_label(v: &Value) -> String {
+    match v.get("from_terminal").and_then(|x| x.as_u64()) {
+        Some(t) => format!("terminal #{t} (remote claude)"),
+        None => format!("#{}", v.get("from").and_then(|x| x.as_u64()).unwrap_or(0)),
+    }
+}
+
+fn take_inbox(ctx: &Ctx, id: usize) -> Vec<(u64, String, String)> {
     let dir = ctx.inbox_dir.join(id.to_string());
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -1364,7 +1622,7 @@ fn take_inbox(ctx: &Ctx, id: usize) -> Vec<(u64, usize, String)> {
             if let Ok(content) = std::fs::read_to_string(&file) {
                 if let Ok(v) = serde_json::from_str::<Value>(&content) {
                     let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let from = v.get("from").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    let from = sender_label(&v);
                     let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
                     out.push((ts, from, body));
                 }
