@@ -199,11 +199,12 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_remote_open",
-            "description": "Start a Claude Code instance on ANOTHER MACHINE over ssh, in a Mulpex terminal, and coordinate with it. Use this when work has to happen on a remote server (a deploy, a staging box, anything that must run there rather than here). The remote instance is told it is being driven by you, works autonomously, and SIGNALS you when it finishes, gets blocked, or needs an answer — you are woken by a hub message, so do NOT sit polling it. Talk to it with hub_terminal_send and read it with hub_terminal_read, using the terminal id this returns. It is a terminal, NOT a hub instance: hub_send can never reach it. Requires working ssh key access to the target, and claude installed there.",
+            "description": "Start a Claude Code instance on ANOTHER MACHINE over ssh, in a Mulpex terminal, and coordinate with it. Opens its own terminal by default; pass terminal_id to use one that already exists, including one the user ssh'd in on themselves. Use this when work has to happen on a remote server (a deploy, a staging box, anything that must run there rather than here). The remote instance is told it is being driven by you, works autonomously, and SIGNALS you when it finishes, gets blocked, or needs an answer — you are woken by a hub message, so do NOT sit polling it. Talk to it with hub_terminal_send and read it with hub_terminal_read, using the terminal id this returns. It is a terminal, NOT a hub instance: hub_send can never reach it. Requires working ssh key access to the target, and claude installed there.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "ssh_target": { "type": "string", "description": "Where to ssh, e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. Key-based auth must already work — there is nowhere to type a password." },
+                    "ssh_target": { "type": "string", "description": "Where to ssh, e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. Key-based auth must already work — there is nowhere to type a password. Optional ONLY when 'terminal_id' names a terminal that is already logged in to the remote machine." },
+                    "terminal_id": { "type": "integer", "description": "Use an EXISTING terminal instead of opening a new one. Two uses: a terminal sitting at a local shell (give ssh_target too and it will ssh from there), or one the user has ALREADY ssh'd in on (omit ssh_target — only claude is started, on the far side). Useful when the login needed a password, a VPN or a jump host. Refused if that terminal is busy or already running a claude." },
                     "cwd": { "type": "string", "description": "Directory ON THE REMOTE machine to start in (its project dir). Defaults to the login directory." },
                     "task": { "type": "string", "description": "What the remote should do, sent once its prompt is ready. Include everything it needs: it cannot see your conversation, your files, or the user." },
                 },
@@ -763,8 +764,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .get("ssh_target")
         .and_then(|x| x.as_str())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or("missing 'ssh_target' — e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias.")?;
+        .filter(|s| !s.is_empty());
     let cwd = args
         .get("cwd")
         .and_then(|x| x.as_str())
@@ -776,37 +776,67 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    let existing = args
+        .get("terminal_id")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as usize);
+    if existing.is_none() && ssh_target.is_none() {
+        return Err("missing 'ssh_target' — e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. \
+                    (It is only optional when you pass 'terminal_id' for a terminal that is \
+                    already logged in to the remote machine.)"
+            .into());
+    }
+
     let token = remote::new_token(ctx.instance, now_ms());
     let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
-    let command = remote::ssh_command(ssh_target, cwd, &rules_b64);
+    // With an ssh target, this terminal is on THIS machine and has to travel;
+    // without one, the caller is telling us the terminal is already on the far
+    // side, so only the `claude` half is launched. Both attach the rules at
+    // launch, which is the only thing that actually matters.
+    let command = match ssh_target {
+        Some(target) => remote::ssh_command(target, cwd, &rules_b64),
+        None => remote::remote_launch_command(cwd, &rules_b64),
+    };
 
-    // The seed carries NO completion marker. `; printf …` marks the end of a
+    // The command carries NO completion marker. `; printf …` marks the end of a
     // shell command, and this "command" is an interactive session that ends only
     // when the remote claude quits — tracking it would report completion at
     // exactly the wrong moment.
-    let reply = terminal_request(
-        ctx,
-        json!({
-            "op": "open",
-            "from": ctx.instance,
-            "seed": command,
-            "label": format!("ssh {ssh_target}"),
-        }),
-    )?;
-    let id = reply
-        .get("id")
-        .and_then(|x| x.as_u64())
-        .ok_or("Mulpex did not report the new terminal's id")? as usize;
+    let id = match existing {
+        Some(id) => {
+            launch_into_existing(ctx, id, &command)?;
+            id
+        }
+        None => {
+            let reply = terminal_request(
+                ctx,
+                json!({
+                    "op": "open",
+                    "from": ctx.instance,
+                    "seed": command,
+                    "label": format!("ssh {}", ssh_target.unwrap_or_default()),
+                }),
+            )?;
+            let id = reply
+                .get("id")
+                .and_then(|x| x.as_u64())
+                .ok_or("Mulpex did not report the new terminal's id")? as usize;
+            // A terminal you opened is one whose entire life you should see.
+            // A terminal the USER opened already has a history that is theirs,
+            // so its cursor is left where it is.
+            set_cursor(ctx, id, 0);
+            id
+        }
+    };
 
     remote::RemoteMeta {
         token: token.clone(),
-        ssh_target: ssh_target.to_string(),
+        ssh_target: ssh_target.unwrap_or_default().to_string(),
         opener: ctx.instance,
     }
     .write(&ctx.state_dir, id)
     .map_err(|e| format!("could not record the remote terminal: {e}"))?;
 
-    set_cursor(ctx, id, 0);
     clear_mark(ctx, id);
 
     // Wait for the remote's input box before typing the task in. This is the
@@ -852,6 +882,68 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         },
     })
     .to_string())
+}
+
+/// Launch into a terminal that already exists, refusing if it is not free.
+///
+/// Typing into a busy terminal is the same class of mistake as appending
+/// `; printf …` to a heredoc terminator: the text is not a command line, it is
+/// input to whatever is running, and it will be consumed as such. Three ways it
+/// can be unfree, and each gets its own message because the fix differs:
+/// something is running, a claude is already there, or the shell exited.
+///
+/// Prompt detection is a heuristic — no shell announces its prompt — so it is
+/// paired with a genuine idleness check rather than trusted on its own.
+fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), String> {
+    let view = LogView::open(ctx, id)
+        .ok_or_else(|| format!("no terminal #{id} — call hub_instances to see the live ones."))?;
+    if !view.running {
+        return Err(format!(
+            "terminal #{id} has exited. Open a new one, or call hub_remote_open without \
+             'terminal_id' and it will make its own."
+        ));
+    }
+    let screen = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
+        .unwrap_or_default();
+    if remote::looks_like_claude_tui(&screen) {
+        return Err(format!(
+            "terminal #{id} already has a Claude Code session running in it. Starting another \
+             inside it would type into that one's prompt. Use hub_terminal_send to talk to it, or \
+             call hub_remote_open without 'terminal_id' for a fresh terminal."
+        ));
+    }
+    // Two independent ways to be sure it is free, because prompt detection is a
+    // heuristic and prompt themes are endless: it is producing no output, AND it
+    // either looks like a prompt or has been quiet long enough that whatever ran
+    // is plainly over. Without the second clause an unrecognised prompt theme
+    // makes the tool permanently refuse a terminal that is perfectly idle.
+    const SETTLED_MS: u64 = 750;
+    const UNRECOGNISED_GRACE_MS: u64 = 3_000;
+    let quiet = view.idle_ms >= SETTLED_MS;
+    let ready = remote::at_shell_prompt(&screen) || view.idle_ms >= UNRECOGNISED_GRACE_MS;
+    if !quiet || !ready {
+        let last = screen
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("(blank)")
+            .trim()
+            .chars()
+            .take(80)
+            .collect::<String>();
+        return Err(format!(
+            "terminal #{id} does not look like it is sitting at a shell prompt — something may \
+             still be running in it, and the launch command would be typed into that instead of \
+             into a shell. Its last line is: {last:?}. Wait for it to finish (hub_terminal_read \
+             with wait_ms), or call hub_remote_open without 'terminal_id'."
+        ));
+    }
+    terminal_request(
+        ctx,
+        json!({ "op": "send", "from": ctx.instance, "id": id,
+                "data": format!("{command}\r") }),
+    )?;
+    Ok(())
 }
 
 /// How many times to try getting a task into a remote claude's input box.
@@ -1852,6 +1944,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // -- remote peers -------------------------------------------------------
+
+    /// Typing a launch command into a terminal that is mid-command feeds it to
+    /// whatever is running, not to a shell — the same mistake as appending
+    /// `; printf …` to a heredoc terminator.
+    #[test]
+    fn launching_into_a_busy_terminal_is_refused() {
+        let dir = tmpdir("remote-busy");
+        let ctx = test_ctx(&dir, 1);
+        fake_terminal(&ctx, 3, "", "   Compiling mulpex v0.6.0\n   Compiling serde v1.0");
+
+        let err = launch_into_existing(&ctx, 3, "ssh somewhere").unwrap_err();
+        assert!(err.contains("shell prompt"), "unhelpful refusal: {err}");
+        assert!(err.contains("Compiling"), "the refusal does not show what it saw: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Launching into a terminal that already holds a claude would type the
+    /// command into *its* prompt — a whole conversation's worth of confusion.
+    #[test]
+    fn launching_into_a_terminal_that_already_runs_claude_is_refused() {
+        let dir = tmpdir("remote-occupied");
+        let ctx = test_ctx(&dir, 1);
+        let tui = format!("{}\n❯ \n{}", "─".repeat(40), "─".repeat(40));
+        fake_terminal(&ctx, 4, "", &tui);
+
+        let err = launch_into_existing(&ctx, 4, "ssh somewhere").unwrap_err();
+        assert!(
+            err.contains("already has a Claude Code session"),
+            "wrong refusal: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_or_exited_terminal_is_refused_by_name() {
+        let dir = tmpdir("remote-gone");
+        let ctx = test_ctx(&dir, 1);
+        assert!(launch_into_existing(&ctx, 9, "x").unwrap_err().contains("no terminal #9"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read of a remote terminal reports the signal and hides the marker: the
+    /// wire protocol is Mulpex's, and a model that saw it could forge a wake.
+    #[test]
+    fn reading_a_remote_reports_its_signal_and_hides_the_marker() {
+        let dir = tmpdir("remote-read");
+        let ctx = test_ctx(&dir, 1);
+        let token = "beefcafe";
+        crate::remote::RemoteMeta {
+            token: token.into(),
+            ssh_target: "root@vm".into(),
+            opener: 1,
+        }
+        .write(&ctx.state_dir, 5)
+        .unwrap();
+        let marker = format!(
+            "{} {token} question Which database should staging use?{}",
+            crate::remote::SIG_OPEN,
+            crate::remote::SIG_CLOSE
+        );
+        fake_terminal(&ctx, 5, &format!("I need a decision.\n{marker}\n"), &marker);
+
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 5})).unwrap()).unwrap();
+        assert_eq!(reply["remote_claude"], json!(true));
+        assert_eq!(reply["remote_signal"], json!("question"));
+        assert_eq!(
+            reply["remote_summary"],
+            json!("Which database should staging use?")
+        );
+        assert_eq!(reply["ssh_target"], json!("root@vm"));
+        for channel in ["new_output", "current_screen"] {
+            let shown = reply[channel].as_str().unwrap();
+            assert!(!shown.contains(token), "the token leaked into {channel}: {shown:?}");
+            assert!(
+                !shown.contains(crate::remote::SIG_OPEN),
+                "the marker leaked into {channel}: {shown:?}"
+            );
+        }
+        assert!(reply["new_output"].as_str().unwrap().contains("I need a decision."));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The screen is the primary channel for a caller that prefixes `clear;`, so

@@ -236,6 +236,29 @@ pub fn has_spinner(screen: &str) -> bool {
     })
 }
 
+/// Whether a screen's last live line looks like a shell waiting for a command.
+///
+/// Used to refuse launching into a terminal that is busy. Prompt detection is a
+/// heuristic in any shell — there is no escape sequence for "I am a prompt" —
+/// so this is deliberately paired with an idleness check at the call site rather
+/// than trusted alone. Known residual: a quiet interactive program (a REPL at
+/// its own `>` prompt) is indistinguishable from a shell, which is why the
+/// caller also rejects a screen that already holds a Claude TUI.
+pub fn at_shell_prompt(screen: &str) -> bool {
+    let Some(last) = screen.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let t = last.trim();
+    // A prompt either ENDS with a sigil (`user@host:~$`) or BEGINS with one
+    // (`➜  ~`, oh-my-zsh's default, where the line ends with the *path*). Both
+    // shapes are needed: keying on the trailing character alone refused to
+    // launch into a perfectly idle terminal on the single most common zsh theme
+    // there is — found live, on the first run against a real box.
+    const TRAILING: [char; 6] = ['$', '#', '%', '>', '❯', '›'];
+    const LEADING: [char; 6] = ['➜', '❯', '›', 'λ', '▶', '»'];
+    t.ends_with(TRAILING) || t.starts_with(LEADING)
+}
+
 /// The rules handed to a remote claude at launch, via `--append-system-prompt`.
 ///
 /// Delivered as part of the *system* prompt on purpose: it is re-sent with every
@@ -521,6 +544,11 @@ pub fn forget_all(state_dir: &Path, id: usize) {
 /// creates is to reply with `hub_send` — which would be addressed to a terminal
 /// id, i.e. to a shell that is not a peer and cannot receive it.
 pub fn wake_body(id: usize, target: &str, sig: &Signal) -> String {
+    let where_ = if target.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" on {target}")
+    };
     let what = match sig.kind {
         Kind::Done => "has FINISHED the work you gave it",
         Kind::Blocked => "is BLOCKED and cannot continue",
@@ -534,7 +562,7 @@ pub fn wake_body(id: usize, target: &str, sig: &Signal) -> String {
         format!("\nIt says: {}", sig.summary.trim())
     };
     format!(
-        "The remote claude you started on {target} (terminal #{id}) {what}.{summary}\n\
+        "The remote claude you started{where_} (terminal #{id}) {what}.{summary}\n\
          Read what it actually did with mcp__mulpex__hub_terminal_read(id: {id}), and reply to it \
          with mcp__mulpex__hub_terminal_send(id: {id}) — it is a terminal, NOT a hub instance, so \
          hub_send cannot reach it."
@@ -703,6 +731,30 @@ mod tests {
         RemoteMeta::forget(&dir, 7);
         assert!(RemoteMeta::read(&dir, 7).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shell_prompt_is_told_from_a_busy_screen() {
+        // `➜  ~` is oh-my-zsh's default and ends with the path, not a sigil —
+        // the case that failed live.
+        for prompt in [
+            "root@vm:/srv# ", "gidi@mac ~ %", "› ", "❯", "$ ", "user@host:~$", "➜  ~",
+            "➜  mulpex git:(master)",
+        ] {
+            assert!(at_shell_prompt(&format!("some output\n{prompt}")), "not a prompt: {prompt:?}");
+        }
+        for busy in ["Compiling mulpex v0.6.0", "  ⎿  /tmp/mpx-probe", ""] {
+            assert!(!at_shell_prompt(busy), "read as a prompt: {busy:?}");
+        }
+        // Trailing blank lines must not hide the prompt.
+        assert!(at_shell_prompt("out\n$ \n\n   \n"));
+    }
+
+    #[test]
+    fn a_wake_without_a_known_target_still_reads_properly() {
+        let body = wake_body(2, "", &Signal { kind: Kind::Done, summary: "built".into() });
+        assert!(body.contains("you started (terminal #2)"), "{body}");
+        assert!(!body.contains(" on  "), "empty target left a gap: {body}");
     }
 
     #[test]

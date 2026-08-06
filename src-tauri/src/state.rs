@@ -2674,6 +2674,112 @@ mod remote_peer_live {
     use super::*;
     use mulpex_core::remote;
 
+    /// The flow where the *user* establishes the connection: a terminal that is
+    /// already logged in to the remote machine, into which only the `claude`
+    /// half is launched. This is what makes a password login, a jump host or a
+    /// VPN usable — none of which ssh keys alone can reach.
+    #[test]
+    #[ignore]
+    fn a_claude_launched_into_an_already_connected_terminal_signals_home() {
+        let Ok(target) = std::env::var("MULPEX_TEST_SSH") else {
+            eprintln!("set MULPEX_TEST_SSH to run this");
+            return;
+        };
+        let _env = tests::env_guard();
+        let (root, mut core) = tests::scratch_core_inner("remote-attach");
+
+        let driver = core.spawn_terminal(None, Some("driver".into()), false).unwrap();
+        // The user's own terminal, logged in by hand — no rules, no token yet.
+        let term = core
+            .spawn_terminal(Some(format!("ssh -tt {target}")), Some("my ssh".into()), false)
+            .unwrap();
+        let screen_path = crate::pty::terminal_screen_path(&core.state_dir, term.id);
+
+        assert!(
+            wait_until_slow(|| {
+                let s = std::fs::read_to_string(&screen_path).unwrap_or_default();
+                remote::at_shell_prompt(&s) && !s.trim().is_empty()
+            }),
+            "never reached a remote shell prompt:\n{}",
+            std::fs::read_to_string(&screen_path).unwrap_or_default()
+        );
+        eprintln!("remote shell is up");
+
+        // Only the claude half is launched — the terminal is already there.
+        let token = remote::new_token(driver.id, 7);
+        let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
+        let cmd = remote::remote_launch_command(Some("/tmp/mpx-probe"), &rules_b64);
+        remote::RemoteMeta {
+            token: token.clone(),
+            ssh_target: String::new(),
+            opener: driver.id,
+        }
+        .write(&core.state_dir, term.id)
+        .unwrap();
+        send_to(&mut core, driver.id, term.id, &format!("{cmd}\r"));
+
+        assert!(
+            wait_until_slow(|| remote::looks_like_claude_tui(
+                &std::fs::read_to_string(&screen_path).unwrap_or_default()
+            )),
+            "the remote claude never drew its input box"
+        );
+        eprintln!("remote claude is up inside the user's own ssh session");
+
+        let task = "Run `echo attached` and then follow your signalling instructions.";
+        send_to(&mut core, driver.id, term.id, task);
+        std::thread::sleep(Duration::from_millis(400));
+        send_to(&mut core, driver.id, term.id, "\r");
+
+        let inbox = core.state_dir.join("inbox").join(driver.id.to_string());
+        let mut delivered = Vec::new();
+        for _ in 0..240 {
+            std::thread::sleep(Duration::from_millis(500));
+            core.process_remote_signals();
+            if let Ok(entries) = std::fs::read_dir(&inbox) {
+                delivered = entries
+                    .flatten()
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .collect();
+                if !delivered.is_empty() {
+                    break;
+                }
+            }
+        }
+        let body = delivered.join("\n");
+        eprintln!("delivered:\n{body}");
+        assert!(!body.is_empty(), "no wake reached the driver");
+        assert!(
+            body.contains("has FINISHED the work"),
+            "woken by the backstop rather than a real signal: {body}"
+        );
+        // With no ssh target recorded, the wake must still read as English.
+        assert!(
+            !body.contains("started  ("),
+            "an empty target left a gap in the message: {body}"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn send_to(core: &mut Core, from: usize, id: usize, data: &str) {
+        core.apply_terminal_request(
+            &serde_json::json!({ "op": "send", "from": from, "id": id, "data": data }).to_string(),
+        );
+    }
+
+    /// Like `wait_until` but patient enough for a network round trip.
+    fn wait_until_slow(mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..120 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        false
+    }
+
     #[test]
     #[ignore]
     fn a_remote_claude_signals_home_and_wakes_its_driver() {

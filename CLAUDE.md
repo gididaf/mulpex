@@ -882,6 +882,37 @@ through the same machinery a peer's `hub_send` does.
   updater's busy guard and `attention.ts` all lean on. The wake message says so twice over, because
   a *hub message* invites a `hub_send` reply and that would be addressed to a shell.
 
+### Three ways to start one
+
+`hub_remote_open` opens its own terminal by default, and takes an optional `terminal_id` to use one
+that already exists. What matters in every case is that the rules are attached **at launch**, on the
+command line — where the terminal came from is irrelevant to the mechanism:
+
+- **No `terminal_id`** — Mulpex opens a terminal and runs the whole `ssh … claude …` in it.
+- **`terminal_id` + `ssh_target`** — the same launch, but in a terminal that already exists (e.g. one
+  the user opened and left idle).
+- **`terminal_id`, no `ssh_target`** — the terminal is *already logged in to the far machine*, so only
+  the `claude` half is launched, on the far side. This is the one that makes a password login, a
+  jump host or a VPN workable: the human does the connecting, the instance does the rest. The wake
+  message then has no target to name, so `wake_body` drops that clause rather than printing a gap.
+
+**Adopting an already-running remote claude is still not supported, and that is a different thing.**
+Rules typed in as a message drift out of context; rules on the command line do not. Only the launch
+is being moved, never the delivery mechanism.
+
+`launch_into_existing` refuses a terminal it cannot safely type into, because a launch command sent
+to a running program is *input to that program*, not a command line — the same class of mistake as
+appending `; printf …` to a heredoc terminator. It refuses on three distinct grounds, each with its
+own message: the shell exited, a Claude TUI is already on screen, or it is not free.
+
+**"Free" is deliberately two-sided, and the first version was wrong.** It required output to have
+stopped *and* the last line to look like a prompt — and prompt themes are endless. Run live, the box
+answered with `➜  ~`, oh-my-zsh's default, which ends with the **path** rather than a sigil: the tool
+would have permanently refused a perfectly idle terminal on the most common zsh theme there is. So
+`at_shell_prompt` now matches a leading sigil as well as a trailing one, and — more importantly —
+an unrecognised prompt is no longer fatal: after `UNRECOGNISED_GRACE_MS` of silence the terminal is
+treated as free regardless of how its prompt looks.
+
 ### The marker, and why it looks like that
 
 Every one of these was measured against a real remote over ssh (fixtures
@@ -1145,12 +1176,18 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   everything a model can read. That test **failed twice before it passed**, and both failures were
   real bugs, not harness noise: the backstop firing before the task was typed, and the `\r` being
   swallowed as paste content so the task sat unsubmitted in the input box.
-  Offline: 14 `remote.rs` unit tests (marker grammar, wrap-at-every-position, foreign/missing token,
+  The **already-connected** flow is proven live too
+  (`a_claude_launched_into_an_already_connected_terminal_signals_home`): a terminal ssh'd in by hand,
+  `claude` launched into it on the far side with no `ssh_target` at all, task delivered, and the wake
+  read "has FINISHED the work you gave it. It says: echo attached ran; output: attached". That test
+  also failed first — on `➜  ~` — which is how the prompt-detection defect above was found.
+  Offline: 16 `remote.rs` unit tests (marker grammar, wrap-at-every-position, foreign/missing token,
   strip, base64 vectors, and one asserting the rules' own example parses — the two halves of the
   contract cannot drift); 2 watcher tests against real shells standing in for a remote, one of them
   confirmed to fail with the `remote_awaiting` guard removed; 2 `vtgrid` replays of the real captures
   pinning "no alternate screen" and the markdown-eats-underscores measurement.
-  `cargo test` 82 (45 app + 37 core) green, `clippy` clean but for the two pre-existing warnings. No
+  plus 4 `mcp.rs` tests for the refusals and the read integration.
+  `cargo test` 88 (45 app + 43 core) green, `clippy` clean but for the two pre-existing warnings. No
   frontend change, so `svelte-check`/`vite build` were not re-run. **Not verified:** the flow inside
   the real GUI — an instance calling the tool itself and being woken while idle. The wake rides the
   existing Monitor path, which is separately proven, but that specific end-to-end has not been driven.
