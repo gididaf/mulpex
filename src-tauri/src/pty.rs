@@ -71,7 +71,11 @@ done, blocked, or needs an answer. It opens its own terminal by default. Pass te
 one that already exists instead — either an idle terminal at a local shell, or (omitting \
 ssh_target) one the USER has already ssh'd in on themselves, which is how a login needing a \
 password, a VPN or a jump host gets done. It refuses a terminal that is busy or already running a \
-claude, so just try it and read the error. That signal reaches you as a hub message like any peer's, so \
+claude, so just try it and read the error. IF THE USER HAS NOT NAMED A TASK (e.g. \"start a claude \
+on that server for our next task\"), do NOT ask them what to seed it with and do NOT invent one: open \
+it with no task at all, tell them it is up and waiting, and stop. It sits idle at its prompt and you \
+give it work later with hub_terminal_send. Ask only when the request itself is genuinely ambiguous. \
+That signal reaches you as a hub message like any peer's, so \
 DO NOT sit polling it — end your turn and you will be woken. When woken, read what it actually \
 did with hub_terminal_read and reply with hub_terminal_send. Two things to remember about it: it \
 is a TERMINAL, not an instance, so hub_send can never reach it and it will never appear in \
