@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
-    "tauri:build": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key})\" tauri build",
+    "tauri:build": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key})\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" tauri build",
     "release": "bash scripts/release.sh"
   },
   "dependencies": {
