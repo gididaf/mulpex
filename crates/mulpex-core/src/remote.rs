@@ -316,16 +316,24 @@ pub fn peer_rules(token: &str) -> String {
 /// very often entered as root. This deliberately bypasses a safety check Claude
 /// Code put there on purpose: a remote peer runs unattended and answers to
 /// another model, so it must not stop at a permission prompt no human will see.
-pub fn remote_launch_command(cwd: Option<&str>, rules_b64: &str) -> String {
+pub fn remote_launch_command(cwd: Option<&str>, rules_b64: &str, replace_shell: bool) -> String {
     let cd = match cwd {
         Some(dir) => format!("cd {} && ", quote_path(dir)),
         // No `cd` at all rather than `cd ~`: a login shell already starts in the
         // home directory, and quoting `~` would defeat the expansion that makes
-        // it mean anything.
+        // it mean anything. Omitting it is also what lets a launch into an
+        // existing session inherit the directory the user already navigated to.
         None => String::new(),
     };
+    // `exec` hands the shell's process slot to claude, which is right for a
+    // terminal Mulpex opened for this and nothing else — one less process, and
+    // the terminal ends when the claude does. It is wrong for a session the
+    // USER established: exec'ing there means that when the remote claude quits,
+    // their ssh login dies with it and the terminal goes to `exited`, instead of
+    // dropping them back at the prompt they started from.
+    let exec = if replace_shell { "exec " } else { "" };
     format!(
-        "{cd}export IS_SANDBOX=1 && exec claude --dangerously-skip-permissions \
+        "{cd}export IS_SANDBOX=1 && {exec}claude --dangerously-skip-permissions \
          --append-system-prompt \"$(printf %s {rules_b64} | base64 -d)\""
     )
 }
@@ -352,7 +360,9 @@ pub fn ssh_command(ssh_target: &str, cwd: Option<&str>, rules_b64: &str) -> Stri
     format!(
         "ssh -tt {} {}",
         shell_quote(ssh_target),
-        shell_quote(&remote_launch_command(cwd, rules_b64))
+        // Mulpex opened this terminal for the ssh and nothing else, so the
+        // remote shell may hand its slot straight to claude.
+        shell_quote(&remote_launch_command(cwd, rules_b64, true))
     )
 }
 
@@ -671,6 +681,24 @@ mod tests {
         assert!(out.contains("real output") && out.contains("more output"));
         assert!(out.contains("other done theirs"), "a foreign marker was eaten: {out:?}");
         assert!(!out.contains("\n\n"), "stripping left a blank line: {out:?}");
+    }
+
+    #[test]
+    fn a_launch_into_the_users_own_session_leaves_their_shell_alive() {
+        let mine = remote_launch_command(Some("/opt/ticket-system"), "B64", true);
+        let theirs = remote_launch_command(Some("/opt/ticket-system"), "B64", false);
+        assert!(mine.contains("&& exec claude"), "{mine}");
+        assert!(theirs.contains("&& claude"), "{theirs}");
+        assert!(!theirs.contains("exec"), "the user's shell would be replaced: {theirs}");
+        // Both still cd, sandbox-flag and carry the rules.
+        for cmd in [&mine, &theirs] {
+            assert!(cmd.contains("cd '/opt/ticket-system' && "), "{cmd}");
+            assert!(cmd.contains("IS_SANDBOX=1"), "{cmd}");
+            assert!(cmd.contains("base64 -d"), "{cmd}");
+        }
+        // With no cwd there is no `cd`, so the launch inherits wherever the
+        // user had already navigated to.
+        assert!(!remote_launch_command(None, "B64", false).contains("cd "));
     }
 
     #[test]

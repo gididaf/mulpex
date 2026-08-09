@@ -795,7 +795,9 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // launch, which is the only thing that actually matters.
     let command = match ssh_target {
         Some(target) => remote::ssh_command(target, cwd, &rules_b64),
-        None => remote::remote_launch_command(cwd, &rules_b64),
+        // No ssh hop means this terminal is the user's own remote session, so
+        // the launch must NOT exec: their shell has to survive the claude.
+        None => remote::remote_launch_command(cwd, &rules_b64, false),
     };
 
     // The command carries NO completion marker. `; printf …` marks the end of a
@@ -1116,7 +1118,8 @@ fn hub_terminal_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
             None => true,
         }
     });
-    let action = mark_action(submit, input, control, idle);
+    let is_remote = remote::RemoteMeta::read(&ctx.state_dir, id).is_some();
+    let action = mark_action(submit, input, control, idle, is_remote);
     let track = action == Mark::Track;
 
     let mut data = String::new();
@@ -1220,7 +1223,17 @@ enum Mark {
 /// it, so the marker will never be printed, and a dangling mark would leave the
 /// terminal reading as permanently not-idle — nothing sent afterwards could ever
 /// be tracked again.
-fn mark_action(submit: bool, input: &str, control: &str, idle: Option<bool>) -> Mark {
+fn mark_action(submit: bool, input: &str, control: &str, idle: Option<bool>, remote: bool) -> Mark {
+    // There is no shell on the other end of a remote terminal — there is a
+    // claude. Wrapping input in `; printf …` would not measure anything; it
+    // would append shell plumbing to the END OF THE PROMPT the remote claude
+    // reads, so it receives the task plus a line of gibberish. Found in the
+    // field: a driver's message arrived with the completion sentinel glued to
+    // it. Nothing about a claude TUI distinguishes it from a shell prompt in
+    // the transcript, so the terminal's own kind has to say so.
+    if remote {
+        return Mark::Clear;
+    }
     if aborts_running_command(control) {
         return Mark::Clear;
     }
@@ -1484,7 +1497,12 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // retained megabyte — but it says so, so the model knows it's mid-story.
     let (text, truncated) = tail_lines(&text, max_lines);
 
-    let finished = token.and_then(|t| find_completion(&view.data, t));
+    // A remote terminal has no shell command to finish; `remote_signal` is how
+    // its turn ends. Reporting `command_finished` there would be a wrong answer,
+    // not a missing one.
+    let finished = token
+        .filter(|_| remote_meta.is_none())
+        .and_then(|t| find_completion(&view.data, t));
     // The screen gets the same treatment as `new_output`: it is read straight
     // off disk, so without this every screen read carries the visible
     // `; printf '…__MPX_DONE_…' "$?"` plumbing. That matters more than it looks
@@ -1821,21 +1839,21 @@ mod tests {
     fn an_untracked_send_at_a_prompt_retires_the_old_mark() {
         let idle = Some(true);
         // Text left sitting at the prompt (submit=false).
-        assert_eq!(mark_action(false, "ls", "", idle), Mark::Clear);
+        assert_eq!(mark_action(false, "ls", "", idle, false), Mark::Clear);
         // A control key on its own.
-        assert_eq!(mark_action(true, "", "enter", idle), Mark::Clear);
+        assert_eq!(mark_action(true, "", "enter", idle, false), Mark::Clear);
         // Multi-line, which is never tracked.
-        assert_eq!(mark_action(true, "cat <<'PY'\nx\nPY", "", idle), Mark::Clear);
+        assert_eq!(mark_action(true, "cat <<'PY'\nx\nPY", "", idle, false), Mark::Clear);
         // The ordinary case still tracks.
-        assert_eq!(mark_action(true, "ls -la", "", idle), Mark::Track);
+        assert_eq!(mark_action(true, "ls -la", "", idle, false), Mark::Track);
     }
 
     /// A mark for a command that is still *running* stays: the input is an
     /// answer to that command, and its completion is still worth reporting.
     #[test]
     fn answering_a_running_command_keeps_its_mark() {
-        assert_eq!(mark_action(true, "y", "", Some(false)), Mark::Keep);
-        assert_eq!(mark_action(true, "y", "", None), Mark::Keep);
+        assert_eq!(mark_action(true, "y", "", Some(false), false), Mark::Keep);
+        assert_eq!(mark_action(true, "y", "", None, false), Mark::Keep);
     }
 
     /// An interrupt kills the `; printf …` too, so the marker never arrives.
@@ -1843,10 +1861,10 @@ mod tests {
     /// not-idle and nothing could ever be tracked again.
     #[test]
     fn an_interrupt_retires_the_mark() {
-        assert_eq!(mark_action(true, "", "c", Some(false)), Mark::Clear);
-        assert_eq!(mark_action(true, "", "d", Some(false)), Mark::Clear);
+        assert_eq!(mark_action(true, "", "c", Some(false), false), Mark::Clear);
+        assert_eq!(mark_action(true, "", "d", Some(false), false), Mark::Clear);
         // A cursor key is not an abort.
-        assert_eq!(mark_action(true, "", "up", Some(false)), Mark::Keep);
+        assert_eq!(mark_action(true, "", "up", Some(false), false), Mark::Keep);
     }
 
     /// Multi-line input is passed through untouched: appending the marker to a
@@ -1947,6 +1965,37 @@ mod tests {
     }
 
     // -- remote peers -------------------------------------------------------
+
+    /// A remote terminal hosts a claude, not a shell, so input must never be
+    /// wrapped in the completion sentinel. In the field this appended
+    /// `; printf '\n__MPX_DONE_…' "$?"` to the end of the task text the remote
+    /// claude read as its prompt.
+    #[test]
+    fn input_to_a_remote_claude_is_never_wrapped_in_shell_plumbing() {
+        // Exactly the shape that gets tracked for a shell: submitted, one line,
+        // at an idle prompt.
+        assert_eq!(
+            mark_action(true, "fix the bug in auth.ts", "", Some(true), false),
+            Mark::Track,
+            "a shell command should still be tracked"
+        );
+        assert_eq!(
+            mark_action(true, "fix the bug in auth.ts", "", Some(true), true),
+            Mark::Clear,
+            "a remote claude must never get the sentinel"
+        );
+        // And no combination brings it back.
+        for submit in [true, false] {
+            for idle in [Some(true), Some(false), None] {
+                assert_eq!(
+                    mark_action(submit, "anything", "", idle, true),
+                    Mark::Clear,
+                    "submit={submit} idle={idle:?}"
+                );
+            }
+        }
+    }
+
 
     /// Typing a launch command into a terminal that is mid-command feeds it to
     /// whatever is running, not to a shell — the same mistake as appending

@@ -2708,7 +2708,9 @@ mod remote_peer_live {
         // Only the claude half is launched — the terminal is already there.
         let token = remote::new_token(driver.id, 7);
         let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
-        let cmd = remote::remote_launch_command(Some("/tmp/mpx-probe"), &rules_b64);
+        // false: this is the user's own ssh session in the live test too, so
+        // their shell must outlive the claude.
+        let cmd = remote::remote_launch_command(Some("/tmp/mpx-probe"), &rules_b64, false);
         remote::RemoteMeta {
             token: token.clone(),
             ssh_target: String::new(),

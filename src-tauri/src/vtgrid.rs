@@ -113,6 +113,14 @@ pub struct Screen {
     top: usize,
     bot: usize,
     /// Set between `?1049h` and `?1049l` — a full-screen program is drawing.
+    ///
+    /// It suppresses *logging*, not emulation. The grid keeps tracking the
+    /// program's output so `screen_text` (and therefore `hub_terminal_read`'s
+    /// `current_screen`) shows what is actually on screen. This used to drop
+    /// every byte, which made a full-screen program completely unreadable —
+    /// fine for a stray `vim`, fatal once Claude Code itself started using the
+    /// alternate screen in v2.1.226, because a remote claude then had no
+    /// readable output at all.
     suppressed: bool,
     state: PState,
     /// CSI parameter + intermediate bytes collected so far.
@@ -195,6 +203,12 @@ impl Screen {
 
     /// Push everything still on screen into `out` (on exit, or a screen clear).
     pub fn flush_visible(&mut self) {
+        // Same reason as `scroll_up`: what is on an alt screen is a live view,
+        // not history, and must not be dumped into the log on exit or on a
+        // clear.
+        if self.suppressed {
+            return;
+        }
         let mut last = None;
         for r in 0..self.rows {
             if !self.row_text(r).is_empty() {
@@ -396,9 +410,6 @@ impl Screen {
     }
 
     fn print(&mut self, c: char) {
-        if self.suppressed {
-            return;
-        }
         if self.col >= self.cols {
             // Auto-wrap: this row does not end here, it continues below.
             self.wrapped[self.row] = true;
@@ -412,9 +423,6 @@ impl Screen {
     /// An explicit line break (LF/VT/FF/IND/NEL): whatever the cursor's row used
     /// to be, it ends here.
     fn newline(&mut self) {
-        if self.suppressed {
-            return;
-        }
         self.wrapped[self.row] = false;
         self.line_feed();
     }
@@ -423,9 +431,6 @@ impl Screen {
     /// explicit break and by auto-wrap, which must *not* clear the flag it just
     /// set.
     fn line_feed(&mut self) {
-        if self.suppressed {
-            return;
-        }
         if self.row == self.bot {
             self.scroll_up(1);
         } else if self.row + 1 < self.rows {
@@ -434,9 +439,6 @@ impl Screen {
     }
 
     fn reverse_index(&mut self) {
-        if self.suppressed {
-            return;
-        }
         if self.row == self.top {
             self.scroll_down(1);
         } else {
@@ -449,7 +451,11 @@ impl Screen {
     /// managing its own pane, and its churn is not history.
     fn scroll_up(&mut self, n: usize) {
         for _ in 0..n.min(self.rows) {
-            if self.top == 0 {
+            // On the alt screen the grid is still maintained — that is what
+            // makes a full-screen program *readable* — but its churn never
+            // reaches the log. A TUI repaints continuously and would evict the
+            // whole retained history within seconds.
+            if self.top == 0 && !self.suppressed {
                 // A row that wraps is emitted without a terminator: its
                 // continuation scrolls off later and lands on the same line,
                 // which is how a line longer than the screen survives the log.
@@ -533,10 +539,6 @@ impl Screen {
             }
             return;
         }
-        if self.suppressed {
-            return;
-        }
-
         match final_byte {
             'A' => self.row = self.row.saturating_sub(n).max(self.top.min(self.row)),
             'B' => self.row = (self.row + n).min(self.bot),
@@ -883,6 +885,48 @@ mod tests {
         assert_eq!(s.screen_text(), "click here done");
     }
 
+    /// The case that broke the remote-claude feature in the field: Claude Code
+    /// v2.1.226 draws on the alternate screen, where v2.1.223 rendered inline.
+    /// A full-screen program's output must stay *readable on the screen* even
+    /// though it never enters the log — otherwise a remote claude has no
+    /// readable output at all and its driver is blind.
+    #[test]
+    fn a_full_screen_program_is_still_readable_on_screen() {
+        let mut s = Screen::new(6, 40);
+        feed(&mut s, "before\r\n");
+        feed(&mut s, "\x1b[?1049h");
+        feed(&mut s, "\x1b[H● Migrated the schema\r\n<<<MPX tok done all good>>>\r\n");
+
+        let screen = s.screen_text();
+        assert!(screen.contains("Migrated the schema"), "TUI unreadable: {screen:?}");
+        assert!(
+            screen.contains("<<<MPX tok done all good>>>"),
+            "a signal on the alt screen must be findable: {screen:?}"
+        );
+
+        // …and none of it may reach the log, which a repainting TUI would
+        // otherwise flood.
+        let logged = drain(&mut s);
+        assert!(logged.contains("before"), "{logged:?}");
+        assert!(logged.contains(ALT_SCREEN_NOTE), "{logged:?}");
+        assert!(!logged.contains("Migrated"), "the TUI leaked into the log: {logged:?}");
+    }
+
+    /// A repainting alt-screen program must not grow the log at all, however
+    /// long it runs — the property that justifies suppressing it in the first
+    /// place.
+    #[test]
+    fn a_repainting_alt_screen_never_grows_the_log() {
+        let mut s = Screen::new(6, 40);
+        feed(&mut s, "\x1b[?1049h");
+        let before = s.out.len();
+        for i in 0..500 {
+            feed(&mut s, &format!("\x1b[H\x1b[2Jframe {i}\r\n"));
+        }
+        assert_eq!(s.out.len(), before, "the alt screen grew the log");
+        assert!(s.screen_text().contains("frame 499"), "latest frame not on screen");
+    }
+
     #[test]
     fn full_screen_programs_are_suppressed() {
         let mut s = Screen::new(4, 30);
@@ -1191,14 +1235,15 @@ mod remote_claude_replays {
         (s.out.clone(), screen)
     }
 
+    /// NOTE: this fixture is Claude Code **v2.1.223**, which rendered inline.
+    /// v2.1.226 moved to the alternate screen, so the absence of `?1049h` here
+    /// is a fact about this recording, NOT a property of remote claudes — it
+    /// was briefly relied on as the latter, and the feature shipped blind
+    /// against a newer remote because of it. The alt-screen path is covered by
+    /// `a_full_screen_program_is_still_readable_on_screen`.
     #[test]
     fn a_remote_claude_over_ssh_is_legible_to_the_recorder() {
         let raw = include_bytes!("../tests/fixtures/remote-claude-ssh.bin");
-        assert!(
-            !raw.windows(7).any(|w| w == b"[?1049h"),
-            "the remote claude took the alternate screen — the transcript would be suppressed"
-        );
-
         let (log, screen) = replay(raw);
         let all = format!("{log}\n{screen}");
         assert!(!log.contains('\u{1b}'), "escape sequences leaked into the log");
