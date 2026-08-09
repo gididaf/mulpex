@@ -1536,6 +1536,18 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     if let Some(m) = &remote_meta {
         map.insert("remote_claude".into(), json!(true));
         map.insert("ssh_target".into(), json!(m.ssh_target));
+        // A remote claude draws full-screen, repainting by absolute cursor
+        // position rather than scrolling (measured: zero newlines, 22 CUPs in a
+        // 3 KB startup). Nothing ever passes through the terminal's scrollback,
+        // so `new_output` cannot carry its history however it is recorded —
+        // `current_screen` is the entire channel. Saying so is the fix: without
+        // it a reply that overflowed the screen silently loses its top, and the
+        // reader has no way to tell that from the remote never having said it.
+        map.insert("screen_only".into(), json!(true));
+        map.insert(
+            "screen_only_note".into(),
+            json!("This is a full-screen Claude session: you can see ONLY the visible screen.                    Anything that scrolled above it is in the remote's own scrollback and is not                    retrievable here — new_output stays empty by design. If a reply looks like it                    is missing its beginning, ask the remote to re-print that part compactly (it                    still has it in context, so it does not need to redo the work), and prefer                    asking for answers in screen-sized chunks."),
+        );
         match &signal {
             Some(sig) => {
                 map.insert("remote_signal".into(), json!(sig.kind.as_str()));

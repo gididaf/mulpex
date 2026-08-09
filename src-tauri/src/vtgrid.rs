@@ -1256,6 +1256,39 @@ mod remote_claude_replays {
         );
     }
 
+    /// A REAL alt-screen remote claude (v2.1.226 over ssh, captured at 20x100).
+    ///
+    /// This is the recording that proved two things at once: newer Claude Code
+    /// draws full-screen, and it repaints by absolute cursor positioning rather
+    /// than scrolling — zero newlines in the whole capture. Which is why the log
+    /// can never hold its history, and why the screen must stay readable.
+    #[test]
+    fn a_real_alt_screen_remote_claude_stays_readable() {
+        let raw = include_bytes!("../tests/fixtures/remote-claude-altscreen.bin");
+        assert!(
+            raw.windows(7).any(|w| w == b"[?1049h"),
+            "fixture no longer shows the alt screen"
+        );
+        assert_eq!(
+            raw.iter().filter(|&&b| b == b'\n').count(),
+            0,
+            "it scrolled after all — the log could then carry its history"
+        );
+
+        let (log, screen) = replay(raw);
+        assert!(
+            !screen.trim().is_empty(),
+            "the alt screen rendered nothing — the driver would be blind"
+        );
+        assert!(
+            screen.contains("ticket-system") || screen.contains("Claude Code"),
+            "screen unreadable: {screen:?}"
+        );
+        // Its history cannot be in the log — nothing ever scrolled — so the log
+        // holds only the note. This is the fact `screen_only` reports.
+        assert!(log.contains(ALT_SCREEN_NOTE), "{log:?}");
+    }
+
     /// The measurement that chose the marker syntax. `__MPX_TO_LOCAL__` was
     /// asked for; `MPX_TO_LOCAL` is what arrived.
     #[test]

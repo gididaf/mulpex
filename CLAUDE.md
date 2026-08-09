@@ -938,6 +938,36 @@ Every one of these was measured against a real remote over ssh (fixtures
 - **Both the log and the screen are scanned.** A row reaches the log only when it scrolls off the
   top, so a remote that answers briefly and sits there has its marker on screen and *nowhere else*.
 
+### A remote claude is SCREEN-ONLY, and that is not fixable here
+
+Newer Claude Code (v2.1.226 on a real box; v2.1.223 did not) draws on the **alternate screen**, and
+it repaints by **absolute cursor positioning** — measured on a real capture
+(`remote-claude-altscreen.bin`): `?1049h`, 22 CUP sequences, 11 erase-lines and **zero newlines** in
+a 3 KB startup. Two consequences follow, both load-bearing:
+
+- **The recorder must keep emulating while suppressed.** `Screen::suppressed` suppresses *logging*,
+  never emulation. It used to drop every byte, which was fine for a stray `vim` and fatal here: a
+  remote claude's terminal went completely dark, `<id>.screen` was **0 bytes**, and the driving
+  instance could read *nothing at all*. Guarded by `a_real_alt_screen_remote_claude_stays_readable`,
+  confirmed to fail ("the driver would be blind") with the old early-return restored.
+- **Its history cannot be recovered by any amount of logging.** Nothing ever scrolls, so no row ever
+  passes through `scroll_up` — the text above the viewport lives in *claude's own* buffer and is
+  redrawn only when someone scrolls it. `new_output` is therefore empty by design and
+  `current_screen` is the whole channel. Don't "fix" this by logging during alt screen: there is
+  nothing there to log, and a repainting TUI would evict the retained history.
+
+So the constraint is *reported* rather than papered over. `hub_terminal_read` sets **`screen_only`**
+on a remote and explains it, the remote's rules cap replies at about a screen and tell it to
+re-print (not re-investigate) on request, and the driver's rules say to ask for screen-sized chunks.
+This came from the field: a remote answered in six sections, the driver received 4–6, and 1–3 had
+scrolled into a buffer it could never reach. Nothing errored; the text simply was not there.
+
+Worth noting how long the trigger stayed hidden: `?1049h` did **not** reproduce on a local claude of
+the same version, nor with a `statusLine` configured, nor in a fresh directory — that last one only
+because the probe never got past the trust prompt. It appears at 1.7 s in an already-trusted project
+over ssh. Three hypotheses were falsified before the reproduction; treat "it renders inline" as a
+fact about a specific recording, never as a property of Claude Code.
+
 ### Two triggers, because a model can forget
 
 The marker is an instruction to an LLM, and instructions get skipped. `--append-system-prompt` means

@@ -77,7 +77,11 @@ it with no task at all, tell them it is up and waiting, and stop. It sits idle a
 give it work later with hub_terminal_send. Ask only when the request itself is genuinely ambiguous. \
 That signal reaches you as a hub message like any peer's, so \
 DO NOT sit polling it — end your turn and you will be woken. When woken, read what it actually \
-did with hub_terminal_read and reply with hub_terminal_send. Two things to remember about it: it \
+did with hub_terminal_read and reply with hub_terminal_send. You can see only its CURRENTLY \
+VISIBLE screen — a remote Claude repaints in place rather than scrolling, so whatever ran off the \
+top of its window is unreachable to you and new_output stays empty. Ask it for answers that fit \
+one screen, and if a reply is missing its start, ask it to re-print that part compactly rather \
+than to investigate again. Two things to remember about it: it \
 is a TERMINAL, not an instance, so hub_send can never reach it and it will never appear in \
 hub_instances' instance list; and it cannot see your conversation, your files or the user, so a \
 task must carry everything it needs. If it asks a question only the user can answer, it is asking \

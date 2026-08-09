@@ -294,6 +294,13 @@ pub fn peer_rules(token: &str) -> String {
          Never print it in any other context.\n\
          - Emit it EXACTLY ONCE per turn, at the end. Never in the middle of your work, and never \
          speculatively.\n\
+         KEEP EACH REPLY SHORT ENOUGH TO FIT ON ONE SCREEN (about 40 lines). This is a hard \
+         constraint, not a style note: your driver reads you through a terminal screen-scrape and \
+         can see ONLY what is currently visible. Anything that scrolls above the viewport is in \
+         your scrollback, which it cannot reach — to it, that text was never said. If you have \
+         more to report than fits, say the most important part, add one line naming what you are \
+         holding back, and wait to be asked for the rest. If your driver says it missed part of \
+         an answer, re-print that part compactly from your context; do not re-do the work.\n\
          Example of a correct final line:\n\
          {SIG_OPEN} {token} done Migrated the schema; 3 tables changed, tests pass{SIG_CLOSE}"
     )
