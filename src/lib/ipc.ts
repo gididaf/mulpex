@@ -46,8 +46,12 @@ export interface WaitEntry {
   file: string;
   holder: number;
 }
+/** Both ends are *addresses*: `claude#2` in this project, `all` for a broadcast,
+ *  `central-one#3` for an instance in another open project. `from` was a bare
+ *  number until a sender could live in a different project — there was nowhere
+ *  to put the project. Mirrors `snapshot.rs::MsgEntry` (no codegen; keep in sync). */
 export interface MsgEntry {
-  from: number;
+  from: string;
   to: string;
   body: string;
   ts: number;

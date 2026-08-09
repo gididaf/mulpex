@@ -32,6 +32,16 @@ impl Status {
             _ => None,
         }
     }
+
+    /// Back to that word — for the workspace registry, which another project's
+    /// helper reads as plain text rather than through serde.
+    pub fn word(self) -> &'static str {
+        match self {
+            Status::Working => "working",
+            Status::Waiting => "waiting",
+            Status::Needs => "needs",
+        }
+    }
 }
 
 /// What a session runs. Terminals share the session list, the id space and every
@@ -87,10 +97,16 @@ pub struct WaitEntry {
     pub holder: usize,
 }
 
-/// One record from the persistent cross-instance conversation log.
+/// One record from the persistent conversation log.
+///
+/// Both ends are *addresses*, not numbers: `claude#2` for an instance in this
+/// project, `all` for a broadcast, `central-one#3` for one in another open
+/// project. `from` used to be a bare `usize`, which had nowhere to put the
+/// project once a sender could live in a different one. The log is written into a
+/// per-pid scratch dir, so changing its shape costs no compatibility.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MsgEntry {
-    pub from: usize,
+    pub from: String,
     pub to: String,
     pub body: String,
     pub ts: u64,

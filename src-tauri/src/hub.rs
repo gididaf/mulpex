@@ -2,10 +2,16 @@
 //! sessions, fulfils hub_spawn requests, tracks the worked-on set, and emits that
 //! project's live hub snapshot to the frontend. Ports the cadence of the old
 //! `App::run` loop (minus all the redraw bookkeeping), now fanned out per project.
+//!
+//! It also publishes the **workspace registry** (`mulpex_core::registry`), which
+//! is what makes cross-project messaging possible: this loop is the only context
+//! that holds every `Core` at once, so it is the only thing that can say what the
+//! other projects are and where their hubs live on disk.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use mulpex_core::registry::Registry;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::snapshot::{
@@ -36,6 +42,11 @@ pub fn start(app: AppHandle) {
             // Collect everything under the lock, then drop it before emitting.
             let mut batch: Vec<(ProjectHandle, Vec<usize>, HubSnapshot, Vec<SessionInfo>)> =
                 Vec::new();
+            // What every project publishes about itself to the others. This loop
+            // is the only context that holds every `Core` at once, so it is the
+            // only thing that can describe the workspace honestly.
+            let mut reg = Registry::default();
+            let state_root = ws.state_root.clone();
             let mut live: HashSet<ProjectHandle> = HashSet::new();
             for core in &mut ws.projects {
                 live.insert(core.handle);
@@ -60,14 +71,16 @@ pub fn start(app: AppHandle) {
                 // this is what stops the manifest instances read from going on
                 // advertising it as running. Writes only on change.
                 core.sync_terminal_index();
-                batch.push((
-                    core.handle,
-                    removed,
-                    core.hub_snapshot(),
-                    core.session_infos(),
-                ));
+                let snap = core.hub_snapshot();
+                reg.projects.push(core.registry_entry(&snap));
+                batch.push((core.handle, removed, snap, core.session_infos()));
             }
             drop(ws);
+
+            // Cross-project addressing rests on this file. Written outside the
+            // lock and only when the bytes change, so a quiet tick costs one
+            // string compare — and a closed project simply stops appearing.
+            Registry::write_if_changed(&state_root, &reg);
 
             for (handle, removed, snap, sessions) in batch {
                 for id in &removed {

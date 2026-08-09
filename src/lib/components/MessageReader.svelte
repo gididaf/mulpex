@@ -35,10 +35,10 @@
     </header>
     <div class="body">
       {#if $hub && $hub.messages.length}
-        {#each $hub.messages as m (m.ts + "-" + m.from + "-" + m.to)}
+        {#each $hub.messages as m, i (m.ts + "-" + m.from + "-" + m.to + "-" + i)}
           <article>
             <div class="meta">
-              <span class="route">#{m.from} → {m.to}</span>
+              <span class="route">{m.from} → {m.to}</span>
               <span class="ts">{when(m.ts)}</span>
             </div>
             <div class="text">{m.body}</div>

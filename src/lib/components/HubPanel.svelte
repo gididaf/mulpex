@@ -16,10 +16,15 @@
         <span class="unread">({$unread} unread)</span>
       {/if}
     </button>
+    <!-- Both ends are already addresses (`claude#2`, `all`, `central-one#3`), so
+         they render verbatim — a route must stay unambiguous now that a sender
+         can live in another project. The index is in the key because
+         (ts, from, to) is not unique: two messages on the same route inside one
+         second are possible, and Svelte 5 throws on a duplicate key. -->
     {#if $hub && $hub.messages.length}
-      {#each $hub.messages.slice(0, 8) as m (m.ts + "-" + m.from + "-" + m.to)}
+      {#each $hub.messages.slice(0, 8) as m, i (m.ts + "-" + m.from + "-" + m.to + "-" + i)}
         <div class="msg">
-          <span class="route">#{m.from}→{m.to}</span>
+          <span class="route">{m.from}→{m.to}</span>
           <span class="snippet">{m.body.replace(/\s+/g, " ").slice(0, 60)}</span>
         </div>
       {/each}

@@ -470,9 +470,101 @@ against the *local* hub:
   same hook on that first turn.)*
 - **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
   autonomously, replies to the sender only when it adds value (no bare acks), and prefixes the
-  self-triggered turn with a `⟳ hub message from #<sender> →` marker so the human can tell it
+  self-triggered turn with a `⟳ hub message from <sender> →` marker so the human can tell it
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
+
+## Vocabulary (fixed — use these words)
+
+- **project** — one entry in the project tab bar, named by its folder (`cloud`, `central-one`).
+- **instance** — one sidebar row: a claude **or** a terminal. Written **`claude#1`**, **`term#5`**,
+  no space, in prose, tool descriptions, `HUB_RULES` and error strings. Not "session", not "peer
+  #3".
+
+The code used instance/session/peer/terminal-id interchangeably until this was settled; one
+vocabulary is what lets an address like `central-one#3` be read without guessing. The sidebar
+itself still renders `claude #1` with a space (`InstanceList.svelte`); only the written/address
+form drops it.
+
+## Cross-project messaging (`<project>#<n>`)
+
+`hub_send` / `hub_inbox` / `hub_instances` reach **every project open in this Mulpex window**.
+Everything else stays strictly per-project: locks, `hub_spawn`, terminals, mute, the badges.
+
+Before this, isolation was not a check — it was **unreachability**. An instance is handed exactly
+one `MULPEX_STATE_DIR` (`pty.rs`), every hub path is `state_dir.join(…)`, so another project's hub
+had no name a child process could utter. The feature is therefore mostly about *naming*.
+
+- **The registry** (`mulpex-core/src/registry.rs`, published at the state ROOT as
+  `temp/mulpex-<pid>/registry.json`) is the one file that says what the other projects are, where
+  each one's state dir is, and who is live in it. The **poll loop writes it** (`hub.rs`) because it
+  is the only context holding every `Core` under one lock; `Core::registry_entry` builds an entry
+  from the snapshot it already computed, so it costs no extra disk reads and inherits `statuses`'
+  membership rule — shells and failed-to-start instances are absent, exactly as they are locally.
+  Written only when the bytes change, temp+rename.
+  - The root is per **process** (`mulpex-<pid>`), so "reachable" means precisely "open in this
+    Mulpex window" — a second Mulpex is a separate universe, with no code to make it so.
+  - A child knows its own `MULPEX_STATE_DIR = <root>/<handle>`, so it finds the registry with
+    `parent()`. **No new env var was needed**, which is why nothing in `pty.rs` changed.
+  - Staleness is ≤200 ms — the same guarantee the per-project `instances` file already gives, so
+    validating a foreign recipient is no more of a race than validating a local one.
+- **Sending is a direct write into the target's own `inbox/<id>/`** (`mcp.rs::send_foreign`), not a
+  brokered handshake like `hub_spawn`'s. That is the whole reason the feature is small: **nothing
+  downstream changed.** Their 1 Hz listener Monitor wakes them, the `PostToolUse` nudge and the
+  blocking `Stop` hook count it, `hub_snapshot`'s `pending` counts it, their amber tab badge lights
+  — every one of those paths already existed, because the message lands where a local one would.
+  The `<token>.done` handshake was rejected on latency: `hub_send` must feel instant.
+- **Provenance rides on extra keys**, `from_project` / `from_project_dir`, the same way the
+  remote-claude wake already rides on `from_terminal`. `take_inbox` reads only `ts`/`body` plus
+  whatever `sender_label` decides, so the reader needed no change.
+- **`sender_label` returns an address you can reply to** — `claude#2`, `cloud#2`,
+  `term#4 (remote claude)`. The reply address is never assembled or guessed.
+- **Both sides' `messages.log` get the line.** Logging only where `hub_send` ran would leave the
+  recipient's unread badge climbing with nothing in its reader to explain it. `MsgEntry.from` is
+  therefore a `String` address, not a `usize` — there was nowhere to put the project. The log lives
+  in a per-pid scratch dir, so the format change costs no compatibility.
+
+### The `#` collision — the trap, and why the parser is ordered
+
+`claude#3` separates *kind* from *number*; `central-one#3` separates *project* from *number*. One
+character, two jobs. That is a trap rather than a wart: `claude#3` is how an instance is written
+everywhere else, so a model will eventually put it in `to` meaning the local instance 3. So
+`registry::parse_address` resolves the kind words **before** any project lookup — `claude#<n>` is
+the local instance, `term#<n>` is refused naming `hub_terminal_send` (promoting a rule `HUB_RULES`
+only stated into one that is enforced), everything else is a project qualifier. Cost, accepted:
+a project literally named `claude` or `term` needs a path qualifier (`dreamvps/claude#3`); the
+errors say so.
+
+Resolution is exact-dir, then **whole trailing path components** (`cloud`, `dreamvps/cloud`) — a
+substring match would let `one` hit `central-one`. An ambiguous name is an error listing the
+candidates' full paths **plus a suffix that actually disambiguates**; sending to the wrong
+repository is a wrong answer, not an inconvenience.
+
+### Two things that had to change, both quiet failures
+
+- **`bounce_dead_inbox` had to learn `from_project_dir`.** A foreign message's bare `from` is an id
+  in *another* project's numbering, so bouncing on the number alone hands a stranger's undelivered
+  mail to whichever local instance shares it — mis-delivery, not a dropped message. It now resolves
+  the sender through the registry and bounces back across the boundary; a sender whose project has
+  closed is dropped rather than guessed at. Pinned by
+  `a_foreign_bounce_goes_back_across_the_boundary_not_to_the_local_same_number`, which is
+  non-tautological by construction (project B has a *live* `claude#2`, exactly where the old code
+  put it) and was confirmed to fail with that message.
+- **"Which project am I" cannot be a string compare** (`registry::same_dir`). The app writes the dir
+  it opened; the helper asks with the canonicalized one, and on macOS `/var` vs `/private/var` is
+  enough to disagree — a symlinked project path disagrees everywhere. The symptom is an instance
+  seeing its **own** project among the "other" ones. **Found by driving two real helper processes,
+  not by a unit test**, whose hand-matched strings agreed by construction.
+
+### What deliberately did NOT change
+
+`to: "all"` is still project-local — a message is mandatory reading, so one project must not be
+able to stall another. Cross-project mail raises the recipient project's **amber tab badge only**:
+no dock badge, no notification, keeping the documented rule that the dock badge means "a claude is
+blocked on YOU". `hub_spawn` still only creates instances in its own project, terminals are still
+un-driveable across the boundary, and locks are meaningless between separate checkouts. `HUB_RULES`
+says all of this, and says the thing that matters most for correctness: an instance over there is a
+**different repository and working tree**, so anything sent to it must be self-contained.
 
 ## Spawning instances (`hub_spawn`)
 
@@ -1056,6 +1148,9 @@ whatever the driving instance asks of it.**
 
 ## Shared-tree guardrail
 
+(Note this is per project — an instance in *another* project has its own tree, and none of this
+applies between them. See **Cross-project messaging**.)
+
 All instances **of a given project** share one working directory and one git checkout (not a
 worktree per instance; separate projects are separate trees), so
 a tree-wide git op by one (`reset --hard`, `checkout .`/`restore .`, `clean`, `stash`, branch
@@ -1309,6 +1404,25 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   artifact was installed and launched before publishing: it runs under the hardened runtime the
   bundler adds (`flags=0x10002(adhoc,runtime)`), spawns `claude`, restores projects, and **kept its
   TCC grant** across the swap.
+- **Cross-project messaging.** Offline: 17 `registry.rs` tests (the grammar in resolution order —
+  including `claude#3` landing local rather than looking for a project called "claude", `term#5`
+  refused, `<project>#all` refused; whole-component matching so `one` cannot hit `central-one`;
+  the ambiguity error carrying both full paths *and* a suffix that itself resolves; the file's
+  write-only-on-change and symlink identity), 6 new `mcp.rs` tests, and 3 in `state.rs`. Two are
+  confirmed non-tautological by breaking the code: both bounce tests fail — on exactly their own
+  assertion messages — when foreign routing is disabled.
+  **Driven end to end through TWO real `mulpex-helper` processes** (`scratchpad/drive_xproject.py`,
+  30 checks): a registry laid out as the poll loop writes it, then discovery, a send landing in the
+  *other* project's own inbox, both feeds logging it, the recipient reading a sender address it can
+  reply to verbatim, the reply arriving back, local messaging unchanged, all five refusals, and a
+  closed project vanishing from `other_projects`. **That harness is what found the `same_dir` bug**
+  — an instance seeing its own project among the "other" ones, invisible to unit tests whose
+  strings agreed by construction.
+  `cargo test` 117 (51 app + 66 core) green, `clippy` clean but for the two pre-existing warnings,
+  `svelte-check` 120 files 0 errors, `vite build` clean.
+  **Not verified:** the live GUI — two real projects open, one instance messaging the other, and in
+  particular the **idle wake** (the recipient sitting between prompts and being woken by its own
+  Monitor rather than reading the message inside a turn it was already taking).
 
 ## Auto-update
 

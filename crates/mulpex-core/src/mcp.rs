@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::hook::{canonical_target, now, read_field, Ctx};
+use crate::registry::{self, Address, ProjectEntry, Registry};
 use crate::remote;
 use crate::persist::{fnv1a, new_uuid};
 use crate::termlog;
@@ -135,7 +136,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "hub_instances",
-            "description": "List every parallel Claude instance Mulpex is running here, with each one's status (working/waiting/needs), current task, and the files it currently holds a lock on. Also reports how many unread hub messages you have, and every shell terminal open in this project (whether opened by you, by another instance, or by the user) with how much output is waiting for you to read. Call this to coordinate before starting overlapping work.",
+            "description": "List every parallel Claude instance Mulpex is running in THIS project (claude#1, claude#2, …), with each one's status (working/waiting/needs), current task, the files it currently holds a lock on, and the `address` to message it at. Also reports how many unread hub messages you have; every shell terminal open in this project (term#1, term#2 — whether opened by you, by another instance, or by the user) with how much output is waiting for you to read; and `other_projects`: the OTHER projects open in Mulpex right now with their instances and cross-project addresses, which is the only way to discover them. Call this to coordinate before starting overlapping work.",
             "inputSchema": empty,
         },
         {
@@ -167,11 +168,11 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_send",
-            "description": "Leave a message for another instance (e.g. 'I'm refactoring auth, hold off on session.rs'), or broadcast to every other instance at once with to: \"all\". It appears in each recipient's hub_inbox and is surfaced at the start of its next turn. Note that a message is mandatory reading for whoever receives it — an instance cannot finish a turn holding unread mail — so broadcast only what genuinely concerns everyone, and name a single recipient otherwise.",
+            "description": "Leave a message for another instance (e.g. 'I'm refactoring auth, hold off on session.rs'), or broadcast to every other instance in this project at once with to: \"all\". It appears in the recipient's hub_inbox and wakes it even if it is sitting idle. A message is mandatory reading for whoever receives it — an instance cannot finish a turn holding unread mail — so broadcast only what genuinely concerns everyone, and name a single recipient otherwise. You can also message an instance in ANOTHER project open in Mulpex, as \"<project>#<n>\" (get the exact addresses from hub_instances' `other_projects`). That instance works in a DIFFERENT repository and working tree and cannot see your files, so make such a message self-contained.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Recipient instance number (e.g. \"2\"), or \"all\" to broadcast to every other instance." },
+                    "to": { "type": "string", "description": "Who to message. In THIS project: the instance number (\"3\") or \"claude#3\". In another open project: \"<project>#<n>\", e.g. \"central-one#3\". Or \"all\" to broadcast to every other instance in this project (a broadcast is always project-local). Terminals cannot receive messages — use hub_terminal_send for those." },
                     "message": { "type": "string", "description": "The message body." },
                 },
                 "required": ["to", "message"],
@@ -179,7 +180,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_inbox",
-            "description": "Read and clear the messages other instances have sent you. Returns each message's sender and body.",
+            "description": "Read and clear the messages sent to you. Returns each message's body and its sender, given as the address you would reply to: \"claude#2\" for an instance in this project, \"<project>#<n>\" for one in another open project, or \"term#<n> (remote claude)\" for a remote claude you are driving (reply to that one with hub_terminal_send, not hub_send).",
             "inputSchema": empty,
         },
         {
@@ -292,11 +293,16 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
 
 fn hub_instances(ctx: &Ctx) -> String {
     let holds = locks_by_holder(ctx);
+    let reg = Registry::read_for(&ctx.state_dir);
+    let project = my_project_name(ctx, &reg);
     let list: Vec<Value> = live_ids(ctx)
         .into_iter()
         .map(|id| {
             json!({
                 "id": id,
+                // Every instance reported here carries the string you would put
+                // in hub_send's `to`, so nothing has to be assembled by hand.
+                "address": format!("claude#{id}"),
                 "is_me": id == ctx.instance,
                 "status": status_of(ctx, id),
                 "task": task_of(ctx, id),
@@ -305,14 +311,46 @@ fn hub_instances(ctx: &Ctx) -> String {
         })
         .collect();
     json!({
+        "project": project,
+        "your_address": format!("{project}#{}", ctx.instance),
         "instances": list,
         "your_unread_messages": unread_for(ctx, ctx.instance),
         // Terminals ride along here rather than needing their own list call —
-        // seeing "there is a dev server running in terminal #4" is exactly the
+        // seeing "there is a dev server running in term#4" is exactly the
         // context an instance wants at the same moment it asks who else is here.
         "terminals": terminal_list(ctx),
+        // Other PROJECTS open in this Mulpex window. Empty in the single-project
+        // case, so it costs nothing there; when it isn't, it is the only way an
+        // instance can learn a cross-project address exists at all.
+        "other_projects": other_projects(ctx, &reg),
     })
     .to_string()
+}
+
+/// Every open project except mine, with each one's live instances and the
+/// address to reach them at. Terminals are absent by design — a terminal is not
+/// a hub peer, and one in another project cannot be driven from here either.
+fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
+    reg.projects
+        .iter()
+        .filter(|p| !p.is_dir(&ctx.project_dir))
+        .map(|p| {
+            let instances: Vec<Value> = p
+                .instances
+                .iter()
+                .map(|i| {
+                    json!({
+                        "id": i.id,
+                        "address": p.address(i.id),
+                        "status": i.status,
+                        "task": i.task,
+                        "name": i.name,
+                    })
+                })
+                .collect();
+            json!({ "project": p.name, "dir": p.dir, "instances": instances })
+        })
+        .collect()
 }
 
 /// The project's terminals, from the manifest Mulpex maintains, each with how
@@ -432,34 +470,55 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .get("message")
         .and_then(|v| v.as_str())
         .ok_or("missing 'message'")?;
-    // `to` may arrive as a number or a string ("2" / "all").
+    // `to` may arrive as a number or a string ("2" / "claude#2" / "all" /
+    // "central-one#3").
     let to_raw = match args.get("to") {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::String(s)) => s.trim().to_string(),
-        _ => return Err("missing 'to' (instance number or \"all\")".into()),
-    };
-
-    let recipients: Vec<usize> = if to_raw.eq_ignore_ascii_case("all") {
-        peer_ids(ctx)
-    } else {
-        let id: usize = to_raw.parse().map_err(|_| "'to' must be a number or \"all\"")?;
-        // Refuse to "deliver" to an instance that isn't running: it has closed, so
-        // the message would rot in an inbox no live instance reads (Mulpex reaps a
-        // dead recipient's inbox). Tell the sender plainly instead of faking
-        // success — this is what stops instances messaging a peer that's gone.
-        if !live_ids(ctx).contains(&id) {
-            return Err(format!(
-                "claude #{id} is not a running instance — it has closed, so it can't receive \
-                 messages and nothing was sent. Call mcp__mulpex__hub_instances to see who is \
-                 still active."
-            ));
+        _ => {
+            return Err("missing 'to' — an instance in this project (\"3\" or \"claude#3\"), one \
+                        in another open project (\"central-one#3\"), or \"all\" to broadcast to \
+                        this project."
+                .into())
         }
-        vec![id]
     };
-    if recipients.is_empty() {
-        return Ok(json!({ "ok": false, "note": "no other instances are running right now" }).to_string());
-    }
 
+    match registry::parse_address(&to_raw)? {
+        Address::LocalAll => send_local(ctx, peer_ids(ctx), "all", message),
+        Address::Local(id) => {
+            // Refuse to "deliver" to an instance that isn't running: it has closed,
+            // so the message would rot in an inbox no live instance reads (Mulpex
+            // reaps a dead recipient's inbox). Tell the sender plainly instead of
+            // faking success — this is what stops instances messaging a peer
+            // that's gone.
+            if !live_ids(ctx).contains(&id) {
+                return Err(format!(
+                    "claude#{id} is not a running instance — it has closed, so it can't receive \
+                     messages and nothing was sent. Call mcp__mulpex__hub_instances to see who is \
+                     still active."
+                ));
+            }
+            send_local(ctx, vec![id], &format!("claude#{id}"), message)
+        }
+        Address::Foreign { qualifier, id } => send_foreign(ctx, &qualifier, id, message),
+    }
+}
+
+/// Deliver to instances in MY OWN project — the original path, unchanged: a JSON
+/// file per recipient under `inbox/<id>/`, which their hub-listener Monitor sees.
+fn send_local(
+    ctx: &Ctx,
+    recipients: Vec<usize>,
+    to_label: &str,
+    message: &str,
+) -> Result<String, String> {
+    if recipients.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "note": "no other instances are running in this project right now",
+        })
+        .to_string());
+    }
     let mut delivered = Vec::new();
     for to in recipients {
         let dir = ctx.inbox_dir.join(to.to_string());
@@ -472,24 +531,133 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
         }
     }
     if !delivered.is_empty() {
-        log_message(ctx, &to_raw, message);
+        log_message(
+            &ctx.state_dir.join("messages.log"),
+            &format!("claude#{}", ctx.instance),
+            to_label,
+            message,
+        );
     }
     Ok(json!({ "ok": !delivered.is_empty(), "delivered_to": delivered }).to_string())
 }
 
-/// Append a sent message to the persistent cross-instance conversation log
-/// (`state_dir/messages.log`), TSV `ts\tfrom\tto\tbody`. The body's backslashes,
-/// tabs and newlines are escaped so each message stays on one line (the UI
-/// decodes them). Unlike the inbox files (deleted when the recipient reads them)
-/// this log persists, so Mulpex can show the full instance-to-instance
-/// conversation. One `write_all` under `O_APPEND` is atomic across instances.
-fn log_message(ctx: &Ctx, to: &str, body: &str) {
+/// Deliver to an instance in ANOTHER open project.
+///
+/// The write goes straight into the target's own `inbox/<id>/`, which is what
+/// makes this cheap: nothing downstream changes. Their 1 Hz listener Monitor sees
+/// the new file and wakes them, the `PostToolUse` nudge and the blocking `Stop`
+/// hook count it, and their project's amber tab badge picks it up — all paths
+/// that already existed, because the message lands where a local one would.
+///
+/// The extra `from_project` / `from_project_dir` keys are what tell the recipient
+/// (and `bounce_dead_inbox`) that the sender lives elsewhere. `take_inbox` reads
+/// only `ts`/`body` and whatever `sender_label` decides, so the format tolerated
+/// this without a reader change — the same way the remote-claude wake already
+/// rides on a `from_terminal` key.
+fn send_foreign(ctx: &Ctx, qualifier: &str, id: usize, message: &str) -> Result<String, String> {
+    let reg = Registry::read_for(&ctx.state_dir);
+    let target = reg.resolve(qualifier)?;
+
+    // Naming my own project by name is simply a local send. Cheaper to honour
+    // than to explain.
+    if target.is_dir(&ctx.project_dir) {
+        if !live_ids(ctx).contains(&id) {
+            return Err(format!(
+                "claude#{id} is not a running instance in this project ({}). Call \
+                 mcp__mulpex__hub_instances to see who is still active.",
+                target.name
+            ));
+        }
+        return send_local(ctx, vec![id], &format!("claude#{id}"), message);
+    }
+
+    if !target.has_instance(id) {
+        let live: Vec<String> = target
+            .instances
+            .iter()
+            .map(|i| target.address(i.id))
+            .collect();
+        return Err(format!(
+            "{} is not a running instance — nothing was sent. {}",
+            target.address(id),
+            if live.is_empty() {
+                format!("Project \"{}\" has no claude instances running.", target.name)
+            } else {
+                format!("Running there right now: {}.", live.join(", "))
+            }
+        ));
+    }
+
+    let dir = target.inbox_dir(id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not reach {}'s inbox: {e}", target.name))?;
+    let me = my_address(ctx, &reg);
+    let payload = json!({
+        "from": ctx.instance,
+        "from_project": my_project_name(ctx, &reg),
+        "from_project_dir": ctx.project_dir.to_string_lossy(),
+        "ts": now(),
+        "body": message,
+    });
+    std::fs::write(
+        dir.join(format!("{}.json", new_uuid())),
+        payload.to_string(),
+    )
+    .map_err(|e| format!("could not deliver to {}: {e}", target.address(id)))?;
+
+    // Both sides' feeds. Logging only where `hub_send` ran would leave the
+    // recipient's unread badge climbing with nothing in its reader to explain it.
+    let to_addr = target.address(id);
+    log_message(&ctx.state_dir.join("messages.log"), &me, &to_addr, message);
+    log_message(&target.messages_log(), &me, &to_addr, message);
+
+    Ok(json!({
+        "ok": true,
+        "delivered_to": [to_addr],
+        "project": target.name,
+        "note": format!(
+            "Delivered to another PROJECT. They work in a different repository and working tree \
+             ({}), so they cannot see your files. Reply address for them: {me}.",
+            target.dir,
+        ),
+    })
+    .to_string())
+}
+
+/// This project's name, as another project must qualify it. Falls back to the
+/// directory basename so a send still works in the window before the poll loop
+/// has published its first registry.
+fn my_project_name(ctx: &Ctx, reg: &Registry) -> String {
+    reg.project_for_dir(&ctx.project_dir)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| {
+            ctx.project_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ctx.project_dir.display().to_string())
+        })
+}
+
+/// How an instance in another project must address me.
+fn my_address(ctx: &Ctx, reg: &Registry) -> String {
+    format!("{}#{}", my_project_name(ctx, reg), ctx.instance)
+}
+
+/// Append a sent message to the persistent conversation log, TSV
+/// `ts\tfrom\tto\tbody`, where `from` and `to` are *addresses* (`claude#2`,
+/// `all`, `central-one#3`). The body's backslashes, tabs and newlines are escaped
+/// so each message stays on one line (the UI decodes them). Unlike the inbox
+/// files (deleted when the recipient reads them) this log persists, so Mulpex can
+/// show the full conversation. One `write_all` under `O_APPEND` is atomic across
+/// instances — and across projects, since a cross-project send appends to two
+/// different logs.
+fn log_message(log: &Path, from: &str, to: &str, body: &str) {
     let esc = body.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
-    let line = format!("{}\t{}\t{}\t{}\n", now(), ctx.instance, to, esc);
+    let line = format!("{}\t{}\t{}\t{}\n", now(), from, to, esc);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(ctx.state_dir.join("messages.log"))
+        .open(log)
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
@@ -898,10 +1066,10 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
 /// paired with a genuine idleness check rather than trusted on its own.
 fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), String> {
     let view = LogView::open(ctx, id)
-        .ok_or_else(|| format!("no terminal #{id} — call hub_instances to see the live ones."))?;
+        .ok_or_else(|| format!("no term#{id} — call hub_instances to see the live ones."))?;
     if !view.running {
         return Err(format!(
-            "terminal #{id} has exited. Open a new one, or call hub_remote_open without \
+            "term#{id} has exited. Open a new one, or call hub_remote_open without \
              'terminal_id' and it will make its own."
         ));
     }
@@ -909,7 +1077,7 @@ fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), Strin
         .unwrap_or_default();
     if remote::looks_like_claude_tui(&screen) {
         return Err(format!(
-            "terminal #{id} already has a Claude Code session running in it. Starting another \
+            "term#{id} already has a Claude Code session running in it. Starting another \
              inside it would type into that one's prompt. Use hub_terminal_send to talk to it, or \
              call hub_remote_open without 'terminal_id' for a fresh terminal."
         ));
@@ -934,7 +1102,7 @@ fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), Strin
             .take(80)
             .collect::<String>();
         return Err(format!(
-            "terminal #{id} does not look like it is sitting at a shell prompt — something may \
+            "term#{id} does not look like it is sitting at a shell prompt — something may \
              still be running in it, and the launch command would be typed into that instead of \
              into a shell. Its last line is: {last:?}. Wait for it to finish (hub_terminal_read \
              with wait_ms), or call hub_remote_open without 'terminal_id'."
@@ -1396,7 +1564,7 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .min(MAX_WAIT_MS);
 
     let mut view = LogView::open(ctx, id)
-        .ok_or_else(|| format!("no terminal #{id} — call hub_instances to see the live ones."))?;
+        .ok_or_else(|| format!("no term#{id} — call hub_instances to see the live ones."))?;
     let cursor = cursor_of(ctx, id);
     let first_read = cursor.is_none();
     let token = tracked_token(ctx, id);
@@ -1465,7 +1633,7 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
             std::thread::sleep(std::time::Duration::from_millis(200));
             // A vanished log means the terminal was closed while we waited.
             let Some(next) = LogView::open(ctx, id) else {
-                return Err(format!("terminal #{id} was closed while you were waiting."));
+                return Err(format!("term#{id} was closed while you were waiting."));
             };
             view = next;
         }
@@ -1618,17 +1786,27 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
     let holds = locks_by_holder(ctx);
     let peers: Vec<usize> = live_ids(ctx).into_iter().filter(|&id| id != ctx.instance).collect();
     let unread = unread_for(ctx, ctx.instance);
-    if peers.is_empty() && unread == 0 {
+    let reg = Registry::read_for(&ctx.state_dir);
+    // Only projects that actually have someone to talk to. A project open with no
+    // instances is not worth a line in every turn's context.
+    let elsewhere: Vec<&ProjectEntry> = reg
+        .projects
+        .iter()
+        .filter(|p| !p.is_dir(&ctx.project_dir) && !p.instances.is_empty())
+        .collect();
+    if peers.is_empty() && unread == 0 && elsewhere.is_empty() {
         return None;
     }
 
-    let mut s = String::from("[Mulpex hub] You are one of several parallel Claude instances in this directory.");
+    let mut s = String::from(
+        "[Mulpex hub] You are one of several parallel Claude instances in this project.",
+    );
     if !peers.is_empty() {
-        s.push_str(" Other instances right now:");
+        s.push_str(" Other instances here right now:");
         for id in peers {
             let task = task_of(ctx, id);
             let held = holds.get(&id).cloned().unwrap_or_default();
-            s.push_str(&format!("\n  - claude #{id} [{}]", status_of(ctx, id)));
+            s.push_str(&format!("\n  - claude#{id} [{}]", status_of(ctx, id)));
             if !task.is_empty() {
                 s.push_str(&format!(" task: \"{task}\""));
             }
@@ -1636,6 +1814,18 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
                 s.push_str(&format!(" holds: {}", held.join(", ")));
             }
         }
+    }
+    if !elsewhere.is_empty() {
+        s.push_str("\nOTHER PROJECTS are open in Mulpex and their instances are reachable too:");
+        for p in elsewhere {
+            let who: Vec<String> = p.instances.iter().map(|i| p.address(i.id)).collect();
+            s.push_str(&format!("\n  - {} — {}", p.name, who.join(", ")));
+        }
+        s.push_str(
+            "\n  Message them with mcp__mulpex__hub_send at those addresses. They are a DIFFERENT \
+             repository and working tree, so they cannot see your files — anything you send must \
+             be self-contained.",
+        );
     }
     if unread > 0 {
         s.push_str(&format!(
@@ -1724,14 +1914,22 @@ fn locks_by_holder(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
 /// Read and remove every message addressed to `id`. Returns `(ts, from, body)`.
 /// A message's sender, as the recipient should see it.
 ///
-/// Almost always a peer instance. The exception is a **remote claude**, which
-/// has no instance id at all — the app writes its wake on its behalf and tags it
-/// with the terminal it came from, so the recipient is never told to reply to a
-/// peer number that does not exist.
+/// Whatever it returns is a valid `hub_send` `to`, which is the point: the reply
+/// address never has to be assembled or guessed.
+///
+/// Three senders. A peer in my own project (`claude#2`). An instance in another
+/// open project (`cloud#2`) — tagged with `from_project` by `send_foreign`. And a
+/// **remote claude**, which has no instance id at all: the app writes its wake on
+/// its behalf and tags it with the terminal it came from, so the recipient is
+/// never told to reply to a peer number that does not exist.
 fn sender_label(v: &Value) -> String {
-    match v.get("from_terminal").and_then(|x| x.as_u64()) {
-        Some(t) => format!("terminal #{t} (remote claude)"),
-        None => format!("#{}", v.get("from").and_then(|x| x.as_u64()).unwrap_or(0)),
+    if let Some(t) = v.get("from_terminal").and_then(|x| x.as_u64()) {
+        return format!("term#{t} (remote claude)");
+    }
+    let id = v.get("from").and_then(|x| x.as_u64()).unwrap_or(0);
+    match v.get("from_project").and_then(|x| x.as_str()) {
+        Some(p) if !p.is_empty() => format!("{p}#{id}"),
+        _ => format!("claude#{id}"),
     }
 }
 
@@ -1956,6 +2154,204 @@ mod tests {
         }
     }
 
+    // -- cross-project messaging ---------------------------------------------
+
+    /// Two open projects under one state root, laid out exactly as the app does
+    /// it: `<root>/<handle>` per project, `registry.json` alongside them.
+    /// Returns (root, ctx for A's claude#2, B's state dir).
+    fn two_projects(tag: &str) -> (PathBuf, Ctx, PathBuf) {
+        let root = std::env::temp_dir().join(format!("mulpex-xproj-{tag}-{}", new_uuid()));
+        let (a_state, b_state) = (root.join("1"), root.join("2"));
+        let (a_dir, b_dir) = (root.join("proj-a"), root.join("proj-b"));
+        for d in [&a_state, &b_state, &a_dir, &b_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(a_state.join("inbox")).unwrap();
+        std::fs::create_dir_all(b_state.join("inbox")).unwrap();
+        // A has claude#1 and claude#2 (me); B has claude#1.
+        std::fs::write(a_state.join("instances"), "1\n2\n").unwrap();
+
+        let entry = |name: &str, dir: &PathBuf, state: &PathBuf, ids: &[usize]| ProjectEntry {
+            handle: 1,
+            name: name.into(),
+            dir: dir.to_string_lossy().into_owned(),
+            state_dir: state.to_string_lossy().into_owned(),
+            instances: ids
+                .iter()
+                .map(|&id| registry::InstanceEntry {
+                    id,
+                    status: "waiting".into(),
+                    task: String::new(),
+                    name: None,
+                })
+                .collect(),
+        };
+        let reg = Registry {
+            projects: vec![
+                entry("proj-a", &a_dir, &a_state, &[1, 2]),
+                entry("proj-b", &b_dir, &b_state, &[1]),
+            ],
+        };
+        assert!(Registry::write_if_changed(&root, &reg));
+
+        let ctx = Ctx {
+            instance: 2,
+            project_dir: a_dir,
+            locks_dir: a_state.join("locks"),
+            history_dir: a_state.join("history"),
+            tasks_dir: a_state.join("tasks"),
+            inbox_dir: a_state.join("inbox"),
+            waiting_dir: a_state.join("waiting"),
+            state_dir: a_state,
+        };
+        (root, ctx, b_state)
+    }
+
+    fn only_file(dir: &Path) -> Value {
+        let path = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .flatten()
+            .next()
+            .unwrap_or_else(|| panic!("nothing in {}", dir.display()))
+            .path();
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The delivery lands in the OTHER project's own inbox — which is the whole
+    /// design: their listener Monitor, their Stop-hook gate and their tab badge
+    /// all key off that directory, so nothing downstream needed changing.
+    #[test]
+    fn a_cross_project_send_lands_in_their_inbox_and_logs_on_both_sides() {
+        let (root, ctx, b_state) = two_projects("send");
+
+        let reply = hub_send(
+            &ctx,
+            &json!({ "to": "proj-b#1", "message": "the shared endpoint is /v2/tokens" }),
+        )
+        .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["delivered_to"][0], "proj-b#1");
+
+        // Delivered into B's own inbox, tagged with where it came from.
+        let msg = only_file(&b_state.join("inbox").join("1"));
+        assert_eq!(msg["from"], 2);
+        assert_eq!(msg["from_project"], "proj-a");
+        assert_eq!(msg["body"], "the shared endpoint is /v2/tokens");
+        // Nothing was written locally — this is not a copy, it is a delivery.
+        assert!(!ctx.inbox_dir.join("1").exists());
+
+        // Both feeds carry it, with the same route on each. Logging only where
+        // hub_send ran would leave B's unread badge climbing with nothing in its
+        // reader to explain it.
+        for log in [
+            ctx.state_dir.join("messages.log"),
+            b_state.join("messages.log"),
+        ] {
+            let line = std::fs::read_to_string(&log).unwrap();
+            let cols: Vec<&str> = line.trim_end().split('\t').collect();
+            assert_eq!(cols.len(), 4, "{line}");
+            assert_eq!(cols[1], "proj-a#2");
+            assert_eq!(cols[2], "proj-b#1");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sender label IS the reply address, for all three kinds of sender.
+    #[test]
+    fn a_senders_label_is_an_address_you_can_reply_to() {
+        assert_eq!(sender_label(&json!({ "from": 2 })), "claude#2");
+        assert_eq!(
+            sender_label(&json!({ "from": 2, "from_project": "cloud" })),
+            "cloud#2"
+        );
+        // A remote claude has no instance id; it must not be given a peer number
+        // that does not exist.
+        assert_eq!(
+            sender_label(&json!({ "from": 0, "from_terminal": 4 })),
+            "term#4 (remote claude)"
+        );
+        // And the two local forms both parse back as addresses.
+        assert_eq!(registry::parse_address("claude#2").unwrap(), Address::Local(2));
+        assert!(matches!(
+            registry::parse_address("cloud#2").unwrap(),
+            Address::Foreign { id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn a_local_send_still_writes_a_bare_id_and_one_log_line() {
+        let (root, ctx, b_state) = two_projects("local");
+        hub_send(&ctx, &json!({ "to": "claude#1", "message": "hi" })).unwrap();
+
+        let msg = only_file(&ctx.inbox_dir.join("1"));
+        assert_eq!(msg["from"], 2);
+        assert!(msg.get("from_project").is_none(), "a local send stays local");
+        let line = std::fs::read_to_string(ctx.state_dir.join("messages.log")).unwrap();
+        let cols: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!((cols[1], cols[2]), ("claude#2", "claude#1"));
+        assert!(!b_state.join("messages.log").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every refusal names what to do instead — a send that silently went nowhere
+    /// would be a wrong answer, and a model branches on these.
+    #[test]
+    fn cross_project_refusals_say_what_to_do_instead() {
+        let (root, ctx, _b) = two_projects("refuse");
+        let err = |to: &str| hub_send(&ctx, &json!({ "to": to, "message": "x" })).unwrap_err();
+
+        assert!(err("nope#1").contains("proj-b"), "unknown project lists what is open");
+        let gone = err("proj-b#9");
+        assert!(gone.contains("proj-b#9"), "{gone}");
+        assert!(gone.contains("proj-b#1"), "names who IS running there: {gone}");
+        assert!(err("term#3").contains("hub_terminal_send"));
+        assert!(err("proj-b#all").contains("project-local"));
+        assert!(err("claude#9").contains("not a running instance"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Discovery: the only way an instance learns a cross-project address exists.
+    #[test]
+    fn hub_instances_reports_the_other_projects_with_usable_addresses() {
+        let (root, ctx, _b) = two_projects("list");
+        let v: Value = serde_json::from_str(&hub_instances(&ctx)).unwrap();
+
+        assert_eq!(v["project"], "proj-a");
+        assert_eq!(v["your_address"], "proj-a#2");
+        assert_eq!(v["instances"][0]["address"], "claude#1");
+        let others = v["other_projects"].as_array().unwrap();
+        assert_eq!(others.len(), 1, "my own project must not be listed");
+        assert_eq!(others[0]["project"], "proj-b");
+        assert_eq!(others[0]["instances"][0]["address"], "proj-b#1");
+        // Terminals never cross the boundary.
+        assert!(others[0].get("terminals").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With one project open, nothing about this feature shows up.
+    #[test]
+    fn a_single_project_sees_no_cross_project_noise() {
+        // Own state ROOT, so the registry we read is definitely the one we didn't
+        // write — `read_for` climbs to the parent, which for `tmpdir` would be the
+        // shared temp dir.
+        let root = tmpdir("xproj-solo");
+        let dir = root.join("1");
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        let ctx = test_ctx(&dir, 1);
+        std::fs::write(dir.join("instances"), "1\n").unwrap();
+
+        let v: Value = serde_json::from_str(&hub_instances(&ctx)).unwrap();
+        assert_eq!(v["other_projects"].as_array().unwrap().len(), 0);
+        assert!(peers_context(&ctx).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Write a terminal log + screen the way `vtgrid::Recorder` would.
     fn fake_terminal(ctx: &Ctx, id: usize, log: &str, screen: &str) {
         let dir = terminals_dir(ctx);
@@ -2045,7 +2441,7 @@ mod tests {
     fn an_unknown_or_exited_terminal_is_refused_by_name() {
         let dir = tmpdir("remote-gone");
         let ctx = test_ctx(&dir, 1);
-        assert!(launch_into_existing(&ctx, 9, "x").unwrap_err().contains("no terminal #9"));
+        assert!(launch_into_existing(&ctx, 9, "x").unwrap_err().contains("no term#9"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

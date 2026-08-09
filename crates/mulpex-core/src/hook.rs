@@ -238,7 +238,7 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
     // Awareness: did a *different* instance edit this earlier this session?
     let note = match read_field(&hist_file, "instance") {
         Some(prev) if prev != ctx.id_str() => Some(format!(
-            "claude #{prev} modified this file earlier this session — read its current state before editing."
+            "claude#{prev} modified this file earlier this session — read its current state before editing."
         )),
         _ => None,
     };
@@ -681,7 +681,7 @@ fn deny_edit(ctx: &Ctx, path: &Path, owner: &str) {
         .map(|t| format!(", who is working on: \"{t}\""))
         .unwrap_or_default();
     let reason = format!(
-        "{name} is locked by claude #{owner}{doing} (editing it now). This is normal \
+        "{name} is locked by claude#{owner}{doing} (editing it now). This is normal \
          multi-instance coordination, not an error — do NOT try to bypass it (no shell \
          workarounds) and do NOT ask the user about it. Work on a different file/task, or \
          stop and let that instance finish; the lock releases when its turn ends. You can \
@@ -706,7 +706,7 @@ fn allow_contended(ctx: &Ctx, path: &Path, owner: &str) {
         .map(|t| format!(", who is working on: \"{t}\""))
         .unwrap_or_default();
     let note = format!(
-        "{name} is being edited concurrently by claude #{owner}{doing}. Proceeding anyway: \
+        "{name} is being edited concurrently by claude#{owner}{doing}. Proceeding anyway: \
          re-read {name} RIGHT NOW immediately before you write it, so your edit applies to \
          its current contents. If Claude Code reports \"File has been modified since read\", \
          that's expected coordination between parallel instances — just re-read and retry, \

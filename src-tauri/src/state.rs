@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use mulpex_core::config::{HOOK_SETTINGS_JSON, MCP_CONFIG_JSON};
 use mulpex_core::persist::{self, SessionStore};
+use mulpex_core::registry;
 
 use crate::pty::{self, Session, SpawnSpec, SpawnTask};
 use crate::snapshot::{
@@ -796,7 +797,7 @@ impl Core {
                         false,
                     ),
                     Some(s) if !s.is_alive() => (
-                        serde_json::json!({ "ok": false, "error": format!("terminal #{id} has exited; open a new one") }),
+                        serde_json::json!({ "ok": false, "error": format!("term#{id} has exited; open a new one") }),
                         false,
                     ),
                     Some(s) => {
@@ -810,7 +811,7 @@ impl Core {
                         (serde_json::json!({ "ok": true, "id": id }), false)
                     }
                     None => (
-                        serde_json::json!({ "ok": false, "error": format!("no terminal #{id}") }),
+                        serde_json::json!({ "ok": false, "error": format!("no term#{id}") }),
                         false,
                     ),
                 }
@@ -832,7 +833,7 @@ impl Core {
                         (serde_json::json!({ "ok": true, "id": id }), true)
                     }
                     None => (
-                        serde_json::json!({ "ok": false, "error": format!("no terminal #{id}") }),
+                        serde_json::json!({ "ok": false, "error": format!("no term#{id}") }),
                         false,
                     ),
                 }
@@ -1295,7 +1296,7 @@ impl Core {
     /// Drop a message into an instance's inbox as if a peer had sent it.
     ///
     /// Writes the same shape `mcp::hub_send` writes, plus `from_terminal` so the
-    /// recipient is told a *terminal* is calling and not instance #N — replying
+    /// recipient is told a *terminal* is calling and not claude#N — replying
     /// with `hub_send` to a terminal id would go nowhere.
     fn deliver_hub_message(&self, to: usize, from_terminal: usize, body: &str) {
         let dir = self.state_dir.join("inbox").join(to.to_string());
@@ -1416,7 +1417,14 @@ impl Core {
                     continue;
                 };
                 if !live.contains(&id) {
-                    bounce_dead_inbox(&self.state_dir, id, &entry.path(), &live);
+                    bounce_dead_inbox(
+                        &self.state_dir,
+                        &self.project_dir,
+                        &self.project_name,
+                        id,
+                        &entry.path(),
+                        &live,
+                    );
                     continue;
                 }
                 let count = std::fs::read_dir(entry.path())
@@ -1468,6 +1476,40 @@ impl Core {
             messages,
             pending_messages: pending,
             pending: pending_by_id,
+        }
+    }
+
+    /// This project as the workspace registry describes it to the OTHER projects:
+    /// who is live here, and where this project's hub lives on disk so another
+    /// project's helper can deliver into its inboxes.
+    ///
+    /// Derived from the snapshot the poll loop has already computed, so it costs
+    /// no extra disk reads — and it inherits `statuses`' membership rule for
+    /// free, which is the one that matters: shells and failed-to-start instances
+    /// are absent, so `hub_send` can never be offered one as a cross-project peer
+    /// any more than it can as a local one.
+    pub fn registry_entry(&self, snap: &HubSnapshot) -> registry::ProjectEntry {
+        let instances = snap
+            .statuses
+            .iter()
+            .map(|s| registry::InstanceEntry {
+                id: s.id,
+                status: s.status.word().to_string(),
+                task: snap
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == s.id)
+                    .map(|t| t.task.clone())
+                    .unwrap_or_default(),
+                name: self.names.get(&s.id).cloned(),
+            })
+            .collect();
+        registry::ProjectEntry {
+            handle: self.handle,
+            name: self.project_name.clone(),
+            dir: self.project_dir.to_string_lossy().into_owned(),
+            state_dir: self.state_dir.to_string_lossy().into_owned(),
+            instances,
         }
     }
 
@@ -1680,11 +1722,13 @@ fn read_messages(path: &Path, max: usize) -> Vec<MsgEntry> {
         else {
             continue;
         };
-        let (Ok(ts), Ok(from)) = (ts.parse::<u64>(), from.parse::<usize>()) else {
+        // `from` is an address (`claude#2` / `central-one#3`), not a number — it
+        // has to carry the project once a sender can live in a different one.
+        let Ok(ts) = ts.parse::<u64>() else {
             continue;
         };
         out.push(MsgEntry {
-            from,
+            from: from.to_string(),
             to: to.to_string(),
             body: unescape_msg(body),
             ts,
@@ -1717,40 +1761,107 @@ fn unescape_msg(s: &str) -> String {
 
 /// Bounce a closed instance's undelivered mail back to live senders, then remove
 /// the inbox dir. Ports `app::bounce_dead_inbox`.
-fn bounce_dead_inbox(state_dir: &Path, dead_id: usize, inbox: &Path, live: &HashSet<usize>) -> usize {
+///
+/// **The sender may live in another project**, and that is not a detail: a
+/// foreign message carries `from_project_dir`, and its bare `from` is an id in
+/// *that* project's numbering. Routing on `from` alone would hand a stranger's
+/// undelivered mail to whichever local instance happens to share the number —
+/// mis-delivery, not a dropped message. So a tagged sender is resolved through
+/// the registry and bounced back across the boundary, and one whose project has
+/// since closed is dropped rather than guessed at.
+fn bounce_dead_inbox(
+    state_dir: &Path,
+    project_dir: &Path,
+    project_name: &str,
+    dead_id: usize,
+    inbox: &Path,
+    live: &HashSet<usize>,
+) -> usize {
     let mut bounced = 0usize;
+    // Read lazily: this whole function only runs when an instance has closed
+    // holding unread mail, and the foreign case is rarer still.
+    let mut reg: Option<registry::Registry> = None;
+    let my_dir = project_dir.to_string_lossy().into_owned();
+
     if let Ok(entries) = std::fs::read_dir(inbox) {
         for entry in entries.flatten() {
             let file = entry.path();
             if file.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Some((from, body)) = std::fs::read_to_string(&file).ok().and_then(|c| {
-                let v: serde_json::Value = serde_json::from_str(&c).ok()?;
-                let from = v.get("from").and_then(|x| x.as_u64())? as usize;
-                let body = v
-                    .get("body")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some((from, body))
-            }) else {
+            let Some((from, from_project_dir, body)) =
+                std::fs::read_to_string(&file).ok().and_then(|c| {
+                    let v: serde_json::Value = serde_json::from_str(&c).ok()?;
+                    // A remote claude's wake has no id to bounce to (`from: 0`
+                    // plus `from_terminal`); it is skipped by the liveness checks
+                    // below, since 0 is never a live instance.
+                    let from = v.get("from").and_then(|x| x.as_u64())? as usize;
+                    let from_project_dir = v
+                        .get("from_project_dir")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    let body = v
+                        .get("body")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((from, from_project_dir, body))
+                })
+            else {
                 continue;
             };
-            if from == dead_id || !live.contains(&from) {
-                continue;
-            }
+
             let snippet: String = body.chars().take(80).collect();
             let ellipsis = if body.chars().count() > 80 { "…" } else { "" };
+
+            // Where the bounce goes, and how the dead recipient is named to the
+            // sender — from *their* point of view, so the address they see is one
+            // they could have used.
+            let (dir, dead_addr, foreign) = match from_project_dir {
+                Some(ref d) if !registry::same_dir(Path::new(d), project_dir) => {
+                    let reg = reg.get_or_insert_with(|| registry::Registry::read_for(state_dir));
+                    let Some(sender) = reg.projects.iter().find(|p| p.is_dir(Path::new(d))) else {
+                        continue; // their whole project closed too
+                    };
+                    if !sender.has_instance(from) {
+                        continue;
+                    }
+                    (
+                        sender.inbox_dir(from),
+                        format!("{project_name}#{dead_id}"),
+                        true,
+                    )
+                }
+                _ => {
+                    if from == dead_id || !live.contains(&from) {
+                        continue;
+                    }
+                    (
+                        state_dir.join("inbox").join(from.to_string()),
+                        format!("claude#{dead_id}"),
+                        false,
+                    )
+                }
+            };
+
             let notice = format!(
-                "[Mulpex hub — automated] Your message to claude #{dead_id} was NOT delivered: \
+                "[Mulpex hub — automated] Your message to {dead_addr} was NOT delivered: \
                  that instance closed before reading it. Original: \"{snippet}{ellipsis}\""
             );
-            let dir = state_dir.join("inbox").join(from.to_string());
             if std::fs::create_dir_all(&dir).is_ok() {
-                let payload = serde_json::json!({
-                    "from": dead_id, "ts": now_secs(), "body": notice,
-                });
+                // A cross-project bounce must carry the provenance keys too, or
+                // the sender's `sender_label` would read it as a local `claude#N`.
+                let payload = if foreign {
+                    serde_json::json!({
+                        "from": dead_id,
+                        "from_project": project_name,
+                        "from_project_dir": my_dir,
+                        "ts": now_secs(),
+                        "body": notice,
+                    })
+                } else {
+                    serde_json::json!({ "from": dead_id, "ts": now_secs(), "body": notice })
+                };
                 if std::fs::write(
                     dir.join(format!("{}.json", persist::new_uuid())),
                     payload.to_string(),
@@ -1804,6 +1915,199 @@ mod tests {
         );
         assert_eq!(core.next_id, 1, "first ⌘T should hand out instance id 1");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The log carries addresses now, not ids, so an entry can name the project a
+    /// message came from. A bare-number `from` would have nowhere to put it.
+    #[test]
+    fn the_message_log_carries_addresses_on_both_ends() {
+        let dir = std::env::temp_dir().join(format!("mulpex-msglog-{}", persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("messages.log");
+        std::fs::write(
+            &log,
+            "100\tclaude#1\tclaude#2\thello\n\
+             101\tclaude#2\tall\tbroadcast\n\
+             102\tcloud#2\tcentral-one#3\tacross\\nprojects\n",
+        )
+        .unwrap();
+
+        // Newest first.
+        let msgs = read_messages(&log, 10);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].from, "cloud#2");
+        assert_eq!(msgs[0].to, "central-one#3");
+        assert_eq!(msgs[0].body, "across\nprojects", "escapes still decode");
+        assert_eq!(msgs[1].to, "all");
+        assert_eq!(msgs[2].from, "claude#1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A message from another project carries `from_project_dir`, and its bare
+    /// `from` is an id in *that* project's numbering. Bouncing on the number alone
+    /// would hand a stranger's undelivered mail to whichever local instance
+    /// happens to share it — mis-delivery, not a dropped message.
+    ///
+    /// Non-tautological by construction: project B has a LIVE claude#2, which is
+    /// exactly where the pre-fix code would have put this bounce.
+    #[test]
+    fn a_foreign_bounce_goes_back_across_the_boundary_not_to_the_local_same_number() {
+        let root = std::env::temp_dir().join(format!("mulpex-bounce-{}", persist::new_uuid()));
+        let a_state = root.join("1");
+        let b_state = root.join("2");
+        let a_dir = root.join("proj-a");
+        let b_dir = root.join("proj-b");
+        std::fs::create_dir_all(a_state.join("inbox").join("2")).unwrap();
+        std::fs::create_dir_all(b_state.join("inbox").join("2")).unwrap();
+        let dead_inbox = b_state.join("inbox").join("3");
+        std::fs::create_dir_all(&dead_inbox).unwrap();
+
+        let reg = registry::Registry {
+            projects: vec![
+                registry::ProjectEntry {
+                    handle: 1,
+                    name: "proj-a".into(),
+                    dir: a_dir.to_string_lossy().into_owned(),
+                    state_dir: a_state.to_string_lossy().into_owned(),
+                    instances: vec![registry::InstanceEntry {
+                        id: 2,
+                        status: "waiting".into(),
+                        task: String::new(),
+                        name: None,
+                    }],
+                },
+                registry::ProjectEntry {
+                    handle: 2,
+                    name: "proj-b".into(),
+                    dir: b_dir.to_string_lossy().into_owned(),
+                    state_dir: b_state.to_string_lossy().into_owned(),
+                    instances: vec![],
+                },
+            ],
+        };
+        assert!(registry::Registry::write_if_changed(&root, &reg));
+
+        // proj-a's claude#2 wrote to proj-b's claude#3, which has since closed.
+        std::fs::write(
+            dead_inbox.join("m.json"),
+            serde_json::json!({
+                "from": 2,
+                "from_project": "proj-a",
+                "from_project_dir": a_dir.to_string_lossy(),
+                "ts": 1,
+                "body": "the shared endpoint is /v2/tokens",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // proj-b's own claude#1 also wrote to the same dead instance.
+        std::fs::write(
+            dead_inbox.join("local.json"),
+            serde_json::json!({ "from": 1, "ts": 1, "body": "local note" }).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(b_state.join("inbox").join("1")).unwrap();
+
+        // proj-b's claude#2 is LIVE — the wrong place the old routing would pick.
+        let live: HashSet<usize> = [1usize, 2].into_iter().collect();
+        let bounced = bounce_dead_inbox(&b_state, &b_dir, "proj-b", 3, &dead_inbox, &live);
+        assert_eq!(bounced, 2, "both senders should have been told");
+
+        let count = |p: PathBuf| {
+            std::fs::read_dir(p)
+                .map(|d| d.flatten().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            count(b_state.join("inbox").join("2")),
+            0,
+            "the foreign bounce landed on the LOCAL claude#2 — that is the bug"
+        );
+        assert_eq!(count(a_state.join("inbox").join("2")), 1);
+        assert_eq!(count(b_state.join("inbox").join("1")), 1);
+
+        // The foreign sender must be told an address it could have used, and the
+        // notice must carry provenance or their `sender_label` would read it as a
+        // local `claude#3`.
+        let file = std::fs::read_dir(a_state.join("inbox").join("2"))
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        let body = v["body"].as_str().unwrap();
+        assert!(body.contains("proj-b#3"), "{body}");
+        assert!(body.contains("the shared endpoint"), "{body}");
+        assert_eq!(v["from_project"], "proj-b");
+        assert_eq!(v["from"], 3);
+
+        // And the local one still reads as local.
+        let file = std::fs::read_dir(b_state.join("inbox").join("1"))
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        assert!(v["body"].as_str().unwrap().contains("claude#3"));
+        assert!(v.get("from_project").is_none());
+
+        assert!(!dead_inbox.exists(), "the dead inbox is removed either way");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sender whose whole project has closed has nowhere to bounce to. Dropping
+    /// it is the only honest option — the alternative is guessing at a local id.
+    #[test]
+    fn a_bounce_to_a_closed_project_is_dropped_rather_than_guessed_at() {
+        let root = std::env::temp_dir().join(format!("mulpex-bounce2-{}", persist::new_uuid()));
+        let b_state = root.join("2");
+        let b_dir = root.join("proj-b");
+        let dead_inbox = b_state.join("inbox").join("3");
+        std::fs::create_dir_all(&dead_inbox).unwrap();
+        std::fs::create_dir_all(b_state.join("inbox").join("2")).unwrap();
+        // Registry knows only proj-b; the sender's project is gone.
+        let reg = registry::Registry {
+            projects: vec![registry::ProjectEntry {
+                handle: 2,
+                name: "proj-b".into(),
+                dir: b_dir.to_string_lossy().into_owned(),
+                state_dir: b_state.to_string_lossy().into_owned(),
+                instances: vec![],
+            }],
+        };
+        registry::Registry::write_if_changed(&root, &reg);
+        std::fs::write(
+            dead_inbox.join("m.json"),
+            serde_json::json!({
+                "from": 2,
+                "from_project": "ghost",
+                "from_project_dir": root.join("ghost").to_string_lossy(),
+                "ts": 1,
+                "body": "x",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let live: HashSet<usize> = [2usize].into_iter().collect();
+        assert_eq!(
+            bounce_dead_inbox(&b_state, &b_dir, "proj-b", 3, &dead_inbox, &live),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(b_state.join("inbox").join("2"))
+                .map(|d| d.flatten().count())
+                .unwrap_or(0),
+            0,
+            "a bounce for a closed project must not fall back to a local id"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2642,7 +2946,7 @@ mod tests {
         core.process_terminal_requests();
         let r = reply(&t);
         assert_eq!(r["ok"], false);
-        assert!(r["error"].as_str().unwrap().contains("no terminal"));
+        assert!(r["error"].as_str().unwrap().contains("no term#"));
 
         let t = post(serde_json::json!({ "op": "close", "from": 1, "id": id }));
         core.process_terminal_requests();
@@ -2869,7 +3173,7 @@ mod remote_peer_live {
         let body = delivered.join("\n");
         eprintln!("delivered:\n{body}");
         assert!(
-            body.contains(&format!("terminal #{}", remote_term.id)),
+            body.contains(&format!("term#{}", remote_term.id)),
             "the wake does not name the terminal: {body}"
         );
         // The wake must be the remote's own signal, not the backstop: passing on

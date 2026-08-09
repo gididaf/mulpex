@@ -579,7 +579,7 @@ pub fn wake_body(id: usize, target: &str, sig: &Signal) -> String {
         format!("\nIt says: {}", sig.summary.trim())
     };
     format!(
-        "The remote claude you started{where_} (terminal #{id}) {what}.{summary}\n\
+        "The remote claude you started{where_} (term#{id}) {what}.{summary}\n\
          Read what it actually did with mcp__mulpex__hub_terminal_read(id: {id}), and reply to it \
          with mcp__mulpex__hub_terminal_send(id: {id}) — it is a terminal, NOT a hub instance, so \
          hub_send cannot reach it."
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn a_wake_without_a_known_target_still_reads_properly() {
         let body = wake_body(2, "", &Signal { kind: Kind::Done, summary: "built".into() });
-        assert!(body.contains("you started (terminal #2)"), "{body}");
+        assert!(body.contains("you started (term#2)"), "{body}");
         assert!(!body.contains(" on  "), "empty target left a gap: {body}");
     }
 

@@ -5,14 +5,17 @@
 //! from the original terminal-UI mulpex: the file-locking hook coordinator
 //! (`hook`), the inner MCP coordination-hub server (`mcp`), per-project session
 //! persistence (`persist`), the shell-terminal transcript format the app writes
-//! and the helper reads (`termlog`), and the static `--settings` /
-//! `--mcp-config` templates (`config`). It links no GUI/terminal dependencies so
-//! the helper binary the child `claude` processes exec stays tiny and fast.
+//! and the helper reads (`termlog`), the workspace registry + address grammar
+//! that let an instance message one in another open project (`registry`), and the
+//! static `--settings` / `--mcp-config` templates (`config`). It links no
+//! GUI/terminal dependencies so the helper binary the child `claude` processes
+//! exec stays tiny and fast.
 
 pub mod config;
 pub mod hook;
 pub mod mcp;
 pub mod persist;
+pub mod registry;
 pub mod remote;
 pub mod termlog;
 
