@@ -793,10 +793,47 @@ linker-signed)`, `Sealed Resources=none`), and a **random per-build identifier**
 build. macOS will not persist a TCC grant for a bundle whose signature does not validate, and a
 changing identifier makes every update look like a brand-new app — so users were re-asked on every
 release until someone clicked Don't Allow, at which point they hit the permanent failure above.
-Fixed with `bundle.macOS.signingIdentity: "-"`, which ad-hoc signs the `.app` **before** the
-`.tar.gz` and `.dmg` are built from it; the identifier then falls back to the stable
-`com.mulpex.app` and `codesign --verify` passes. Don't remove it, and don't assume a green build
-means a signed one — `release.sh` only checks the artifacts *exist*.
+v0.6.0 fixed *half* of this with `bundle.macOS.signingIdentity: "-"`, which ad-hoc signs the `.app`
+**before** the `.tar.gz` and `.dmg` are built from it; the identifier then falls back to the stable
+`com.mulpex.app` and `codesign --verify` passes. Don't assume a green build means a signed one —
+`release.sh` only checks the artifacts *exist*.
+
+**Ad-hoc signing is not enough, and v0.7.0 replaced it with a self-signed certificate.** A grant is
+pinned to the bundle's **designated requirement**, and for an ad-hoc signature that requirement is a
+bare `cdhash`:
+
+```
+# ad-hoc      designated => cdhash H"0f8d43466974ae615256b442ef8535f743dc853e"
+# certificate designated => identifier "com.mulpex.app" and certificate root = H"356eabc7…"
+```
+
+A cdhash is the hash of *those exact bytes*, so **every rebuild is a different application to TCC**
+and silently discards every folder permission the user ever gave — for them and for every other
+user, on every release. That is the "Don't Allow" trap above, fired on a schedule. Measured
+directly: after an in-place update, `codesign --verify -R='cdhash H"<old>"'` on the new bundle fails
+with *"code failed to satisfy specified code requirement(s)"* while the TCC row still reads
+`auth_value=2`, i.e. allowed-but-unsatisfiable.
+
+`signingIdentity` is therefore the SHA-1 of a **self-signed code-signing certificate**, and the
+requirement is now anchored to the certificate instead of the bytes, so a rebuild inherits the
+existing grant. Details that cost time to rediscover:
+
+- The identity lives in the login keychain; the cert + key + `.p12` are backed up at
+  `~/.mulpex/signing/` (0600, **not** in the repo). It is now as load-bearing as `updater.key`:
+  lose it and every future build mints a new identity, resetting permissions for everyone again.
+- **No Apple Developer account, no trust settings and no admin prompt are needed.** `codesign` signs
+  happily with an untrusted self-signed identity (`security find-identity -v` reports
+  `CSSMERR_TP_NOT_TRUSTED` and lists 0 *valid* identities — that is fine). Trust affects Gatekeeper,
+  which is irrelevant here: the app is unnotarized either way and the updater path sets no
+  quarantine xattr.
+- macOS's `security import` cannot read OpenSSL 3's default PKCS#12 encryption — it fails with
+  *"MAC verification failed during PKCS12 import (wrong password?)"*, which reads as a password bug
+  and is not one. Export with `-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1`.
+- **Never leave a second bundle with the same identifier on disk.** Keeping a rollback copy as
+  `/tmp/Mulpex-0.6.0-rollback.app` produced an infinite prompt loop: two apps both claiming
+  `com.mulpex.app` with different code identities, each Allow invalidating the other's row. `mv`
+  also drags the Dock icon to the new path, so the old bundle is what a Dock click then launches.
+  Deleting the duplicate is the fix; the prompt's *app name* is what identifies which one is asking.
 
 ## A session that failed to start is kept, not reaped
 
@@ -895,6 +932,14 @@ command line — where the terminal came from is irrelevant to the mechanism:
   the `claude` half is launched, on the far side. This is the one that makes a password login, a
   jump host or a VPN workable: the human does the connecting, the instance does the rest. The wake
   message then has no target to name, so `wake_body` drops that clause rather than printing a gap.
+
+**No task named means start it idle, and do not ask.** "Start a claude on that server for our next
+task" contains no task, so an instance had nothing to hand the remote and stopped to ask which is
+a round trip for a question with an obvious answer: `hub_remote_open` accepts no `task` at all and
+the remote simply waits at its prompt. `HUB_RULES` says to do that and report it ready. Deliberately
+narrow — it removes an unnecessary question, it does **not** license guessing. A remote runs
+unattended with permissions skipped on someone's server, so "pick something plausible" is the wrong
+instinct there, and the standing zero-assumptions rule still governs anything genuinely ambiguous.
 
 **Adopting an already-running remote claude is still not supported, and that is a different thing.**
 Rules typed in as a message drift out of context; rules on the command line do not. Only the launch
@@ -1214,13 +1259,29 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   Offline: 16 `remote.rs` unit tests (marker grammar, wrap-at-every-position, foreign/missing token,
   strip, base64 vectors, and one asserting the rules' own example parses — the two halves of the
   contract cannot drift); 2 watcher tests against real shells standing in for a remote, one of them
-  confirmed to fail with the `remote_awaiting` guard removed; 2 `vtgrid` replays of the real captures
-  pinning "no alternate screen" and the markdown-eats-underscores measurement.
-  plus 4 `mcp.rs` tests for the refusals and the read integration.
-  `cargo test` 88 (45 app + 43 core) green, `clippy` clean but for the two pre-existing warnings. No
-  frontend change, so `svelte-check`/`vite build` were not re-run. **Not verified:** the flow inside
-  the real GUI — an instance calling the tool itself and being woken while idle. The wake rides the
-  existing Monitor path, which is separately proven, but that specific end-to-end has not been driven.
+  confirmed to fail with the `remote_awaiting` guard removed; 4 `mcp.rs` tests for the refusals and
+  the read integration; and 3 `vtgrid` replays of real captures — the markdown-eats-underscores
+  measurement, and `a_real_alt_screen_remote_claude_stays_readable`, confirmed to fail with *"the
+  alt screen rendered nothing — the driver would be blind"* when the old early-return is restored.
+  `cargo test` 93 (48 app + 45 core) green, `clippy` clean but for the two pre-existing warnings. No
+  frontend change, so `svelte-check`/`vite build` were not re-run.
+
+  **Driven in the real GUI (2026-08-09), which is where the three field bugs came from.** A real
+  instance called `hub_remote_open` itself against a terminal the user had ssh'd in by hand, named
+  itself `remote claude on tickets VM`, launched the remote, and drove a substantial cross-machine
+  investigation with it. What that exposed, none of which the harness could have: the recorder going
+  dark on the alternate screen (`<id>.screen` at **0 bytes** — the driver could read *nothing*), the
+  completion sentinel being appended to the task text the remote reads as its prompt, and the
+  screen-only history limit. All three fixed and pinned; the first two were **confirmed against the
+  live scratch dir**, where `<id>.screen` went 0 → 7,658 bytes after the fix. **Still not verified:**
+  the *idle wake* specifically — a driver that has ended its turn being woken by the hub message
+  rather than reading the terminal within a turn it was already taking.
+- **Signing by certificate (v0.7.0, unreleased).** The requirement change was verified directly:
+  the installed bundle reports `identifier "com.mulpex.app" and certificate root = H"356eabc7…"`,
+  `codesign --verify --deep --strict` passes, and — the point of the exercise — a **subsequent
+  rebuild installed over it produced no permission prompt at all**, where the previous ad-hoc build
+  had re-prompted. The ad-hoc failure was measured first: `codesign --verify -R='cdhash H"<old>"'`
+  fails on the new bundle while TCC still records `auth_value=2`.
 - **Session drag-to-reorder (shipped in v0.6.0).** The order math was driven through the **real
   `stores.ts`** (transpiled, not re-implemented) — 27 assertions on `clampToGroup` / `dragOrder` /
   `displayOrder` / the `reorderSessions` mutator, including the invariant that every emitted order
@@ -1345,4 +1406,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`45442123527b9fbe55d0d153daa6d4aeba058069` — 2026-08-05
+`fd16eedca202cdfdeb157d3f6fdcc0c82e2c355b` — 2026-08-09
