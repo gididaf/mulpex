@@ -1500,6 +1500,13 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   lives at `~/.mulpex/updater.key` (0600, no password) and is **not** in the repo — lose it and no
   existing install can ever accept another update; the only recovery is a new keypair plus a manual
   DMG reinstall by every user.
+- **`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` must be exported too, even though the key has none.** The
+  bundler always tries to decrypt, so with the variable unset it prompts — and on a non-interactive
+  shell that read fails with `Device not configured (os error 6)`, dressed up as
+  *"incorrect updater private key password"*, which reads as a wrong password and is not one.
+  Same late-failure shape as the bullet above: the `.app` and `.dmg` are already written by then,
+  so it looks like a finished build with a **stale** `Mulpex.app.tar.gz` beside it from a previous
+  run. `release.sh` exports it (`:73`); `tauri:build` didn't until this was hit, and now does.
 
 ## Teardown fires on TWO RunEvents (the fixed scratch-root leak)
 
@@ -1530,4 +1537,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`fd16eedca202cdfdeb157d3f6fdcc0c82e2c355b` — 2026-08-09
+`60b32b2e1b1dfea62c7848510763c87228710f82` — 2026-08-10

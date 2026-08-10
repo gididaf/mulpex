@@ -35,10 +35,9 @@ menu shortcuts.
 ## What it does
 
 - **Multiple projects at once.** Open several projects side by side — a persistent tab bar and a
-  **⌘P** fuzzy quick-switcher. Each project keeps its own
-  isolated coordination hub and its sessions running in the background; Mulpex reopens everything
-  you had open on the next launch. Jump straight to a tab with ⌘1–9, close a project with ⌘⇧W,
-  cycle with ⌘⇧[ ⌘⇧].
+  **⌘P** fuzzy quick-switcher. Each project keeps its own coordination hub and its sessions
+  running in the background; Mulpex reopens everything you had open on the next launch. Jump
+  straight to a tab with ⌘1–9, close a project with ⌘⇧W, cycle with ⌘⇧[ ⌘⇧].
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W), and drag rows in
   the sidebar to reorder them — that order is what ⌘[ ⌘] cycle through, and it survives a restart.
@@ -62,10 +61,18 @@ menu shortcuts.
   file-locking coordinator (a `PreToolUse` hook: edits/reads to a file another instance is
   writing simply *wait*, then proceed — never a hard deny, zero model tokens) plus an inner MCP
   server (`mcp__mulpex__*` tools: see peers, publish your task, message another instance).
-- **Idle wake.** An instance notices and acts on a hub message from a peer *even while it's
-  sitting idle* between your prompts: on startup it arms a persistent background listener on its
-  inbox (via the `Monitor` tool) and wakes itself when mail arrives, tagging the self-triggered
-  turn (`⟳ hub message from #N →`) so you can tell it wasn't your prompt.
+- **They can message across projects.** An instance in one project can see and message the
+  instances in every *other* project you have open — address them `central-one#3`, discovered
+  through `hub_instances`. That's how two repos get built against each other: the claude in your
+  API repo tells the one in your frontend what the endpoint now returns, and it acts on it. Only
+  messaging crosses the boundary; file locks, spawning and terminals stay inside their own
+  project, and each instance is told the other side is a *different* checkout it cannot see, so
+  what it sends has to stand on its own.
+- **Idle wake.** An instance notices and acts on a hub message *even while it's sitting idle*
+  between your prompts — from a peer in its own project or from one in another. On its first turn
+  it arms a persistent background listener on its inbox (via the `Monitor` tool) and wakes itself
+  when mail arrives, tagging the self-triggered turn (`⟳ hub message from cloud#1 →`) so you can
+  tell it wasn't your prompt.
 - **Shared-tree safety.** Every instance shares one working tree (not a git worktree each), so
   each is told via its system prompt to treat tree-wide/destructive git ops (`reset --hard`,
   `checkout .`, `clean`, `stash`, branch switch, `rebase`) as dangerous — check the hub and
