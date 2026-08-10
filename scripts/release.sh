@@ -59,6 +59,22 @@ if [ "$DRY_RUN" -eq 0 ]; then
     echo "ERROR: working tree is dirty — commit before releasing." >&2
     exit 1
   fi
+  # `gh release create` below passes no --target, so GitHub creates the tag at
+  # the REMOTE default branch's HEAD. With local commits unpushed that tags the
+  # wrong code — silently, because the uploaded artifacts are the correct local
+  # build, so the release works while its source tag points somewhere else.
+  # This already happened: v0.6.0's tag sits on the v0.5.0 release commit.
+  git fetch --quiet origin || true
+  UNPUSHED="$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo unknown)"
+  if [ "$UNPUSHED" = "unknown" ]; then
+    echo "ERROR: no upstream for this branch — push it first so the tag lands on this code." >&2
+    exit 1
+  fi
+  if [ "$UNPUSHED" != "0" ]; then
+    echo "ERROR: $UNPUSHED commit(s) not pushed — the tag would be created at the remote's" >&2
+    echo "  HEAD, i.e. on code that does not contain this release. Run: git push" >&2
+    exit 1
+  fi
 fi
 
 echo "==> releasing Mulpex $VERSION (tag $TAG)${DRY_RUN:+ [dry run]}"
