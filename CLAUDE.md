@@ -1420,9 +1420,19 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   strings agreed by construction.
   `cargo test` 117 (51 app + 66 core) green, `clippy` clean but for the two pre-existing warnings,
   `svelte-check` 120 files 0 errors, `vite build` clean.
-  **Not verified:** the live GUI — two real projects open, one instance messaging the other, and in
-  particular the **idle wake** (the recipient sitting between prompts and being woken by its own
-  Monitor rather than reading the message inside a turn it was already taking).
+  **Driven live in the installed app (2026-08-10)**, with the user's real `cloud` and `central-one`
+  open: `cloud#1` found `central-one#1` in `other_projects`, messaged it, and got a reply — a full
+  round trip 14 s apart, both feeds byte-identical, both inboxes drained, and the reply sent by
+  pasting `sender_label`'s output straight back into `to`.
+  **The idle wake is confirmed, and by better evidence than the timing:** `central-one`'s
+  `tasks/1` still reads `just say ready` afterwards. A human prompt would have overwritten it via
+  `userpromptsubmit`; it survives only because the turn arrived as a `<task-notification>` from the
+  instance's own Monitor. That is the wake path, read out of the state files rather than off the
+  screen — and it is the same claim listed as unverified for remote peers, now proven for hub
+  messages.
+  `HUB_RULES`' self-contained rule also landed rather than merely existing: the sender opened with
+  "we can't see each other's files" and named its own repo, and the reply volunteered the actual
+  shared contract between the two codebases (the `X-Api-Key` ingest endpoints).
 
 ## Auto-update
 
