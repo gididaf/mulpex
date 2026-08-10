@@ -41,8 +41,10 @@ menu shortcuts.
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W), and drag rows in
   the sidebar to reorder them — that order is what ⌘[ ⌘] cycle through, and it survives a restart.
-  Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no `/terminal-setup`
-  needed.
+  **Rows label themselves**: a session names its own row after the work it's doing, so a sidebar
+  of five Claudes reads as five tasks rather than five numbers. A name you type with ⌘R always
+  wins. Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no
+  `/terminal-setup` needed.
 - **Terminal sessions (⌘⇧T).** A session can also be a plain interactive shell, in the same
   sidebar and the same pane. Use it for the long-running and the interactive — a dev server, a
   watcher, `tail -f`, a REPL — anything Claude's request/response Bash tool cannot hold open. They

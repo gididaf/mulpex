@@ -1424,7 +1424,7 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   live scratch dir**, where `<id>.screen` went 0 → 7,658 bytes after the fix. **Still not verified:**
   the *idle wake* specifically — a driver that has ended its turn being woken by the hub message
   rather than reading the terminal within a turn it was already taking.
-- **Signing by certificate (v0.7.0, unreleased).** The requirement change was verified directly:
+- **Signing by certificate (shipped in v0.7.0).** The requirement change was verified directly:
   the installed bundle reports `identifier "com.mulpex.app" and certificate root = H"356eabc7…"`,
   `codesign --verify --deep --strict` passes, and — the point of the exercise — a **subsequent
   rebuild installed over it produced no permission prompt at all**, where the previous ad-hoc build
@@ -1486,7 +1486,7 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `HUB_RULES`' self-contained rule also landed rather than merely existing: the sender opened with
   "we can't see each other's files" and named its own repo, and the reply volunteered the actual
   shared contract between the two codebases (the `X-Api-Key` ingest endpoints).
-- **Row naming backstops (2026-08-10, unreleased).** The failure was diagnosed off the *live*
+- **Row naming backstops (2026-08-10).** The failure was diagnosed off the *live*
   scratch dir rather than reproduced (`armed/6` present, `named/6` absent, `namereq/` empty), and
   the tool was confirmed present in the **installed** helper's `tools/list` before the model was
   blamed. Both fixes are pinned by tests confirmed to fail when the fix is removed:
@@ -1495,8 +1495,8 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `an_unnamed_instance_gets_a_provisional_name_that_never_persists` (fails on the store assertion
   if the guess is written into `names`). `cargo test` 119 (52 app + 67 core) green, `clippy` clean
   but for the two pre-existing warnings, `svelte-check` 120 files 0 errors, `vite build` clean.
-  **Not verified live:** the mid-turn nudge actually landing in a running instance, and the
-  provisional label as it renders — both need the new build installed.
+  Then **confirmed by the user in the installed build** — the case that motivated it (a row that
+  had sat showing a pasted prompt) now labels itself.
 
 ## Auto-update
 
@@ -1548,8 +1548,14 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   that *adds* the updater, so nothing older could deliver it. v0.4.8 was a deliberate no-op
   release published to exercise the real path end to end.
 - **Releasing:** `npm run release` (`scripts/release.sh`) — preflights the key, the
-  tauri.conf.json/Cargo.toml version agreement, a clean tree and an unused tag; builds; writes
-  `latest.json`; `gh release create`s all four artifacts. `--dry-run` builds and writes the JSON
+  tauri.conf.json/Cargo.toml version agreement, a clean tree, **an upstream with nothing
+  unpushed**, and an unused tag; builds; writes `latest.json`; `gh release create`s all four
+  artifacts. The unpushed check exists because `gh release create` is called with **no
+  `--target`**, so GitHub creates the tag at the *remote* default branch's HEAD: with local
+  commits unpushed, the tag names code the release does not contain — **silently**, since the
+  uploaded artifacts are the correct local build, so the release works while its source tag
+  points elsewhere. Not hypothetical: **the v0.6.0 tag sits on the v0.5.0 release commit** for
+  exactly this reason. `--dry-run` builds and writes the JSON
   without publishing — and because it skips the clean-tree and unused-tag checks, it is also how
   you inspect a release build *before* committing. Use it: `release.sh` checks only that the
   artifacts **exist**, never that the `.app` inside them is signed, which is exactly how the
@@ -1601,4 +1607,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`60b32b2e1b1dfea62c7848510763c87228710f82` — 2026-08-10
+`136930de6ffaab777b265e67b83fc7650b9c3d5f` — 2026-08-10
