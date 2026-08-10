@@ -474,6 +474,59 @@ against the *local* hub:
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
 
+## Naming a row (`hub_set_name`), and the two backstops behind it
+
+An instance labels its own sidebar row with `hub_set_name`, which is a **fire-and-forget file
+handshake** (`mcp.rs` writes `namereq/<id>`, the poll loop's `Core::process_name_requests` turns it
+into a real, persisted rename — exactly as if the user had pressed ⌘R). It is asked for by the
+`UserPromptSubmit` hook's `AUTO_NAME_NUDGE`, the same self-healing shape as the listener-arming
+nudge: injected as hidden `additionalContext` while `named/<id>` is absent, and the flag is written
+by **`hub_set_name` itself** rather than when the rename lands, so a *refused* request (the user
+already named the row) also stops the asking. ⌘R sets `manual_names`, and the user's label always
+wins — `name_verdict` is the one place that rule lives.
+
+**A nudge is a request, and a model can drop it.** Measured on a live instance, 2026-08-10:
+claude#6 opened its turn with *"I'll start by arming the hub listener and naming this instance"*,
+armed the Monitor (`armed/6` written — proof the nudge landed), then worked for three minutes and
+never called `hub_set_name`. `named/6` was absent and `namereq/` empty afterwards, so nothing was
+refused and nothing was lost in transit; the instruction was simply displaced by the actual task.
+The row meanwhile showed the user's raw prompt — a wall of pasted JSX — and **nothing would ask
+again until the user's next prompt**, which for a long turn is a long time. Diagnosis came from the
+live scratch dir (`armed/` present, `named/` absent, `namereq/` empty), which distinguishes
+"never called" from "called and refused" in one listing; the tool itself was confirmed present in
+the *installed* helper's `tools/list` before blaming the model.
+
+So naming now has the same two-layer treatment hub mail has:
+
+- **A mid-turn nudge** (`hook.rs::name_nudge_due`, fired from `posttooluse` alongside the mail and
+  departed-peer notes). At `NAME_NUDGE_AFTER_TOOLS` (3) tool calls into a turn, an unnamed instance
+  is reminded again — late enough that it knows what the session is about, early enough that the
+  row is labelled while the work is still running. Deduped per **turn** via a `namenudge/<id>`
+  count that `userpromptsubmit` clears, so it arrives once, not on every tool call. The counter is
+  a subdir for the same reason `peers/` is: bare-integer filenames at the state-dir root are
+  scanned as instance status files (`mcp::live_ids` falls back to exactly that).
+- **A provisional label** (`state.rs::apply_fallback_names`, called from the poll loop). An
+  instance that reaches a turn boundary (`waiting`/`needs`) still unnamed gets `name_from_task` of
+  its own captured task — the same label a `hub_spawn` child is auto-named with. Only at a turn
+  boundary (mid-turn the task is whatever was typed first), only into an empty label, and only
+  once.
+
+**The provisional label lives in its own map, `Core.fallback_names`, and that is the load-bearing
+part.** Putting it in `names` would look identical on screen and be wrong twice over: `names` is
+what `persist_sessions` writes, and a name coming back from the store is treated as the **user's**
+(`manual_names` is seeded from the restored names on `Core::open`, since a persisted name can't be
+told from a hand-typed one) — so a machine-made guess would harden into a user label on the next
+launch and `name_verdict` would then refuse the instance's own `hub_set_name` **forever**. It also
+must not count as `current` for `name_verdict`. So it is a display-only overlay: `display_name`
+prefers the real name, `process_name_requests` and `rename` drop the guess, and `named/<id>` is
+*not* written — the instance keeps being nudged and can still replace it. Pinned by
+`an_unnamed_instance_gets_a_provisional_name_that_never_persists`, whose store assertion goes
+through a real `persist_sessions()` (asserting only "we didn't persist right now" passes even with
+the bug) and was confirmed to fail when the label is inserted into `names`.
+
+`.name` in `InstanceList.svelte` is line-clamped to 2 like `.task`, because a name is no longer
+always 2-5 words.
+
 ## Vocabulary (fixed — use these words)
 
 - **project** — one entry in the project tab bar, named by its folder (`cloud`, `central-one`).
@@ -1433,6 +1486,17 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   `HUB_RULES`' self-contained rule also landed rather than merely existing: the sender opened with
   "we can't see each other's files" and named its own repo, and the reply volunteered the actual
   shared contract between the two codebases (the `X-Api-Key` ingest endpoints).
+- **Row naming backstops (2026-08-10, unreleased).** The failure was diagnosed off the *live*
+  scratch dir rather than reproduced (`armed/6` present, `named/6` absent, `namereq/` empty), and
+  the tool was confirmed present in the **installed** helper's `tools/list` before the model was
+  blamed. Both fixes are pinned by tests confirmed to fail when the fix is removed:
+  `the_naming_nudge_comes_back_once_mid_turn_until_the_row_is_named` (fails with *"the reminder
+  repeated within one turn"* if the once-per-turn dedup becomes `>=`) and
+  `an_unnamed_instance_gets_a_provisional_name_that_never_persists` (fails on the store assertion
+  if the guess is written into `names`). `cargo test` 119 (52 app + 67 core) green, `clippy` clean
+  but for the two pre-existing warnings, `svelte-check` 120 files 0 errors, `vite build` clean.
+  **Not verified live:** the mid-turn nudge actually landing in a running instance, and the
+  provisional label as it renders — both need the new build installed.
 
 ## Auto-update
 

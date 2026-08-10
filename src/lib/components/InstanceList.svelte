@@ -313,11 +313,19 @@
   .failed {
     color: var(--warn, #e0a34a);
   }
+  /* Clamped like .task, because a name is no longer always 2-5 words: a row the
+     instance never named gets a provisional label derived from its task, which
+     can run to the full 48 characters. A ⌘R name can be long too. */
   .name {
     margin-top: 2px;
     color: var(--text);
     font-weight: 600;
     font-size: 0.8rem;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
   .task {
     margin-top: 2px;

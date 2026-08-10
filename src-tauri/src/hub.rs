@@ -72,6 +72,12 @@ pub fn start(app: AppHandle) {
                 // advertising it as running. Writes only on change.
                 core.sync_terminal_index();
                 let snap = core.hub_snapshot();
+                // An instance that ended a turn still unnamed gets a provisional
+                // label from its own task, so the row stops showing the user's
+                // raw prompt. In-memory only, and superseded by the instance's
+                // own `hub_set_name` — it must run *before* the two readers
+                // below, which are what publish the label.
+                core.apply_fallback_names(&snap);
                 reg.projects.push(core.registry_entry(&snap));
                 batch.push((core.handle, removed, snap, core.session_infos()));
             }

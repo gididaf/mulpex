@@ -231,6 +231,19 @@ pub struct Core {
     /// protecting it is the safe direction). An instance's own `hub_set_name` is
     /// refused for these: the user's label always wins. See `process_name_requests`.
     manual_names: HashSet<usize>,
+    /// Provisional labels Mulpex derived from an instance's own task because it
+    /// finished a turn without naming itself (`apply_fallback_names`). Displayed
+    /// exactly like a real name, but **deliberately kept out of `names`**:
+    ///
+    /// - it must never be persisted — a name coming back from the store is taken
+    ///   as the user's (`manual_names` is seeded from the restored names), which
+    ///   would freeze a machine-made guess *and* permanently refuse the
+    ///   instance's own `hub_set_name`;
+    /// - it must not count as "named" for `name_verdict`, whose `current` check
+    ///   would otherwise let a fallback shadow the real thing.
+    ///
+    /// So it is a display-only overlay, dropped the moment a real name lands.
+    fallback_names: HashMap<usize, String>,
     /// Muted instance ids (⌘M), persisted alongside session ids. Presentation
     /// only — a muted instance runs and coordinates exactly like any other; the
     /// frontend just dims it, sorts it last, and leaves it out of the badges.
@@ -440,6 +453,7 @@ impl Core {
             // instance is neither nudged to rename itself nor allowed to.
             manual_names: names.keys().copied().collect(),
             names,
+            fallback_names: HashMap::new(),
             muted,
             worked,
             closing: HashSet::new(),
@@ -482,7 +496,7 @@ impl Core {
             .iter()
             .map(|s| SessionInfo {
                 id: s.id,
-                name: self.names.get(&s.id).cloned(),
+                name: self.display_name(s.id),
                 muted: self.muted.contains(&s.id),
                 kind: kind_of(s),
                 exited: s.is_shell() && !s.is_alive(),
@@ -860,6 +874,9 @@ impl Core {
     /// which is the only way to undo an auto-name you didn't like.
     pub fn rename(&mut self, id: usize, name: &str) {
         let name = name.trim();
+        // Either way the user has spoken, so a provisional label is done: clearing
+        // a name must actually clear the row, not fall back to Mulpex's guess.
+        self.fallback_names.remove(&id);
         if name.is_empty() {
             self.names.remove(&id);
             self.manual_names.remove(&id);
@@ -903,11 +920,68 @@ impl Core {
             );
             if let NameVerdict::Apply(name) = verdict {
                 self.names.insert(id, name);
+                // A real name supersedes anything we guessed for this row.
+                self.fallback_names.remove(&id);
                 changed = true;
             }
         }
         if changed {
             self.persist_sessions();
+        }
+        changed
+    }
+
+    /// The label the sidebar shows for a row: the real name if there is one,
+    /// otherwise the provisional one. See `fallback_names` for why the two are
+    /// separate maps rather than one.
+    fn display_name(&self, id: usize) -> Option<String> {
+        self.names
+            .get(&id)
+            .or_else(|| self.fallback_names.get(&id))
+            .cloned()
+    }
+
+    /// Give an instance that has finished a turn without naming itself a
+    /// provisional label derived from its own captured task — the same
+    /// `name_from_task` a `hub_spawn` child is labelled with.
+    ///
+    /// This is the deterministic half of the naming fix; the model-facing half is
+    /// the hook's mid-turn nudge. Both exist because the prompt-time reminder is
+    /// only a *request*: an instance can acknowledge it, get absorbed in a long
+    /// task, and never call `hub_set_name` — and until the user's next prompt
+    /// nothing asks again, leaving the row showing the raw prompt verbatim.
+    ///
+    /// Three things make this safe to do behind the model's back:
+    /// - **Only at a turn boundary.** Naming from a task mid-turn would label the
+    ///   row off the first thing typed; by `waiting`/`needs` the task is at least
+    ///   the whole request. (An unnamed row shows that same text meanwhile, so
+    ///   nothing is hidden in the interim — it just isn't frozen yet.)
+    /// - **Never over anything.** A real name, a ⌘R name, or an earlier fallback
+    ///   all win; this only fills an empty label, once.
+    /// - **Not persisted, and not `named/<id>`.** The instance keeps being nudged
+    ///   and its own `hub_set_name` still lands, so a guess is always replaceable
+    ///   by the real thing. See `fallback_names`.
+    ///
+    /// Pure in-memory (the statuses and tasks come from the snapshot the poll loop
+    /// already computed), so a quiet tick costs a couple of hash lookups — this
+    /// runs at 5 Hz per project.
+    pub fn apply_fallback_names(&mut self, snap: &HubSnapshot) -> bool {
+        let mut changed = false;
+        for entry in &snap.statuses {
+            let id = entry.id;
+            if entry.status == Status::Working
+                || self.names.contains_key(&id)
+                || self.fallback_names.contains_key(&id)
+            {
+                continue;
+            }
+            let Some(task) = snap.tasks.iter().find(|t| t.id == id) else {
+                continue;
+            };
+            if let Some(name) = name_from_task(&task.task) {
+                self.fallback_names.insert(id, name);
+                changed = true;
+            }
         }
         changed
     }
@@ -1100,6 +1174,8 @@ impl Core {
         };
         self.worked.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.names.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
+        self.fallback_names
+            .retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.muted.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
@@ -1501,7 +1577,7 @@ impl Core {
                     .find(|t| t.id == s.id)
                     .map(|t| t.task.clone())
                     .unwrap_or_default(),
-                name: self.names.get(&s.id).cloned(),
+                name: self.display_name(s.id),
             })
             .collect();
         registry::ProjectEntry {
@@ -2303,6 +2379,65 @@ mod tests {
             name_verdict("same", true, false, Some("same")),
             NameVerdict::Ignore
         );
+    }
+
+    /// An instance that ends a turn without having named itself gets a
+    /// provisional label from its own task — and that guess must never harden
+    /// into a real name, because a name coming back from the store is taken as
+    /// the *user's* and would then refuse the instance's own `hub_set_name`
+    /// forever.
+    ///
+    /// The bug this closes: claude#6 acknowledged the naming nudge, armed its
+    /// listener, worked for three minutes and never called `hub_set_name`, so
+    /// its row showed the user's raw prompt verbatim with nothing to ask again
+    /// until the next prompt.
+    #[test]
+    fn an_unnamed_instance_gets_a_provisional_name_that_never_persists() {
+        let (_env, root, mut core) = scratch_core("fallback-name-test");
+        let id = core.spawn_instance().unwrap().id;
+        let status = core.state_dir.join(id.to_string());
+        let task = "fix the brand switcher on the organizations page";
+        std::fs::write(core.state_dir.join("tasks").join(id.to_string()), task).unwrap();
+
+        // Mid-turn, nothing is guessed: the request is still being read.
+        std::fs::write(&status, "working").unwrap();
+        core.refresh_worked();
+        let snap = core.hub_snapshot();
+        assert!(!core.apply_fallback_names(&snap), "named mid-turn");
+        assert_eq!(core.session_infos()[0].name, None);
+
+        // Turn over, still unnamed → the row is labelled from the task.
+        std::fs::write(&status, "waiting").unwrap();
+        let snap = core.hub_snapshot();
+        assert!(core.apply_fallback_names(&snap), "no fallback label");
+        assert_eq!(core.session_infos()[0].name.as_deref(), Some(task));
+        // Once, not on every one of the five ticks a second takes.
+        assert!(!core.apply_fallback_names(&snap), "the label churns every tick");
+
+        // It is a display overlay only — the store must stay empty of it, or the
+        // next launch would restore it as a name the user chose.
+        assert!(core.worked.contains(&id), "the store test would be vacuous");
+        // Through a real write, not just the stale file: the store is rewritten
+        // from `names` by anything that persists (a rename, a mute, a reap), so
+        // "we didn't persist right now" is not the invariant — "it isn't in
+        // `names` at all" is.
+        core.persist_sessions();
+        assert_eq!(core.store.load().first().and_then(|s| s.name.clone()), None);
+
+        // And the instance can still name itself properly, which supersedes it.
+        std::fs::write(core.state_dir.join("namereq").join(id.to_string()), "brand switcher gate")
+            .unwrap();
+        assert!(core.process_name_requests());
+        assert_eq!(core.session_infos()[0].name.as_deref(), Some("brand switcher gate"));
+        assert!(!core.fallback_names.contains_key(&id), "the guess outlived the real name");
+        assert_eq!(
+            core.store.load().first().and_then(|s| s.name.clone()).as_deref(),
+            Some("brand switcher gate"),
+            "a real name is persisted, unlike the guess"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// End to end through the request dir: the file an instance's `hub_set_name`

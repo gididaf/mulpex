@@ -17,8 +17,9 @@
 //!   mail it BLOCKS the stop (the model continues and reads its inbox), so no turn
 //!   ends with unhandled coordination messages; otherwise it releases every lock
 //!   that instance holds (per-turn lifetime) and writes its `waiting` status word.
-//! - `posttooluse` keeps the `working` status word and nudges the instance to read
-//!   newly-arrived hub mail mid-turn (deduped, so once per message).
+//! - `posttooluse` keeps the `working` status word and nudges the instance mid-turn
+//!   (each deduped) to read newly-arrived hub mail, to drop coordination with a peer
+//!   that has closed, and to name its own sidebar row if it still hasn't.
 //!
 //! Identity/coordination come from env vars set at spawn (`MULPEX_INSTANCE_ID`,
 //! `MULPEX_STATE_DIR`, `MULPEX_PROJECT_DIR`), inherited by the hook process. The
@@ -463,12 +464,14 @@ fn release_my_locks(ctx: &Ctx) {
 }
 
 /// Handle a PostToolUse event: keep the sidebar status `working` (preserving the
-/// old `printf` hook), and inject a mid-turn nudge (once) when either (a) new hub
-/// mail has arrived, or (b) a peer this instance knew about has closed — so it
-/// stops messaging / waiting on / deferring to an instance that's gone. Both are
-/// deduped: mail via the `<id>.notified` high-water mark, departures via the
-/// `peers/<id>` baseline (see `departed_peers`). At most one nudge is emitted per
-/// tool call (a hook can print only one decision), so the notes are combined.
+/// old `printf` hook), and inject a mid-turn nudge (once) when (a) new hub mail
+/// has arrived, (b) a peer this instance knew about has closed — so it stops
+/// messaging / waiting on / deferring to an instance that's gone — or (c) this
+/// instance still hasn't named its sidebar row. All three are deduped: mail via
+/// the `<id>.notified` high-water mark, departures via the `peers/<id>` baseline
+/// (see `departed_peers`), naming via the per-turn `namenudge/<id>` count. At most
+/// one nudge is emitted per tool call (a hook can print only one decision), so the
+/// notes are combined.
 fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
 
@@ -495,6 +498,11 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     let departed = departed_peers(ctx);
     if !departed.is_empty() {
         notes.push(departed_nudge(&departed));
+    }
+
+    // (c) Still unnamed a few tool calls into the turn?
+    if name_nudge_due(ctx) {
+        notes.push(NAME_NUDGE_MIDTURN.to_string());
     }
 
     if !notes.is_empty() {
@@ -616,6 +624,9 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // Baseline the peers this turn starts knowing about, so the PostToolUse hook
     // can nudge if any of them close before this turn ends.
     seed_seen_peers(ctx);
+    // Restart the tool-call count behind the mid-turn naming reminder, so it gets
+    // one shot per turn rather than one per session.
+    let _ = std::fs::remove_file(name_nudge_marker(ctx));
     Ok(())
 }
 
@@ -663,6 +674,62 @@ reminder only until the instance is named.)";
 /// launch is why the restore case has to seed it explicitly, unlike `armed`.
 fn instance_named(ctx: &Ctx) -> bool {
     crate::named_flag_path(&ctx.state_dir, ctx.instance).exists()
+}
+
+/// How many tool calls into a turn the mid-turn naming reminder fires.
+///
+/// `AUTO_NAME_NUDGE` arrives with the user's prompt and is easy to *acknowledge*
+/// and then lose: measured on a live instance, claude#6 opened its turn with "I'll
+/// start by arming the hub listener and naming this instance", armed the Monitor
+/// (so `armed/<id>` was written — proof the nudge landed), and then spent three
+/// minutes on the actual task and never called `hub_set_name`. `named/<id>` was
+/// absent and `namereq/` empty afterwards, so nothing was refused; the reminder was
+/// simply dropped, and the next one would not come until the user's *next* prompt.
+///
+/// So naming gets the second chance hub mail already has (`posttooluse`). A few
+/// calls in is the useful moment: late enough that the model knows what the session
+/// is about, early enough that the row is labelled while the work is still running.
+const NAME_NUDGE_AFTER_TOOLS: usize = 3;
+
+/// The mid-turn form of `AUTO_NAME_NUDGE`. Shorter and more direct than the
+/// prompt-time one — this instance has already been asked once this turn — but it
+/// keeps the same permission to defer, for the same reason.
+const NAME_NUDGE_MIDTURN: &str = "You still have no sidebar name, so your row shows my raw prompt \
+instead. Call mcp__mulpex__hub_set_name now with a short label (2-5 words, my language, naming \
+the TASK) and then carry straight on with what you were doing — one call, no narration, don't \
+restate your plan. Skip it only if it's still genuinely unclear what this session is about.";
+
+/// Whether *this* tool call is the one that carries the mid-turn naming reminder:
+/// the instance is still unnamed, and this is the Nth call of the turn. The count
+/// only advances while unnamed, so a named instance costs nothing.
+fn name_nudge_due(ctx: &Ctx) -> bool {
+    if instance_named(ctx) {
+        return false;
+    }
+    bump_name_nudge(ctx) == NAME_NUDGE_AFTER_TOOLS
+}
+
+/// Count this tool call against `NAME_NUDGE_AFTER_TOOLS` and return the new total.
+///
+/// Kept in its own `namenudge/` subdir rather than beside the status files: the
+/// App's state scans pick up bare-integer filenames at the root, and `mcp::live_ids`
+/// falls back to exactly that — the same reason `peers/` is a subdir. The counter is
+/// cleared at each `UserPromptSubmit`, so the nudge fires at most once per turn.
+fn bump_name_nudge(ctx: &Ctx) -> usize {
+    let path = name_nudge_marker(ctx);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let count = read_field_or_line(&path)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::write(&path, count.to_string());
+    count
+}
+
+fn name_nudge_marker(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir.join("namenudge").join(ctx.id_str())
 }
 
 /// Emit a PreToolUse deny naming the holder (and what they're working on, when
@@ -787,4 +854,66 @@ pub(crate) fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx(dir: &Path, instance: usize) -> Ctx {
+        let state_dir = dir.to_path_buf();
+        Ctx {
+            instance,
+            project_dir: state_dir.clone(),
+            locks_dir: state_dir.join("locks"),
+            history_dir: state_dir.join("history"),
+            tasks_dir: state_dir.join("tasks"),
+            inbox_dir: state_dir.join("inbox"),
+            waiting_dir: state_dir.join("waiting"),
+            state_dir,
+        }
+    }
+
+    /// The naming reminder has to arrive a second time *inside* the turn, because
+    /// the prompt-time one is easy to acknowledge and then lose — measured on a
+    /// live instance that armed its Monitor, announced it would name itself, and
+    /// then worked for three minutes without ever calling `hub_set_name`.
+    ///
+    /// Once per turn, though: repeating it on every tool call would be noise in
+    /// the middle of someone else's work.
+    #[test]
+    fn the_naming_nudge_comes_back_once_mid_turn_until_the_row_is_named() {
+        let dir = std::env::temp_dir().join(format!("mulpex-namenudge-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 6);
+
+        // Not on the first calls — the model needs to know what it's naming.
+        for call in 1..NAME_NUDGE_AFTER_TOOLS {
+            assert!(!name_nudge_due(&ctx), "nudged too early, on call {call}");
+        }
+        assert!(name_nudge_due(&ctx), "no reminder ever arrived");
+        // …and not again for the rest of the turn, however long it runs.
+        for _ in 0..10 {
+            assert!(!name_nudge_due(&ctx), "the reminder repeated within one turn");
+        }
+
+        // A new turn (UserPromptSubmit clears the count) re-arms it.
+        let _ = std::fs::remove_file(name_nudge_marker(&ctx));
+        for _ in 1..NAME_NUDGE_AFTER_TOOLS {
+            assert!(!name_nudge_due(&ctx));
+        }
+        assert!(name_nudge_due(&ctx), "the next turn was never reminded");
+
+        // Naming the row ends it for good — including the ⌘R case, where the flag
+        // is written by Mulpex rather than by the instance.
+        let _ = std::fs::remove_file(name_nudge_marker(&ctx));
+        let flag = crate::named_flag_path(&ctx.state_dir, ctx.instance);
+        std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        std::fs::write(&flag, "").unwrap();
+        for _ in 0..(NAME_NUDGE_AFTER_TOOLS + 5) {
+            assert!(!name_nudge_due(&ctx), "a named instance was still nudged");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
