@@ -98,13 +98,14 @@ pub fn run() {
         ])
         .setup(|app| {
             // Warm the `claude` lookup off-thread: it shells out to the user's
-            // login shell (up to a 5s timeout) to reconstruct the PATH a
-            // Finder-launched bundle doesn't inherit. Caching it here means the
-            // first project open — and the `claude_status` probe — hit a
-            // populated OnceLock instead of paying the shell spawn inline.
-            std::thread::spawn(|| {
-                let _ = claude_bin::resolve_claude();
-            });
+            // login shell (up to a 5s timeout) to reconstruct the environment a
+            // Finder-launched bundle doesn't inherit — the PATH `claude` is found
+            // on, and the rc-file exports (auth tokens above all) every session
+            // needs. Caching it here means the first project open — and the
+            // `claude_status` probe — hit a populated cache instead of paying the
+            // shell spawn inline. The same thread then re-probes periodically, so
+            // a rotating token stays live in a long-running Mulpex.
+            claude_bin::warm_and_refresh();
 
             // Restore every project that was open when Mulpex last quit, each
             // spawning its sessions (--resume). Output buffers pre-attach, so the

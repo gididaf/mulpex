@@ -438,6 +438,39 @@ in the shipped `.app`:
   **xterm.js**, so we declare that emulator rather than inherit whatever started Mulpex:
   `TERM=xterm-256color` + `COLORTERM=truecolor`, plus `LANG` only when absent.
 
+- **Every instance opened logged out** — the symptom is `Not logged in · Please run /login` in
+  every pane at once, and it is the same fact one layer up: `PATH` was never the only casualty.
+  `portable_pty` passes *our* environment through, and a Finder-launched bundle's environment is
+  LaunchServices', which never sourced an rc file — so **nothing the user exports reaches the
+  child**. For anyone authenticating by token (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`
+  exported from `.zshrc`, commonly by a refresher daemon, with **no `~/.claude/.credentials.json`
+  on disk**) that variable *is* the entire credential, so every ⌘T instance opened logged out
+  while the user's own terminal was fine.
+
+  So the probe now harvests the **whole login environment** (`$SHELL -lic '… env -0 …'`, NUL-
+  separated so a value containing a newline survives) and `pty.rs::base_env` forwards it to every
+  child. What is *not* forwarded is `claude_bin::DENY`/`DENY_PREFIX`, each entry with its reason:
+  `PATH` (replaced by the merged one), `TERM`/`COLORTERM` and the terminal-identity vars (the
+  child talks to xterm.js, not to whatever ran the probe), `CLAUDE_CODE_CHILD_SESSION`/
+  `ENTRYPOINT` (inheriting the child marker silently disables transcript saving and breaks
+  `--resume`), `IS_SANDBOX` and `MULPEX_*` (hub identity is assigned per session — and if Mulpex
+  was launched from inside a Mulpex claude, the login shell carries *that* instance's id), and the
+  shell's own bookkeeping. `LANG` now comes from the login shell when it has one; the
+  `en_US.UTF-8` fallback only fires when neither environment names one.
+
+  **The environment is re-probed every `ENV_REFRESH_INTERVAL` (10 min) on the warm-up thread, and
+  `PATH` deliberately does not follow.** Auth tokens rotate and Mulpex is left open for days, so a
+  value pinned at launch eventually logs every *new* instance out — but `resolve_claude` hands out
+  an absolute path derived from the first `PATH`, and a `PATH` disagreeing with the binary already
+  chosen is worse than a stale one. A failed re-probe keeps the last good environment: a stale
+  token beats no token.
+
+  Two reasons this stayed invisible for so long, both the usual ones: a ⌘⇧T **terminal was never
+  affected** (`$SHELL -l -i` sources the rc files itself, so the user's own shell always looked
+  healthy), and it **cannot reproduce under `tauri dev`**, which inherits the launching terminal's
+  environment. The pane also says `Please run /login`, which reads as a Claude Code problem rather
+  than a Mulpex one.
+
 Failure is now visible rather than swallowed: a `claude_status` command backs a **picker banner**
 when the CLI is missing, and `open_project` errors render inline in the picker.
 
@@ -1424,6 +1457,27 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   live scratch dir**, where `<id>.screen` went 0 → 7,658 bytes after the fix. **Still not verified:**
   the *idle wake* specifically — a driver that has ended its turn being woken by the hub message
   rather than reading the terminal within a turn it was already taking.
+- **Login-shell environment forwarding (the "Not logged in" bug).** Diagnosed by reading the live
+  process environments rather than by inference: the running app (`ps eww`) held exactly the bare
+  LaunchServices set — `PATH=/usr/bin:/bin:…`, no `TERM`, no `LANG`, no token — and so did the
+  claude it had spawned, while `~/.claude/.credentials.json` did not exist at all. The premise was
+  then isolated in one command: the same `claude` under `env -i PATH=… HOME=…` answers
+  `Not logged in · Please run /login`, and with `CLAUDE_CODE_OAUTH_TOKEN` added answers the prompt.
+  Offline: `an_rc_file_export_reaches_a_spawned_child` exports a value **only** from the probe's
+  `$ZDOTDIR/.zshrc`, then removes `ZDOTDIR` before spawning — so the child cannot source that file
+  itself and the value can only arrive by being forwarded (the value carries a newline, which is
+  what `env -0` is for). Confirmed non-tautological: with the forwarding loop removed it fails with
+  `tok=[]`, the live symptom. Plus a denylist test pinning both directions.
+  `cargo test` 54 green, `clippy` clean but for the pre-existing warning, `svelte-check` 120 files
+  0 errors.
+  **Driven in a real signed bundle**, launched with `env -i` in the LaunchServices shape and an
+  isolated `HOME` whose only credential was a `.zshrc` export: the app process itself had no token,
+  the claude it spawned via the File menu **did**, and that instance reached `Welcome back!`, ran a
+  turn, answered, armed its hub listener and named its own row. Two false alarms along the way,
+  both first-run wizardry on a fresh `HOME` rather than auth: the onboarding login screen, and the
+  bypass-permissions warning — whose default selection is **`No, exit`**, so a stray Return kills
+  the instance and it reaps like a normal exit.
+
 - **Signing by certificate (shipped in v0.7.0).** The requirement change was verified directly:
   the installed bundle reports `identifier "com.mulpex.app" and certificate root = H"356eabc7…"`,
   `codesign --verify --deep --strict` passes, and — the point of the exercise — a **subsequent

@@ -2905,6 +2905,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An rc-file export must reach a spawned child.
+    ///
+    /// This is the "Not logged in · Please run /login" bug: a Finder-launched
+    /// bundle never sourced a login shell, so `CLAUDE_CODE_OAUTH_TOKEN` —
+    /// which for a token-authenticated user is the ONLY credential, with no
+    /// `~/.claude/.credentials.json` to fall back to — simply wasn't in the
+    /// environment `portable_pty` passed through, and every instance opened
+    /// logged out. Neither `tauri dev` (inherits the terminal's environment) nor
+    /// a ⌘⇧T terminal (`$SHELL -l -i` sources the rc itself) could show it.
+    ///
+    /// Non-tautological by construction: the variable is exported ONLY from the
+    /// probe's `$ZDOTDIR/.zshrc`, and `ZDOTDIR` is removed before the child is
+    /// spawned — so the child cannot source that file itself, and the value can
+    /// only arrive by being forwarded. The value carries a newline, which is why
+    /// the probe uses `env -0`.
+    #[test]
+    fn an_rc_file_export_reaches_a_spawned_child() {
+        let _env = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-loginenv-{}", persist::new_uuid()));
+        let project = root.join("project");
+        let zdot = root.join("zdot");
+        let home = root.join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("SHELL", "/bin/zsh");
+        // zsh reads $ZDOTDIR/.zshrc when interactive — the same file the real
+        // token export lives in.
+        std::fs::write(
+            zdot.join(".zshrc"),
+            "export MPX_TEST_TOKEN='sk-ant-probe\nsecond-line'\n",
+        )
+        .unwrap();
+        std::env::set_var("ZDOTDIR", &zdot);
+
+        crate::claude_bin::refresh_login_env();
+
+        let forwarded = crate::claude_bin::forwarded_env();
+        let seen = forwarded
+            .iter()
+            .find(|(k, _)| k == "MPX_TEST_TOKEN")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            seen.as_deref(),
+            Some("sk-ant-probe\nsecond-line"),
+            "the login shell's rc export was not harvested (forwarded keys: {:?})",
+            forwarded.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+
+        // From here on nothing but the forwarding can supply the value.
+        std::env::remove_var("ZDOTDIR");
+        assert!(std::env::var_os("MPX_TEST_TOKEN").is_none());
+
+        let out = project.join("env.txt");
+        let mut core = Core::open(
+            1,
+            project.clone(),
+            Path::new("/nonexistent/mulpex-helper"),
+            root.join("state"),
+        )
+        .unwrap();
+        let info = core
+            .spawn_terminal(
+                Some(format!(
+                    "printf 'tok=[%s]\\n' \"$MPX_TEST_TOKEN\" > {}",
+                    out.display()
+                )),
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(
+            wait_until(|| std::fs::read_to_string(&out)
+                .map(|s| s.contains("tok="))
+                .unwrap_or(false)),
+            "the shell never wrote its environment"
+        );
+        let got = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            got.contains("sk-ant-probe") && got.contains("second-line"),
+            "the rc-file export never reached the child — it saw {got:?}. Every \
+             instance would open on \"Not logged in\"."
+        );
+        let _ = info;
+
+        core.teardown();
+        // Leave the cached environment as the next test would expect it.
+        crate::claude_bin::refresh_login_env();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Repro harness for the restore path. Needs a real, resumable claude
     /// session id in `/tmp/mulpex_test_uuid` and its project dir in
     /// `/tmp/mulpex_test_dir`, so it is `#[ignore]`d and run by hand.

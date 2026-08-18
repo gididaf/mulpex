@@ -999,10 +999,30 @@ fn claude_command() -> anyhow::Result<CommandBuilder> {
 
 /// The environment every PTY child needs, whichever program it is.
 fn base_env(cmd: &mut CommandBuilder) {
+    // `portable_pty` passes OUR environment through — and a Finder-launched
+    // bundle's environment is LaunchServices' bare one, which never saw a login
+    // shell. So the rc files' exports have to be reconstructed and handed over
+    // explicitly, or the child simply doesn't have them. The sharpest case is
+    // authentication: with `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)
+    // exported from `.zshrc` and no `~/.claude/.credentials.json` on disk, every
+    // instance opens on "Not logged in · Please run /login" while the user's own
+    // terminal is authenticated. A ⌘⇧T terminal never showed it — `$SHELL -l -i`
+    // sources the rc files itself — and neither did `tauri dev`, which inherits
+    // the launching terminal's environment.
+    //
+    // What is NOT forwarded (PATH, TERM, the hub identity, the Claude child
+    // markers) is `claude_bin::DENY`, next to the reasons.
+    let mut has_lang = std::env::var_os("LANG").is_some();
+    for (k, v) in claude_bin::forwarded_env() {
+        has_lang |= k == "LANG";
+        cmd.env(k, v);
+    }
+
     // A Finder-launched bundle inherits only LaunchServices' bare PATH, which
     // omits `~/.local/bin`, Homebrew and every version manager. The child's own
     // tools (`node`, `git`, whatever the user types in a shell) resolve through
-    // this, so it has to be the reconstructed one.
+    // this, so it has to be the reconstructed one — the login shell's PATH plus
+    // the fallback install dirs, which is why it overrides the forwarded value.
     cmd.env("PATH", claude_bin::merged_path());
 
     // The child talks to **xterm.js**, not to whatever terminal (if any) started
@@ -1015,8 +1035,10 @@ fn base_env(cmd: &mut CommandBuilder) {
 
     // Same story for the locale: terminals export LANG, LaunchServices doesn't,
     // and without it child tools can fall back to ASCII. Only filled in when
-    // genuinely absent, so a user's real locale is never overridden.
-    if std::env::var_os("LANG").is_none() {
+    // genuinely absent — from our environment *and* from the forwarded one, or
+    // this fallback would overwrite the user's real locale on exactly the launch
+    // path that needs it most.
+    if !has_lang {
         cmd.env("LANG", "en_US.UTF-8");
     }
 }
