@@ -27,8 +27,9 @@ src-tauri/            the Tauri app (Rust backend)
                       to a frontend Channel
   src/vtgrid.rs       shell terminals only: a small VT grid → plain-text transcript on
                       disk, so a claude in another process can read a terminal's output
-  src/state.rs        Workspace = N open projects (Vec<Core> + active handle); each
-                      Core = one project + sessions + its OWN scratch dir; reap/persist/hub-read
+  src/state.rs        Workspace = N open projects (Vec<Core> + active handle + the ONE
+                      geometry every PTY spawns at); each Core = one project + sessions
+                      + its OWN scratch dir; reap/persist/hub-read
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
@@ -226,10 +227,12 @@ amber unread badge, and the hub-panel/status-strip unread readouts.
   now also emits a per-recipient `pending: Vec<PendingEntry>` breakdown, and `unreadCount`
   subtracts the muted share. The **message log itself is untouched**: mute silences the count that
   pulls your eye, not the record of what happened.
-- **Persisted per project**, alongside the custom name, as a third tab-separated field in
-  `~/.mulpex/sessions/<key>.txt` (`<uuid>[\t<name>[\tmuted]]`). Both older formats still load — a
-  bare uuid and a `<uuid>\t<name>` line — and a muted-but-unnamed instance writes the name column
-  empty so the flag stays in field three. Covered by three `persist.rs` tests.
+- **Persisted per project**, alongside the custom name and the instance number, as the third
+  tab-separated field in `~/.mulpex/sessions/<key>.txt`
+  (`<uuid>[\t<name>[\tmuted[\t<id>]]]` — see **An instance number is an identity, not a position**).
+  Every older format still loads — a bare uuid, a `<uuid>\t<name>` line, and a three-column
+  pre-id line — and because the columns are positional a muted-but-unnamed instance writes the
+  name column empty so the flag stays in field three. Covered by five `persist.rs` tests.
 - **Muting never moves focus**, and the muted terminal stays visible and typeable. Mute means "stop
   shouting at me", not "I'm done with this one".
 - **The 🔇 is not decoration.** A dimmed, dot-less, status-less row would otherwise read as *dead*
@@ -426,10 +429,12 @@ engages.
 `(handle,id)`); exactly one — the active project's active session — is `visibility: visible`, all
 the rest `visibility: hidden` (**never** `display:none`, which would zero their size and break
 `fit()`). Hidden terminals (including whole background *projects*) keep receiving `term.write()`,
-so background Claudes keep rendering. Geometry is central: a `ResizeObserver` on the pane fits the
-visible terminal, then applies the same `cols/rows` to every session + backend PTY (all PTYs share
-one size, as the TUI did) — `refit` issues one `resize_session(handle,…)` per open project so
-background projects aren't left at spawn size.
+so background Claudes keep rendering. Geometry is central — and load-bearing, not just tidy: a
+`ResizeObserver` on the pane fits the visible terminal, then applies the same `cols/rows` to every
+session + backend PTY (all PTYs share one size, as the TUI did) via a single workspace-wide
+`resize_terminals(cols, rows)`, so no project is left at spawn size. A terminal whose PTY is a
+different size is corrupted **permanently**, so the sizes are also matched before a terminal is
+ever attached — see **One geometry, or the pane is corrupted forever**.
 
 ## One geometry, or the pane is corrupted forever
 
@@ -527,8 +532,11 @@ Residual limit: the caret is still column-based, so it can sit visually off insi
 
 - **Startup:** `lib.rs::setup()` reopens **every project in `open.txt`** (each builds its `Core` —
   scratch dir, config files, restore sessions — before the window paints; output buffers
-  pre-attach). The frontend then calls `bootstrap()` → `WorkspaceInfo`, builds one xterm per
-  session of each project, `attach_session`es each, and activates `active`. With no open projects
+  pre-attach). The frontend then calls `bootstrap()` → `WorkspaceInfo`, **adopts the geometry it
+  reports** (`terminals.setGeometry`, before any `TerminalView` mounts — the buffered startup paint
+  is about to be flushed and the xterm has to already be the size it was rendered for), builds one
+  xterm per session of each project, `attach_session`es each, and activates `active`. Restored
+  instances come back with the numbers they had, gaps included. With no open projects
   it shows the picker (recents + `@tauri-apps/plugin-dialog` folder picker); opening one goes
   through `open_project(path)`.
 - **No project ever auto-starts a `claude`.** `Core::open` restores what was worked on last time
@@ -1245,10 +1253,18 @@ loss of the session.
 
 So `Core` tracks `restored` (id → when it started) and, when a restored session dies inside
 `RESTORE_GRACE` (120 s) without having been explicitly closed, keeps its `SavedSession` in
-`sticky`, which `persist_sessions` merges back in. A restore that fails once may well succeed next
-launch; if it never does, the user still has the id. Guarded by
+`sticky`, which `persist_sessions` merges back in — **at the row it held**, paired as
+`(usize, SavedSession)`, because appending it silently moved that conversation to the bottom of the
+sidebar for good (see **An instance number is an identity, not a position**). A restore that fails
+once may well succeed next launch; if it never does, the user still has the id. Guarded by
 `a_failed_restore_is_kept_visible_and_never_erases_the_record`, confirmed to fail with the `sticky` push
 disabled.
+
+**That test does not reach the `sticky` path, despite its name.** A session that dies within
+`EARLY_DEATH_GRACE` is deliberately *kept* rather than reaped, so nothing is removed and nothing
+goes sticky — the record survives simply because it is still in `sessions`, which is a different
+guarantee. To exercise `sticky` at all, age the session's `started` stamp past that grace (what
+`a_failed_restore_is_written_back_where_it_sat` does); killing it is not enough.
 
 **The failure mode this protects against, and how to recognise it:** a `claude` that inherits
 `CLAUDE_CODE_CHILD_SESSION` runs with **transcript saving off**. It behaves completely normally —
@@ -1900,4 +1916,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`136930de6ffaab777b265e67b83fc7650b9c3d5f` — 2026-08-10
+`554e732d86468088d7ed1d6af0f9014f927bbfdd` — 2026-08-19

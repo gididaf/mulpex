@@ -81,7 +81,8 @@ menu shortcuts.
   coordinate or ask before running them. Instances are also held to a zero-assumptions planning
   discipline (verify assumptions via `AskUserQuestion` before implementing).
 - **Session persistence.** The sessions you worked on are remembered per project and
-  auto-resume (`claude --resume`) when you reopen that project.
+  auto-resume (`claude --resume`) when you reopen that project — each coming back as the same
+  `claude#N` it was, so a number keeps meaning the same conversation across restarts.
 - **Drag a file in to reference it.** Drop a file or folder anywhere on the window and its
   absolute path lands at the prompt — escaped if it needs it, nothing submitted — so you can hand
   Claude a path without typing it out. Multiple files land space-separated. **Drop an image and
