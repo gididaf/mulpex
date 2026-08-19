@@ -185,7 +185,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_spawn",
-            "description": "Start one or more NEW Claude instances in this same project, each seeded with its own task that it begins working on immediately and autonomously. Use this to fan work out — e.g. fetch a list of tickets/items and spawn one instance per item to handle it in parallel. Each new instance is a full sibling on the coordination hub; it is told you are its spawner and will hub_send its result back to you when done. Returns the new instances' ids so you can track them (hub_instances) or message them (hub_send). Max 8 per call — for more, call again in batches.",
+            "description": "Start one or more NEW Claude instances in this same project, each seeded with its own task that it begins working on immediately and autonomously. Use this to fan work out — e.g. fetch a list of tickets/items and spawn one instance per item to handle it in parallel. Each new instance is a full sibling on the coordination hub; it is told you are its spawner and will hub_send its result back to you when done. Returns the new instances' ids so you can track them (hub_instances) or message them (hub_send). Max 8 per call — for more, call again in batches. Seeding is NOT instant: the task is typed into each new instance once its UI is up, so this call waits for that and reports it. Read the reply: `ok` is true ONLY when every task actually reached its instance. `tasks_not_delivered_yet` means still starting (leave them alone, re-check with hub_instances); `tasks_never_delivered` means the task was LOST and you must hub_send it yourself. A brand-new instance reporting `status: waiting` with no visible activity is normal while delivery is pending — do not read it as a failure.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -298,7 +298,7 @@ fn hub_instances(ctx: &Ctx) -> String {
     let list: Vec<Value> = live_ids(ctx)
         .into_iter()
         .map(|id| {
-            json!({
+            let mut e = json!({
                 "id": id,
                 // Every instance reported here carries the string you would put
                 // in hub_send's `to`, so nothing has to be assembled by hand.
@@ -307,7 +307,16 @@ fn hub_instances(ctx: &Ctx) -> String {
                 "status": status_of(ctx, id),
                 "task": task_of(ctx, id),
                 "holds": holds.get(&id).cloned().unwrap_or_default(),
-            })
+            });
+            // A spawned child whose task has not been typed into it yet looks
+            // EXACTLY like an idle one — `waiting` is what `status_of` reports
+            // when the status file does not exist. Say which it is, or a spawner
+            // has no way to tell "still starting" from "its task was lost".
+            if let Some((state, note)) = delivery_of(ctx, id) {
+                e["task_delivery"] = json!(state);
+                e["task_delivery_note"] = json!(note);
+            }
+            e
         })
         .collect();
     json!({
@@ -733,22 +742,82 @@ fn hub_spawn(ctx: &Ctx, args: &Value) -> Result<String, String> {
                     )
                 })
                 .unwrap_or_default();
+            // Creating the PROCESS is not delivering the TASK. The task is typed
+            // into the child's TUI by a background thread once that TUI is ready,
+            // which is seconds later on a good day and was measured at 90 s in the
+            // field. Answering `ok: true` here — as this used to — told the caller
+            // the assignment had landed at a moment when it provably had not, and
+            // every signal it could check said the same thing a LOST task says.
+            // So wait for the injector's own verdict before answering.
+            let (delivered, pending, failed) = await_delivery(ctx, &ids);
+            let ok = !ids.is_empty() && failed.is_empty() && pending.is_empty();
+            let note = if ok {
+                "Their tasks have been delivered and they are working on them. They will \
+                 hub_send their results back to you when done."
+                    .to_string()
+            } else if !failed.is_empty() {
+                format!(
+                    "WARNING — these instances exist but NEVER received their task: {failed:?}. \
+                     Delivery was attempted and could not be confirmed. Send each of them its \
+                     task yourself with hub_send; do NOT assume they are working."
+                )
+            } else {
+                format!(
+                    "These instances exist but their tasks have not been typed into them yet \
+                     (still starting): {pending:?}. This is not a failure — check \
+                     hub_instances, whose `task_delivery` field says which of `pending` / \
+                     `failed` each one is in. Do not re-send unless it reports `failed`."
+                )
+            };
             return Ok(json!({
-                "ok": !ids.is_empty(),
+                "ok": ok,
                 "spawned_instances": ids,
-                "note": "New instances are starting on their assigned tasks and will hub_send \
-                         their results back to you when done. Use hub_instances to check on them."
+                "tasks_delivered": delivered,
+                "tasks_not_delivered_yet": pending,
+                "tasks_never_delivered": failed,
+                "note": note,
             })
             .to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // The poll loop never answered. The instances may well be coming, but nothing
+    // here has seen one — so this cannot claim success.
     Ok(json!({
-        "ok": true,
-        "note": "Spawn requested; the new instances are being created. Call hub_instances in a \
-                 moment to see them and their ids."
+        "ok": false,
+        "note": "Spawn requested, but Mulpex did not confirm it within the wait window, so \
+                 neither the instance ids nor their tasks are confirmed. Call hub_instances in a \
+                 moment: any instance that appeared carries a `task_delivery` field saying \
+                 whether its task actually reached it."
     })
     .to_string())
+}
+
+/// How long `hub_spawn` will wait for the tasks it queued to actually be typed
+/// into the new instances. Delivery normally takes a couple of seconds; the
+/// injector's own worst case is longer than this (`pty::READY_TIMEOUT` plus its
+/// retries), which is exactly why an unresolved wait is reported as `pending`
+/// rather than being silently rounded up to success.
+const SPAWN_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll the injector's on-disk verdict for each new instance until every one has
+/// resolved or the wait runs out. Returns (delivered, still-pending, failed).
+fn await_delivery(ctx: &Ctx, ids: &[u64]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    let deadline = std::time::Instant::now() + SPAWN_DELIVERY_WAIT;
+    loop {
+        let (mut done, mut pending, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+        for &id in ids {
+            match delivery_of(ctx, id as usize) {
+                None => done.push(id),
+                Some(("failed", _)) => failed.push(id),
+                Some(_) => pending.push(id),
+            }
+        }
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            return (done, pending, failed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 // ---- terminals ------------------------------------------------------------
@@ -1873,6 +1942,28 @@ fn status_of(ctx: &Ctx, id: usize) -> String {
         .unwrap_or_else(|| "waiting".to_string())
 }
 
+/// Whether a spawned instance has actually received the task it was created
+/// with. `None` once it has landed (and for every instance nobody spawned).
+///
+/// Written by the injector thread in `pty.rs`; see `pty::spawn_delivery_path`.
+fn delivery_of(ctx: &Ctx, id: usize) -> Option<(&'static str, &'static str)> {
+    let raw = std::fs::read_to_string(ctx.state_dir.join("spawning").join(id.to_string())).ok()?;
+    match raw.trim() {
+        "pending" => Some((
+            "pending",
+            "This instance was spawned with a task that has NOT been typed into it yet — it is \
+             still starting up. It is not idle and it is not stuck; wait and re-check rather \
+             than re-sending the task.",
+        )),
+        "failed" => Some((
+            "failed",
+            "This instance NEVER received the task it was spawned with — delivery was attempted \
+             and could not be confirmed. Send it the task yourself with hub_send.",
+        )),
+        _ => None,
+    }
+}
+
 fn task_of(ctx: &Ctx, id: usize) -> String {
     std::fs::read_to_string(ctx.tasks_dir.join(id.to_string()))
         .ok()
@@ -2126,6 +2217,66 @@ mod tests {
         assert!(hub_set_name(&ctx, &json!({ "name": "   " })).is_err());
         assert!(hub_set_name(&ctx, &json!({})).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spawned instance that has not been typed into yet is INDISTINGUISHABLE
+    /// from an idle one by every other signal: `status_of` answers `waiting` for
+    /// a missing status file, and a spawn child's task is never captured by the
+    /// `UserPromptSubmit` hook (the injected prompt carries the sentinel that
+    /// hook skips). That is the whole reason a merely-slow spawn read as a lost
+    /// task in the field. `hub_instances` must say which it is.
+    #[test]
+    fn hub_instances_says_whether_a_spawned_task_actually_arrived() {
+        let dir = std::env::temp_dir().join(format!("mulpex-deliv-{}", new_uuid()));
+        std::fs::create_dir_all(dir.join("spawning")).unwrap();
+        std::fs::create_dir_all(dir.join("tasks")).unwrap();
+        let ctx = test_ctx(&dir, 1);
+        // Three instances, none of which has ever written a status file — so all
+        // three look identical without the delivery marker.
+        std::fs::write(dir.join("instances"), "1\n2\n3\n").unwrap();
+        std::fs::write(dir.join("spawning").join("2"), "pending").unwrap();
+        std::fs::write(dir.join("spawning").join("3"), "failed").unwrap();
+
+        let v: Value = serde_json::from_str(&hub_instances(&ctx)).unwrap();
+        let of = |i: usize| v["instances"][i].clone();
+        assert_eq!(of(0)["status"], "waiting");
+        assert_eq!(of(1)["status"], "waiting");
+        assert_eq!(of(2)["status"], "waiting");
+
+        // An instance nobody spawned carries no delivery claim at all.
+        assert!(of(0)["task_delivery"].is_null());
+        assert_eq!(of(1)["task_delivery"], "pending");
+        assert_eq!(of(2)["task_delivery"], "failed");
+        assert!(
+            of(2)["task_delivery_note"]
+                .as_str()
+                .unwrap()
+                .contains("hub_send"),
+            "a lost task must say how to recover it: {}",
+            of(2)["task_delivery_note"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defect that hid this for months: `hub_spawn` answered `ok: true` the
+    /// moment the child PROCESS existed, which is before its task has been typed
+    /// in and says nothing about whether it ever will be. `ok` must track the
+    /// task, not the process.
+    #[test]
+    fn hub_spawn_never_claims_ok_for_a_task_that_did_not_arrive() {
+        let dir = std::env::temp_dir().join(format!("mulpex-deliv2-{}", new_uuid()));
+        std::fs::create_dir_all(dir.join("spawning")).unwrap();
+        let ctx = test_ctx(&dir, 1);
+
+        // Delivered: the marker is gone, which is what the injector does on
+        // verified submission.
+        assert_eq!(await_delivery(&ctx, &[7]), (vec![7], vec![], vec![]));
+
+        // Lost: the injector exhausted its retries. Reported, not rounded up.
+        std::fs::write(dir.join("spawning").join("8"), "failed").unwrap();
+        let (done, pending, failed) = await_delivery(&ctx, &[7, 8]);
+        assert_eq!((done, pending, failed), (vec![7], vec![], vec![8]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

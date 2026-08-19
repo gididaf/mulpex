@@ -581,7 +581,28 @@ impl Core {
         task: String,
     ) -> anyhow::Result<SessionInfo> {
         let name = name_from_task(&task);
-        let info = self.spawn_with(Some(SpawnTask { parent_id, task }), false)?;
+        // Publish the assignment BEFORE the child exists, both because injection
+        // is asynchronous and because a spawn child's task is never captured by
+        // the `UserPromptSubmit` hook (the injected prompt carries the
+        // `[mulpex:hub]` sentinel, which that hook skips). Without this, every
+        // spawned instance reports `task: ""` to `hub_instances` for its whole
+        // life — the exact reading that made a merely-slow spawn look like a
+        // dropped one.
+        let id = self.next_id;
+        let tasks_dir = self.state_dir.join("tasks");
+        let _ = std::fs::create_dir_all(&tasks_dir);
+        let _ = std::fs::write(tasks_dir.join(id.to_string()), task.trim());
+        pty::mark_delivery_pending(&self.state_dir, id);
+        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), false) {
+            Ok(info) => info,
+            Err(e) => {
+                // Nothing to deliver to; don't leave the markers behind for a
+                // number that will be handed to somebody else.
+                let _ = std::fs::remove_file(tasks_dir.join(id.to_string()));
+                let _ = std::fs::remove_file(pty::spawn_delivery_path(&self.state_dir, id));
+                return Err(e);
+            }
+        };
         if let Some(name) = name {
             self.names.insert(info.id, name.clone());
             return Ok(SessionInfo {
@@ -1318,6 +1339,7 @@ impl Core {
     fn forget_session_files(&self, id: usize) {
         let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
         let _ = std::fs::remove_file(self.state_dir.join("tasks").join(id.to_string()));
+        let _ = std::fs::remove_file(crate::pty::spawn_delivery_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
         let _ = std::fs::remove_file(terminal_mark_path(&self.state_dir, id));

@@ -303,7 +303,53 @@ const VERIFY_WINDOW: Duration = Duration::from_secs(6);
 /// between `claude` versions.
 fn input_box_ready(tail: &[u8]) -> bool {
     let s = String::from_utf8_lossy(tail);
-    s.contains('╭') && s.contains('╰') && s.contains('>')
+    // Two chrome styles have both been observed from claude v2.1.235 on the SAME
+    // machine, differing by project: a rounded box ('╭' … '╰') and a pair of plain
+    // horizontal rules. Requiring the corners alone made this a coin flip — in the
+    // project the field report came from, the child emitted ZERO '╭'/'╰' and 408
+    // '─', so readiness was never detected and the task was typed in only when
+    // READY_TIMEOUT expired — 90 s after the instance appeared in the sidebar, by
+    // which point its spawner had long since concluded the task was lost.
+    let framed = (s.contains('╭') && s.contains('╰')) || s.contains(RULE_RUN);
+    framed && (s.contains('>') || s.contains('❯'))
+}
+
+/// A run of the box-drawing horizontal line claude rules the input area with.
+/// Long enough that a stray table border in banner text cannot pass for it.
+const RULE_RUN: &str = "────────────────";
+
+/// Where a spawned child's task-delivery state is published, so the rest of the
+/// system can tell "its task has not landed YET" from "its task never landed".
+///
+/// Injection runs on a background thread long after `hub_spawn` has answered, and
+/// until this existed nothing anywhere recorded how it went: a child that had not
+/// been typed into yet was indistinguishable from one whose task was lost — both
+/// show `status: waiting` (`mcp::status_of`'s default for a missing status file)
+/// and an empty task (the injected prompt is sentinel-prefixed, so
+/// `hook::userpromptsubmit` deliberately skips capturing it). A subdir for the
+/// usual reason: a bare integer at the state-dir root is scanned as a status file.
+pub fn spawn_delivery_path(state_dir: &Path, id: usize) -> PathBuf {
+    state_dir.join("spawning").join(id.to_string())
+}
+
+/// Mark a spawned child's task as not-yet-delivered. Written synchronously by the
+/// spawn path, before `hub_spawn` can answer, so there is no window in which the
+/// child looks like an ordinary idle instance.
+pub fn mark_delivery_pending(state_dir: &Path, id: usize) {
+    let p = spawn_delivery_path(state_dir, id);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, "pending");
+}
+
+fn mark_delivery(state_dir: &Path, id: usize, state: &str) {
+    let p = spawn_delivery_path(state_dir, id);
+    if state.is_empty() {
+        let _ = std::fs::remove_file(p);
+    } else {
+        let _ = std::fs::write(p, state);
+    }
 }
 
 /// Whether the child has actually begun a turn. The `UserPromptSubmit` hook writes
@@ -637,6 +683,7 @@ impl Session {
                 loop {
                     thread::sleep(Duration::from_millis(150));
                     if !alive.load(Ordering::Relaxed) {
+                        mark_delivery(&state_dir, id, "failed");
                         return; // died during startup — nothing to bootstrap
                     }
                     let elapsed = start.elapsed();
@@ -706,10 +753,16 @@ impl Session {
                             return;
                         }
                         if turn_started(&state_dir, id) {
-                            return; // landed
+                            mark_delivery(&state_dir, id, ""); // landed
+                            return;
                         }
                     }
                 }
+                // Every attempt typed the task in and none provably submitted.
+                // Say so on disk rather than returning quietly: this thread is the
+                // only thing that ever knows the task was lost, and its silence is
+                // what made a lost task look like a slow start.
+                mark_delivery(&state_dir, id, "failed");
             });
         }
 
@@ -1110,6 +1163,25 @@ fn b64encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness check is what decides whether a spawned child is typed into
+    /// in a couple of seconds or only when `READY_TIMEOUT` expires 90 s later.
+    /// Both of these frames were captured from a real claude v2.1.235 — the
+    /// rounded box in a scratch project, the plain rules in the project the field
+    /// report came from, which emitted ZERO rounded corners. Requiring the
+    /// corners made the fast path a coin flip decided by the project.
+    #[test]
+    fn the_input_box_is_recognised_in_both_chrome_styles() {
+        let rounded = "╭──────────────────────────────╮\n│ > Try \"edit users.ts\"        │\n╰──────────────────────────────╯";
+        let ruled = "────────────────────────────────\n ❯ Try \"edit users.ts to...\"\n────────────────────────────────";
+        assert!(input_box_ready(rounded.as_bytes()), "rounded box not detected");
+        assert!(input_box_ready(ruled.as_bytes()), "ruled input area not detected");
+
+        // Still-booting output must NOT pass: typing before the box exists is
+        // what the retry machinery exists to survive, not something to invite.
+        let booting = "Loading MCP servers…\n  connecting > mulpex\n";
+        assert!(!input_box_ready(booting.as_bytes()), "a booting pane read as ready");
+    }
     use std::os::unix::fs::PermissionsExt;
 
     /// The preflight must actually recognise an unreadable directory, and say
