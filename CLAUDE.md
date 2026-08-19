@@ -826,8 +826,8 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   inherent (children also have `hub_spawn`); only the per-call cap bounds a single call.
 - **Injection is verified, not fire-and-forget** (`pty.rs`). Typing the task in requires the
   child's input box to actually exist, and nothing about the PTY stream says so directly. The
-  injector therefore: (1) waits for a *drawn input box* — `input_box_ready` looks for the rounded
-  box chrome in a rolling `TAIL_CAP` tail of output — rather than for "painted then quiet", which
+  injector therefore: (1) waits for a *drawn input box* — `input_box_ready` looks for that chrome
+  in a rolling `TAIL_CAP` tail of output — rather than for "painted then quiet", which
   a mid-startup lull while MCP servers load imitates perfectly; (2) types the prompt, then sends
   `\r` separately (a `\r` at the tail of a fast burst is treated as paste content, not a submit);
   (3) **verifies** via `turn_started`, which reads the child's own `state_dir/<id>` status file —
@@ -842,7 +842,71 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   recover (their hub listeners arm from the first turn, which never came, so even `hub_send`
   couldn't reach them). Readiness detection alone would not be enough — it can always be wrong on
   a future `claude` whose chrome differs — which is why verification plus retry is the part that
-  actually makes this robust, and why the readiness check can afford to key off TUI chrome.
+  actually makes this robust.
+
+  **But the readiness check cannot afford to be casually wrong, which this file used to claim it
+  could.** A false negative is not free: it costs the full `READY_TIMEOUT` (90 s) of a child
+  sitting there with no task, which is long enough that its spawner gives up and concludes the
+  task was lost. Measured in the field — see **A slow spawn must not look like a lost one**.
+  `input_box_ready` therefore accepts **both** chrome styles claude v2.1.235 was observed drawing
+  *on the same machine*: the rounded box (`╭` … `╰`) and a pair of plain `─` rules, either of them
+  plus a `>`/`❯`. In the project the field report came from, the child emitted **zero** `╭`/`╰`
+  and 408 `─`, so requiring the corners made the fast path a coin flip decided by the project.
+  Pinned by `the_input_box_is_recognised_in_both_chrome_styles`, confirmed to fail (*"ruled input
+  area not detected"*) with the corners-only rule restored.
+
+### A slow spawn must not look like a lost one
+
+Reported from the field: two consecutive `hub_spawn` calls each returned `ok: true` with a new id,
+the instance appeared, and it sat there doing nothing. The spawner checked `hub_instances`, saw
+`{"status":"waiting","task":""}`, concluded the seeding had silently dropped its 9,000-character
+assignment, and re-sent the whole thing by hand with `hub_send`.
+
+**Nothing was ever dropped.** The child's own transcript has the injected prompt arriving intact,
+all 10,213 characters of it, **91 s after the spawn** — i.e. at the `READY_TIMEOUT` ceiling, the
+readiness bug above. The spawner's manual `hub_send` went out 19 s *before* the real task landed.
+Length and content were ruled out by measurement first, driving a real `claude` on a PTY: 50 /
+2 k / 8 k / 9 k-char tasks and an 8.5 k Hebrew one (15.5 KB of UTF-8, with backticks, `===`
+headings and `--flags`) **all land on attempt 1**. The PTY itself only starts discarding above
+~25 KB, and `write_all` blocks rather than truncating below that.
+
+What made a slow spawn *unfalsifiable* is that every signal a spawner can read says exactly what a
+lost task would say:
+
+- **`status: waiting`** is `mcp::status_of`'s **default for a missing status file** — and a child
+  that has not taken a turn yet has no status file. It is not reporting idleness; it is reporting
+  ignorance, in the same word.
+- **`task: ""`** is what a spawn child shows for its *whole life*, not just at startup: the
+  injected prompt carries the `[mulpex:hub]` sentinel precisely so `hook::userpromptsubmit` skips
+  capturing it. Every other row in the listing has a task, so the empty one reads as broken.
+- **`ok: true`** was answered as soon as the child *process* existed. Creating a process is not
+  delivering a task, and the two were minutes apart.
+
+So the spawn path now publishes what it knows, and the API stops asserting what it doesn't:
+
+- **`spawn_instance_with_task` seeds `tasks/<id>` with the assignment before the child exists**, so
+  `hub_instances` shows what it was sent instead of `""`. (Removed again if the spawn itself
+  fails, so a number handed to somebody else can't inherit it.)
+- **The injector publishes its verdict to `spawning/<id>`** (`pty::spawn_delivery_path`):
+  `pending` written synchronously by the spawn path, cleared on the `turn_started` proof, and
+  `failed` when the retries are exhausted or the child dies during startup. That thread is the
+  only thing in the system that ever knows the task was lost, and **returning quietly was the
+  defect** — same shape as every other silent failure in this file. A subdir for the usual reason:
+  a bare integer at the state-dir root is scanned as a status file (`mcp::live_ids`).
+- **`hub_instances` reports `task_delivery`** (`pending`/`failed`, absent once delivered) with a
+  note saying what to do about it — wait, or `hub_send` it yourself. An instance nobody spawned
+  carries no delivery claim at all.
+- **`hub_spawn` waits for delivery** (`await_delivery`, capped at `SPAWN_DELIVERY_WAIT` = 60 s) and
+  **`ok` now tracks the task, not the process**: `tasks_delivered` / `tasks_not_delivered_yet` /
+  `tasks_never_delivered`, with `ok` true only when every task landed. The injector's own worst
+  case is longer than that wait, which is exactly why an unresolved wait is reported as `pending`
+  rather than rounded up to success; the no-response fallback reply is now `ok: false` too. The
+  tool description says all of this, including that a brand-new instance showing `status: waiting`
+  is *normal* while delivery is pending.
+
+Pinned by `hub_instances_says_whether_a_spawned_task_actually_arrived` (three instances, none with
+a status file, so they are indistinguishable without the marker) and
+`hub_spawn_never_claims_ok_for_a_task_that_did_not_arrive`.
 
 ## Terminal sessions (⌘⇧T + `hub_terminal_*`)
 
@@ -1806,6 +1870,23 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   but for the two pre-existing warnings, `svelte-check` 120 files 0 errors, `vite build` clean.
   Then **confirmed by the user in the installed build** — the case that motivated it (a row that
   had sat showing a pasted prompt) now labels itself.
+- **Spawned-task delivery (shipped in v0.7.4).** Diagnosed by measurement in this order, because
+  the cheap reading was wrong at every step. (1) **Truncation ruled out first**: a Python PTY
+  harness replicating `pty.rs`'s injection byte for byte against a real `claude` landed 50 / 2 k /
+  8 k / 9 k-char tasks and an 8.5 k Hebrew one (15.5 KB, backticks, `===`, `--flags`) all on
+  attempt 1; a separate `openpty` probe showed the tty blocks rather than truncating until ~25 KB.
+  (2) **The field instance's own transcript** (`~/.claude/projects/…/<session-id>.jsonl`) showed
+  the task arriving intact 91 s after the spawn — so the question was never "where did it go" but
+  "why so late". The scratch dir gave the spawn instant (`spawn/` mtime) and `messages.log` gave
+  the spawner's manual re-send 19 s *before* the real arrival. (3) **The readiness check was then
+  run against a real `claude` cold-starting in the reporting project**: `input_box_ready` never
+  matched — zero `╭`/`╰`, 408 `─` — so the injector could only type at the 90 s ceiling, while the
+  identical harness in a scratch project matched at 0.5 s. After the fix, re-measured in that same
+  project: **readiness at 1.1 s instead of never**. `cargo test --workspace` 135 (60 app + 75 core)
+  green, `clippy` clean but for the pre-existing `hook.rs` warning. The chrome test is confirmed
+  non-tautological (fails *"ruled input area not detected"* when reverted).
+  **Not verified in the real window** — the fix only takes effect for instances spawned after a
+  relaunch, which was deliberately not done while the user was working inside the app.
 
 ## Auto-update
 
@@ -1916,4 +1997,4 @@ finally collected the 12 dirs the old bug had accumulated on this machine.
 
 ## Last Synced Commit
 
-`554e732d86468088d7ed1d6af0f9014f927bbfdd` — 2026-08-19
+`91b97926ce4bccc8f7cf392d10778c9d00783b7b` — 2026-08-19
