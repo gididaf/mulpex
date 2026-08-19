@@ -80,6 +80,10 @@ export interface BootstrapInfo {
 export interface WorkspaceInfo {
   projects: BootstrapInfo[];
   active: ProjectHandle | null;
+  /** The geometry every PTY is running at. Terminals must be built at exactly
+   *  this size before they are attached — see `terminals.ts::create`. */
+  cols: number;
+  rows: number;
 }
 
 export interface ClaudeStatus {
@@ -174,11 +178,10 @@ export const sendBytes = (
   data: Uint8Array,
 ) => invoke<void>("send_bytes", { projectHandle, id, data });
 
-export const resizeSession = (
-  projectHandle: ProjectHandle,
-  cols: number,
-  rows: number,
-) => invoke<void>("resize_session", { projectHandle, cols, rows });
+/** Bring every PTY in every open project to the center pane's geometry. One call
+ *  for the whole workspace — see `resize_terminals` in commands.rs. */
+export const resizeTerminals = (cols: number, rows: number) =>
+  invoke<void>("resize_terminals", { cols, rows });
 
 export const focusSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("focus_session", { projectHandle, id });

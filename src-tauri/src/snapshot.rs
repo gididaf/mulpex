@@ -169,6 +169,12 @@ pub struct BootstrapInfo {
 pub struct WorkspaceInfo {
     pub projects: Vec<BootstrapInfo>,
     pub active: Option<ProjectHandle>,
+    /// The geometry **every** PTY in the workspace currently has. The frontend
+    /// must build each xterm at exactly this size *before* attaching its channel:
+    /// a terminal fed bytes that were rendered for a different size is corrupted
+    /// permanently, not transiently — see `terminals.ts::create`.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Result of the startup `claude_status` probe: whether the user's `claude` CLI

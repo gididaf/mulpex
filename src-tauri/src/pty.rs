@@ -768,6 +768,13 @@ impl Session {
         }
     }
 
+    /// This session's PTY geometry, `(cols, rows)`. The frontend's xterm for it
+    /// must match, or the pane is corrupted permanently — see `terminals.ts`.
+    #[cfg(test)]
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
     pub fn is_shell(&self) -> bool {
         self.kind == SessionKind::Shell
     }

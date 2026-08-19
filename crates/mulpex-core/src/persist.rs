@@ -45,6 +45,15 @@ pub struct SavedSession {
     pub session_id: String,
     pub name: Option<String>,
     pub muted: bool,
+    /// The instance NUMBER this session had — the `claude#15` the user reads,
+    /// types into `hub_send` and remembers a conversation by.
+    ///
+    /// Persisted because it is an identity, not an index. Without it a restore
+    /// hands out `sessions.len() + 1`, so #2/#3/#15 silently come back as
+    /// #1/#2/#3: every number now names a different conversation than it did
+    /// before the restart, and nothing on screen says so. `None` is a store
+    /// written before this column existed — those still number sequentially.
+    pub id: Option<usize>,
 }
 
 /// The tab-separated flag marking a muted instance in the store file.
@@ -94,10 +103,14 @@ impl SessionStore {
     /// error, if there is no store yet, or if the recorded project path doesn't
     /// match (guards against a hash collision clobbering another project).
     ///
-    /// Each line is `<uuid>[\t<name>[\tmuted]]`, so every older format still
-    /// loads: a bare uuid (before names existed) yields no name and unmuted, and
-    /// a `<uuid>\t<name>` line (before mute existed) yields unmuted. A muted
-    /// instance with no name writes the name field empty — `<uuid>\t\tmuted`.
+    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>]]]`, so every older format
+    /// still loads: a bare uuid (before names existed) yields no name and
+    /// unmuted, a `<uuid>\t<name>` line (before mute existed) yields unmuted, and
+    /// a three-column line (before ids were persisted) yields `id: None` and is
+    /// numbered sequentially on restore, exactly as it used to be. The columns
+    /// are positional, so an instance that has only some of them writes the
+    /// earlier ones empty — a muted unnamed instance is `<uuid>\t\tmuted`, and
+    /// an unnamed unmuted instance with an id is `<uuid>\t\t\t15`.
     pub fn load(&self) -> Vec<SavedSession> {
         let Ok(content) = std::fs::read_to_string(&self.path) else {
             return Vec::new();
@@ -115,7 +128,7 @@ impl SessionStore {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(|l| {
-                let mut parts = l.splitn(3, '\t');
+                let mut parts = l.splitn(4, '\t');
                 let session_id = parts.next().unwrap_or("").to_string();
                 let name = parts
                     .next()
@@ -123,10 +136,12 @@ impl SessionStore {
                     .filter(|n| !n.is_empty())
                     .map(String::from);
                 let muted = parts.next().map(str::trim) == Some(MUTED_FLAG);
+                let id = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 SavedSession {
                     session_id,
                     name,
                     muted,
+                    id,
                 }
             })
             .filter(|s| !s.session_id.is_empty())
@@ -134,8 +149,9 @@ impl SessionStore {
     }
 
     /// Persist `sessions` (in order) for this project as
-    /// `<uuid>[\t<name>[\tmuted]]`. Best-effort: any I/O failure is silently
-    /// ignored.
+    /// `<uuid>[\t<name>[\tmuted[\t<id>]]]`. Trailing empty columns are dropped, so
+    /// a store with nothing new in it is written byte-identically to the older
+    /// format. Best-effort: any I/O failure is silently ignored.
     pub fn save(&self, sessions: &[SavedSession]) {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -153,13 +169,18 @@ impl SessionStore {
                 .map(|n| n.replace(['\t', '\n', '\r'], " "))
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty());
-            if name.is_some() || s.muted {
+            let mut cols = [
+                name.unwrap_or_default(),
+                if s.muted { MUTED_FLAG.into() } else { String::new() },
+                s.id.map(|i| i.to_string()).unwrap_or_default(),
+            ];
+            // Positional columns, so only trailing empties can be dropped — an
+            // id with no name still needs its empty name and muted fields
+            // written or it would be read back as the name.
+            let keep = cols.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
+            for col in cols.iter_mut().take(keep) {
                 out.push('\t');
-                out.push_str(name.as_deref().unwrap_or(""));
-            }
-            if s.muted {
-                out.push('\t');
-                out.push_str(MUTED_FLAG);
+                out.push_str(col);
             }
             out.push('\n');
         }
@@ -176,7 +197,66 @@ mod tests {
             session_id: id.to_string(),
             name: name.map(String::from),
             muted,
+            id: None,
         }
+    }
+
+    fn numbered(uuid: &str, name: Option<&str>, muted: bool, id: usize) -> SavedSession {
+        SavedSession {
+            id: Some(id),
+            ..saved(uuid, name, muted)
+        }
+    }
+
+    /// The instance number survives a save/load, including the awkward shapes:
+    /// an unnamed unmuted instance still needs its two empty columns written or
+    /// the number would be read back as the name.
+    #[test]
+    fn the_instance_number_round_trips_through_every_column_shape() {
+        let dir = std::env::temp_dir().join(format!("mulpex-idcols-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        let project = dir.join("proj");
+        let store = SessionStore::new(&project);
+
+        let rows = vec![
+            numbered("u1", Some("named"), false, 2),
+            numbered("u2", None, false, 15),
+            numbered("u3", None, true, 7),
+            numbered("u4", Some("both"), true, 9),
+            saved("u5", Some("no id at all"), false),
+        ];
+        store.save(&rows);
+        assert_eq!(store.load(), rows, "a column shape did not survive the round trip");
+
+        // The unnamed-with-id line must not read its number back as a name.
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(text.contains("u2\t\t\t15\n"), "columns misaligned:\n{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store with nothing new in it must be written byte-identically to the
+    /// older format, so upgrading Mulpex doesn't rewrite every project's file
+    /// into something an older build would misread.
+    #[test]
+    fn a_store_with_no_ids_is_written_in_the_old_format() {
+        let dir = std::env::temp_dir().join(format!("mulpex-oldfmt-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        let project = dir.join("proj");
+        let store = SessionStore::new(&project);
+
+        store.save(&[
+            saved("u1", None, false),
+            saved("u2", Some("named"), false),
+            saved("u3", None, true),
+        ]);
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines, vec!["u1", "u2\tnamed", "u3\t\tmuted"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

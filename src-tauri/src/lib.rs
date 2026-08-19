@@ -91,7 +91,7 @@ pub fn run() {
             commands::set_session_muted,
             commands::set_mute_menu_checked,
             commands::send_bytes,
-            commands::resize_session,
+            commands::resize_terminals,
             commands::focus_session,
             commands::get_hub_snapshot,
             commands::restart_app,

@@ -69,6 +69,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "pretooluse" => pretooluse(&ctx),
         "posttooluse" => posttooluse(&ctx),
         "stop" => stop(&ctx),
+        "notification" => notification(&ctx),
+        "precompact" => precompact(&ctx),
+        "sessionstart" => sessionstart(&ctx),
         "userpromptsubmit" => userpromptsubmit(&ctx),
         _ => Ok(()),
     }
@@ -91,6 +94,16 @@ pub(crate) struct Ctx {
     /// `waiting/<id>` = "<basename>\t<holder>" while this instance is blocked
     /// waiting for a locked file (for the UI's ⏳ indicator).
     pub(crate) waiting_dir: PathBuf,
+    /// `bg/<id>` exists while this instance ended a turn with background work
+    /// still running — a background agent or a `run_in_background` shell. It is
+    /// the only way the idle notification can tell "waiting for the user" from
+    /// "waiting for its own agent"; see `notification`.
+    pub(crate) bg_dir: PathBuf,
+    /// `compacting/<id>` holds the compaction `trigger` ("manual"/"auto") between
+    /// `PreCompact` and the `SessionStart` that ends it. Same job as `bg_dir`:
+    /// compaction can run for minutes with no hook in between, so without it the
+    /// 60 s idle notification lands mid-compaction and reports "needs you".
+    pub(crate) compacting_dir: PathBuf,
 }
 
 impl Ctx {
@@ -105,11 +118,15 @@ impl Ctx {
         let tasks_dir = state_dir.join("tasks");
         let inbox_dir = state_dir.join("inbox");
         let waiting_dir = state_dir.join("waiting");
+        let bg_dir = state_dir.join("bg");
+        let compacting_dir = state_dir.join("compacting");
         let _ = std::fs::create_dir_all(&locks_dir);
         let _ = std::fs::create_dir_all(&history_dir);
         let _ = std::fs::create_dir_all(&tasks_dir);
         let _ = std::fs::create_dir_all(&inbox_dir);
         let _ = std::fs::create_dir_all(&waiting_dir);
+        let _ = std::fs::create_dir_all(&bg_dir);
+        let _ = std::fs::create_dir_all(&compacting_dir);
         Some(Ctx {
             instance,
             state_dir,
@@ -119,6 +136,8 @@ impl Ctx {
             tasks_dir,
             inbox_dir,
             waiting_dir,
+            bg_dir,
+            compacting_dir,
         })
     }
 
@@ -419,10 +438,21 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // nudge can still finish (no wedge).
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let already_continued = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let payload = serde_json::from_str::<serde_json::Value>(&input).ok();
+    let already_continued = payload
+        .as_ref()
         .and_then(|j| j.get("stop_hook_active").and_then(|v| v.as_bool()))
         .unwrap_or(false);
+    // The turn is ending, but the instance may not be: a background agent or a
+    // `run_in_background` shell keeps running and will wake it with a
+    // `<task-notification>` turn of its own. Recorded here because this is the
+    // ONLY place the fact is available — `Stop`'s payload carries
+    // `background_tasks`, and the idle notification's does not (measured; see
+    // `notification`).
+    let busy = background_work_running(payload.as_ref());
+    set_background_flag(ctx, busy);
+    // A turn boundary is proof we are not mid-compaction.
+    clear_compacting(ctx);
 
     // Per-turn locks release at *every* turn boundary — including when we block to
     // deliver mail. The continuation re-acquires (via `edit_guard`) anything it
@@ -446,9 +476,175 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // The turn is really ending; reset the nudge high-water mark to the current
     // (now-read, usually 0) count so the next message re-nudges cleanly.
     let _ = std::fs::write(notified_marker(ctx), unread.to_string());
-    // Preserve the sidebar status the old `printf waiting` Stop hook produced.
-    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "waiting");
+    // Preserve the sidebar status the old `printf waiting` Stop hook produced —
+    // unless work this instance started is still running, in which case the turn
+    // ended but the instance did not, and `waiting` (a green "ready" dot, and 60 s
+    // later a red "needs you") would be a lie.
+    let status = if busy { "working" } else { "waiting" };
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), status);
     Ok(())
+}
+
+/// Does this `Stop` payload say work the instance started is still running?
+///
+/// `background_tasks` covers both a background **agent** and a
+/// `run_in_background` **shell** — measured shapes:
+///   `{"id":…,"type":"subagent","status":"running","description":…,"agent_type":…}`
+///   `{"id":…,"type":"shell","status":"running","description":…,"command":…}`
+/// and the array is `[]` once everything has finished. Entries with any other
+/// status are ignored; a task with no status at all counts as running, because
+/// the failure that matters is claiming the instance is idle when it isn't.
+///
+/// `session_crons` is deliberately NOT counted. A scheduled future run is not
+/// work in flight — between firings the instance genuinely is idle and a prompt
+/// really is what it is waiting for.
+fn background_work_running(payload: Option<&serde_json::Value>) -> bool {
+    payload
+        .and_then(|j| j.get("background_tasks"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|tasks| {
+            tasks.iter().any(|t| {
+                t.get("status")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s == "running")
+                    .unwrap_or(true)
+            })
+        })
+}
+
+fn background_flag(ctx: &Ctx) -> PathBuf {
+    ctx.bg_dir.join(ctx.id_str())
+}
+
+fn set_background_flag(ctx: &Ctx, busy: bool) {
+    if busy {
+        let _ = std::fs::write(background_flag(ctx), "");
+    } else {
+        let _ = std::fs::remove_file(background_flag(ctx));
+    }
+}
+
+/// Handle a `Notification` event (matcher `permission_prompt|idle_prompt`).
+///
+/// This used to be a bare `printf needs > $MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID`
+/// in the settings template, which is wrong for one case and one case only:
+/// **`idle_prompt` while the instance has background work outstanding.** Claude
+/// Code fires that notification 60 s after a turn ends (measured: `Stop` at
+/// 11:58:56, `Notification` at 11:59:56, to the second), regardless of whether a
+/// background agent it launched is still running — so an instance quietly waiting
+/// on its own agent lit the red dot, the tab's red badge, the dock badge and a
+/// desktop banner, all saying "this one needs YOU". It didn't.
+///
+/// The notification's own payload cannot answer the question — it carries only
+/// `notification_type` and `message` (measured) — so the answer comes from the
+/// flag the `Stop` hook left behind, which is written from the one payload that
+/// does know.
+///
+/// `permission_prompt` is never suppressed: a permission request is a question
+/// for the user whatever else is running. Neither is `AskUserQuestion`, which
+/// writes `needs` from its own `PreToolUse` matcher and never comes through here.
+fn notification(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let kind = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|j| {
+            j.get("notification_type")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), notify_status(ctx, &kind));
+    Ok(())
+}
+
+/// The whole decision `notification` makes, split out so a test can drive the
+/// real thing rather than a copy of it (the hook itself reads stdin, which a test
+/// cannot hand it).
+fn notify_status(ctx: &Ctx, kind: &str) -> &'static str {
+    let busy = background_flag(ctx).exists() || compacting_flag(ctx).exists();
+    if kind == "idle_prompt" && busy {
+        "working"
+    } else {
+        "needs"
+    }
+}
+
+fn compacting_flag(ctx: &Ctx) -> PathBuf {
+    ctx.compacting_dir.join(ctx.id_str())
+}
+
+/// Compaction has started (`/compact`, or an automatic one when the context
+/// fills). It can run for minutes and fires **no other hook while it runs** —
+/// measured on a real session: `PreCompact` 09:24:19, the `SessionStart` that
+/// ends it 09:24:53, and nothing in between. `/compact` does not even fire
+/// `UserPromptSubmit` (it is a local command, not a prompt), so without this the
+/// status file still says whatever the last turn left — and the 60 s idle
+/// notification then overwrites it with `needs`, mid-compaction. Measured:
+/// `PreCompact` 09:18:10 → `Notification{idle_prompt}` 09:19:10, to the second.
+///
+/// The `trigger` is kept because it decides what the END of compaction means:
+/// after a manual `/compact` the instance is idle at its prompt, but an
+/// automatic one happens mid-turn and the turn carries on afterwards.
+fn precompact(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let trigger = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|j| {
+            j.get("trigger")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "manual".into());
+    let _ = std::fs::write(compacting_flag(ctx), trigger);
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
+    Ok(())
+}
+
+/// A session began. Only `source == "compact"` is ours: it is the event that
+/// ends a compaction (the other sources — startup, resume, clear — are ordinary
+/// lifecycle and must not touch a status the restore path already set).
+fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let source = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|j| j.get("source").and_then(|v| v.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    if !is_compaction_end(&source) {
+        return Ok(());
+    }
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), compaction_end_status(ctx));
+    clear_compacting(ctx);
+    Ok(())
+}
+
+/// `SessionStart` also fires for `startup`, `resume` and `clear`; only the
+/// compaction one ends a compaction, and the others must leave the status alone.
+fn is_compaction_end(source: &str) -> bool {
+    source == "compact"
+}
+
+/// What the instance is doing the moment a compaction finishes. A manual
+/// `/compact` leaves it idle at the prompt; an automatic one interrupted a turn
+/// that now resumes, and reporting a green "ready" dot in the middle of that
+/// turn would be the same lie in the other direction.
+fn compaction_end_status(ctx: &Ctx) -> &'static str {
+    match std::fs::read_to_string(compacting_flag(ctx)).as_deref().map(str::trim) {
+        Ok("auto") => "working",
+        _ => "waiting",
+    }
+}
+
+/// Bound how long a stale flag can last. Compaction normally ends with its own
+/// `SessionStart`, but a REFUSED one does not: `PreCompact` fires and then Claude
+/// Code answers "Not enough messages to compact" and nothing else happens
+/// (measured). Any hook that proves the instance is doing something else clears
+/// it, so the worst case is one status word until the next prompt or turn end.
+fn clear_compacting(ctx: &Ctx) {
+    let _ = std::fs::remove_file(compacting_flag(ctx));
 }
 
 /// Release every lock currently held by this instance (per-turn lifetime).
@@ -573,6 +769,7 @@ fn write_seen_peers(ctx: &Ctx, ids: &[usize]) {
 /// other instances into this turn via `additionalContext`.
 fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
+    clear_compacting(ctx);
 
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_ok() {
@@ -870,8 +1067,157 @@ mod tests {
             tasks_dir: state_dir.join("tasks"),
             inbox_dir: state_dir.join("inbox"),
             waiting_dir: state_dir.join("waiting"),
+            bg_dir: state_dir.join("bg"),
+            compacting_dir: state_dir.join("compacting"),
             state_dir,
         }
+    }
+
+    /// The exact payloads Claude Code v2.1.234 hands the `Stop` hook, captured
+    /// from a real session driven on a PTY (`scratchpad/agentprobe.py`). The array
+    /// is what tells an ended turn apart from an idle instance.
+    const STOP_WITH_AGENT: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "background_tasks":[{"id":"a02a60b9ffa020198","type":"subagent","status":"running",
+        "description":"Sleep then reply","agent_type":"general-purpose"}],"session_crons":[]}"#;
+    const STOP_WITH_SHELL: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "background_tasks":[{"id":"bwg6gwcry","type":"shell","status":"running",
+        "description":"Sleep 150 seconds in background","command":"sleep 150; echo done"}],
+        "session_crons":[]}"#;
+    const STOP_IDLE: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "background_tasks":[],"session_crons":[]}"#;
+    /// A session with a cron scheduled but nothing in flight is genuinely idle.
+    const STOP_CRON_ONLY: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "background_tasks":[],"session_crons":[{"id":"c1"}]}"#;
+
+    fn payload(s: &str) -> Option<serde_json::Value> {
+        serde_json::from_str(s).ok()
+    }
+
+    /// A turn that ends with a background agent — or a `run_in_background` shell —
+    /// still running is NOT the instance waiting for the user, and must not be
+    /// reported as such. Both kinds arrive in the same `background_tasks` array.
+    #[test]
+    fn a_turn_that_ends_with_background_work_is_not_idle() {
+        assert!(background_work_running(payload(STOP_WITH_AGENT).as_ref()));
+        assert!(background_work_running(payload(STOP_WITH_SHELL).as_ref()));
+        assert!(!background_work_running(payload(STOP_IDLE).as_ref()));
+        assert!(
+            !background_work_running(payload(STOP_CRON_ONLY).as_ref()),
+            "a scheduled cron is not work in flight — between firings the instance really is idle"
+        );
+        // A payload from some future Claude Code that drops the field at all, and
+        // a finished task still listed, both read as idle.
+        assert!(!background_work_running(payload(r#"{"hook_event_name":"Stop"}"#).as_ref()));
+        assert!(!background_work_running(
+            payload(r#"{"background_tasks":[{"id":"x","status":"completed"}]}"#).as_ref()
+        ));
+        // ...but an entry with no status at all counts as running: the failure that
+        // matters is calling a busy instance idle.
+        assert!(background_work_running(
+            payload(r#"{"background_tasks":[{"id":"x"}]}"#).as_ref()
+        ));
+    }
+
+    /// The bug the user hit: the row said "needs you" while the pane said
+    /// "Waiting for 1 background agent to finish".
+    ///
+    /// Claude Code fires `idle_prompt` 60 s after a turn ends whether or not the
+    /// instance launched something that is still running (measured to the second:
+    /// `Stop` 11:58:56 → `Notification` 11:59:56, with the agent still live). The
+    /// notification's payload carries only `notification_type` and `message` — no
+    /// task list — so the only thing that can answer "is it actually waiting for
+    /// ME?" is what `Stop` recorded on its way out.
+    #[test]
+    fn an_idle_prompt_is_only_needs_you_when_nothing_is_running() {
+        let dir = std::env::temp_dir().join(format!("mulpex-notify-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        // Turn ended with an agent still running.
+        set_background_flag(&ctx, background_work_running(payload(STOP_WITH_AGENT).as_ref()));
+        assert!(background_flag(&ctx).exists());
+        assert_eq!(
+            notify_status(&ctx, "idle_prompt"),
+            "working",
+            "an instance waiting on its own agent must not claim it needs the user"
+        );
+
+        // A permission prompt is a real question whatever else is running.
+        assert_eq!(notify_status(&ctx, "permission_prompt"), "needs");
+
+        // The agent finishes; the next turn boundary clears the flag and the
+        // ordinary idle behaviour comes straight back.
+        set_background_flag(&ctx, background_work_running(payload(STOP_IDLE).as_ref()));
+        assert!(!background_flag(&ctx).exists());
+        assert_eq!(notify_status(&ctx, "idle_prompt"), "needs");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction is work, and it is invisible to every other hook.
+    ///
+    /// Measured on a real session: `/compact` fires **no `UserPromptSubmit`** (it
+    /// is a local command, not a prompt), so the status file keeps whatever the
+    /// last turn left it — and 60 s later the idle notification overwrites that
+    /// with `needs`, while the pane is still drawing "Compacting conversation…".
+    /// `PreCompact` 09:18:10 → `Notification{idle_prompt}` 09:19:10, to the
+    /// second. Between `PreCompact` and the `SessionStart` that ends it nothing
+    /// else fires at all (09:24:19 → 09:24:53 on a real compaction).
+    #[test]
+    fn compaction_is_working_and_never_needs_you() {
+        let dir = std::env::temp_dir().join(format!("mulpex-compact-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("compacting")).unwrap();
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 1);
+
+        // The exact payload Claude Code hands PreCompact.
+        std::fs::write(compacting_flag(&ctx), "manual").unwrap();
+        assert_eq!(
+            notify_status(&ctx, "idle_prompt"),
+            "working",
+            "the 60 s idle notification landed mid-compaction and claimed the user was needed"
+        );
+        // A permission prompt is still a real question, compaction or not.
+        assert_eq!(notify_status(&ctx, "permission_prompt"), "needs");
+
+        // A manual /compact leaves the instance idle at its prompt...
+        assert_eq!(compaction_end_status(&ctx), "waiting");
+        // ...but an automatic one interrupted a turn that now carries on, and a
+        // green "ready" dot in the middle of that turn is the same lie inverted.
+        std::fs::write(compacting_flag(&ctx), "auto").unwrap();
+        assert_eq!(compaction_end_status(&ctx), "working");
+
+        // Once it has ended, the ordinary idle behaviour comes straight back.
+        clear_compacting(&ctx);
+        assert!(!compacting_flag(&ctx).exists());
+        assert_eq!(notify_status(&ctx, "idle_prompt"), "needs");
+
+        // A missing/garbled flag must not strand the row as busy.
+        assert_eq!(compaction_end_status(&ctx), "waiting");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SessionStart` fires for startup, resume and clear as well as compaction,
+    /// and only the compaction one is ours: the others must not overwrite a
+    /// status the restore path has already set.
+    #[test]
+    fn only_a_compaction_session_start_touches_the_status() {
+        let dir = std::env::temp_dir().join(format!("mulpex-sstart-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("compacting")).unwrap();
+        let ctx = test_ctx(&dir, 1);
+        let status = dir.join("1");
+
+        for source in ["startup", "resume", "clear"] {
+            std::fs::write(&status, "waiting").unwrap();
+            std::fs::write(compacting_flag(&ctx), "manual").unwrap();
+            assert!(
+                !is_compaction_end(source),
+                "SessionStart[source={source}] would have rewritten the status"
+            );
+        }
+        assert!(is_compaction_end("compact"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The naming reminder has to arrive a second time *inside* the turn, because

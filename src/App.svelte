@@ -510,6 +510,12 @@
 
     (async () => {
       const ws = await bootstrap();
+      // BEFORE any TerminalView mounts. Restored sessions' PTYs have been running
+      // since before the window painted, and `attach_session` flushes everything
+      // they printed — so each xterm has to be built at the size those bytes were
+      // rendered for. Building at xterm's 80x24 default and resizing afterwards
+      // corrupts the pane permanently; see `terminals.ts::create`.
+      terminals.setGeometry(ws.cols, ws.rows);
       if (ws.projects.length) {
         for (const info of ws.projects) {
           await bootstrapProject(info, info.handle === ws.active);

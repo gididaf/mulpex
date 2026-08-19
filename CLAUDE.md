@@ -316,7 +316,82 @@ tab badges. And the first sweep only *records* state (`primed`), because restore
 already be in `needs` at launch and a burst of stale banners would bury the live one.
 
 > `needs` fires less often than you'd guess: sessions run with `--dangerously-skip-permissions`, so
-> the `permission_prompt` matcher is effectively dead and `needs` means AskUserQuestion or idle.
+> the `permission_prompt` matcher is effectively dead and `needs` means AskUserQuestion, or idle
+> **with nothing of its own still running** — see the next section.
+
+### `needs` must mean "needs YOU", not "its agent is still going"
+
+An instance that launches a **background agent** (or a `run_in_background` shell) ends its turn and
+is then woken later by a `<task-notification>`. Claude Code fires its `idle_prompt` notification
+**60 s after every turn end regardless** — measured to the second on a real session: `Stop` at
+11:58:56, `Notification` at 11:59:56, with the agent still live. The old settings template answered
+that with a bare `printf needs`, so a row reading *"Waiting for 1 background agent to finish"* in
+the pane showed **needs you** in the sidebar, plus a red tab badge, a dock badge and a desktop
+banner. Every one of those means "go and answer this", and none of it was true.
+
+The fix is that `Stop` is the only hook that can see the truth, so it records it:
+
+- **`Stop`'s payload carries `background_tasks`** (and `session_crons`). Measured shapes, from
+  `scratchpad/agentprobe.py` driving a real `claude` v2.1.234 on a PTY:
+  `{"id":…,"type":"subagent","status":"running","description":…,"agent_type":…}` and
+  `{"id":…,"type":"shell","status":"running","description":…,"command":…}`; the array is `[]` once
+  everything has finished. **Both kinds count** — a background shell is no more "waiting for you"
+  than a background agent is.
+- **The notification's payload does not.** It carries `notification_type` and `message` and nothing
+  else — measured, and the reason there is a flag on disk at all rather than one self-contained
+  hook. `Stop` writes/clears `bg/<id>`; `hook::notification` reads it.
+- `Stop` writes **`working`** instead of `waiting` while background work is outstanding, and the
+  idle notification then leaves it there. `working` rather than a fourth status because everything
+  keyed off it is already right: no dock badge, no red tab badge, and `updater.ts`'s busy guard
+  keeps counting the instance as busy, so an auto-update cannot restart the app out from under a
+  running agent.
+- **`permission_prompt` is never suppressed** — a permission request is a question for the user
+  whatever else is running — and `AskUserQuestion` never comes through here at all, since it writes
+  `needs` from its own `PreToolUse` matcher. A genuinely blocked instance still shouts.
+- **`session_crons` is deliberately not counted.** A scheduled future run is not work in flight;
+  between firings the instance really is idle and a prompt really is what it wants.
+- A task entry with **no** `status` counts as running. The failure that matters is calling a busy
+  instance idle, so the unknown case errs toward quiet.
+
+### Compaction is work too
+
+Same shape, different silence. `/compact` **fires no `UserPromptSubmit`** — it is a local command,
+not a prompt — so the status file simply keeps whatever the last turn left it, and the 60 s idle
+notification then overwrites that with `needs` while the pane is still drawing *"Compacting
+conversation… 39%"*. Measured on a real session: `PreCompact` 09:18:10 → `Notification{idle_prompt}`
+09:19:10, to the second.
+
+Compaction is also **invisible between its endpoints** — between `PreCompact` and the `SessionStart`
+that ends it, nothing fires at all (09:24:19 → 09:24:53 on a real compaction). So both ends are
+needed:
+
+- **`PreCompact`** → `working`, and stash its `trigger` in `compacting/<id>`. The idle notification
+  suppresses `needs` while that flag is present, exactly as it does for `bg/<id>`.
+- **`SessionStart` with `source == "compact"`** → the compaction ended. `SessionStart` also fires for
+  `startup`, `resume` and `clear`, and those must **not** touch a status the restore path already
+  set, so the source is checked (`is_compaction_end`).
+- **The `trigger` decides what the end means.** A manual `/compact` leaves the instance idle at its
+  prompt → `waiting`. An **automatic** compaction interrupted a turn that then carries on → `working`,
+  because a green "ready" dot in the middle of that turn is the same lie inverted.
+- **`PreCompact` fires even when the compaction is then REFUSED** — "Not enough messages to compact",
+  measured — and no `SessionStart` follows. So the flag is also cleared by `userpromptsubmit` and
+  `stop`: any hook that proves the instance is doing something else. Worst case is one stale status
+  word until the next prompt or turn end.
+
+Pinned by `compaction_is_working_and_never_needs_you` (confirmed to fail with *"the 60 s idle
+notification landed mid-compaction and claimed the user was needed"*) and
+`only_a_compaction_session_start_touches_the_status`, then replayed through the real
+`mulpex-helper` as the captured live sequence: Stop → `waiting`, PreCompact → `working`, idle_prompt
+mid-compaction → stays `working`, SessionStart[compact] → `waiting`, idle_prompt after → `needs`.
+
+`bg` and `compacting` are subdirs for the same reason `peers/` is: a bare integer at the state-dir
+root is scanned as an instance status file (`mcp::live_ids`).
+
+Pinned by `a_turn_that_ends_with_background_work_is_not_idle` and
+`an_idle_prompt_is_only_needs_you_when_nothing_is_running`, both confirmed to fail when their half
+of the fix is reverted, and both driven end to end through the real `mulpex-helper` binary
+afterwards (agent → `working`, idle_prompt → stays `working`, permission_prompt → `needs`,
+background shell → `working`, empty array → `waiting` and the flag gone, cron-only → `waiting`).
 
 Banners come from **`tauri-plugin-notification`**, which needs *two* registrations to work — the
 plugin in `lib.rs` **and** `notification:default` in `src-tauri/capabilities/default.json`. Miss
@@ -355,6 +430,65 @@ so background Claudes keep rendering. Geometry is central: a `ResizeObserver` on
 visible terminal, then applies the same `cols/rows` to every session + backend PTY (all PTYs share
 one size, as the TUI did) — `refit` issues one `resize_session(handle,…)` per open project so
 background projects aren't left at spawn size.
+
+## One geometry, or the pane is corrupted forever
+
+**An xterm must never be fed bytes that were rendered for a different size.** Not "should not" —
+the damage is permanent, and it is why the last few rows of a pane could sit showing stale content
+indefinitely.
+
+Claude Code (v2.1.226+) draws on the **alternate screen** and repaints it **differentially**: a
+frame is `ESC[H`, then runs of `ESC[<n>B` to *skip* rows it believes are already correct, and
+writes only the rows that changed. Measured on a real capture at 204x55 — 146 `ESC[H`, 123
+`ESC[48B`, and in 20 KB of repaint exactly one `ESC[2J` and thirteen `ESC[K`. It essentially never
+erases. So a row the emulator holds wrong is never rewritten, because claude is not going to write
+there again — and for a row it thinks is *blank* that is forever.
+
+Mulpex had two sizes for one session. The backend spawned every PTY at `DEFAULT_COLS`x`DEFAULT_ROWS`
+(120x32), while the frontend built the xterm with `new Terminal({…})` — i.e. at **xterm's own 80x24
+default** — and `attach_session` then flushed everything the PTY had already printed into it.
+`refit()` corrected both afterwards, which is far too late: at launch the PTYs have been running
+since before the window painted, so the flush *is* claude's entire startup paint, and `refit`
+early-returns (`if (!active) return`) until the first `focus()`, which `bootstrapProject` only
+reaches after every `TerminalView` has mounted and attached.
+
+**Too few rows/cols is the destructive direction**, and that is the part worth remembering: content
+scrolls off the top or hard-wraps, and what scrolled away can never be repainted. Measured, real
+`claude` on a PTY replayed through this exact xterm build (`scratchpad/harness2.py` + `replay2.mjs`):
+a stream rendered for 120x32 fed to an **80x24** emulator and then resized keeps its debris to the
+end of the session — a leftover box rule struck through `⏺─I'll─look─at─…`, `| Ctx Used: 3.0%` with
+its `Model:` gone, the input box's own border missing, welcome-banner fragments stranded in rows
+1-5. The **same stream** into an emulator that was 120x32 all along is byte-identical to tmux's
+render of it.
+
+The fix is therefore not "resize sooner" but **one geometry both sides always agree on**:
+
+- `Workspace::geometry` is the single (cols, rows) every PTY in every project runs at. Every spawn
+  path uses it — restore, ⌘T, `hub_spawn`, ⌘⇧T — so a session created now matches the xterm about
+  to be built for it.
+- `bootstrap()` reports it (`WorkspaceInfo::cols/rows`) and `App.svelte` applies it with
+  `terminals.setGeometry()` **before any `TerminalView` mounts**. `create()` then builds each
+  Terminal at `this.cols/this.rows`, never at the 80x24 default.
+- Resize is **workspace-wide**, not per project: `resize_terminals(cols, rows)` (was
+  `resize_session(handle, …)`, one call per handle). A project the frontend has no xterms for yet
+  was otherwise left at the stale size and would spawn its next session there, handing the frontend
+  a PTY of a shape its terminal never had.
+
+**A resize while the two agree is fully self-healing** — claude repaints everything on SIGWINCH.
+Measured by replaying with the emulator's resize deliberately skewed ±200 and +2000 bytes from the
+PTY's: the final screen is identical to the unskewed one in every case. That is what makes the
+small async gap inside `refit()` (xterm resizes synchronously, the PTY over IPC) harmless, and it
+is why *attach time* is the only moment that has to be exact.
+
+Pinned by `a_session_spawns_at_the_geometry_the_frontend_will_build_its_xterm_at`, which reads the
+size off a live PTY (a real shell, so it cannot pass vacuously) and was confirmed to fail —
+`left: (120, 32) right: (100, 40)` — with the spawn reverted to the fixed default. `TEST_GEOMETRY`
+is deliberately not the DEFAULT pair, so the assertion cannot pass by reading the default back.
+
+Diagnosis note, because every cheap step here was misleading: the same byte stream replayed through
+xterm.js at the *right* size matches tmux exactly, and a plain replay of a captured session shows
+nothing wrong. The bug is invisible unless the replay reproduces the *size history*, so the harness
+has to record the PTY's resize offsets alongside the bytes and apply them at the identical point.
 
 ## RTL (Hebrew/Arabic) — two separate fixes, both load-bearing
 
@@ -1038,6 +1172,68 @@ above it. The row reads `⚠ … failed to start` and stays until ⌘W, exactly 
 - The ordinary case is untouched: an instance that ran and then exited is still removed
   (`an_instance_that_dies_after_the_grace_is_still_reaped`).
 
+## An instance number is an identity, not a position
+
+Reported from the field: three instances — **claude#2, claude#3, claude#15** — were closed for an
+update and came back as **claude#1, claude#2, claude#3**, with the third row holding the
+conversation that used to be claude#3 rather than claude#15. Nothing on screen said the numbers had
+moved, so the obvious reading was "claude#3 resumed the wrong session". Two independent defects
+compounded, and each is worth keeping written down.
+
+**1. Ids were positional.** The store recorded `<uuid>[\t<name>[\tmuted]]` and nothing else, so
+`Core::open` handed out `id = sessions.len() + 1`: every launch renumbered 2/3/15 → 1/2/3. That is
+not a cosmetic relabel. The number is what the sidebar shows, what a person says out loud, and what
+`hub_send` addresses (`claude#15`, `central-one#3`) — so after a restart every number named a
+different conversation than it had the day before. The store now carries the id as a **fourth
+positional column**, `<uuid>[\t<name>[\tmuted[\t<id>]]]`, read with `splitn(4, '\t')`, and a restore
+reuses it. Gaps are kept (#2, #3, #15) because the gap is the truth; `next_id` continues from
+`max + 1`, so a fresh ⌘T cannot collide with a restored instance or land in a hole.
+
+`sessions.len() + 1` was wrong for a second reason that the field report also hit: **it does not
+advance when a spawn fails**, so the next record silently took the failed one's number.
+
+**2. A failed restore moved to the end of the list.** `sticky` — the records kept so a restore that
+failed doesn't erase the session id (see the next section) — was *appended* by `persist_sessions`.
+So one bad launch moved that conversation to the bottom of the sidebar, **permanently**, because the
+next launch reads the new order back as the order. Combined with positional ids that reshuffles
+which number holds which conversation, which is exactly how the third row ended up holding the
+oldest session. `sticky` is now `Vec<(usize, SavedSession)>` — the row it occupied travels with the
+record — and `persist_sessions` re-inserts it there, ascending so earlier records don't push later
+ones past their slot.
+
+Details worth not rediscovering:
+
+- **Trailing empty columns are dropped on write**, so a store with no ids in it is written
+  byte-identically to the old format — upgrading does not rewrite every project's file into
+  something an older build would misread. Pinned by `a_store_with_no_ids_is_written_in_the_old_format`.
+- **The columns are positional, so only *trailing* empties can go.** An unnamed unmuted instance
+  with an id must still write both empty fields — `<uuid>\t\t\t15` — or the number is read back as
+  the name. Pinned by `the_instance_number_round_trips_through_every_column_shape`.
+- **A store written before this change has no ids and numbers sequentially, exactly as it used to.**
+  So the first launch after upgrading still renumbers once; from the save that follows it, the
+  numbers are stable.
+- A duplicate or zero id (a hand-edited file) falls back to the next free number rather than
+  colliding.
+- **The frontend needed no change.** It keys everything by `(handle, id)` lookup and never does
+  index arithmetic on the id, so non-contiguous ids just render as `claude #2`, `claude #3`,
+  `claude #15`. `Core.active` is an index into `sessions`, not an id, and stays that way.
+
+Both halves are pinned by tests confirmed to fail when reverted:
+`a_restored_instance_keeps_the_number_the_user_knows_it_by` fails with
+`left: [1, 2, 3] right: [2, 3, 15]` — the field report, verbatim — and
+`a_failed_restore_is_written_back_where_it_sat` fails with *"a failed restore moved its conversation
+to another row"*.
+
+That second test needed one trick, and the reason is a trap. **Killing a restored session does not
+reach the `sticky` path at all**: a session that dies within `EARLY_DEATH_GRACE` is deliberately
+*kept* on screen rather than reaped, so nothing is ever removed and nothing goes sticky. The first
+version of the test passed with the fix reverted for exactly that reason. It now ages the session's
+`started` stamp past the grace, which makes `reap_dead` genuinely remove it while `restored` still
+puts it inside `RESTORE_GRACE` — the real lost-restore path, driven in a tenth of a second. The
+pre-existing `a_failed_restore_is_kept_visible_and_never_erases_the_record` has the same shape and
+also never reaches `sticky`; it passes because the record survives in `sessions`, which is a
+different guarantee than the one its name suggests.
+
 ## A failed restore must not erase the session record
 
 `reap_dead` used to rewrite the store without any session it removed. That is right for a session
@@ -1478,6 +1674,49 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
   bypass-permissions warning — whose default selection is **`No, exit`**, so a stray Return kills
   the instance and it reaps like a normal exit.
 
+- **Compaction status.** The hook sequence was captured from a real `/compact`
+  (`scratchpad/compactprobe2.py`), which is the only way the two silences show up: no
+  `UserPromptSubmit` for the slash command, and nothing at all between `PreCompact` and
+  `SessionStart[source=compact]`. The first probe attempt is worth remembering — the conversation was
+  too short and Claude Code answered *"Not enough messages to compact"*, so `PreCompact` fired with no
+  `SessionStart` after it. That accident is what surfaced the refused-compact path the flag has to
+  survive. `cargo test` 134 (59 app + 73 core + 2 helper) green, `clippy` clean but for the two
+  pre-existing warnings, `svelte-check` 120 files 0 errors. Driven through the real helper across
+  eight cases. **Not verified in the real window** — the settings template only changes for sessions
+  started after a relaunch.
+- **Stable instance numbers.** Diagnosed from the code and the on-disk stores rather than by
+  re-driving the GUI: the store files under `~/.mulpex/sessions/` carry no id column, and
+  `Core::open` assigns `sessions.len() + 1`, which is the whole of the renumbering. The
+  order-drift half was found by reading the two `sticky` push sites, both of which discard the
+  record's position. `cargo test` 130 (59 app + 71 core) green, `clippy` clean but for the two
+  pre-existing warnings, `svelte-check` 120 files 0 errors. Both halves confirmed to fail when
+  reverted. **Not verified in the real window** — and note the first launch after this ships still
+  renumbers once, because the existing stores have no ids to restore; the save that follows writes
+  them, and from then on the numbers hold.
+- **Background work vs. `needs`.** The hook surface was measured, not assumed: a probe
+  (`scratchpad/agentprobe.py`) registered every lifecycle hook against a real `claude` v2.1.234,
+  launched a background agent and recorded all 29 events with their full payloads. That is what
+  showed `Stop` firing *while* the agent ran, `background_tasks` riding on its payload, subagents
+  inheriting the parent's hooks (their `Stop` arrives as `SubagentStop`, which Mulpex does not
+  register, so they never touch the parent's status), and — from a second, longer probe — the
+  `idle_prompt` notification landing exactly 60 s after `Stop` carrying no task information at all.
+  `SubagentStart`/`SubagentStop` counting was the obvious design and is not needed: `Stop` already
+  knows. `cargo test` 125 (56 app + 69 core) green, `clippy` clean but for the two pre-existing
+  warnings. Then driven through the real `mulpex-helper` binary across all six cases.
+  **Not verified in the real window** — the settings template only changes for sessions started
+  after a relaunch, which was deliberately not done.
+- **One geometry (the stale-last-few-lines bug).** Reproduced against a real `claude` before it was
+  fixed, not reasoned about: tmux at 204x55 shows a clean blank row where the app showed leftover
+  prompt text, and replaying that same captured byte stream through this xterm build at 204x55
+  matches tmux byte for byte — so neither Claude Code nor xterm's parser was at fault. Reproducing
+  it needed the *size history*: a PTY harness that boots claude at Mulpex's 120x32 spawn size,
+  records the byte offset of the resize, and replays with the emulator starting at xterm's 80x24
+  default. That leaves permanent debris; starting the emulator at the PTY's size does not. The
+  ±200/+2000-byte skew runs are what established that a synchronised resize self-heals, which is
+  what bounds the fix to attach time. `cargo test` 123 (56 app + 67 core) green, `clippy` clean but
+  for the two pre-existing warnings, `svelte-check` 120 files 0 errors, `vite build` clean.
+  **Not verified in the real window** — the fix only takes effect on a relaunch, which was
+  deliberately not done (the user was mid-session in the running app).
 - **Signing by certificate (shipped in v0.7.0).** The requirement change was verified directly:
   the installed bundle reports `identifier "com.mulpex.app" and certificate root = H"356eabc7…"`,
   `codesign --verify --deep --strict` passes, and — the point of the exercise — a **subsequent

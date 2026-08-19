@@ -11,9 +11,14 @@
 /// hooks for both the status dots and the file-locking coordinator.
 ///
 /// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
-/// `PreToolUse[AskUserQuestion]` and the `permission_prompt`/`idle_prompt`
-/// notifications → needs; `Stop` → waiting (via the helper, which also releases
-/// locks). The sidebar polls these one-word state files.
+/// `PreToolUse[AskUserQuestion]` → needs; `Stop` → waiting (via the helper, which
+/// also releases locks); the `permission_prompt`/`idle_prompt` notifications →
+/// needs, via the helper rather than a bare `printf` because `idle_prompt` fires
+/// 60 s after every turn end *even when a background agent the instance launched
+/// is still running* — see `hook::notification`. `PreCompact` → working and
+/// `SessionStart[source=compact]` → back to a real status, because compaction
+/// runs for minutes firing nothing else and `/compact` does not even fire
+/// `UserPromptSubmit`. The sidebar polls these one-word state files.
 ///
 /// **File-locking coordinator** — the `PreToolUse` matchers for the edit tools
 /// (`Read|Write|Edit|MultiEdit|NotebookEdit`) and for `Bash` invoke
@@ -34,10 +39,16 @@ pub const HOOK_SETTINGS_JSON: &str = r#"{
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse" } ] }
     ],
     "Notification": [
-      { "matcher": "permission_prompt|idle_prompt", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] }
+      { "matcher": "permission_prompt|idle_prompt", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook notification" } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook stop" } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook precompact" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook sessionstart" } ] }
     ]
   }
 }

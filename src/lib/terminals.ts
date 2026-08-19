@@ -20,7 +20,7 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Channel, attachSession, sendBytes, resizeSession } from "./ipc";
+import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
 import type { SessionKind } from "./ipc";
 
 const THEME: ITheme = {
@@ -77,6 +77,18 @@ class TerminalManager {
   private cols = 80;
   private rows = 24;
 
+  /** Adopt the geometry the backend spawned every PTY at, before any terminal is
+   *  built. Called once from `bootstrap()`; after that `refit` owns the value and
+   *  moves both sides together. Without it the first terminals of a launch are
+   *  built at xterm's 80x24 default and fed a stream rendered for another size —
+   *  see `create`. */
+  setGeometry(cols: number, rows: number): void {
+    if (cols >= 1 && rows >= 1) {
+      this.cols = cols;
+      this.rows = rows;
+    }
+  }
+
   has(handle: number, id: number): boolean {
     return this.entries.has(keyOf(handle, id));
   }
@@ -94,7 +106,27 @@ class TerminalManager {
     const key = keyOf(handle, id);
     if (this.entries.has(key)) return;
 
+    // `cols`/`rows`, NOT xterm's 80x24 default. This terminal is about to be
+    // attached, and `attach_session` flushes everything the PTY has produced so
+    // far — for a session restored at launch that is claude's entire startup
+    // paint. Rendering those bytes at a size the PTY never had is not a transient
+    // glitch that the next frame repairs: Claude Code draws on the ALT SCREEN and
+    // repaints it DIFFERENTIALLY (it skips unchanged rows with CUD rather than
+    // redrawing them), so any row the emulator gets wrong stays wrong until
+    // claude happens to write to that row again — which for a blank row is never.
+    // Too FEW rows/cols is the destructive direction: the content scrolls off the
+    // top or wraps, and what scrolled away can never be repainted.
+    // Measured (scratchpad harness, real claude on a PTY, replayed through this
+    // exact xterm build): a stream rendered for 120x32 fed to an 80x24 emulator
+    // and then resized leaves permanent debris — leftover box rule through
+    // "⏺─I'll─look─at─…", "| Ctx Used: 3.0%" with its "Model:" gone, the input
+    // box's own border missing. The same stream into an emulator that was 120x32
+    // all along is byte-identical to tmux's render. A resize while the two agree
+    // is fully self-healing (claude repaints everything on SIGWINCH), which is
+    // why keeping the sizes equal AT ATTACH TIME is the whole fix.
     const term = new Terminal({
+      cols: this.cols,
+      rows: this.rows,
       scrollback: 10000,
       macOptionIsMeta: true,
       allowProposedApi: true,
@@ -234,11 +266,7 @@ class TerminalManager {
     // synced, or the pane resized), so no session's PTY is left at spawn size —
     // including background projects. All PTYs share this one geometry; resize each
     // open project's sessions (one backend call per distinct project handle).
-    if (resized) {
-      const handles = new Set<number>();
-      for (const e of this.entries.values()) handles.add(e.handle);
-      for (const h of handles) resizeSession(h, this.cols, this.rows);
-    }
+    if (resized) resizeTerminals(this.cols, this.rows);
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

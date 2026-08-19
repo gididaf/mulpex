@@ -44,6 +44,12 @@ pub struct Workspace {
     pub active: Option<ProjectHandle>,
     pub next_handle: ProjectHandle,
     pub state_root: PathBuf,
+    /// The one geometry every PTY in every project runs at (cols, rows) — the
+    /// center pane's, once the frontend has measured it. Held here rather than
+    /// per-project because all PTYs have always shared one size, and a project
+    /// that happens to have no xterms yet must still spawn at the size the
+    /// frontend is about to build them at. See `resize_all`.
+    pub geometry: (u16, u16),
 }
 
 impl Default for Workspace {
@@ -59,6 +65,7 @@ impl Workspace {
             active: None,
             next_handle: 1,
             state_root: std::env::temp_dir().join(format!("mulpex-{}", std::process::id())),
+            geometry: (DEFAULT_COLS, DEFAULT_ROWS),
         }
     }
 
@@ -104,7 +111,7 @@ impl Workspace {
         }
         let handle = self.alloc_handle();
         let state_dir = self.state_root.join(handle.to_string());
-        let core = Core::open(handle, canon, helper_path, state_dir)?;
+        let core = Core::open(handle, canon, helper_path, state_dir, self.geometry)?;
         self.projects.push(core);
         self.active = Some(handle);
         Ok((handle, true))
@@ -152,6 +159,23 @@ impl Workspace {
         WorkspaceInfo {
             projects: self.projects.iter().map(Core::bootstrap_info).collect(),
             active: self.active,
+            cols: self.geometry.0,
+            rows: self.geometry.1,
+        }
+    }
+
+    /// Bring **every** session in **every** project to the center pane's geometry,
+    /// and record it as the size future spawns start at.
+    ///
+    /// Workspace-wide rather than per-project on purpose. The frontend holds one
+    /// geometry for all its xterms, so a project it hasn't built xterms for yet
+    /// would otherwise keep spawning at the stale size while the frontend built
+    /// its terminals at the current one — and a PTY whose emulator is a different
+    /// size is corrupted permanently (see `WorkspaceInfo::cols`).
+    pub fn resize_all(&mut self, cols: u16, rows: u16) {
+        self.geometry = (cols.max(1), rows.max(1));
+        for core in &mut self.projects {
+            core.resize_all(cols, rows);
         }
     }
 
@@ -275,11 +299,19 @@ pub struct Core {
     /// **kept** so the failure is visible; see `reap_dead`.
     failed: HashMap<usize, String>,
     /// Records that must stay in the store even though their session is gone —
-    /// see `reap_dead`. Keyed by session id, deduped.
-    sticky: Vec<persist::SavedSession>,
+    /// see `reap_dead`. Deduped by session id, and each paired with the row it
+    /// occupied so `persist_sessions` can put it back there rather than at the
+    /// end: a conversation that silently migrates to the bottom of the sidebar
+    /// after a failed launch is indistinguishable from one that was reordered on
+    /// purpose.
+    sticky: Vec<(usize, persist::SavedSession)>,
     /// Last content written to `terminals/index`, so the poll loop can refresh
     /// it on change without a disk write every tick.
     terminal_index: String,
+    /// The size this project's PTYs run at (cols, rows). Every spawn uses it, so
+    /// a session created now matches the xterm the frontend is about to build for
+    /// it; `resize_all` keeps it current. Seeded from `Workspace::geometry`.
+    geometry: (u16, u16),
     /// `hub_spawn` batches still being drip-fed, one child per `SPAWN_STAGGER`.
     /// See `process_spawn_requests`.
     pending_spawns: VecDeque<PendingSpawn>,
@@ -347,6 +379,7 @@ impl Core {
         project_dir: PathBuf,
         helper_path: &Path,
         state_dir: PathBuf,
+        geometry: (u16, u16),
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&state_dir)?;
         let settings_path = state_dir.join("settings.json");
@@ -368,6 +401,8 @@ impl Core {
             "tasks",
             "inbox",
             "waiting",
+            "bg",
+            "compacting",
             "spawn",
             "armed",
             mulpex_core::NAMED_DIR,
@@ -390,9 +425,27 @@ impl Core {
         // `sessions` to persist them from, and `persist_sessions` rewrites the
         // store from `sessions`, so without this a directory that was briefly
         // unreadable would erase the ids on the next write.
-        let mut sticky: Vec<persist::SavedSession> = Vec::new();
-        for saved in store.load() {
-            let id = sessions.len() + 1;
+        let mut sticky: Vec<(usize, persist::SavedSession)> = Vec::new();
+        // Ids come from the store, so an instance keeps the number the user knows
+        // it by (`claude#15` stays claude#15). `sessions.len() + 1` cannot do that
+        // for two independent reasons: it renumbers 2/3/15 to 1/2/3 on every
+        // launch, and it does not advance when a spawn fails, so the next record
+        // would silently take the failed one's number.
+        let mut used: HashSet<usize> = HashSet::new();
+        let mut next_free = 1usize;
+        for (position, saved) in store.load().into_iter().enumerate() {
+            // A store written before ids were persisted (or one with a duplicate
+            // after hand-editing) numbers sequentially, exactly as before.
+            let id = match saved.id {
+                Some(n) if n >= 1 && !used.contains(&n) => n,
+                _ => {
+                    while used.contains(&next_free) {
+                        next_free += 1;
+                    }
+                    next_free
+                }
+            };
+            used.insert(id);
             // Restores are deliberately NOT preflighted with `dir_access_error`.
             // Letting the spawn fail produces a session row that says why it
             // failed, which is the whole point — refusing up front would restore
@@ -400,8 +453,8 @@ impl Core {
             if let Ok(session) = Session::spawn(
                 id,
                 &project_dir,
-                DEFAULT_ROWS,
-                DEFAULT_COLS,
+                geometry.1,
+                geometry.0,
                 SpawnSpec::Claude {
                     settings_path: &settings_path,
                     state_dir: &state_dir,
@@ -421,7 +474,10 @@ impl Core {
                 }
                 sessions.push(session);
             } else {
-                sticky.push(saved);
+                // Keep the record AND where it sat: appending it would move that
+                // conversation to the last row on the next launch, which is how a
+                // single bad restore reshuffles a whole sidebar.
+                sticky.push((position, persist::SavedSession { id: Some(id), ..saved }));
             }
         }
 
@@ -433,7 +489,9 @@ impl Core {
         // the last session with ⌘W produces it): `active` stays 0 and indexes
         // nothing, `bootstrap_info` yields `activeSessionId: null`, the frontend
         // hides every terminal and `TerminalPane` shows its ⌘T empty state.
-        let next_id = sessions.len() + 1;
+        // Continue past the highest number ever handed out, so a new ⌘T can never
+        // collide with a restored instance (or with the gap a failed one left).
+        let next_id = used.iter().copied().max().unwrap_or(0) + 1;
         let project_name = project_dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -463,6 +521,7 @@ impl Core {
             failed: HashMap::new(),
             sticky,
             terminal_index: String::new(),
+            geometry,
             pending_spawns: VecDeque::new(),
             last_spawn_at: None,
         };
@@ -553,8 +612,8 @@ impl Core {
         let session = Session::spawn(
             id,
             &self.project_dir,
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
+            self.geometry.1,
+            self.geometry.0,
             SpawnSpec::Claude {
                 settings_path: &self.settings_path,
                 state_dir: &self.state_dir,
@@ -600,8 +659,8 @@ impl Core {
         let session = Session::spawn(
             id,
             &self.project_dir,
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
+            self.geometry.1,
+            self.geometry.0,
             SpawnSpec::Shell {
                 state_dir: &self.state_dir,
                 seed,
@@ -1071,6 +1130,7 @@ impl Core {
     /// Resize every session's PTY to the shared center-pane geometry (all
     /// sessions share one size, as the TUI did).
     pub fn resize_all(&mut self, cols: u16, rows: u16) {
+        self.geometry = (cols.max(1), rows.max(1));
         for s in &mut self.sessions {
             s.resize(rows, cols);
         }
@@ -1144,13 +1204,14 @@ impl Core {
                         session_id: session.session_id.clone(),
                         name: self.names.get(&session.id).cloned(),
                         muted: self.muted.contains(&session.id),
+                        id: Some(session.id),
                     };
                     if !self
                         .sticky
                         .iter()
-                        .any(|s| s.session_id == record.session_id)
+                        .any(|(_, s)| s.session_id == record.session_id)
                     {
-                        self.sticky.push(record);
+                        self.sticky.push((kept.len(), record));
                     }
                 }
                 removed.push(session.id);
@@ -1620,14 +1681,22 @@ impl Core {
                 session_id: s.session_id.clone(),
                 name: self.names.get(&s.id).cloned(),
                 muted: self.muted.contains(&s.id),
+                // The number the user knows this instance by, so the next launch
+                // brings it back as the same `claude#N`.
+                id: Some(s.id),
             })
             .collect();
         // Records whose session is gone but must not be forgotten — a restore
-        // that failed. Appended, and only if the id isn't already live, so a
-        // later successful restore of the same id doesn't duplicate it.
-        for record in &self.sticky {
+        // that failed. Re-inserted at the row they held (ascending, so earlier
+        // ones don't shift the later ones past their slot), and only if the
+        // session isn't already live, so a later successful restore of the same
+        // one doesn't duplicate it.
+        let mut pending: Vec<&(usize, persist::SavedSession)> = self.sticky.iter().collect();
+        pending.sort_by_key(|(at, _)| *at);
+        for (at, record) in pending {
             if !sessions.iter().any(|s| s.session_id == record.session_id) {
-                sessions.push(record.clone());
+                let at = (*at).min(sessions.len());
+                sessions.insert(at, record.clone());
             }
         }
         self.store.save(&sessions);
@@ -1964,6 +2033,11 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
 
+    /// What `Workspace::geometry` hands a `Core` at open. Deliberately not the
+    /// DEFAULT pair, so a test asserting a spawn used the *workspace's* size
+    /// can't pass by accidentally reading the default.
+    const TEST_GEOMETRY: (u16, u16) = (100, 40);
+
     /// Opening a project must never start a `claude` the user didn't ask for.
     /// With nothing to restore the project comes up empty and waits for ⌘T.
     #[test]
@@ -1981,6 +2055,7 @@ mod tests {
             project_dir,
             Path::new("/nonexistent/mulpex-helper"),
             root.join("state"),
+            TEST_GEOMETRY,
         )
         .expect("open should succeed with no sessions to restore");
 
@@ -2214,9 +2289,207 @@ mod tests {
             project_dir,
             Path::new("/nonexistent/mulpex-helper"),
             root.join("state"),
+            TEST_GEOMETRY,
         )
         .unwrap();
         (root, core)
+    }
+
+    /// A session's PTY must spawn at the geometry the frontend is going to build
+    /// its xterm at — not at a fixed default the frontend then has to correct.
+    ///
+    /// This is the whole of the "last few lines render outdated content" bug.
+    /// `attach_session` flushes everything the PTY has already printed, so an
+    /// xterm built at some other size renders that backlog wrong — and Claude
+    /// Code draws on the alt screen and repaints it DIFFERENTIALLY, skipping rows
+    /// it believes are already correct, so a row the emulator got wrong is never
+    /// rewritten. Measured against a real `claude`: a stream rendered for 120x32
+    /// replayed into an 80x24 emulator and then resized keeps its debris forever,
+    /// while the same stream into an emulator that agreed all along matches
+    /// tmux byte for byte.
+    ///
+    /// Spawning a real shell rather than asserting on a constant: the assertion
+    /// reads the size off the live PTY, so it fails if the spawn path goes back
+    /// to `DEFAULT_COLS`/`DEFAULT_ROWS` (which `TEST_GEOMETRY` deliberately is
+    /// not) or ignores a later resize.
+    #[test]
+    fn a_session_spawns_at_the_geometry_the_frontend_will_build_its_xterm_at() {
+        let (_env, root, mut core) = scratch_core("geometry-test");
+
+        let first = core.spawn_terminal(None, None, true).unwrap();
+        assert_eq!(
+            core.session_mut(first.id).unwrap().size(),
+            TEST_GEOMETRY,
+            "a new PTY ignored the workspace geometry, so its xterm cannot match it"
+        );
+
+        // What the frontend's refit does once it has measured the center pane.
+        core.resize_all(204, 55);
+        assert_eq!(
+            core.session_mut(first.id).unwrap().size(),
+            (204, 55),
+            "an existing PTY was not brought to the new geometry"
+        );
+
+        let second = core.spawn_terminal(None, None, true).unwrap();
+        assert_eq!(
+            core.session_mut(second.id).unwrap().size(),
+            (204, 55),
+            "a session spawned after a resize went back to the spawn-time default"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The geometry is workspace-wide, and `bootstrap` must report it: the
+    /// frontend builds every xterm at whatever this says before attaching any of
+    /// them. A project with no xterms yet still has to spawn at the same size.
+    #[test]
+    fn the_workspace_reports_and_applies_one_geometry_for_every_project() {
+        let mut ws = Workspace::new();
+        assert_eq!(
+            (ws.workspace_info().cols, ws.workspace_info().rows),
+            ws.geometry,
+            "bootstrap must hand the frontend the size the PTYs actually have"
+        );
+
+        ws.resize_all(204, 55);
+        assert_eq!(ws.geometry, (204, 55));
+        let info = ws.workspace_info();
+        assert_eq!((info.cols, info.rows), (204, 55));
+    }
+
+    /// Restore a store seeded exactly as a previous run left it, and hand back
+    /// the `Core` plus its scratch root.
+    fn core_from_store(tag: &str, saved: &[persist::SavedSession]) -> (std::sync::MutexGuard<'static, ()>, PathBuf, Core) {
+        let guard = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-{tag}-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("HOME", root.join("home"));
+        SessionStore::new(&project_dir).save(saved);
+        let core = Core::open(
+            1,
+            project_dir,
+            Path::new("/nonexistent/mulpex-helper"),
+            root.join("state"),
+            TEST_GEOMETRY,
+        )
+        .unwrap();
+        (guard, root, core)
+    }
+
+    fn record(name: &str, id: Option<usize>) -> persist::SavedSession {
+        persist::SavedSession {
+            session_id: persist::new_uuid(),
+            name: Some(name.into()),
+            muted: false,
+            id,
+        }
+    }
+
+    /// An instance must come back as the number the user knows it by.
+    ///
+    /// Reported from the field: three instances — claude#2, claude#3, claude#15 —
+    /// came back after a restart as claude#1, claude#2, claude#3. Every number
+    /// then named a different conversation than it had before, with nothing on
+    /// screen saying so, which is how you end up opening the wrong one. The id is
+    /// an identity (it is what `hub_send` addresses, and what a person says out
+    /// loud), not a position in a list.
+    #[test]
+    fn a_restored_instance_keeps_the_number_the_user_knows_it_by() {
+        let saved = [
+            record("waiting-room phase 2", Some(2)),
+            record("ticket routing", Some(3)),
+            record("drifted STAGING audit", Some(15)),
+        ];
+        let (_env, root, mut core) = core_from_store("keepid", &saved);
+
+        assert_eq!(
+            core.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3, 15],
+            "restored instances were renumbered, so every claude#N now means something else"
+        );
+        // The conversation, the name and the number must all still be the same
+        // row — a number that survives while the transcript it points at moves is
+        // worse than renumbering, not better.
+        for (session, want) in core.sessions.iter().zip(saved.iter()) {
+            assert_eq!(session.session_id, want.session_id);
+            assert_eq!(core.display_name(session.id).as_deref(), want.name.as_deref());
+        }
+        assert_eq!(core.next_id, 16, "a fresh ⌘T would collide with a restored id");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store written before ids were persisted has to keep working, and keep
+    /// numbering exactly as it used to.
+    #[test]
+    fn a_store_without_ids_still_numbers_sequentially() {
+        let saved = [record("one", None), record("two", None), record("three", None)];
+        let (_env, root, mut core) = core_from_store("legacyid", &saved);
+
+        assert_eq!(
+            core.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(core.next_id, 4);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A restore that failed must be written back where it sat, not at the end.
+    ///
+    /// The second half of the field report: `sticky` records were appended, so a
+    /// single bad launch moved that conversation to the bottom of the sidebar —
+    /// permanently, since the next launch reads the new order back. Combined with
+    /// positional ids it silently reshuffled which number held which
+    /// conversation, which is what made the wrong session look like the right one.
+    #[test]
+    fn a_failed_restore_is_written_back_where_it_sat() {
+        let saved = [record("first", Some(1)), record("second", Some(2)), record("third", Some(3))];
+        let (_env, root, mut core) = core_from_store("stickyorder", &saved);
+        assert_eq!(core.sessions.len(), 3, "the restore did not spawn");
+
+        // The middle one dies inside RESTORE_GRACE without being closed — a lost
+        // restore, the case `sticky` exists for. Age its start stamp past
+        // EARLY_DEATH_GRACE so `reap_dead` actually REMOVES it (a session that
+        // dies within the grace is deliberately kept on screen instead, which is
+        // why simply killing it never reaches the `sticky` path at all).
+        let victim = core.sessions[1].session_id.clone();
+        let victim_id = core.sessions[1].id;
+        core.started
+            .insert(victim_id, Instant::now() - EARLY_DEATH_GRACE - Duration::from_secs(1));
+        core.sessions[1].kill();
+        assert!(wait_until(|| !core.sessions[1].is_alive()), "it never died");
+        core.reap_dead();
+        assert_eq!(core.sessions.len(), 2, "the lost restore was not reaped");
+        assert!(!core.sticky.is_empty(), "the lost restore was not kept as sticky");
+
+        let order: Vec<String> = core
+            .store
+            .load()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(
+            order,
+            saved.iter().map(|s| s.session_id.clone()).collect::<Vec<_>>(),
+            "a failed restore moved its conversation to another row"
+        );
+        assert_eq!(
+            core.store.load()[1].session_id,
+            victim,
+            "the failed record did not land back in its own slot"
+        );
+        // ...and it kept its number, so the next launch restores it as claude#2.
+        assert_eq!(core.store.load()[1].id, Some(2));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A `Core` holding one instance that spawned and then died — the shape of
@@ -2234,12 +2507,14 @@ mod tests {
             session_id: persist::new_uuid(),
             name: None,
             muted: false,
+            id: None,
         }]);
         let mut core = Core::open(
             1,
             project_dir,
             Path::new("/nonexistent/mulpex-helper"),
             root.join("state"),
+            TEST_GEOMETRY,
         )
         .unwrap();
         assert_eq!(core.sessions.len(), 1, "the restore did not spawn");
@@ -2774,6 +3049,7 @@ mod tests {
             session_id: ghost.clone(),
             name: Some("important work".into()),
             muted: false,
+            id: None,
         }]);
 
         let mut core = Core::open(
@@ -2781,6 +3057,7 @@ mod tests {
             project_dir,
             Path::new("/nonexistent/mulpex-helper"),
             root.join("state"),
+            TEST_GEOMETRY,
         )
         .unwrap();
 
@@ -2865,6 +3142,7 @@ mod tests {
                 project.clone(),
                 Path::new("/nonexistent/mulpex-helper"),
                 root.join("state"),
+                TEST_GEOMETRY,
             )
             .unwrap(),
         );
@@ -2965,6 +3243,7 @@ mod tests {
             project.clone(),
             Path::new("/nonexistent/mulpex-helper"),
             root.join("state"),
+            TEST_GEOMETRY,
         )
         .unwrap();
         let info = core
@@ -3023,6 +3302,7 @@ mod tests {
             session_id: uuid.clone(),
             name: None,
             muted: false,
+            id: None,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -3032,7 +3312,7 @@ mod tests {
             .join("target/debug/mulpex-helper");
         assert!(helper.exists(), "build mulpex-helper first: {helper:?}");
 
-        let mut core = Core::open(1, project_dir, &helper, root.join("state")).unwrap();
+        let mut core = Core::open(1, project_dir, &helper, root.join("state"), TEST_GEOMETRY).unwrap();
         eprintln!("restored {} session(s)", core.sessions.len());
         assert_eq!(core.sessions.len(), 1, "the saved session did not spawn");
 
@@ -3078,6 +3358,7 @@ mod tests {
             session_id: uuid.clone(),
             name: None,
             muted: false,
+            id: None,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");

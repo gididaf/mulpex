@@ -2150,6 +2150,8 @@ mod tests {
             tasks_dir: state_dir.join("tasks"),
             inbox_dir: state_dir.join("inbox"),
             waiting_dir: state_dir.join("waiting"),
+            bg_dir: state_dir.join("bg"),
+            compacting_dir: state_dir.join("compacting"),
             state_dir,
         }
     }
@@ -2202,6 +2204,8 @@ mod tests {
             tasks_dir: a_state.join("tasks"),
             inbox_dir: a_state.join("inbox"),
             waiting_dir: a_state.join("waiting"),
+            bg_dir: a_state.join("bg"),
+            compacting_dir: a_state.join("compacting"),
             state_dir: a_state,
         };
         (root, ctx, b_state)

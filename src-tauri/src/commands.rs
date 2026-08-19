@@ -214,19 +214,18 @@ pub fn send_bytes(
     }
 }
 
-/// Resize all of a project's sessions to the shared center-pane geometry. The
-/// frontend calls this per open project so background projects' PTYs aren't left
-/// at spawn size (garbled on switch).
+/// Resize **every** session in **every** open project to the center pane's
+/// geometry, and record it as the size later spawns start at.
+///
+/// One call for the whole workspace, not one per project: all PTYs share a single
+/// size, and the frontend builds every xterm at that same size, so the two must
+/// be updated together or not at all. A project left at the old size would spawn
+/// its next session there and hand the frontend a PTY whose emulator is a
+/// different shape — which corrupts the session permanently, not transiently
+/// (see `WorkspaceInfo::cols`).
 #[tauri::command]
-pub fn resize_session(
-    state: State<AppState>,
-    project_handle: ProjectHandle,
-    cols: u16,
-    rows: u16,
-) {
-    if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
-        core.resize_all(cols, rows);
-    }
+pub fn resize_terminals(state: State<AppState>, cols: u16, rows: u16) {
+    state.ws.lock().unwrap().resize_all(cols, rows);
 }
 
 /// Set the focused instance (⌘1–9 / ⌘[ ⌘] / sidebar click); also makes its project
