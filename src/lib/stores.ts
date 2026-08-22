@@ -42,30 +42,45 @@ export const activeProject = derived(
   ([$p, $h]) => ($h != null ? ($p.get($h) ?? null) : null),
 );
 
-// ---- mute: display order + the badge counts that must exclude muted ----
+// ---- display order: kind split + mute sinking, and the drag clamp they imply ----
 
 /**
- * Sidebar order: unmuted first, muted sunk to the bottom, each group keeping its
- * creation order. `Array.prototype.sort` is required to be stable, so a plain
- * key sort is enough — a muted instance keeps its place relative to other muted
- * ones, and unmuting drops it straight back where it came from.
+ * The block a row belongs to, top to bottom: unmuted claudes (0), muted claudes
+ * (1), terminals (2).
+ *
+ * Kind is the OUTER grouping — every terminal sits below every claude, muted
+ * ones included — because the two are different things you switch between, not
+ * two states of one thing. Mute only ranks claudes: the backend refuses to
+ * record the flag for a shell (a terminal produces none of the signals mute
+ * silences), so a terminal's own flag is never trusted here either.
+ */
+function groupOf(s: SessionInfo): number {
+  return s.kind === "shell" ? 2 : Number(s.muted);
+}
+
+/**
+ * Sidebar order: claudes first (unmuted, then muted), then terminals, each block
+ * keeping its creation/drag order. `Array.prototype.sort` is required to be
+ * stable, so a plain key sort is enough — a muted instance keeps its place
+ * relative to other muted ones, and unmuting drops it straight back where it
+ * came from.
  *
  * This is the single source of the visible order: ⌘[ / ⌘] cycle through *this*
  * list, so what you see is what you cycle.
  */
 export function displayOrder(list: SessionInfo[]): SessionInfo[] {
-  return [...list].sort((a, b) => Number(a.muted) - Number(b.muted));
+  return [...list].sort((a, b) => groupOf(a) - groupOf(b));
 }
 
 /**
  * The slot a dragged sidebar row can actually land in: `to`, clamped to the
- * dragged row's own group (the unmuted block, or the muted block below it).
+ * dragged row's own block (see `groupOf`).
  *
  * `list` is the *displayed* order — i.e. already through `displayOrder`.
  *
- * This exists because manual order and muted-sinking are composed, not
+ * This exists because manual order and the display grouping are composed, not
  * alternatives: `displayOrder` runs on top of the arrangement a drag commits, so
- * a drop across the mute boundary could never stick — the row would visibly snap
+ * a drop across a block boundary could never stick — the row would visibly snap
  * back on release. Clamping keeps the drop indicator honest, and keeps the order
  * `dragOrder` emits already-grouped (so re-applying `displayOrder` to it is the
  * identity, and the frontend's optimistic repaint matches what the backend
@@ -76,11 +91,14 @@ export function clampToGroup(
   from: number,
   to: number,
 ): number {
-  const firstMuted = list.findIndex((s) => s.muted);
-  if (firstMuted < 0) return to; // nothing muted: the whole list is one group
-  return list[from]?.muted
-    ? Math.max(to, firstMuted)
-    : Math.min(to, firstMuted - 1);
+  const row = list[from];
+  if (!row) return to;
+  const g = groupOf(row);
+  let lo = 0;
+  while (lo < list.length && groupOf(list[lo]) !== g) lo++;
+  let hi = list.length - 1;
+  while (hi > lo && groupOf(list[hi]) !== g) hi--;
+  return Math.min(Math.max(to, lo), hi);
 }
 
 /** The new top-to-bottom id order after dragging row `from` onto slot `to`. */

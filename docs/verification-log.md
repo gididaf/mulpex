@@ -6,6 +6,20 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
 [CLAUDE.md](../CLAUDE.md) and the subsystem docs.
 
 - Both crates + the Tauri app compile clean; `svelte-check` + `vite build` clean.
+- **Sidebar kind-split + context menu driven in a real browser (headless Chrome, 2026-08-22).** The
+  actual `stores.ts` bundle was exercised for the ordering (kind split, mute sinking, all four
+  clamp boundaries, and an exhaustive `dragOrder(from,to)` sweep proving every emitted order is
+  already-grouped and loses no row), and the actual `InstanceList` / `ContextMenu` components were
+  mounted and clicked for the rest: the rendered order and the single divider above the first
+  terminal, right-click reporting the clicked row *without* selecting it, the empty-space menu
+  firing exactly once (and never in addition to a row's), edge-flipping at the viewport corner,
+  arrow-key navigation skipping the separator, Enter/Escape/click-away, and that the open menu holds
+  `document.activeElement`. **That last one caught a live bug:** `focus()` on the still
+  `visibility: hidden` menu was silently ignored, so keystrokes kept reaching the terminal
+  underneath — invisible by inspection, obvious the moment activeElement was read.
+- **NOT verified:** the context menu's clipboard write inside WKWebView. `navigator.clipboard`
+  works in Chrome (where it was tested) and there is an `execCommand` fallback behind it, but which
+  of the two actually runs in the shipped app is unmeasured.
 - The whole coordination hub works **end-to-end through `mulpex-helper`**: MCP `initialize` /
   `tools/list` (all 6 `hub_*` tools), `hub_send`→`hub_inbox` delivery + `messages.log`,
   `userpromptsubmit` task capture + peer snapshot, and `pretooluse` `O_EXCL` lock acquisition

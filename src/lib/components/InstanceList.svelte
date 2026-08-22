@@ -8,18 +8,25 @@
     clampToGroup,
     dragOrder,
   } from "../stores";
-  import type { Status } from "../ipc";
+  import type { SessionInfo, Status } from "../ipc";
 
   let {
     onselect,
     onmute,
     onreorder,
+    oncontext,
+    oncontextempty,
   }: {
     onselect: (id: number) => void;
     /** Toggle mute for any row, without selecting it first. */
     onmute: (id: number, muted: boolean) => void;
     /** Commit a new top-to-bottom order (session ids) after a drag. */
     onreorder: (ids: number[]) => void;
+    /** Right-click on a row. Carries the row itself, not its id: the menu acts
+     *  on the row you clicked, which is deliberately NOT the focused one. */
+    oncontext: (e: MouseEvent, s: SessionInfo) => void;
+    /** Right-click on the empty space below the rows. */
+    oncontextempty: (e: MouseEvent) => void;
   } = $props();
 
   const DOT: Record<Status, string> = {
@@ -118,11 +125,30 @@
   }
 </script>
 
-<!-- `$sessions` is already in display order (muted sunk to the bottom, creation
-     order preserved within each group) — see stores.ts::displayOrder. -->
-<div class="list">
+<!-- `$sessions` is already in display order (claudes first with muted sunk to the
+     bottom of them, then terminals; creation order preserved within each block)
+     — see stores.ts::displayOrder. -->
+<!-- The empty-space menu hangs off the container. Rows stop the event before it
+     gets here, so this only ever fires on the gap below the last row (or on a
+     project with no sessions at all, where it is the only way to right-click
+     anything). -->
+<div
+  class="list"
+  role="presentation"
+  oncontextmenu={(e) => {
+    e.preventDefault();
+    oncontextempty(e);
+  }}
+>
   {#each $sessions as s, i (s.id)}
     {@const st = statusOf(s.id)}
+    <!-- The rule between the two blocks. Drawn from the first terminal rather
+         than emitted once after the loop, so it lands in the right place no
+         matter how the list is ordered, and only when there is actually a claude
+         above it to separate from. -->
+    {#if s.kind === "shell" && i > 0 && $sessions[i - 1].kind !== "shell"}
+      <div class="split" aria-hidden="true"></div>
+    {/if}
     <!-- A muted row drops every attention signal — dot, status word, ⏳ — and
          carries 🔇 instead, so "dimmed" reads as "you silenced this" rather than
          "this one died". The mute toggle is a sibling of the select button, not
@@ -130,12 +156,19 @@
     {@const shell = s.kind === "shell"}
     <div
       class="row"
+      role="presentation"
       class:active={s.id === $activeId}
       class:muted={s.muted}
       class:shell
       class:dragging={dragging && dragIdx === i}
       class:drop-target={dragging && overIdx === i && dragIdx !== i}
       bind:this={rowEls[i]}
+      oncontextmenu={(e) => {
+        e.preventDefault();
+        // Stops the container's empty-space menu from also firing.
+        e.stopPropagation();
+        oncontext(e, s);
+      }}
     >
       <button
         class="body"
@@ -217,6 +250,13 @@
   }
   .row:hover {
     background: var(--bg-elev);
+  }
+  /* Claudes above, terminals below. The margins carry as much of the separation
+     as the rule does — the gap is what you read first. */
+  .split {
+    height: 1px;
+    background: var(--border);
+    margin: 0.45rem 0.35rem 0.55rem;
   }
   .row.active {
     border-color: var(--border-focus);

@@ -30,6 +30,7 @@
     type SessionExitedEvent,
     type ProjectHandle,
   } from "./lib/ipc";
+  import type { SessionInfo } from "./lib/ipc";
   import {
     projects,
     activeProjectHandle,
@@ -67,6 +68,8 @@
   import MessageReader from "./lib/components/MessageReader.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
+  import ContextMenu from "./lib/components/ContextMenu.svelte";
+  import type { CtxItem } from "./lib/components/ContextMenu.svelte";
 
   let recents: string[] = $state([]);
   let ready = $state(false);
@@ -133,6 +136,98 @@
     if (h == null) return;
     reorderSessionsLocal(h, ids);
     reorderSessions(h, ids);
+  }
+
+  // ---- sidebar context menu (right-click) ----
+  //
+  // The menu acts on the row you clicked, NOT on the focused one — right-clicking
+  // a background instance to rename or close it must not yank the center pane
+  // away from whatever you were reading. That is also why the ⌘R/⌘M/⌘W hints are
+  // conditional below: those keys act on the *focused* row, so printing them
+  // beside an item aimed at a different one would advertise a key that does
+  // something else.
+
+  let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
+
+  /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
+   *  the execCommand path otherwise. WKWebView has historically refused the
+   *  async API off a secure-context check, and a silently empty clipboard is
+   *  exactly the kind of failure that gets blamed on the user's fingers. */
+  async function copyText(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        ta.remove();
+      }
+    }
+  }
+
+  function openRowMenu(e: MouseEvent, s: SessionInfo) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    // Only the focused row's menu carries key hints (see above).
+    const key = (k: string) => (get(activeId) === s.id ? k : undefined);
+    const shell = s.kind === "shell";
+    const items: CtxItem[] = [
+      {
+        label: "Rename…",
+        hint: key("⌘R"),
+        run: () => rename.set({ handle: h, id: s.id, value: s.name ?? "" }),
+      },
+      // Terminals can't be muted — the backend drops the flag for a shell — so
+      // the item is absent rather than present-and-dead.
+      ...(shell
+        ? []
+        : [
+            {
+              label: s.muted ? "Unmute" : "Mute",
+              hint: key("⌘M"),
+              run: () => muteSession(s.id, !s.muted),
+            },
+          ]),
+      {
+        // The address the hub itself uses (`claude#3` / `term#5`), so it can be
+        // pasted straight into a hub_send or a prompt. The cross-project
+        // `<project>#<n>` form is deliberately not what this copies.
+        label: "Copy address",
+        run: () => copyText(`${shell ? "term" : "claude"}#${s.id}`),
+      },
+      { sep: true },
+      { label: "Close", hint: key("⌘W"), danger: true, run: () => closeSession(h, s.id) },
+    ];
+    ctx = { x: e.clientX, y: e.clientY, items };
+  }
+
+  /** The gap below the last row. These two act on the active project rather than
+   *  on any row, so their hints are unconditional. */
+  function openEmptyMenu(e: MouseEvent) {
+    if (get(activeProjectHandle) == null) return;
+    ctx = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: "New Session", hint: "⌘T", run: () => void newSession() },
+        { label: "New Terminal", hint: "⌘⇧T", run: () => void newTerminal() },
+      ],
+    };
+  }
+
+  function closeContextMenu(chosen?: CtxItem) {
+    ctx = null;
+    chosen?.run?.();
+    // Rename opens a dialog that wants the keyboard; everything else should hand
+    // it straight back to the terminal, which the menu took focus from.
+    if (!get(rename)) terminals.refocus();
   }
 
   function selectSession(id: number) {
@@ -324,17 +419,38 @@
     selectSession(info.id);
   }
 
-  /** Cycle sessions within the active project, in the order the sidebar shows
-   *  them — muted ones last. What you see is what you cycle. */
+  /**
+   * Cycle sessions within the active project, in the order the sidebar shows
+   * them — claudes, then terminals. What you see is what you cycle.
+   *
+   * Muted rows are *skipped*: muting says "stop putting this in front of me",
+   * and a row you have to tab past is still in front of you. They stay
+   * reachable by clicking, and they still hold focus if one is selected — from
+   * there the walk below simply steps to the nearest unmuted row in the
+   * direction of travel, so ⌘] out of a muted row lands where the eye expects
+   * rather than at the end of the list.
+   *
+   * The walk starts *before* the head of the list when nothing is focused, so a
+   * first ⌘] selects the top row rather than the second one.
+   */
   function cycle(delta: number) {
     const h = get(activeProjectHandle);
     if (h == null) return;
     const list = displayOrder(get(projects).get(h)?.sessions ?? []);
-    if (list.length === 0) return;
+    const n = list.length;
+    if (n === 0) return;
     const cur = get(activeId);
-    const idx = list.findIndex((s) => s.id === cur);
-    const next = list[(idx + delta + list.length) % list.length];
-    if (next) selectSession(next.id);
+    const at = list.findIndex((s) => s.id === cur);
+    const start = at >= 0 ? at : delta > 0 ? -1 : 0;
+    for (let k = 1; k <= n; k++) {
+      const next = list[(((start + delta * k) % n) + n) % n];
+      // Everything muted (and the focused row among them): nothing to move to,
+      // so the keystroke does nothing rather than reselecting a silenced row.
+      if (next && !next.muted) {
+        selectSession(next.id);
+        return;
+      }
+    }
   }
 
   /** Cycle between open projects (⌘⇧[ / ⌘⇧]). */
@@ -554,6 +670,8 @@
         onselect={selectSession}
         onmute={muteSession}
         onreorder={applySessionOrder}
+        oncontext={openRowMenu}
+        oncontextempty={openEmptyMenu}
       />
       <HubPanel />
     </aside>
@@ -581,6 +699,9 @@
   {/if}
   {#if $rename}
     <RenameDialog />
+  {/if}
+  {#if ctx}
+    <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onclose={closeContextMenu} />
   {/if}
 {:else if ready}
   <ProjectPicker
