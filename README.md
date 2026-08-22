@@ -41,20 +41,24 @@ menu shortcuts.
 - **Multiple Claude sessions per project.** Each runs as a real `claude` process on its own
   PTY, rendered by xterm.js. Add (⌘T), switch (⌘[ ⌘]), rename (⌘R), close (⌘W), and drag rows in
   the sidebar to reorder them — that order is what ⌘[ ⌘] cycle through, and it survives a restart.
+  **Right-click any row** for rename / mute / copy address / close, aimed at the row you clicked
+  rather than the focused one; right-click the space below the rows to start a new session or
+  terminal.
   **Rows label themselves**: a session names its own row after the work it's doing, so a sidebar
   of five Claudes reads as five tasks rather than five numbers. A name you type with ⌘R always
   wins. Shift+Enter (or Option+Enter) inserts a newline instead of submitting — no
   `/terminal-setup` needed.
 - **Terminal sessions (⌘⇧T).** A session can also be a plain interactive shell, in the same
-  sidebar and the same pane. Use it for the long-running and the interactive — a dev server, a
+  sidebar and the same pane, gathered in their own block below the Claudes. Use it for the long-running and the interactive — a dev server, a
   watcher, `tail -f`, a REPL — anything Claude's request/response Bash tool cannot hold open. They
   are **shared**: your instances can open their own, and any of them can read or drive any
   terminal, including one you started, so a Claude can watch your dev server's output and tell
   when a command finished and with what exit code. A terminal that exits stays in the list with
   its output still readable until you close it.
 - **Mute a session (⌘M)** when you don't want to hear from it. It keeps running and keeps
-  coordinating — it just stops competing for your attention: dimmed, sunk to the bottom of the
-  sidebar, and dropped from every badge, including its project tab's. Persists across restarts.
+  coordinating — it just stops competing for your attention: dimmed, sunk below the other Claudes,
+  skipped by ⌘[ ⌘], and dropped from every badge, including its project tab's. Persists across
+  restarts.
 - **Right-to-left text renders correctly.** Hebrew and Arabic read in the right order, mixed with
   English on the same line — no setting to turn on. Most terminals (and anything drawing the grid
   on a GPU, VS Code's included) show RTL mirrored, because a cell grid puts character *n* in

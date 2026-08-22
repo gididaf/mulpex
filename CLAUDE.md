@@ -68,7 +68,7 @@ src/                  Svelte/Vite frontend
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
   lib/updater.ts      update check/download/apply + the cross-project busy-session count
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename, UpdateBanner…
+                      TerminalPane/View, MessageReader, Rename, ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 docs/                 the deferred half of these notes — see the table above
 ```
@@ -290,4 +290,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`81e96515d602d3ea65d5c79bf399e222140e30b7` — 2026-08-22
+`1bb57fa70d556bea4f266ca77af7a5385408a112` — 2026-08-22
