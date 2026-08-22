@@ -87,9 +87,39 @@ echo "==> releasing Mulpex $VERSION (tag $TAG)${DRY_RUN:+ [dry run]}"
 # no private key", *after* a full release compile.
 export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+
+# CI=true makes the bundler pass `--skip-jenkins` to create-dmg, which skips the
+# AppleScript that asks Finder to prettify the mounted volume's window. That
+# AppleScript is a RACE and it killed releases: it runs milliseconds after
+# `hdiutil attach`, and if Finder has not registered a window for the new volume
+# yet it fails with
+#
+#   Finder got an error: Can't set statusbar visible of container window
+#   of disk "dmg.u9NTDy" to false. (-10006)
+#
+# which create-dmg treats as fatal (`exit 64`) — after the full release compile,
+# and reported by tauri only as "error running bundle_dmg.sh", with the actual
+# reason swallowed. Measured 2026-08-22: 3 failures in 6 consecutive builds, and
+# orphaned `rw.*.dmg` images dating back to 2026-08-18 show it had been happening
+# for releases before that. create-dmg's only mitigation is a fixed `sleep 2`
+# (added for the sibling error -1728) with no retry, so whether a release
+# survives comes down to how fast Finder notices a volume.
+#
+# The cost is cosmetic and only affects first installs: the .dmg keeps its
+# /Applications symlink but not the icon positions or window size. Updates never
+# touch the .dmg — they go through Mulpex.app.tar.gz.
+# `true`/`false` only — the tauri CLI parses this env var as its own `--ci` flag,
+# and `CI=1` fails the whole build with `invalid value '1' for '--ci'`.
+export CI=true
+
 npm run tauri build
 
 BUNDLE="target/release/bundle"
+
+# Every failed dmg run leaves its ~34 MB read/write scratch image behind, and
+# nothing else ever removes them (95 MB had accumulated by 2026-08-22). They are
+# pure garbage the moment the build is over: the finished .dmg is elsewhere.
+rm -f "$BUNDLE"/macos/rw.*.dmg
 TARBALL="$BUNDLE/macos/Mulpex.app.tar.gz"
 SIGFILE="$TARBALL.sig"
 DMG="$BUNDLE/dmg/Mulpex_${VERSION}_aarch64.dmg"

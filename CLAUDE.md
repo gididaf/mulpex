@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + task delivery | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript, `hub_terminal_*`, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
+| [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
 ## The key idea

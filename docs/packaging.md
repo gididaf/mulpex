@@ -107,6 +107,43 @@ existing grant. Details that cost time to rediscover:
   also drags the Dock icon to the new path, so the old bundle is what a Dock click then launches.
   Deleting the duplicate is the fix; the prompt's *app name* is what identifies which one is asking.
 
+## The DMG step is a Finder race — `release.sh` exports `CI=true`
+
+`create-dmg` (which the tauri bundler ships as `bundle_dmg.sh`) mounts the image and then runs an
+**AppleScript telling Finder to prettify the volume's window** — icon positions, window size, hidden
+extension, hidden statusbar. It runs milliseconds after `hdiutil attach`, and if Finder has not yet
+registered a window for that volume the property set fails:
+
+```
+Finder got an error: Can't set statusbar visible of container window
+of disk "dmg.u9NTDy" to false. (-10006)
+```
+
+create-dmg treats **any** AppleScript failure as fatal (`Failed running AppleScript` → detach →
+`exit 64`). So a release dies *after* the full compile — and tauri reports only
+`error running bundle_dmg.sh`, swallowing the script's output entirely, which is why this looked
+like a mystery rather than a race. The only mitigation in the script is a fixed `sleep 2`, added for
+the sibling error `-1728` ("Can't get disk"), with **no retry**.
+
+**Measured 2026-08-22:** 3 failures in 6 consecutive builds, including a `release.sh` run that
+aborted having published nothing. Running the identical command by hand succeeded every time — the
+difference is only timing. Orphaned `rw.*.dmg` scratch images dated 2026-08-18 and 08-19 (95 MB of
+them) show earlier releases had been rolling the same dice and getting lucky. Getting the real error
+out of it took a shim `bash` earlier in `PATH` that ran `bundle_dmg.sh` under `-x`, because tauri
+captures the script's stdout and stderr and prints neither.
+
+- **`export CI=true` in `scripts/release.sh`** makes the bundler pass `--skip-jenkins`, and that
+  skips the AppleScript entirely. The step that fails no longer runs.
+- **`true`/`false` only.** The tauri CLI parses `CI` as its own `--ci` flag, so `CI=1` fails the
+  whole build with `invalid value '1' for '--ci'` — a stricter trap than the usual "any non-empty
+  value" CI convention.
+- **The cost is cosmetic and first-install-only.** The DMG keeps `Mulpex.app`, the `/Applications`
+  symlink and the volume icon, but has no `.DS_Store`, so the window opens with a default layout
+  instead of the app-beside-Applications arrangement. Updates never touch the DMG — they go through
+  `Mulpex.app.tar.gz` (see **Auto-update** below). Verified by mounting the produced image.
+- **Each failed run leaked a ~34 MB `rw.*.dmg`** into `target/release/bundle/macos/` and nothing
+  ever removed them; `release.sh` now deletes them after the build.
+
 ## Auto-update
 
 `tauri-plugin-updater` against the repo's GitHub releases. Checked at launch and every **6 h**
