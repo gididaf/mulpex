@@ -11,6 +11,12 @@ anywhere.** Everything else — each subsystem's full story, and the evidence be
 Open the one that covers what you are about to change, and note that `src/`, `src-tauri/` and
 `crates/mulpex-core/` each carry a small `CLAUDE.md` router that points at the right ones.
 
+**New notes go in the `docs/` page that owns the subsystem, not here.** This file earns its
+length back only by staying short; it grew to 2000 lines once already. Something belongs in this
+file only if it is orientation you need before you can navigate at all, or a rule you could
+break from a file that doesn't mention it — and even then, as a short form linking to the full
+reasoning in `docs/`.
+
 ## Where things are documented
 
 | File | Covers | Read it before touching |
@@ -284,4 +290,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`91b97926ce4bccc8f7cf392d10778c9d00783b7b` — 2026-08-19
+`81e96515d602d3ea65d5c79bf399e222140e30b7` — 2026-08-22

@@ -110,7 +110,9 @@ A Cargo workspace + a Svelte/Vite frontend:
   The tab bar / ⌘P palette switch projects; sidebar + hub panel render from the active project's
   `hub-update` snapshot.
 
-See `CLAUDE.md` for the detailed design.
+See `CLAUDE.md` for the design overview and the rules that apply everywhere; each subsystem's
+full story is in `docs/` (rendering, frontend, sessions, hub, shell-terminals, remote-peers,
+packaging), indexed by a table at the top of `CLAUDE.md`.
 
 ## Install
 
