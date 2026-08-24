@@ -252,6 +252,18 @@ fn tool_defs() -> Value {
             },
         },
         {
+            "name": "hub_terminal_name",
+            "description": "Give a terminal a short label, shown on its row in Mulpex's sidebar. Use this for a terminal you did NOT open — one the user started themselves shows up with name: null, and with several terminals open that leaves you telling them apart by their output. A terminal that already has a name is left alone and the call tells you what that name is: the existing one is usually the user's, and relabelling a row they titled on purpose is not yours to do. To name a terminal you are opening yourself, pass `name` to hub_terminal_open instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Terminal id (from hub_instances)." },
+                    "name": { "type": "string", "description": "Short label for the sidebar row, 2-5 words, naming what the terminal is FOR (\"dev server\", \"api logs\")." },
+                },
+                "required": ["id", "name"],
+            },
+        },
+        {
             "name": "hub_terminal_close",
             "description": "Close a terminal and remove it from the sidebar. Only close terminals you opened for your own work — a terminal the user opened themselves, or one another instance is using, is not yours to close unless you were asked to.",
             "inputSchema": {
@@ -284,6 +296,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
+        "hub_terminal_name" => hub_terminal_name(ctx, &args),
         "hub_terminal_close" => hub_terminal_close(ctx, &args),
         other => Err(format!("unknown tool: {other}")),
     }
@@ -1928,6 +1941,34 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     Ok(out.to_string())
 }
 
+/// Label a terminal this instance did not open. Refused when it already has a
+/// name — and the refusal SAYS the name, so the caller learns what the row is
+/// instead of just being told no.
+fn hub_terminal_name(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|x| x.as_u64())
+        .ok_or("missing 'id' — the terminal to name.")? as usize;
+    let name = args
+        .get("name")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("missing 'name' — a short label for the sidebar row.")?;
+    let name = summarize(name);
+    terminal_request(
+        ctx,
+        json!({ "op": "name", "from": ctx.instance, "id": id, "label": name }),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "terminal_id": id,
+        "name": name,
+        "note": format!("term#{id} is now labelled {name:?} in the sidebar."),
+    })
+    .to_string())
+}
+
 fn hub_terminal_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let id = args
         .get("id")
@@ -2770,6 +2811,35 @@ mod tests {
         assert_eq!(reply["new_output"], json!(""));
         assert_eq!(reply["screen_changed"], json!(true));
         assert!(reply.get("nothing_new").is_none(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The naming tool validates before it ever reaches Mulpex — an empty label
+    /// would otherwise cost a whole request round-trip to be told no, and
+    /// `hub_terminal_name` is offered as the fix for `name: null`, not as a way
+    /// to set one.
+    #[test]
+    fn naming_a_terminal_needs_an_id_and_a_real_label() {
+        let dir = tmpdir("term-name-args");
+        let ctx = test_ctx(&dir, 1);
+        assert!(hub_terminal_name(&ctx, &json!({"name": "x"}))
+            .unwrap_err()
+            .contains("missing 'id'"));
+        assert!(hub_terminal_name(&ctx, &json!({"id": 4}))
+            .unwrap_err()
+            .contains("missing 'name'"));
+        assert!(hub_terminal_name(&ctx, &json!({"id": 4, "name": "   "}))
+            .unwrap_err()
+            .contains("missing 'name'"));
+        // The tool is actually reachable — a name only in the dispatch match or
+        // only in the tool list is the classic half-wired case here.
+        let listed: Vec<String> = tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(listed.contains(&"hub_terminal_name".to_string()), "{listed:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -881,6 +881,53 @@ impl Core {
                     false,
                 ),
             },
+            // Label a terminal this instance did NOT open — in practice one the
+            // user opened with ⌘⇧T, which has no name at all and shows up as
+            // `name: null`. Only an UNNAMED terminal can be labelled: a name is
+            // usually the user's, and a row they deliberately titled must not be
+            // silently relabelled by an instance.
+            "name" => {
+                let Some(id) = id else {
+                    return (
+                        serde_json::json!({ "ok": false, "error": "missing 'id'" }),
+                        false,
+                    );
+                };
+                let Some(label) = str_of("label") else {
+                    return (
+                        serde_json::json!({ "ok": false, "error": "missing 'label'" }),
+                        false,
+                    );
+                };
+                let is_shell = self.sessions.iter().any(|s| s.id == id && s.is_shell());
+                if !is_shell {
+                    let known = self.sessions.iter().any(|s| s.id == id);
+                    let err = if known {
+                        format!("#{id} is a Claude instance, not a terminal")
+                    } else {
+                        format!("no term#{id}")
+                    };
+                    return (serde_json::json!({ "ok": false, "error": err }), false);
+                }
+                if let Some(existing) = self.names.get(&id) {
+                    return (
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "term#{id} is already named {existing:?} — leave it alone"
+                            ),
+                            "name": existing,
+                        }),
+                        false,
+                    );
+                }
+                let label = label.replace(['\t', '\n'], " ");
+                self.names.insert(id, label.clone());
+                // Deliberately NOT persisted: terminals are not restored across a
+                // restart (`persist_sessions` filters on kind), so there is
+                // nothing for a stored label to come back to.
+                (serde_json::json!({ "ok": true, "id": id, "name": label }), true)
+            }
             "send" => {
                 let Some(id) = id else {
                     return (
@@ -3539,6 +3586,85 @@ mod tests {
             after.contains(&uuid),
             "QUIT DESTROYED THE SESSION RECORD — store is now:\n{after}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A terminal the USER opened has no label at all — it reaches an instance as
+    /// `name: null`, which with four or five terminals open leaves it telling
+    /// them apart by their output. An instance can name one, but only if nobody
+    /// has: a name that is already there is usually the user's, and the refusal
+    /// reports it so the caller learns what the row is instead of just being
+    /// told no.
+    #[test]
+    fn an_instance_can_label_an_unnamed_terminal_but_never_rename_one() {
+        let (_env, root, mut core) = scratch_core("term-name-test");
+        let dir = core.state_dir.join("termreq");
+        let post = |body: serde_json::Value| {
+            let token = persist::new_uuid();
+            std::fs::write(dir.join(format!("{token}.json")), body.to_string()).unwrap();
+            token
+        };
+        let reply = |token: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{token}.done"))).unwrap())
+                .unwrap()
+        };
+
+        // A terminal the user opened: no label.
+        let user_term = core.spawn_terminal(None, None, true).unwrap();
+        core.sync_terminal_index();
+        let index_path = core.state_dir.join("terminals").join("index");
+        let index = || std::fs::read_to_string(&index_path).unwrap();
+        assert!(
+            index()
+                .lines()
+                .any(|l| l == format!("{}\trunning\t", user_term.id)),
+            "expected an unnamed row: {:?}",
+            index()
+        );
+
+        // An instance labels it, and the sidebar manifest follows.
+        let t = post(serde_json::json!({
+            "op": "name", "from": 1, "id": user_term.id, "label": "dev server",
+        }));
+        assert!(
+            core.process_terminal_requests(),
+            "naming a row must repaint the session list"
+        );
+        assert_eq!(reply(&t)["ok"], true);
+        core.sync_terminal_index();
+        assert!(index().contains("dev server"), "{:?}", index());
+
+        // A second attempt is refused, and says what the name already is.
+        let t = post(serde_json::json!({
+            "op": "name", "from": 2, "id": user_term.id, "label": "something else",
+        }));
+        core.process_terminal_requests();
+        let r = reply(&t);
+        assert_eq!(r["ok"], false);
+        assert!(
+            r["error"].as_str().unwrap().contains("dev server"),
+            "the refusal must name the existing label: {r}"
+        );
+        core.sync_terminal_index();
+        assert!(!index().contains("something else"), "{:?}", index());
+
+        // …including when the USER named it by hand.
+        let mine = core.spawn_terminal(None, None, true).unwrap();
+        core.rename(mine.id, "my build");
+        let t = post(serde_json::json!({
+            "op": "name", "from": 1, "id": mine.id, "label": "hijacked",
+        }));
+        core.process_terminal_requests();
+        assert_eq!(reply(&t)["ok"], false);
+        core.sync_terminal_index();
+        assert!(!index().contains("hijacked"), "{:?}", index());
+
+        // A claude is not a terminal, and an unknown id is not one either.
+        let t = post(serde_json::json!({ "op": "name", "from": 1, "id": 999, "label": "x" }));
+        core.process_terminal_requests();
+        assert!(reply(&t)["error"].as_str().unwrap().contains("no term#999"));
+
+        core.teardown();
         let _ = std::fs::remove_dir_all(&root);
     }
 

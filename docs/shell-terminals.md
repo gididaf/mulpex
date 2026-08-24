@@ -32,6 +32,16 @@ part of the point. `hub_instances` carries a `terminals` array so that costs no 
   removal ([sessions.md](sessions.md)). Terminals also don't go through `claude_command()`, which
   *errors* when `claude`
   is missing — a shell must not fail to open for that reason.
+- **An instance may LABEL a terminal, but never relabel one.** A terminal the user opened with ⌘⇧T
+  has no name at all — it reaches an instance as `name: null`, which with four or five open leaves
+  it telling them apart by their output. `hub_terminal_name` (termreq op `name`) sets a label on an
+  **unnamed** terminal only; one that already has a name is refused, and **the refusal reports the
+  name**, so the caller learns what the row is instead of just being told no. A name that is
+  already there is usually the user's, and silently relabelling a row they titled on purpose is not
+  an instance's call. The label is not persisted, because terminals are not restored either.
+  `hub_terminal_open` has always taken a `name`, and ⌘R renames any row — this closes the one gap
+  those left. Pinned by `an_instance_can_label_an_unnamed_terminal_but_never_rename_one`, confirmed
+  to fail when the already-named guard is removed.
 - **Hub isolation is by omission.** Terminals are excluded from `write_live_instances` (so
   `hub_send` never offers a shell as a peer), from `hub_snapshot`'s `statuses`, and from
   `persist_sessions`. Excluding them from `statuses` is what keeps `attention.ts`, the updater's

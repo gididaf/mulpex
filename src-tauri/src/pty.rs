@@ -78,7 +78,11 @@ command asked, or send a control key (e.g. Ctrl-C to interrupt).\n\
 - mcp__mulpex__hub_terminal_read — read a terminal's output. Each read returns only what is NEW \
 since YOUR last read of it, so you can follow a long command without re-reading everything; it \
 can also wait for new output, and it tells you when a command you sent has finished and with \
-what exit code.\n\
+what exit code. An empty new_output does NOT mean nothing happened: output enters the history \
+only once it scrolls off the top, so a short command's output is on current_screen and nowhere \
+else. Judge by screen_changed and nothing_new, never by new_output alone.\n\
+- mcp__mulpex__hub_terminal_name — label a terminal the USER opened (those arrive with \
+name: null). One that already has a name is left alone.\n\
 - mcp__mulpex__hub_terminal_close — close a terminal you no longer need. Do not close one the \
 user opened themselves without being asked to.\n\
 REMOTE CLAUDES — mcp__mulpex__hub_remote_open starts a Claude Code instance on ANOTHER MACHINE \
