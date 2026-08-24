@@ -239,14 +239,15 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_terminal_read",
-            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content, how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling. IMPORTANT: an empty `new_output` does NOT mean nothing happened. Output enters the history only once it scrolls off the top of the screen, so a short command's output is on `current_screen` and nowhere else. Judge by `screen_changed` (did the screen move since YOUR last read) and `nothing_new` (present and true only when genuinely nothing changed) — never by `new_output` alone. `running` means the SHELL is alive; `command_running` means something is actually executing in it right now, and `cwd` is where the shell is sitting — both are omitted when Mulpex could not read them, so an absent field means unknown, not no.",
+            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content, how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling. IMPORTANT: an empty `new_output` does NOT mean nothing happened. Output enters the history only once it scrolls off the top of the screen, so a short command's output is on `current_screen` and nowhere else. Judge by `screen_changed` (did the screen move since YOUR last read) and `nothing_new` (present and true only when genuinely nothing changed) — never by `new_output` alone. `running` means the SHELL is alive; `command_running` means something is actually executing in it right now, and `cwd` is where the shell is sitting — both are omitted when Mulpex could not read them, so an absent field means unknown, not no. A FULL-SCREEN program (vim, top, a remote claude) repaints in place and never scrolls, so it puts nothing in the history at all: its earlier screens come back in `frames`, oldest first — unasked when you have not seen them, or the whole retained set with full:true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer", "description": "Terminal id." },
                     "wait_ms": { "type": "integer", "description": "Block up to this many milliseconds (max 30000) instead of returning immediately. If a command you submitted is still running, this waits for it to FINISH; otherwise it waits for any new output. Either way it returns early if the terminal exits, and the reply's `waited_for` says which of the two it was waiting on. Works with `full` too." },
                     "lines": { "type": "integer", "description": "Cap on how many lines to return, most recent kept. Default 200." },
-                    "full": { "type": "boolean", "description": "Ignore your read position and return the whole retained history instead. Use when you need the beginning of a run you have already partly read." },
+                    "frames": { "type": "integer", "description": "How many earlier screen snapshots to return for a full-screen program (vim, top, a remote claude). Defaults to a few unseen ones, or 20 with full:true." },
+                    "full": { "type": "boolean", "description": "Ignore your read position and return the whole retained history instead — including every retained screen snapshot of a full-screen program. Use when you need the beginning of a run you have already partly read." },
                 },
                 "required": ["id"],
             },
@@ -910,9 +911,10 @@ fn mark_path(ctx: &Ctx, id: usize) -> PathBuf {
 }
 
 /// This instance's saved read position in terminal `id`, if it has read before.
-/// A reader's cursor file is two lines: the log offset it has consumed, and a
-/// fingerprint of the screen it last saw (see `screen_mark_of`). The second line
-/// is absent for a reader that has only ever been written by an older build.
+/// A reader's cursor file is three lines: the log offset it has consumed, a
+/// fingerprint of the screen it last saw (see `screen_mark_of`), and the
+/// timestamp of the newest frame it has been shown (see `frame_mark_of`). Later
+/// lines are absent for a reader last written by an older build.
 fn cursor_of(ctx: &Ctx, id: usize) -> Option<u64> {
     std::fs::read_to_string(cursor_path(ctx, id))
         .ok()?
@@ -939,16 +941,75 @@ fn screen_mark_of(ctx: &Ctx, id: usize) -> Option<u64> {
 /// `screen_mark: None` writes the offset alone, leaving this reader with no
 /// remembered screen — which is what "you have never looked at this terminal"
 /// means, and what the two seeding call sites want.
-fn set_cursor(ctx: &Ctx, id: usize, at: u64, screen_mark: Option<u64>) {
+/// The newest frame timestamp this reader has been shown, so a later read can
+/// hand it only what has happened since. Frames have no byte offsets to key off
+/// — they are whole snapshots — so time is the cursor.
+fn frame_mark_of(ctx: &Ctx, id: usize) -> Option<u64> {
+    std::fs::read_to_string(cursor_path(ctx, id))
+        .ok()?
+        .lines()
+        .nth(2)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn set_cursor(ctx: &Ctx, id: usize, at: u64, screen_mark: Option<u64>, frame_mark: Option<u64>) {
     let path = cursor_path(ctx, id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body = match screen_mark {
-        Some(m) => format!("{at}\n{m}"),
-        None => at.to_string(),
-    };
+    let mut body = at.to_string();
+    if let Some(m) = screen_mark {
+        body.push_str(&format!("\n{m}"));
+        if let Some(f) = frame_mark {
+            body.push_str(&format!("\n{f}"));
+        }
+    }
     let _ = std::fs::write(path, body);
+}
+
+/// One stored snapshot of a full-screen program's screen.
+struct Frame {
+    at_ms: u64,
+    text: String,
+}
+
+/// Default number of frames handed back unasked, when the log is blind and they
+/// are the only history there is. Small on purpose: an ordinary read should not
+/// turn into a wall of screens.
+const AUTO_FRAMES: usize = 3;
+/// Default for an explicit `full: true`, where the caller has asked for the
+/// whole retained history.
+const FULL_FRAMES: usize = 20;
+
+/// Parse the frame log. Records are length-prefixed (`--- MPXF <ms> <len>\n` then
+/// exactly `<len>` bytes), and are walked from the start rather than found by
+/// searching for the marker — the marker is plain text and a full-screen program
+/// can draw it. A malformed tail ends the walk instead of poisoning the read.
+fn read_frames(ctx: &Ctx, id: usize) -> Vec<Frame> {
+    let Ok(raw) = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.frames"))) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut rest = raw.as_str();
+    while let Some(nl) = rest.find('\n') {
+        let header = &rest[..nl];
+        let mut parts = header.rsplit(' ');
+        let (Some(len), Some(at)) = (parts.next(), parts.next()) else {
+            break;
+        };
+        let (Ok(len), Ok(at_ms)) = (len.parse::<usize>(), at.parse::<u64>()) else {
+            break;
+        };
+        let body = &rest[nl + 1..];
+        if body.len() < len || !body.is_char_boundary(len) {
+            break;
+        }
+        out.push(Frame { at_ms, text: body[..len].to_string() });
+        rest = &body[len..];
+    }
+    out
 }
 
 /// FNV-1a over the screen text. Hand-rolled rather than `DefaultHasher` because
@@ -1139,7 +1200,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // A terminal you opened is one whose entire life you should see.
             // A terminal the USER opened already has a history that is theirs,
             // so its cursor is left where it is.
-            set_cursor(ctx, id, 0, None);
+            set_cursor(ctx, id, 0, None, None);
             id
         }
     };
@@ -1354,7 +1415,7 @@ fn hub_terminal_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
 
     // Start this instance's cursor at the very beginning: a terminal you opened
     // yourself is one whose entire life you should see on your first read.
-    set_cursor(ctx, id, 0, None);
+    set_cursor(ctx, id, 0, None, None);
     match mark {
         Some(mark) => {
             let _ = std::fs::write(mark_path(ctx, id), mark.to_string());
@@ -1844,14 +1905,41 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     };
     // A finished command and a remote's signal are news in their own right, even
     // when the text they arrived with is empty — never call those "nothing".
-    let nothing_new =
-        text.trim().is_empty() && !screen_changed && finished.is_none() && signal.is_none();
+    // Frames: the only history a full-screen program has. It repaints in place,
+    // so nothing it draws ever scrolls into the log — `new_output` is empty for
+    // it BY DESIGN, and before this the reader had no way to know that history
+    // existed at all. `full: true` asks for the whole retained set; otherwise
+    // whatever this reader has not been shown comes back unasked, capped small.
+    let want_frames = args
+        .get("frames")
+        .and_then(|x| x.as_u64())
+        .map(|n| (n as usize).clamp(1, 100));
+    let seen_frame = frame_mark_of(ctx, id);
+    let stored = read_frames(ctx, id);
+    let chosen: Vec<&Frame> = if full {
+        let take = want_frames.unwrap_or(FULL_FRAMES);
+        stored.iter().rev().take(take).rev().collect()
+    } else {
+        let take = want_frames.unwrap_or(AUTO_FRAMES);
+        let fresh: Vec<&Frame> = stored
+            .iter()
+            .filter(|f| seen_frame.is_none_or(|seen| f.at_ms > seen))
+            .collect();
+        fresh[fresh.len().saturating_sub(take)..].to_vec()
+    };
+    let frame_mark = chosen.last().map(|f| f.at_ms).or(seen_frame);
+
+    let nothing_new = text.trim().is_empty()
+        && !screen_changed
+        && finished.is_none()
+        && signal.is_none()
+        && chosen.is_empty();
 
     // A wait that timed out with nothing new must not consume anything: the
     // caller should be able to retry and still see it — the screen mark included,
     // or the retry would report an unchanged screen it never showed anyone.
     if !(timed_out && text.trim().is_empty()) {
-        set_cursor(ctx, id, view.total, Some(mark));
+        set_cursor(ctx, id, view.total, Some(mark), frame_mark);
     }
 
     let mut out = json!({
@@ -1867,6 +1955,26 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // `running` says the SHELL is alive; `command_running` says something is
     // actually executing in it. Both are absent-if-unknown rather than guessed.
     add_terminal_meta(ctx, id, map);
+    if !chosen.is_empty() {
+        map.insert(
+            "frames".into(),
+            json!(chosen
+                .iter()
+                .map(|f| json!({ "at_ms": f.at_ms, "screen": f.text }))
+                .collect::<Vec<_>>()),
+        );
+        map.insert(
+            "frames_note".into(),
+            json!("Earlier snapshots of this terminal's screen, oldest first. A full-screen \
+                   program repaints in place instead of scrolling, so this is the only history \
+                   it has — `new_output` cannot carry it. Only what you have not been shown is \
+                   here; pass full:true for the whole retained set, or `frames` for a different \
+                   number."),
+        );
+        if stored.len() > chosen.len() && !full {
+            map.insert("more_frames".into(), json!(stored.len() - chosen.len()));
+        }
+    }
     if nothing_new {
         map.insert("nothing_new".into(), json!(true));
     }
@@ -2811,6 +2919,126 @@ mod tests {
         assert_eq!(reply["new_output"], json!(""));
         assert_eq!(reply["screen_changed"], json!(true));
         assert!(reply.get("nothing_new").is_none(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fake_frames(ctx: &Ctx, id: usize, frames: &[(u64, &str)]) {
+        let mut out = String::new();
+        for (at, text) in frames {
+            out.push_str(&format!("--- MPXF {at} {}\n{text}", text.len()));
+        }
+        std::fs::write(terminals_dir(ctx).join(format!("{id}.frames")), out).unwrap();
+    }
+
+    /// A full-screen program repaints in place, so nothing it draws ever scrolls
+    /// and `new_output` is empty BY DESIGN — the reader had no way to know a
+    /// history existed at all. The frames ARE that history, so they come back
+    /// unasked (only what this reader has not seen), and `full: true` asks for
+    /// the whole retained set.
+    #[test]
+    fn a_full_screen_program_hands_back_the_screens_you_have_not_seen() {
+        let dir = tmpdir("frames-read");
+        let ctx = test_ctx(&dir, 1);
+        fake_terminal(&ctx, 6, "", "third screen");
+        fake_frames(
+            &ctx,
+            6,
+            &[(1000, "first screen"), (2000, "second screen"), (3000, "third screen")],
+        );
+
+        // Never read it before: everything retained is unseen, capped at the
+        // small automatic number.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 6})).unwrap()).unwrap();
+        let frames = reply["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 3, "{reply}");
+        assert_eq!(frames[0]["screen"], json!("first screen"), "oldest first");
+        assert_eq!(frames[2]["screen"], json!("third screen"));
+        assert!(reply.get("nothing_new").is_none(), "frames are news: {reply}");
+
+        // Read again with nothing added: no frames, and now genuinely nothing.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 6})).unwrap()).unwrap();
+        assert!(reply.get("frames").is_none(), "{reply}");
+        assert_eq!(reply["nothing_new"], json!(true));
+
+        // The program draws something new: only that comes back.
+        fake_frames(
+            &ctx,
+            6,
+            &[
+                (1000, "first screen"),
+                (2000, "second screen"),
+                (3000, "third screen"),
+                (4000, "fourth screen"),
+            ],
+        );
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 6})).unwrap()).unwrap();
+        let frames = reply["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 1, "{reply}");
+        assert_eq!(frames[0]["screen"], json!("fourth screen"));
+
+        // `full: true` re-reads everything, cursor or no cursor.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 6, "full": true})).unwrap())
+                .unwrap();
+        assert_eq!(reply["frames"].as_array().unwrap().len(), 4, "{reply}");
+
+        // …and `frames` caps it.
+        let reply: Value = serde_json::from_str(
+            &hub_terminal_read(&ctx, &json!({"id": 6, "full": true, "frames": 2})).unwrap(),
+        )
+        .unwrap();
+        let frames = reply["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1]["screen"], json!("fourth screen"), "kept the newest");
+
+        // The frame cursor is per reader, like the others.
+        let other = test_ctx(&dir, 2);
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&other, &json!({"id": 6})).unwrap()).unwrap();
+        assert_eq!(
+            reply["frames"].as_array().unwrap().len(),
+            3,
+            "instance 2 has seen none of them: {reply}"
+        );
+        assert_eq!(reply["more_frames"], json!(1), "and it is told so: {reply}");
+
+        // An ordinary shell has no frames at all and says nothing about them.
+        fake_terminal(&ctx, 7, "some output\n", "$ ");
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 7})).unwrap()).unwrap();
+        assert!(reply.get("frames").is_none(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The frame log is length-prefixed rather than delimiter-separated, because
+    /// the payload is arbitrary screen content: a full-screen program can draw
+    /// the marker itself, and a format that searches for it would split a frame
+    /// in half at the program's whim.
+    #[test]
+    fn a_frame_containing_the_marker_is_still_read_as_one_frame() {
+        let dir = tmpdir("frames-marker");
+        let ctx = test_ctx(&dir, 1);
+        std::fs::create_dir_all(terminals_dir(&ctx)).unwrap();
+        let hostile = "--- MPXF 999 5\nnot a real frame at all";
+        fake_frames(&ctx, 1, &[(1000, hostile), (2000, "after")]);
+        let frames = read_frames(&ctx, 1);
+        assert_eq!(frames.len(), 2, "the drawn marker split a frame");
+        assert_eq!(frames[0].text, hostile);
+        assert_eq!(frames[1].text, "after");
+
+        // A truncated tail (a trim caught mid-write) ends the walk instead of
+        // poisoning the whole read.
+        std::fs::write(
+            terminals_dir(&ctx).join("1.frames"),
+            "--- MPXF 1000 5\nhello--- MPXF 2000 99\nshort",
+        )
+        .unwrap();
+        let frames = read_frames(&ctx, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].text, "hello");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

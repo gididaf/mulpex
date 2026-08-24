@@ -1393,6 +1393,7 @@ impl Core {
         let _ = std::fs::remove_file(crate::pty::spawn_delivery_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(crate::pty::terminal_frames_path(&self.state_dir, id));
         let _ = std::fs::remove_file(terminal_mark_path(&self.state_dir, id));
         // A remote terminal's token and seen-markers go with it: a recycled id
         // must never inherit another terminal's identity.

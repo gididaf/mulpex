@@ -244,6 +244,13 @@ pub fn terminal_screen_path(state_dir: &Path, id: usize) -> PathBuf {
     state_dir.join("terminals").join(format!("{id}.screen"))
 }
 
+/// Timed snapshots of a full-screen program's screen. See `vtgrid::Recorder`
+/// for why a repainting TUI needs its own file: nothing it draws ever scrolls,
+/// so the transcript can hold none of it.
+pub fn terminal_frames_path(state_dir: &Path, id: usize) -> PathBuf {
+    state_dir.join("terminals").join(format!("{id}.frames"))
+}
+
 /// How long to wait for a shell to paint its prompt before typing a seeded
 /// command in anyway. Nothing like `claude`'s cold start — a shell is up in
 /// milliseconds — so this is a backstop, not the expected path.
@@ -528,6 +535,7 @@ impl Session {
             SessionKind::Shell => Some(Arc::new(Mutex::new(Recorder::new(
                 terminal_log_path(&state_dir, id),
                 terminal_screen_path(&state_dir, id),
+                terminal_frames_path(&state_dir, id),
                 rows,
                 cols,
             )?))),

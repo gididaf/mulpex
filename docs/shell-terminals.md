@@ -155,8 +155,38 @@ and a row reaches the log only when it can no longer change.
   which drives a real shell on a real PTY (idle → `sleep 5` → idle → closed), confirmed to fail
   when the comparison is stubbed out, and by `a_read_says_whether_a_command_is_running_and_where`
   for the omit-when-unknown half.
-- **Alt-screen (`?1049h`) is suppressed**, replaced by one `[full-screen program — output
-  omitted]` line. A stray `vim`/`htop` would otherwise evict the whole 1 MB budget.
+- **Alt-screen (`?1049h`) is suppressed** in the *log*, replaced by one note line. A stray
+  `vim`/`htop` would otherwise evict the whole 1 MB budget. Its history lives in the frame log
+  instead — see below.
+- **A full-screen program's history is a stack of screens, not a stream of bytes.** It repaints in
+  place, so nothing it draws ever scrolls and the transcript can hold none of it: measured on the
+  `remote-claude-altscreen.bin` fixture, **zero newlines** in the whole capture. Recording the raw
+  PTY stream would not fix that either — replaying a repaint reproduces the same final frame. So
+  `Recorder` keeps **timed snapshots** in `terminals/<id>.frames` while (and only while) the alt
+  screen is active: at most one a second, identical screens skipped, capped at 1 MB and trimmed to
+  512 KB. A plain shell writes none, because its history already works and a dev server must not
+  cost a megabyte for nothing.
+  - **Records are length-prefixed** (`--- MPXF <ms> <bytes>\n` then exactly that many bytes) and
+    walked from the start, never found by searching for the marker: the payload is arbitrary screen
+    content and a full-screen program can draw the marker itself. Pinned by
+    `a_frame_containing_the_marker_is_still_read_as_one_frame`, which also covers a tail truncated
+    by a trim ending the walk instead of poisoning the read.
+  - **The last frame is taken on the way OUT.** `?1049l` clears the screen, so the program's final
+    state — usually the one a reader wants, since it is where it finished — would be the one frame
+    never recorded. `Screen::last_alt_frame` sets it aside and the recorder picks it up, bypassing
+    the interval throttle; `finish()` does the same for a shell that died inside the program.
+    Confirmed to fail without it.
+  - **Reading:** `hub_terminal_read` returns `frames` (oldest first) **unasked** when the reader has
+    not seen them — the case the field hit, where an instance had no way to know a history existed —
+    and the whole retained set with `full: true`. The per-reader frame cursor is a **third line** on
+    `terminals/cursors/<id>.<instance>`, keyed by **timestamp** rather than a byte offset, because a
+    frame is a whole snapshot and there is no offset to key off. `screen_only_note` was rewritten:
+    it used to say the history was not retrievable, which this makes false.
+  - Pinned by `a_full_screen_program_leaves_its_earlier_screens_in_the_frame_log`,
+    `the_frame_log_is_trimmed_at_a_record_boundary`,
+    `a_full_screen_program_hands_back_the_screens_you_have_not_seen`, and — on the real fixture that
+    originally proved the limitation — `a_real_remote_claude_leaves_a_readable_frame_history`, which
+    asserts a captured frame holds a line the final screen no longer shows.
 - **Partial UTF-8 *and* partial escape sequences carry across chunks.** The reader thread delivers
   arbitrary 8 KB slices; per-chunk `from_utf8_lossy` sprays U+FFFD at every boundary and a
   straddling CSI leaks `[0m` into "stripped" text. Both have tests.

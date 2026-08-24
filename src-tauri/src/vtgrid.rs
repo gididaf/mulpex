@@ -53,7 +53,22 @@ const MAX_LOG: u64 = 1024 * 1024;
 const KEEP_LOG: u64 = 512 * 1024;
 
 /// Placeholder written in place of a full-screen program's output.
-const ALT_SCREEN_NOTE: &str = "[full-screen program — output omitted]";
+const ALT_SCREEN_NOTE: &str =
+    "[full-screen program — repaints in place, so nothing scrolls into this history; \
+read it with hub_terminal_read's frames instead]";
+
+/// Trim the frame log once it passes this…
+const MAX_FRAMES: u64 = 1024 * 1024;
+/// …down to this, cut at a record boundary.
+const KEEP_FRAMES: u64 = 512 * 1024;
+/// Never snapshot the alt screen more often than this. A TUI repaints many times
+/// a second; one frame per second is what a reader can actually use.
+const FRAME_MIN_INTERVAL_MS: u64 = 1000;
+/// Header of one frame record: the marker, the wall-clock ms, and the exact byte
+/// length of the screen text that follows. Length-prefixed rather than
+/// delimiter-separated because the payload is arbitrary screen content and
+/// scanning it for a separator is exactly how that kind of format breaks.
+const FRAME_MARK: &str = "--- MPXF";
 
 /// Rewrite the on-screen snapshot at most this often while output is flowing.
 const SCREEN_THROTTLE_MS: u64 = 120;
@@ -134,6 +149,11 @@ pub struct Screen {
     carry: Vec<u8>,
     /// Lines that have scrolled off, ready for the log.
     pub out: String,
+    /// What the alt screen held at the moment it was left. The screen is cleared
+    /// on the way out, so a full-screen program's LAST state — the one a reader
+    /// most often wants, since it is where the program finished — would otherwise
+    /// be the one frame never recorded. Taken by the `Recorder`.
+    pub last_alt_frame: Option<String>,
 }
 
 impl Screen {
@@ -156,6 +176,7 @@ impl Screen {
             esc_in_str: false,
             carry: Vec::new(),
             out: String::new(),
+            last_alt_frame: None,
         }
     }
 
@@ -529,6 +550,12 @@ impl Screen {
                     }
                     self.suppressed = true;
                 } else {
+                    if self.suppressed {
+                        let text = self.screen_text();
+                        if !text.trim().is_empty() {
+                            self.last_alt_frame = Some(text);
+                        }
+                    }
                     self.suppressed = false;
                     self.clear_all();
                     self.row = 0;
@@ -657,6 +684,35 @@ impl Screen {
     }
 }
 
+/// FNV-1a over a frame's text. Only ever compared with itself, and a collision
+/// costs one skipped frame — never a wrong one.
+fn frame_fingerprint(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Offset of the first frame record at or after `from`. Records are found by
+/// walking from the start rather than by searching for the marker: the marker
+/// is plain text and a full-screen program could perfectly well draw it.
+fn find_frame_start(buf: &[u8], from: usize) -> Option<usize> {
+    let mut at = 0usize;
+    while at < buf.len() {
+        if at >= from {
+            return Some(at);
+        }
+        let rest = &buf[at..];
+        let nl = rest.iter().position(|b| *b == b'\n')?;
+        let header = std::str::from_utf8(&rest[..nl]).ok()?;
+        let len: usize = header.rsplit(' ').next()?.parse().ok()?;
+        at += nl + 1 + len;
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // The on-disk recorder
 // ---------------------------------------------------------------------------
@@ -676,10 +732,29 @@ pub struct Recorder {
     header_written_ms: u64,
     screen_written_ms: u64,
     screen_dirty: bool,
+    /// Frame log for a full-screen program. A repainting TUI moves the cursor
+    /// and overwrites rows in place, so **nothing ever scrolls** and the history
+    /// log can hold none of it — measured on a real remote claude: zero newlines
+    /// in a 3 KB startup, 22 absolute cursor moves. Replaying the raw bytes would
+    /// not help either; it repaints to the same final frame. Keeping timed
+    /// snapshots of the screen is the only thing that recovers what it said two
+    /// minutes ago.
+    frames: Option<File>,
+    frames_len: u64,
+    frame_written_ms: u64,
+    /// Fingerprint of the last frame written, so an unchanged screen is not
+    /// stored once a second forever.
+    last_frame: u64,
 }
 
 impl Recorder {
-    pub fn new(log_path: PathBuf, screen_path: PathBuf, rows: u16, cols: u16) -> io::Result<Self> {
+    pub fn new(
+        log_path: PathBuf,
+        screen_path: PathBuf,
+        frames_path: PathBuf,
+        rows: u16,
+        cols: u16,
+    ) -> io::Result<Self> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -689,6 +764,13 @@ impl Recorder {
             .write(true)
             .truncate(true)
             .open(&log_path)?;
+        let frames = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&frames_path)
+            .ok();
         let mut rec = Self {
             screen: Screen::new(rows, cols),
             file,
@@ -700,6 +782,10 @@ impl Recorder {
             header_written_ms: 0,
             screen_written_ms: 0,
             screen_dirty: true,
+            frames,
+            frames_len: 0,
+            frame_written_ms: 0,
+            last_frame: 0,
         };
         rec.write_header()?;
         rec.write_screen();
@@ -720,6 +806,8 @@ impl Recorder {
         if self.last_out_ms.saturating_sub(self.header_written_ms) >= HEADER_THROTTLE_MS {
             let _ = self.write_header();
         }
+        self.take_final_alt_frame();
+        self.maybe_snapshot(false);
     }
 
     /// Called on a timer so the final chunk of a burst isn't left unpublished
@@ -730,6 +818,7 @@ impl Recorder {
             self.write_screen();
             let _ = self.write_header();
         }
+        self.maybe_snapshot(false);
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -739,6 +828,10 @@ impl Recorder {
 
     /// The shell exited: commit what's still on screen and mark the header.
     pub fn finish(&mut self) {
+        // Dying inside a full-screen program is the same case as leaving one:
+        // take its last frame before the grid is cleared.
+        self.maybe_snapshot(true);
+        self.take_final_alt_frame();
         self.screen.flush_visible();
         let out = std::mem::take(&mut self.screen.out);
         if !out.is_empty() {
@@ -783,6 +876,96 @@ impl Recorder {
         // Header LAST: a reader that saw the old base now sees a new one and
         // knows to retry, rather than trusting a stale offset into moved data.
         self.write_header()
+    }
+
+    /// Record the frame `Screen` set aside when a full-screen program exited.
+    /// It is already gone from the grid by the time we see it, so this bypasses
+    /// the interval throttle — it is the last thing that program ever showed.
+    fn take_final_alt_frame(&mut self) {
+        let Some(text) = self.screen.last_alt_frame.take() else {
+            return;
+        };
+        if self.frames.is_none() {
+            return;
+        }
+        let mark = frame_fingerprint(&text);
+        if mark == self.last_frame {
+            return;
+        }
+        self.last_frame = mark;
+        self.frame_written_ms = now_ms();
+        let _ = self.append_frame(self.frame_written_ms, &text);
+    }
+
+    /// Store the current screen as a frame, if it is worth storing.
+    ///
+    /// Only while a full-screen program is drawing (`suppressed`) — an ordinary
+    /// shell scrolls, so its history is already in the log and a second copy
+    /// would cost a dev server a megabyte for nothing. `force` is for the moment
+    /// the program EXITS: the alt screen is cleared on the way out, so its last
+    /// contents have to be taken before that happens or the end of the session
+    /// is the one part never recorded.
+    fn maybe_snapshot(&mut self, force: bool) {
+        if !self.screen.suppressed || self.frames.is_none() {
+            return;
+        }
+        let now = now_ms();
+        if !force && now.saturating_sub(self.frame_written_ms) < FRAME_MIN_INTERVAL_MS {
+            return;
+        }
+        let text = self.screen.screen_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        let mark = frame_fingerprint(&text);
+        if mark == self.last_frame {
+            // The screen has not changed; a spinner that repainted the same
+            // characters is not a new frame.
+            self.frame_written_ms = now;
+            return;
+        }
+        self.last_frame = mark;
+        self.frame_written_ms = now;
+        let _ = self.append_frame(now, &text);
+    }
+
+    fn append_frame(&mut self, at_ms: u64, text: &str) -> io::Result<()> {
+        let record = format!("{FRAME_MARK} {at_ms} {}\n{text}", text.len());
+        {
+            let Some(file) = self.frames.as_mut() else {
+                return Ok(());
+            };
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(record.as_bytes())?;
+            file.flush()?;
+        }
+        self.frames_len += record.len() as u64;
+        if self.frames_len > MAX_FRAMES {
+            self.trim_frames()?;
+        }
+        Ok(())
+    }
+
+    /// Drop whole records off the front. Cutting mid-record would leave a length
+    /// header describing bytes that are no longer there, which a reader cannot
+    /// recover from — so the cut always lands on a record boundary, and if none
+    /// can be found the log is simply started over.
+    fn trim_frames(&mut self) -> io::Result<()> {
+        let Some(file) = self.frames.as_mut() else {
+            return Ok(());
+        };
+        let mut buf = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut buf)?;
+        let keep_from = buf.len().saturating_sub(KEEP_FRAMES as usize);
+        let cut = find_frame_start(&buf, keep_from).unwrap_or(buf.len());
+        let kept = &buf[cut..];
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(kept)?;
+        file.set_len(kept.len() as u64)?;
+        file.flush()?;
+        self.frames_len = kept.len() as u64;
+        Ok(())
     }
 
     fn write_header(&mut self) -> io::Result<()> {
@@ -1073,14 +1256,14 @@ mod tests {
 
     // -- recorder / log file ------------------------------------------------
 
-    fn tmpdir(name: &str) -> PathBuf {
+    pub(super) fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mulpex-vtgrid-test-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn read_log(path: &Path) -> (u64, bool, String) {
+    pub(super) fn read_log(path: &Path) -> (u64, bool, String) {
         let raw = std::fs::read(path).unwrap();
         // Parsed the same way the MCP helper parses it, so this exercises the
         // shared format rather than a test-local copy of it.
@@ -1094,7 +1277,7 @@ mod tests {
         let dir = tmpdir("basic");
         let log = dir.join("1.log");
         let screen = dir.join("1.screen");
-        let mut rec = Recorder::new(log.clone(), screen.clone(), 3, 20).unwrap();
+        let mut rec = Recorder::new(log.clone(), screen.clone(), dir.join("1.frames"), 3, 20).unwrap();
         rec.push(b"one\r\ntwo\r\nthree\r\nfour\r\n");
         rec.settle();
 
@@ -1110,11 +1293,141 @@ mod tests {
         assert_eq!(data, "one\ntwo\nthree\nfour\n");
     }
 
+    /// Read a frame log back the way `mcp::read_frames` does.
+    pub(super) fn read_frames(path: &Path) -> Vec<(u64, String)> {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut rest = raw.as_str();
+        while let Some(nl) = rest.find('\n') {
+            let mut parts = rest[..nl].rsplit(' ');
+            let len: usize = parts.next().unwrap().parse().unwrap();
+            let at: u64 = parts.next().unwrap().parse().unwrap();
+            let body = &rest[nl + 1..];
+            out.push((at, body[..len].to_string()));
+            rest = &body[len..];
+        }
+        out
+    }
+
+    /// A full-screen program repaints in place, so **nothing it draws scrolls**
+    /// and the history log can hold none of it — that is the limitation the
+    /// frame log exists to remove. Replaying the raw bytes would not have helped:
+    /// a repaint replays to the same final frame.
+    #[test]
+    fn a_full_screen_program_leaves_its_earlier_screens_in_the_frame_log() {
+        let dir = tmpdir("frames");
+        let frames = dir.join("3.frames");
+        let mut rec =
+            Recorder::new(dir.join("3.log"), dir.join("3.screen"), frames.clone(), 3, 20).unwrap();
+
+        // Enter the alt screen and draw something.
+        rec.push(b"\x1b[?1049h\x1b[H first answer ");
+        rec.settle();
+        assert_eq!(read_frames(&frames).len(), 1, "the first screen was not kept");
+
+        // Repaint the SAME content: not a new frame.
+        rec.frame_written_ms = 0;
+        rec.push(b"\x1b[H first answer ");
+        rec.settle();
+        assert_eq!(
+            read_frames(&frames).len(),
+            1,
+            "an unchanged screen was stored again"
+        );
+
+        // Repaint with different content, but within the interval: throttled.
+        rec.push(b"\x1b[H second answer");
+        rec.settle();
+        assert_eq!(
+            read_frames(&frames).len(),
+            1,
+            "the one-per-second throttle did not hold"
+        );
+
+        // Past the interval, it is kept.
+        rec.frame_written_ms = 0;
+        rec.push(b"\x1b[H second answer");
+        rec.settle();
+        let kept = read_frames(&frames);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].1.contains("first answer"), "{kept:?}");
+        assert!(kept[1].1.contains("second answer"), "{kept:?}");
+
+        // The history log still holds none of it — this is what `frames` is for.
+        let (_, _, data) = read_log(&dir.join("3.log"));
+        assert!(!data.contains("first answer"), "{data:?}");
+        assert!(data.contains(ALT_SCREEN_NOTE));
+
+        // Leaving the alt screen clears it, so its LAST state has to be taken on
+        // the way out or it is the one frame never recorded.
+        rec.push(b"\x1b[H the very last thing\x1b[?1049l");
+        rec.settle();
+        let kept = read_frames(&frames);
+        assert_eq!(kept.len(), 3, "the final frame was lost: {kept:?}");
+        assert!(kept[2].1.contains("the very last thing"), "{kept:?}");
+
+        // An ordinary scrolling shell writes no frames at all — its history
+        // already works, and a dev server must not cost a megabyte for nothing.
+        let before = std::fs::metadata(&frames).unwrap().len();
+        for i in 0..50 {
+            rec.push(format!("plain line {i}\r\n").as_bytes());
+        }
+        rec.settle();
+        assert_eq!(
+            std::fs::metadata(&frames).unwrap().len(),
+            before,
+            "a plain shell grew the frame log"
+        );
+        let (_, _, data) = read_log(&dir.join("3.log"));
+        assert!(data.contains("plain line 0"), "the log stopped working");
+    }
+
+    /// The frame log is capped like the transcript is, and the cut lands on a
+    /// record boundary: a partial record would leave a length header describing
+    /// bytes that are no longer there, which a reader cannot recover from.
+    #[test]
+    fn the_frame_log_is_trimmed_at_a_record_boundary() {
+        let dir = tmpdir("frames-trim");
+        let frames = dir.join("4.frames");
+        let mut rec = Recorder::new(
+            dir.join("4.log"),
+            dir.join("4.screen"),
+            frames.clone(),
+            24,
+            200,
+        )
+        .unwrap();
+        rec.push(b"\x1b[?1049h");
+        // Each frame is a full-width line, so ~6000 of them comfortably passes
+        // the 1 MB ceiling and forces several trims.
+        let pad = "x".repeat(170);
+        for i in 0..6000 {
+            rec.frame_written_ms = 0;
+            rec.push(format!("\x1b[H |f{i}| {pad}").as_bytes());
+        }
+        rec.settle();
+
+        let size = std::fs::metadata(&frames).unwrap().len();
+        assert!(size <= MAX_FRAMES, "frame log ran away: {size}");
+        assert!(size > 0, "everything was trimmed");
+        let kept = read_frames(&frames);
+        assert!(kept.len() > 1, "expected several frames to survive");
+        // Parsed cleanly from the very first byte — the proof the cut was on a
+        // boundary — and it is the RECENT frames that survived.
+        assert!(kept.last().unwrap().1.contains("|f5999|"), "{:?}", kept.last());
+        assert!(
+            !kept.iter().any(|(_, t)| t.contains("|f0|")),
+            "the oldest frames were kept instead of the newest"
+        );
+    }
+
     #[test]
     fn trim_advances_base_and_keeps_writing_to_the_same_file() {
         let dir = tmpdir("trim");
         let log = dir.join("2.log");
-        let mut rec = Recorder::new(log.clone(), dir.join("2.screen"), 2, 80).unwrap();
+        let mut rec = Recorder::new(log.clone(), dir.join("2.screen"), dir.join("2.frames"), 2, 80).unwrap();
 
         // ~2 MB of numbered lines, well past MAX_LOG.
         let line = |i: usize| format!("line {i:060}");
@@ -1235,7 +1548,61 @@ mod remote_claude_replays {
         (s.out.clone(), screen)
     }
 
-    /// NOTE: this fixture is Claude Code **v2.1.223**, which rendered inline.
+    /// The fixture that proved the limitation now proves the fix: a REAL
+    /// alt-screen remote claude (v2.1.226 over ssh, zero newlines in the whole
+    /// capture) fed through a real `Recorder`, chunked exactly as the reader
+    /// thread delivers it.
+    ///
+    /// The log gets nothing but the note — nothing scrolled, so there is nothing
+    /// for it to get. The frames are the entire history, and they hold text the
+    /// final screen no longer shows.
+    #[test]
+    fn a_real_remote_claude_leaves_a_readable_frame_history() {
+        let raw = include_bytes!("../tests/fixtures/remote-claude-altscreen.bin");
+        let dir = super::tests::tmpdir("frames-remote");
+        let frames_path = dir.join("9.frames");
+        let mut rec = Recorder::new(
+            dir.join("9.log"),
+            dir.join("9.screen"),
+            frames_path.clone(),
+            20,
+            100,
+        )
+        .unwrap();
+        // Small chunks, because that is how this arrives over ssh — and because a
+        // whole capture handed over at once is a single repaint, which is exactly
+        // the thing that has no history.
+        for chunk in raw.chunks(256) {
+            // The throttle is wall-clock; a replay runs in microseconds, so beat
+            // it down deliberately — this is about what gets captured, not when.
+            rec.frame_written_ms = 0;
+            rec.push(chunk);
+        }
+        rec.settle();
+
+        let frames = super::tests::read_frames(&frames_path);
+        assert!(frames.len() > 1, "only {} frame(s) captured", frames.len());
+        let final_screen = std::fs::read_to_string(dir.join("9.screen")).unwrap();
+        let history: String = frames.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            history.contains("ticket-system") || history.contains("Claude Code"),
+            "the frame history is not legible: {history:?}"
+        );
+        // The point of the whole feature: something that was on screen earlier
+        // and is not on it now is still retrievable.
+        let earlier = frames
+            .iter()
+            .any(|(_, t)| t.lines().any(|l| !l.trim().is_empty() && !final_screen.contains(l.trim())));
+        assert!(
+            earlier,
+            "every captured frame is still visible on the final screen — nothing was recovered"
+        );
+        // …and the log still holds none of it, which is why frames exist.
+        let (_, _, log) = super::tests::read_log(&dir.join("9.log"));
+        assert!(log.contains(ALT_SCREEN_NOTE), "{log:?}");
+    }
+
+    /// NOTE: this fixture is Claude Code **v2.1.223**    /// NOTE: this fixture is Claude Code **v2.1.223**, which rendered inline.
     /// v2.1.226 moved to the alternate screen, so the absence of `?1049h` here
     /// is a fact about this recording, NOT a property of remote claudes — it
     /// was briefly relied on as the latter, and the feature shipped blind
