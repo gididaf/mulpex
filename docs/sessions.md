@@ -109,6 +109,55 @@ The fix is that `Stop` is the only hook that can see the truth, so it records it
 - A task entry with **no** `status` counts as running. The failure that matters is calling a busy
   instance idle, so the unknown case errs toward quiet.
 
+### ...and a watcher is not work either — Mulpex's own listener broke all of this
+
+The fix above then broke the thing it was protecting, everywhere. `HUB_RULES` tells **every**
+instance to arm a persistent Monitor on its inbox (["INCOMING MESSAGES"](hub.md), `pty.rs`), and
+that Monitor is a `while true … sleep 1` loop that never ends. It arrives in `Stop`'s
+`background_tasks` like any other task, so `background_work_running` was **permanently true**:
+every instance in every project ended every turn `working`, `bg/<id>` was never cleared, and
+because `working` is exactly what suppresses the idle notification, `needs` could never be
+written again. No red dot, no tab badge, no dock badge, no banner — for anyone. Reported from the
+field as a pane sitting idle at its prompt under *"Baked for 4m 0s · 1 monitor still running"*;
+confirmed on the live scratch dir, where `bg/` held a flag for **all 14** instances of one project
+and `registry.json` reported every instance in every project as `working`.
+
+A persistent Monitor is a **watcher**, not work in flight — the same judgement `session_crons`
+already gets. But it cannot be recognised at `Stop`. Measured (real `claude` v2.1.241,
+`scratchpad/monprobe`), it reaches the `Stop` hook as
+
+```json
+{"id":"bo013hsts","type":"shell","status":"running","description":"Mulpex hub inbox","command":"while true; do sleep 1; done"}
+```
+
+— **`type: "shell"`, no `persistent` field**: byte-for-byte the shape of a `run_in_background`
+shell, which must keep counting. The one event that does know is `PostToolUse`, whose payload for
+that same call carries `tool_input.persistent: true` and `tool_response.taskId` — the id that
+later appears in `background_tasks`.
+
+So `posttooluse` records it: a persistent Monitor's task id is appended to `monitors/<id>` (one
+per line, deduped), and `background_work_running` subtracts those ids. Consequences worth keeping:
+
+- **A one-shot Monitor still counts.** `persistent: false` is never recorded, so an instance
+  genuinely waiting on a Monitor is still `working`.
+- **Real work alongside the listener still counts** — the exclusion is per task id, not a
+  whole-payload verdict.
+- **`SessionStart` for `startup`/`resume`/`clear` clears the list.** Those Monitors died with the
+  previous session; keeping their ids would let them excuse a *new* session's tasks.
+- **`posttooluse` only parses its stdin when the raw text contains `Monitor`.** That hook forks on
+  every tool call and a `PostToolUse` payload carries the whole `tool_response` (a big Read, a long
+  Bash output); the substring scan keeps the common path a memchr rather than a full serde parse.
+- **An instance that armed its listener before the fix shipped stays `working` until it re-arms** —
+  its task id was never recorded. It self-heals at the next app launch, since the scratch dir is
+  per-run, `armed/<id>` is therefore absent, and the arm nudge fires again.
+
+Pinned by `the_hub_listener_is_a_watcher_not_work_in_flight` (confirmed to fail with the
+subtraction removed, on *"an instance idle at its prompt with only its hub listener running is NOT
+working"*), then driven through the real `mulpex-helper` binary: Stop before recording →
+`working`; PostToolUse[Monitor persistent] → `monitors/7`; the same Stop → `waiting` and the `bg`
+flag gone; idle_prompt → `needs`; a real background shell beside the listener → `working` and it
+stays `working` through the idle notification; SessionStart[resume] → the list is gone.
+
 ### Compaction is work too
 
 Same shape, different silence. `/compact` **fires no `UserPromptSubmit`** — it is a local command,
