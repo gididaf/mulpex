@@ -239,7 +239,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_terminal_read",
-            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content (which may not have scrolled into the history yet — a dev server sitting at a steady screen produces no new history at all), how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling.",
+            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content, how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling. IMPORTANT: an empty `new_output` does NOT mean nothing happened. Output enters the history only once it scrolls off the top of the screen, so a short command's output is on `current_screen` and nowhere else. Judge by `screen_changed` (did the screen move since YOUR last read) and `nothing_new` (present and true only when genuinely nothing changed) — never by `new_output` alone.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -873,20 +873,59 @@ fn mark_path(ctx: &Ctx, id: usize) -> PathBuf {
 }
 
 /// This instance's saved read position in terminal `id`, if it has read before.
+/// A reader's cursor file is two lines: the log offset it has consumed, and a
+/// fingerprint of the screen it last saw (see `screen_mark_of`). The second line
+/// is absent for a reader that has only ever been written by an older build.
 fn cursor_of(ctx: &Ctx, id: usize) -> Option<u64> {
     std::fs::read_to_string(cursor_path(ctx, id))
         .ok()?
+        .lines()
+        .next()?
         .trim()
         .parse()
         .ok()
 }
 
-fn set_cursor(ctx: &Ctx, id: usize, at: u64) {
+/// The fingerprint of the screen this reader saw last time. `None` means it has
+/// never read this terminal — which is NOT the same as "the screen was empty",
+/// and the two produce different answers for `screen_changed`.
+fn screen_mark_of(ctx: &Ctx, id: usize) -> Option<u64> {
+    std::fs::read_to_string(cursor_path(ctx, id))
+        .ok()?
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `screen_mark: None` writes the offset alone, leaving this reader with no
+/// remembered screen — which is what "you have never looked at this terminal"
+/// means, and what the two seeding call sites want.
+fn set_cursor(ctx: &Ctx, id: usize, at: u64, screen_mark: Option<u64>) {
     let path = cursor_path(ctx, id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, at.to_string());
+    let body = match screen_mark {
+        Some(m) => format!("{at}\n{m}"),
+        None => at.to_string(),
+    };
+    let _ = std::fs::write(path, body);
+}
+
+/// FNV-1a over the screen text. Hand-rolled rather than `DefaultHasher` because
+/// this value is written to disk by one process and compared by another: it has
+/// to mean the same thing in both, and `DefaultHasher`'s algorithm is explicitly
+/// not guaranteed stable. Collisions cost a missed `screen_changed`, never a
+/// wrong read.
+fn screen_fingerprint(screen: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in screen.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// A consistent view of one terminal's transcript.
@@ -1063,7 +1102,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // A terminal you opened is one whose entire life you should see.
             // A terminal the USER opened already has a history that is theirs,
             // so its cursor is left where it is.
-            set_cursor(ctx, id, 0);
+            set_cursor(ctx, id, 0, None);
             id
         }
     };
@@ -1278,7 +1317,7 @@ fn hub_terminal_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
 
     // Start this instance's cursor at the very beginning: a terminal you opened
     // yourself is one whose entire life you should see on your first read.
-    set_cursor(ctx, id, 0);
+    set_cursor(ctx, id, 0, None);
     match mark {
         Some(mark) => {
             let _ = std::fs::write(mark_path(ctx, id), mark.to_string());
@@ -1751,10 +1790,31 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
         None => screen,
     };
 
+    // An empty `new_output` is ambiguous and used to be unanswerable. A row
+    // reaches the history log only when it SCROLLS OFF the top (see
+    // `vtgrid.rs`), so a short command whose output is still on screen produces
+    // no history at all — `new_output: ""` then reads exactly like "nothing
+    // happened". Reported from the field on the very first read of a terminal
+    // that had just run `echo test`, with `test` plainly visible on
+    // `current_screen`. Silence and success must not look the same, so the two
+    // are now named: `screen_changed` says the screen moved since YOUR last read
+    // (per reader, like the cursor), and `nothing_new` says nothing did.
+    let mark = screen_fingerprint(&screen);
+    let screen_changed = match screen_mark_of(ctx, id) {
+        Some(seen) => seen != mark,
+        // Never read this terminal: whatever is on screen is new to you.
+        None => !screen.trim().is_empty(),
+    };
+    // A finished command and a remote's signal are news in their own right, even
+    // when the text they arrived with is empty — never call those "nothing".
+    let nothing_new =
+        text.trim().is_empty() && !screen_changed && finished.is_none() && signal.is_none();
+
     // A wait that timed out with nothing new must not consume anything: the
-    // caller should be able to retry and still see it.
+    // caller should be able to retry and still see it — the screen mark included,
+    // or the retry would report an unchanged screen it never showed anyone.
     if !(timed_out && text.trim().is_empty()) {
-        set_cursor(ctx, id, view.total);
+        set_cursor(ctx, id, view.total, Some(mark));
     }
 
     let mut out = json!({
@@ -1764,8 +1824,12 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
         "current_screen": screen,
         "idle_ms": view.idle_ms,
         "running": view.running,
+        "screen_changed": screen_changed,
     });
     let map = out.as_object_mut().unwrap();
+    if nothing_new {
+        map.insert("nothing_new".into(), json!(true));
+    }
     if let Some(code) = finished {
         map.insert("command_finished".into(), json!(true));
         map.insert("exit_code".into(), json!(code));
@@ -2641,6 +2705,113 @@ mod tests {
             );
         }
         assert!(reply["new_output"].as_str().unwrap().contains("I need a decision."));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug the field hit on its FIRST read of a terminal: `echo test` had
+    /// run, `test` was plainly on `current_screen`, and `new_output` was `""`.
+    /// A row reaches the history only when it scrolls off the top, so a short
+    /// command produces no history at all — and silence then looks exactly like
+    /// success. `screen_changed` / `nothing_new` are what tell the two apart.
+    #[test]
+    fn an_empty_new_output_says_whether_anything_actually_happened() {
+        let dir = tmpdir("screen-changed");
+        let ctx = test_ctx(&dir, 1);
+        // Nothing has scrolled; the whole story is on screen.
+        fake_terminal(&ctx, 1, "", "$ echo test\ntest\n$ ");
+
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["new_output"], json!(""));
+        assert_eq!(
+            reply["screen_changed"],
+            json!(true),
+            "the first read of a terminal with something on screen must say so"
+        );
+        assert!(reply.get("nothing_new").is_none(), "{reply}");
+
+        // Read again with nothing at all having happened.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["screen_changed"], json!(false));
+        assert_eq!(reply["nothing_new"], json!(true));
+
+        // The screen moves: no new history, but this is emphatically not nothing.
+        fake_terminal(&ctx, 1, "", "$ echo test\ntest\n$ date\nMon\n$ ");
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["new_output"], json!(""));
+        assert_eq!(reply["screen_changed"], json!(true));
+        assert!(reply.get("nothing_new").is_none(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mark is per READER, exactly like the cursor — one instance reading a
+    /// terminal must not make another instance's next read look unchanged.
+    #[test]
+    fn the_screen_mark_is_per_reader() {
+        let dir = tmpdir("screen-mark-reader");
+        let one = test_ctx(&dir, 1);
+        let two = test_ctx(&dir, 2);
+        fake_terminal(&one, 1, "", "$ echo test\ntest\n$ ");
+
+        let a: Value =
+            serde_json::from_str(&hub_terminal_read(&one, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(a["screen_changed"], json!(true));
+        let b: Value =
+            serde_json::from_str(&hub_terminal_read(&two, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(
+            b["screen_changed"],
+            json!(true),
+            "instance 2 had never looked at this terminal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty screen that stays empty is the one case where `new_output: ""`
+    /// really does mean nothing happened — and a terminal nobody has ever read
+    /// must not claim its blank screen is news.
+    #[test]
+    fn a_blank_screen_is_not_reported_as_a_change() {
+        let dir = tmpdir("screen-blank");
+        let ctx = test_ctx(&dir, 1);
+        fake_terminal(&ctx, 1, "", "   \n\n");
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["screen_changed"], json!(false));
+        assert_eq!(reply["nothing_new"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timed-out wait consumes nothing, and that has to include the screen
+    /// mark: recording a screen the caller was never shown would make the retry
+    /// report an unchanged screen and lose the output for good.
+    #[test]
+    fn a_timed_out_wait_does_not_swallow_the_screen_either() {
+        let dir = tmpdir("screen-timeout");
+        let ctx = test_ctx(&dir, 1);
+        // A tracked command that never prints its marker: the wait is for
+        // completion, and it will time out.
+        fake_terminal(&ctx, 1, "", "$ sleep 30\n");
+        std::fs::write(mark_path(&ctx, 1), "7").unwrap();
+
+        let reply: Value = serde_json::from_str(
+            &hub_terminal_read(&ctx, &json!({"id": 1, "wait_ms": 300})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["timed_out"], json!(true));
+        assert_eq!(reply["screen_changed"], json!(true));
+
+        // The retry still sees it, because nothing was consumed.
+        let reply: Value = serde_json::from_str(
+            &hub_terminal_read(&ctx, &json!({"id": 1, "wait_ms": 300})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply["screen_changed"],
+            json!(true),
+            "the timed-out read recorded a screen it never handed over"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

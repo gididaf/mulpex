@@ -111,6 +111,22 @@ and a row reaches the log only when it can no longer change.
   so a dev server sitting at a steady screen produces no history at all. That is why there is a
   second file (`<id>.screen`, temp+rename) and why `hub_terminal_read` returns both `new_output`
   (history since your cursor) and `current_screen` (re-sent every read, labelled as live).
+- **…and that made `new_output: ""` ambiguous, which bit in the field.** An instance's very first
+  read of a terminal that had just run `echo test` came back with an empty `new_output` while
+  `test` sat plainly on `current_screen` — the line never scrolled, so it never entered the log.
+  Silence and success looked identical, which is the classic shape of a bug here. Two flags now
+  name the difference: **`screen_changed`** (did the screen move since *your* last read) and
+  **`nothing_new`** (present only when genuinely nothing did). The screen fingerprint lives on a
+  second line of the reader's own cursor file (`terminals/cursors/<id>.<instance>`), so it is
+  per-reader exactly like the offset — one instance reading a terminal cannot make another's next
+  read look unchanged. It is FNV-1a rather than `DefaultHasher` because one process writes it and
+  another compares it, and `DefaultHasher`'s algorithm is explicitly not guaranteed stable.
+  A finished command and a remote's signal suppress `nothing_new` even when the text they arrived
+  with is empty, and a timed-out wait leaves the mark alone for the same reason it leaves the
+  cursor alone. Pinned by `an_empty_new_output_says_whether_anything_actually_happened`,
+  `the_screen_mark_is_per_reader`, `a_blank_screen_is_not_reported_as_a_change` and
+  `a_timed_out_wait_does_not_swallow_the_screen_either`; replayed against the real
+  `mulpex-helper mcp` by `scratchpad/drive_screenflags.py`.
 - **Alt-screen (`?1049h`) is suppressed**, replaced by one `[full-screen program — output
   omitted]` line. A stray `vim`/`htop` would otherwise evict the whole 1 MB budget.
 - **Partial UTF-8 *and* partial escape sequences carry across chunks.** The reader thread delivers
