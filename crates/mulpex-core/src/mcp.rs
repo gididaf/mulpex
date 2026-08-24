@@ -239,7 +239,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_terminal_read",
-            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content, how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling. IMPORTANT: an empty `new_output` does NOT mean nothing happened. Output enters the history only once it scrolls off the top of the screen, so a short command's output is on `current_screen` and nowhere else. Judge by `screen_changed` (did the screen move since YOUR last read) and `nothing_new` (present and true only when genuinely nothing changed) — never by `new_output` alone.",
+            "description": "Read a terminal's output. By default returns only what is NEW since YOUR last read of that terminal, so you can follow a long-running command by calling this repeatedly without re-reading everything. Also returns the terminal's current on-screen content, how long it has been idle, whether it is still running, and — if you submitted a command with hub_terminal_send — whether that command has finished and its exit code. Use `wait_ms` to block until there is something new instead of polling. IMPORTANT: an empty `new_output` does NOT mean nothing happened. Output enters the history only once it scrolls off the top of the screen, so a short command's output is on `current_screen` and nowhere else. Judge by `screen_changed` (did the screen move since YOUR last read) and `nothing_new` (present and true only when genuinely nothing changed) — never by `new_output` alone. `running` means the SHELL is alive; `command_running` means something is actually executing in it right now, and `cwd` is where the shell is sitting — both are omitted when Mulpex could not read them, so an absent field means unknown, not no.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -362,6 +362,28 @@ fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
         .collect()
 }
 
+/// What each terminal is *doing*, as the app last observed it: whether a
+/// foreground command is running, and the shell's cwd. Written by the poll loop
+/// (`state.rs::sync_terminal_meta`) because the helper is a separate process. A
+/// terminal absent from this map is one whose state could not be read — the
+/// fields are then omitted rather than guessed, so "not known" never arrives
+/// disguised as "no".
+fn terminal_meta(ctx: &Ctx, id: usize) -> Option<Value> {
+    let raw = std::fs::read_to_string(terminals_dir(ctx).join("meta")).ok()?;
+    let all: Value = serde_json::from_str(&raw).ok()?;
+    all.get(id.to_string())?.clone().into()
+}
+
+/// Copy `command_running` / `cwd` into a reply, when they are known.
+fn add_terminal_meta(ctx: &Ctx, id: usize, map: &mut serde_json::Map<String, Value>) {
+    let Some(meta) = terminal_meta(ctx, id) else { return };
+    for key in ["command_running", "cwd"] {
+        if let Some(v) = meta.get(key) {
+            map.insert(key.into(), v.clone());
+        }
+    }
+}
+
 /// The project's terminals, from the manifest Mulpex maintains, each with how
 /// much output is waiting for *this* reader.
 fn terminal_list(ctx: &Ctx) -> Vec<Value> {
@@ -378,12 +400,14 @@ fn terminal_list(ctx: &Ctx) -> Vec<Value> {
             let unread = LogView::open(ctx, id)
                 .map(|v| v.total.saturating_sub(cursor_of(ctx, id).unwrap_or(0)))
                 .unwrap_or(0);
-            Some(json!({
+            let mut entry = json!({
                 "id": id,
                 "running": state == "running",
                 "name": if label.is_empty() { Value::Null } else { json!(label) },
                 "new_output_bytes": unread,
-            }))
+            });
+            add_terminal_meta(ctx, id, entry.as_object_mut().unwrap());
+            Some(entry)
         })
         .collect()
 }
@@ -1827,6 +1851,9 @@ fn hub_terminal_read(ctx: &Ctx, args: &Value) -> Result<String, String> {
         "screen_changed": screen_changed,
     });
     let map = out.as_object_mut().unwrap();
+    // `running` says the SHELL is alive; `command_running` says something is
+    // actually executing in it. Both are absent-if-unknown rather than guessed.
+    add_terminal_meta(ctx, id, map);
     if nothing_new {
         map.insert("nothing_new".into(), json!(true));
     }
@@ -2743,6 +2770,57 @@ mod tests {
         assert_eq!(reply["new_output"], json!(""));
         assert_eq!(reply["screen_changed"], json!(true));
         assert!(reply.get("nothing_new").is_none(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `running` only ever meant "the shell process is alive", which is not the
+    /// question — a shell at its prompt and a shell three minutes into a build
+    /// both report it. `command_running` and `cwd` answer the real one, and an
+    /// unreadable terminal omits them rather than guessing: "not known" must
+    /// never arrive disguised as "no".
+    #[test]
+    fn a_read_says_whether_a_command_is_running_and_where() {
+        let dir = tmpdir("term-meta");
+        let ctx = test_ctx(&dir, 1);
+        fake_terminal(&ctx, 1, "", "$ ");
+        fake_terminal(&ctx, 2, "", "$ ");
+
+        // No manifest at all: nothing is invented.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["running"], json!(true), "the shell is still alive");
+        assert!(reply.get("command_running").is_none(), "{reply}");
+        assert!(reply.get("cwd").is_none(), "{reply}");
+
+        std::fs::write(
+            terminals_dir(&ctx).join("meta"),
+            r#"{"1":{"command_running":true,"cwd":"/Users/x/cloud"}}"#,
+        )
+        .unwrap();
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 1})).unwrap()).unwrap();
+        assert_eq!(reply["command_running"], json!(true));
+        assert_eq!(reply["cwd"], json!("/Users/x/cloud"));
+        assert_eq!(reply["running"], json!(true), "`running` keeps its meaning");
+
+        // A terminal missing from the manifest still says nothing about itself.
+        let reply: Value =
+            serde_json::from_str(&hub_terminal_read(&ctx, &json!({"id": 2})).unwrap()).unwrap();
+        assert!(reply.get("command_running").is_none(), "{reply}");
+
+        // hub_instances carries the same facts, so an instance does not have to
+        // read every terminal to see which one is busy.
+        std::fs::write(
+            terminals_dir(&ctx).join("index"),
+            "1\trunning\tdev server\n2\trunning\t\n",
+        )
+        .unwrap();
+        let list = terminal_list(&ctx);
+        let first = list.iter().find(|t| t["id"] == json!(1)).unwrap();
+        assert_eq!(first["command_running"], json!(true));
+        assert_eq!(first["cwd"], json!("/Users/x/cloud"));
+        let second = list.iter().find(|t| t["id"] == json!(2)).unwrap();
+        assert!(second.get("cwd").is_none(), "{second}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

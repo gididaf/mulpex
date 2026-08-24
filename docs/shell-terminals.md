@@ -127,6 +127,24 @@ and a row reaches the log only when it can no longer change.
   `the_screen_mark_is_per_reader`, `a_blank_screen_is_not_reported_as_a_change` and
   `a_timed_out_wait_does_not_swallow_the_screen_either`; replayed against the real
   `mulpex-helper mcp` by `scratchpad/drive_screenflags.py`.
+- **`running` is not "busy" — `command_running` is.** `running` says the shell process is alive,
+  which is equally true at an idle prompt and three minutes into a build. Mulpex tracks the
+  commands *it* submits by completion marker, but nothing the user types by hand is tracked, so for
+  a terminal the user is driving there was no way to tell the two apart. The answer comes from the
+  kernel rather than from parsing the screen: an interactive shell puts each job in its own process
+  group and hands the tty to it, so the tty's foreground group (`e_tpgid`) differing from the
+  shell's own (`pbi_pgid`) **is** a foreground command running. Both come out of the
+  `proc_bsdinfo` the tty sweep already reads; `cwd` is a second `proc_pidinfo` call
+  (`PROC_PIDVNODEPATHINFO`). macOS-only, `None` elsewhere — and `None` is reported by **omitting**
+  the fields, never by sending `false`, so "not known" cannot arrive disguised as "no".
+  The poll loop publishes them to `terminals/meta` (`state.rs::sync_terminal_meta`, written only on
+  change) because the MCP helper is a separate process. **One JSON file rather than a fourth column
+  on the index line** — that line is parsed `splitn(3, '\t')` with the label last, so a fourth field
+  would be swallowed by the label, and a path is exactly the kind of value that smuggles a
+  separator in. Pinned by `a_terminal_reports_whether_a_command_is_running_and_where_it_sits`,
+  which drives a real shell on a real PTY (idle → `sleep 5` → idle → closed), confirmed to fail
+  when the comparison is stubbed out, and by `a_read_says_whether_a_command_is_running_and_where`
+  for the omit-when-unknown half.
 - **Alt-screen (`?1049h`) is suppressed**, replaced by one `[full-screen program — output
   omitted]` line. A stray `vim`/`htop` would otherwise evict the whole 1 MB budget.
 - **Partial UTF-8 *and* partial escape sequences carry across chunks.** The reader thread delivers

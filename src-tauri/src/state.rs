@@ -308,6 +308,9 @@ pub struct Core {
     /// Last content written to `terminals/index`, so the poll loop can refresh
     /// it on change without a disk write every tick.
     terminal_index: String,
+    /// Last-written `terminals/meta`, so the 200 ms poll rewrites it only when a
+    /// terminal actually starts or finishes a command, or changes directory.
+    terminal_meta: String,
     /// The size this project's PTYs run at (cols, rows). Every spawn uses it, so
     /// a session created now matches the xterm the frontend is about to build for
     /// it; `resize_all` keeps it current. Seeded from `Workspace::geometry`.
@@ -521,6 +524,7 @@ impl Core {
             failed: HashMap::new(),
             sticky,
             terminal_index: String::new(),
+            terminal_meta: String::new(),
             geometry,
             pending_spawns: VecDeque::new(),
             last_spawn_at: None,
@@ -1759,11 +1763,39 @@ impl Core {
                 .unwrap_or_default();
             out.push_str(&format!("{}\t{}\t{}\n", s.id, state, label));
         }
-        if out == self.terminal_index {
+        if out != self.terminal_index {
+            let _ = std::fs::write(self.state_dir.join("terminals").join("index"), &out);
+            self.terminal_index = out;
+        }
+        self.sync_terminal_meta();
+    }
+
+    /// Publish what each live terminal is *doing* — is a foreground command
+    /// running, and the shell's cwd — for the MCP helper, which is a separate
+    /// process and can only learn this from disk.
+    ///
+    /// One JSON file rather than a column on the index line: that line is parsed
+    /// `splitn(3, '\t')` with the label last, so a fourth field would be read as
+    /// part of the label, and a path is exactly the kind of value that would
+    /// smuggle a separator in. A terminal whose state cannot be read is simply
+    /// absent — the reader must be able to tell "not known" from "no".
+    fn sync_terminal_meta(&mut self) {
+        let mut map = serde_json::Map::new();
+        for s in self.sessions.iter().filter(|s| s.is_shell()) {
+            let Some(state) = s.shell_state() else { continue };
+            let mut entry = serde_json::Map::new();
+            entry.insert("command_running".into(), serde_json::json!(state.command_running));
+            if let Some(cwd) = state.cwd {
+                entry.insert("cwd".into(), serde_json::json!(cwd));
+            }
+            map.insert(s.id.to_string(), serde_json::Value::Object(entry));
+        }
+        let out = serde_json::Value::Object(map).to_string();
+        if out == self.terminal_meta {
             return;
         }
-        let _ = std::fs::write(self.state_dir.join("terminals").join("index"), &out);
-        self.terminal_index = out;
+        let _ = std::fs::write(self.state_dir.join("terminals").join("meta"), &out);
+        self.terminal_meta = out;
     }
 
     /// Deterministic teardown: kill every session's process group, then remove
@@ -2985,6 +3017,82 @@ mod tests {
         assert!(
             !zombies.starts_with('Z'),
             "left a zombie: ps stat = {zombies:?}"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `running: true` on a terminal only ever meant "the shell process is
+    /// alive" — true at an idle prompt and true three minutes into a build, so a
+    /// reader could not tell the two apart for a terminal the USER was driving
+    /// (Mulpex tracks its own submissions by completion marker; nothing typed by
+    /// hand is tracked).
+    ///
+    /// The answer comes from the kernel, not from parsing the screen: an
+    /// interactive shell puts each job in its own process group and hands the
+    /// tty to it, so the tty's foreground group (`e_tpgid`) differing from the
+    /// shell's own (`pbi_pgid`) IS a command running. Driven here against a real
+    /// shell on a real PTY, because that disagreement is the entire claim.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_terminal_reports_whether_a_command_is_running_and_where_it_sits() {
+        let (_env, root, mut core) = scratch_core("term-fg-test");
+        let info = core.spawn_terminal(None, None, true).unwrap();
+        let meta_path = core.state_dir.join("terminals").join("meta");
+        let state_now = |core: &mut Core| -> Option<serde_json::Value> {
+            core.sync_terminal_index();
+            let raw = std::fs::read_to_string(&meta_path).ok()?;
+            let all: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            all.get(info.id.to_string()).cloned()
+        };
+
+        // The shell has to be up and at its prompt before any of this means
+        // anything: a shell that has not yet claimed the tty reports nothing.
+        assert!(
+            wait_until(|| state_now(&mut core).is_some()),
+            "the terminal never reported its state"
+        );
+        assert!(
+            wait_until(|| state_now(&mut core)
+                .map(|m| m["command_running"] == serde_json::json!(false))
+                .unwrap_or(false)),
+            "an idle prompt was reported as running a command: {:?}",
+            state_now(&mut core)
+        );
+        // cwd is the project the terminal was opened in. Compare canonically:
+        // the scratch root is under /var, which is a symlink to /private/var.
+        let want = std::fs::canonicalize(&core.project_dir).unwrap();
+        let got = state_now(&mut core).unwrap()["cwd"].as_str().unwrap().to_string();
+        assert_eq!(std::fs::canonicalize(&got).unwrap(), want, "wrong cwd: {got}");
+
+        // Now run something slow in the foreground.
+        core.sessions
+            .iter_mut()
+            .find(|s| s.id == info.id)
+            .unwrap()
+            .send(b"sleep 5\r");
+        assert!(
+            wait_until(|| state_now(&mut core)
+                .map(|m| m["command_running"] == serde_json::json!(true))
+                .unwrap_or(false)),
+            "a foreground `sleep 5` was reported as an idle prompt"
+        );
+
+        // …and it goes back to false on its own when the command ends.
+        assert!(
+            wait_until(|| state_now(&mut core)
+                .map(|m| m["command_running"] == serde_json::json!(false))
+                .unwrap_or(false)),
+            "the terminal never came back to its prompt"
+        );
+
+        // A dead terminal reports nothing rather than a stale yes/no.
+        core.close(info.id);
+        assert!(wait_until(|| core.reap_dead() == vec![info.id]));
+        assert!(
+            wait_until(|| state_now(&mut core).is_none()),
+            "a closed terminal is still claiming a state"
         );
 
         core.teardown();

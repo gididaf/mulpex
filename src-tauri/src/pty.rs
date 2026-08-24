@@ -836,6 +836,17 @@ impl Session {
         self.alive.load(Ordering::Relaxed)
     }
 
+    /// What this terminal is doing: is a foreground command running, and where
+    /// is the shell sitting. `None` for a claude, for a dead session, and on any
+    /// platform without the probe — a reader must be able to tell "not known"
+    /// from "no", so nothing is invented here.
+    pub fn shell_state(&self) -> Option<ShellState> {
+        if !self.is_shell() || !self.is_alive() {
+            return None;
+        }
+        shell_state_of(self.child_pid?)
+    }
+
     /// Write a line of Mulpex's own text into this session's pane.
     ///
     /// The pane is an xterm fed only by the PTY, so text the *app* wants to say
@@ -942,6 +953,83 @@ impl Session {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// What a shell terminal is doing right now, as far as the kernel knows.
+///
+/// `running` on a terminal only ever meant "the shell process is alive", which
+/// is not the question a reader usually has — a shell sitting at its prompt and
+/// a shell three minutes into a build are both `running: true`, and from the
+/// transcript alone the two are indistinguishable for a terminal the *user* is
+/// driving (a command Mulpex submitted itself is tracked by its completion
+/// marker, but nothing typed by hand is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellState {
+    /// A foreground command is running in this terminal.
+    pub command_running: bool,
+    /// The shell's own working directory. Unaffected by a foreground job, which
+    /// cannot change it.
+    pub cwd: Option<String>,
+}
+
+/// Ask the kernel what `pid`'s shell is doing. macOS-only, `None` elsewhere —
+/// the same shape as the tty sweep, and `None` means "not known", never "no".
+#[cfg(target_os = "macos")]
+fn shell_state_of(pid: libc::pid_t) -> Option<ShellState> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // `e_tpgid` is the process group the tty currently has in the FOREGROUND;
+    // `pbi_pgid` is the shell's own. An interactive shell puts every job it runs
+    // into a process group of its own and hands the terminal to it, so the two
+    // differing IS a foreground command running — no heuristics, no parsing the
+    // prompt. A shell with no controlling terminal reports 0, which is not a
+    // disagreement worth reporting.
+    let command_running = info.e_tpgid != 0 && info.e_tpgid != info.pbi_pgid;
+    Some(ShellState {
+        command_running,
+        cwd: cwd_of(pid),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shell_state_of(_pid: libc::pid_t) -> Option<ShellState> {
+    None
+}
+
+/// `pid`'s current working directory.
+#[cfg(target_os = "macos")]
+fn cwd_of(pid: libc::pid_t) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // `vip_path` is a flat NUL-terminated buffer that `libc` declares as nested
+    // arrays to keep an old rustc happy; read it as the C string it is.
+    let raw = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    let path = raw.to_str().ok()?;
+    (!path.is_empty()).then(|| path.to_owned())
 }
 
 /// The device number of `pid`'s controlling terminal, or `None` if it has none
