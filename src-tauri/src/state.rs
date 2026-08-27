@@ -247,6 +247,9 @@ pub struct Core {
     pub next_id: usize,
     pub state_dir: PathBuf,
     pub settings_path: PathBuf,
+    /// Absolute path to the `mulpex-helper` sidecar, kept so `ensure_state_dir`
+    /// can rewrite the config files before every spawn (see `write_state_dir`).
+    helper_path: PathBuf,
     pub store: SessionStore,
     /// Custom per-instance names (id → name), persisted alongside session ids.
     pub names: HashMap<usize, String>,
@@ -370,6 +373,55 @@ struct PendingSpawn {
     ids: Vec<usize>,
 }
 
+/// Lay out (or repair) a project's scratch dir: the `--settings` / `--mcp-config`
+/// files every `claude` is spawned with, plus the subdirectories the hub writes
+/// into.
+///
+/// Idempotent, and called before **every** spawn rather than only at open,
+/// because the scratch root lives in `$TMPDIR` and macOS deletes anything there
+/// it has not seen touched in 3 days (`com.apple.bsd.dirhelper`,
+/// `CLEAN_FILES_OLDER_THAN_DAYS=3`, daily at 03:35). `settings.json` and
+/// `mcp.json` were the only write-once files in the tree — everything else is
+/// rewritten by the 200 ms poll or re-created by the hook binary — so in a
+/// Mulpex left open past three days they, and only they, were purged. Running
+/// instances kept working (both files are read once, at spawn); every new ⌘T
+/// died instantly with `Error: Settings file not found: …`. Reported from a
+/// v0.8 session that had been open since Aug 23.
+fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let helper = helper_path.to_string_lossy();
+    std::fs::write(
+        state_dir.join("settings.json"),
+        HOOK_SETTINGS_JSON.replace("__MULPEX_BIN__", &helper),
+    )?;
+    std::fs::write(
+        state_dir.join("mcp.json"),
+        MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &helper),
+    )?;
+    // Every name here contains no bare integer at the top level, which is what
+    // keeps `mcp::live_ids`' integer-filename scan from mistaking one for an
+    // instance status file.
+    for sub in [
+        "locks",
+        "history",
+        "tasks",
+        "inbox",
+        "waiting",
+        "bg",
+        "compacting",
+        "spawn",
+        "armed",
+        mulpex_core::NAMED_DIR,
+        mulpex_core::NAMEREQ_DIR,
+        "terminals",
+        "terminals/cursors",
+        "termreq",
+    ] {
+        std::fs::create_dir_all(state_dir.join(sub))?;
+    }
+    Ok(())
+}
+
 impl Core {
     /// Open `project_dir` under its own isolated `state_dir` (so its hub is scoped
     /// to just this project): create the scratch dir, write the `--settings` /
@@ -384,38 +436,8 @@ impl Core {
         state_dir: PathBuf,
         geometry: (u16, u16),
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&state_dir)?;
         let settings_path = state_dir.join("settings.json");
-        let helper = helper_path.to_string_lossy();
-        std::fs::write(
-            &settings_path,
-            HOOK_SETTINGS_JSON.replace("__MULPEX_BIN__", &helper),
-        )?;
-        std::fs::write(
-            state_dir.join("mcp.json"),
-            MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &helper),
-        )?;
-        // Every name here contains no bare integer at the top level, which is what
-        // keeps `mcp::live_ids`' integer-filename scan from mistaking one for an
-        // instance status file.
-        for sub in [
-            "locks",
-            "history",
-            "tasks",
-            "inbox",
-            "waiting",
-            "bg",
-            "compacting",
-            "spawn",
-            "armed",
-            mulpex_core::NAMED_DIR,
-            mulpex_core::NAMEREQ_DIR,
-            "terminals",
-            "terminals/cursors",
-            "termreq",
-        ] {
-            std::fs::create_dir_all(state_dir.join(sub))?;
-        }
+        write_state_dir(&state_dir, helper_path)?;
 
         let store = SessionStore::new(&project_dir);
         let mut sessions: Vec<Session> = Vec::new();
@@ -509,6 +531,7 @@ impl Core {
             next_id,
             state_dir,
             settings_path,
+            helper_path: helper_path.to_path_buf(),
             store,
             // A name that survived a restart is treated as the user's, so the
             // instance is neither nudged to rename itself nor allowed to.
@@ -617,6 +640,18 @@ impl Core {
         Ok(info)
     }
 
+    /// Re-lay the scratch dir before a spawn, repairing whatever macOS purged
+    /// out from under a long-running Mulpex. See `write_state_dir` for why this
+    /// runs on every spawn and not just at open.
+    pub fn ensure_state_dir(&self) -> anyhow::Result<()> {
+        write_state_dir(&self.state_dir, &self.helper_path).map_err(|e| {
+            anyhow::anyhow!(
+                "could not write Mulpex's scratch dir at {}: {e}",
+                self.state_dir.display()
+            )
+        })
+    }
+
     /// Shared spawn path: allocate an id, spawn the session (optionally with an
     /// initial task), append it, optionally focus it, and republish the peer list.
     fn spawn_with(
@@ -632,6 +667,7 @@ impl Core {
         if let Some(reason) = pty::dir_access_error(&self.project_dir) {
             anyhow::bail!(reason);
         }
+        self.ensure_state_dir()?;
         let id = self.next_id;
         let session_id = persist::new_uuid();
         let session = Session::spawn(
@@ -680,6 +716,7 @@ impl Core {
         label: Option<String>,
         focus: bool,
     ) -> anyhow::Result<SessionInfo> {
+        self.ensure_state_dir()?;
         let id = self.next_id;
         let session = Session::spawn(
             id,
@@ -2167,6 +2204,49 @@ mod tests {
             core.sessions.len()
         );
         assert_eq!(core.next_id, 1, "first ⌘T should hand out instance id 1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// macOS purges `$TMPDIR` files it has not seen touched in 3 days, and
+    /// `settings.json` / `mcp.json` were the only write-once files in the scratch
+    /// tree — so a Mulpex left open over a long weekend lost exactly the two files
+    /// `claude` is spawned with, and every new ⌘T died with
+    /// `Error: Settings file not found`. Every spawn now re-lays the dir first.
+    #[test]
+    fn a_purged_scratch_dir_is_rebuilt_before_a_spawn() {
+        let _env = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-open-test-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("HOME", root.join("home"));
+
+        let helper = Path::new("/nonexistent/mulpex-helper");
+        let state_dir = root.join("state");
+        let core = Core::open(1, project_dir, helper, state_dir.clone(), TEST_GEOMETRY).unwrap();
+
+        // What dirhelper did: delete the untouched files, and a subdir with them.
+        std::fs::remove_file(state_dir.join("settings.json")).unwrap();
+        std::fs::remove_file(state_dir.join("mcp.json")).unwrap();
+        std::fs::remove_dir_all(state_dir.join("inbox")).unwrap();
+        assert!(!core.settings_path.exists());
+
+        core.ensure_state_dir().expect("repair should succeed");
+
+        let settings = std::fs::read_to_string(&core.settings_path)
+            .expect("settings.json must be back — `claude --settings` reads it at spawn");
+        let mcp = std::fs::read_to_string(state_dir.join("mcp.json")).unwrap();
+        assert!(state_dir.join("inbox").is_dir(), "hub subdirs must be back");
+        // Rebuilt from the templates, not left with a stale `__MULPEX_BIN__`.
+        assert!(settings.contains(&helper.display().to_string()));
+        assert!(mcp.contains(&helper.display().to_string()));
+        assert!(!settings.contains("__MULPEX_BIN__"));
+        assert!(!mcp.contains("__MULPEX_BIN__"));
+
+        // The whole tree gone (not just its files) is the same repair.
+        std::fs::remove_dir_all(&state_dir).unwrap();
+        core.ensure_state_dir().expect("repair should recreate the root too");
+        assert!(core.settings_path.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

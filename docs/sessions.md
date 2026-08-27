@@ -204,6 +204,47 @@ the capability and `sendNotification` is simply denied at runtime; the badge (a 
 keeps working, so the failure looks like "notifications are flaky", not "notifications are off".
 Same allowlist shape as `lib.rs::is_forwarded` for menu ids.
 
+## The scratch dir is rebuilt before every spawn
+
+Reported from the field on v0.8: a Mulpex that had been open since Aug 23 started failing **every**
+new ⌘T on Aug 27, in several projects at once, with
+
+```
+Error: Settings file not found: /var/folders/…/T/mulpex-86054/2/settings.json
+```
+
+while the instances already running kept working perfectly.
+
+`Core::open` wrote `settings.json` and `mcp.json` into `$TMPDIR/mulpex-<pid>/<handle>/` **once**,
+and nothing ever touched them again. macOS deletes anything in the per-user temp dir it has not
+seen touched in three days — `/System/Library/LaunchDaemons/com.apple.bsd.dirhelper.plist`,
+`CLEAN_FILES_OLDER_THAN_DAYS = 3`, run daily at 03:35. Those two were the **only write-once files
+in the whole tree**: the status and instance files are rewritten by the 200 ms poll, and every hub
+subdirectory is `create_dir_all`ed by the writer that needs it (`hook.rs`, `mcp.rs`). So the purge
+took exactly the two files that matter and left everything else looking healthy.
+
+Running instances survived because `--settings` / `--mcp-config` are read **once, at spawn**. That
+split is what made it read as "Mulpex broke overnight" rather than "a file is missing": nothing in
+the UI changed, and only the next ⌘T failed. Quitting and relaunching fixed it (new pid → new
+scratch dir → files rewritten), which is why it looked intermittent.
+
+`write_state_dir` now owns the layout and `Core::ensure_state_dir` calls it before **every** spawn,
+claude and terminal alike (`spawn_with`, `spawn_terminal`). It is idempotent — two small writes plus
+a few `create_dir_all`s — and re-creates the state dir itself, so it repairs a partially purged tree
+and a fully deleted one. Guarded by `a_purged_scratch_dir_is_rebuilt_before_a_spawn`.
+
+Two things worth carrying:
+
+- **A hand-repair puts the wrong path in.** The user's coworker had a `claude` rebuild the files
+  from the templates and substituted `__MULPEX_BIN__` with `~/.local/bin/mulpex` — the *deprecated
+  TUI* binary, not the app's `mulpex-helper` sidecar. `claude` then started fine, so the fix looked
+  complete, while hooks and the MCP hub were pointed at the wrong program (and an unreachable
+  helper **fails open silently** — see [packaging.md](packaging.md)). The unconditional rewrite
+  corrects that on the next spawn.
+- **This is the "write-once file in a scratch dir" shape, not a one-off.** Anything new that gets
+  written to `state_dir` once at open and read later has the same three-day fuse. Put it in
+  `write_state_dir`.
+
 ## A session that failed to start is kept, not reaped
 
 The general form of the TCC bug ([packaging.md](packaging.md)): any instance that dies before it

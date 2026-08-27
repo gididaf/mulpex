@@ -85,8 +85,10 @@ must be tiny and fast to exec. It links only `mulpex-core` (~1.8 MB vs the ~29 M
 
 **Path resolution** (`lib.rs::resolve_helper_path`): `current_exe().parent().join("mulpex-helper")`
 — works in `tauri dev` (`target/<profile>/`) and in the bundled `.app` (`Contents/MacOS/`). The
-absolute path is substituted for `__MULPEX_BIN__` in the config templates when a project opens
-(`state.rs::Core::open`).
+absolute path is substituted for `__MULPEX_BIN__` in the config templates **before every spawn**,
+not just when a project opens (`state.rs::write_state_dir`) — the scratch dir lives in `$TMPDIR`
+and macOS purges it out from under a long-running Mulpex. See
+[docs/sessions.md](docs/sessions.md#the-scratch-dir-is-rebuilt-before-every-spawn).
 
 Bundling it as a **signed sidecar** is what keeps hooks working in the shipped `.app` — an unsigned
 helper is SIGKILLed by Gatekeeper and **every hook then fails open silently**. Details in
