@@ -25,7 +25,7 @@ reasoning in `docs/`.
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); failed starts; stable instance numbers; failed restores | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + task delivery | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
-| [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript, `hub_terminal_*`, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, terminal MCP tools |
+| [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
@@ -51,7 +51,8 @@ src-tauri/            the Tauri app (Rust backend)
   src/pty.rs          Session = one claude OR one shell on a PTY (SessionKind), streaming
                       to a frontend Channel
   src/vtgrid.rs       shell terminals only: a small VT grid → plain-text transcript on
-                      disk, so a claude in another process can read a terminal's output
+                      disk (+ timed screen frames while a full-screen program is up),
+                      so a claude in another process can read a terminal's output
   src/state.rs        Workspace = N open projects (Vec<Core> + active handle + the ONE
                       geometry every PTY spawns at); each Core = one project + sessions
                       + its OWN scratch dir; reap/persist/hub-read
@@ -292,4 +293,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`1bb57fa70d556bea4f266ca77af7a5385408a112` — 2026-08-22
+`276659e5ca6b2dbaa0bb06e3394d4a177dc9eea2` — 2026-08-27
