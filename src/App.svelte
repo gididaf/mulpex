@@ -20,12 +20,15 @@
     closeSession,
     focusSession,
     getHubSnapshot,
+    getExplains,
     sendBytes,
     setSessionMuted,
     setMuteMenuChecked,
     type BootstrapInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
+    type ExplainUpdateEvent,
+    type ExplainPendingEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
     type ProjectHandle,
@@ -38,6 +41,7 @@
     sessions,
     activeId,
     showMessages,
+    showExplainer,
     showPalette,
     rename,
     addProject,
@@ -47,6 +51,10 @@
     setSessionsFor,
     setSessionMutedLocal,
     applyHubFor,
+    applyExplainFor,
+    setExplainsFor,
+    setExplainPendingFor,
+    removeExplainsFor,
     displayOrder,
     flashNotice,
     reorderProjects as reorderProjectsLocal,
@@ -65,6 +73,7 @@
   import InstanceList from "./lib/components/InstanceList.svelte";
   import HubPanel from "./lib/components/HubPanel.svelte";
   import TerminalPane from "./lib/components/TerminalPane.svelte";
+  import ExplainerPanel from "./lib/components/ExplainerPanel.svelte";
   import MessageReader from "./lib/components/MessageReader.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
@@ -85,12 +94,17 @@
       sessions: info.sessions,
       statuses: new Map(),
       tasks: new Map(),
+      explains: new Map(),
+      explainPending: new Set(),
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,
     });
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle);
     if (snap) applyHubFor(info.handle, snap);
+    // The Explainer feed is push-only after this; the fetch covers what the
+    // workers produced before this webview existed (dev hot-reload, mostly).
+    setExplainsFor(info.handle, await getExplains(info.handle));
     if (makeActive) selectProject(info.handle);
   }
 
@@ -512,6 +526,9 @@
       case "messages":
         showMessages.update((v) => !v);
         break;
+      case "explainer":
+        showExplainer.update((v) => !v);
+        break;
       case "minimize":
         // Custom item (muda hard-binds the predefined one to ⌘M, which is Mute).
         await getCurrentWindow().minimize();
@@ -574,9 +591,18 @@
       listen<HubUpdateEvent>("hub-update", (e) =>
         applyHubFor(e.payload.handle, e.payload.snapshot),
       ),
-      listen<SessionExitedEvent>("session-exited", (e) =>
-        terminals.dispose(e.payload.handle, e.payload.id),
+      listen<ExplainUpdateEvent>("explain-update", (e) =>
+        applyExplainFor(e.payload.handle, e.payload.id, e.payload.entry),
       ),
+      listen<ExplainPendingEvent>("explain-pending", (e) =>
+        setExplainPendingFor(e.payload.handle, e.payload.id, e.payload.active),
+      ),
+      listen<SessionExitedEvent>("session-exited", (e) => {
+        terminals.dispose(e.payload.handle, e.payload.id);
+        // The backend forgets the feed on reap; mirror it so a reused id can't
+        // resurrect a dead instance's explanations.
+        removeExplainsFor(e.payload.handle, e.payload.id);
+      }),
       listen<SessionsChangedEvent>("sessions-changed", async (e) => {
         const { handle, sessions: list } = e.payload;
         setSessionsFor(handle, list);
@@ -657,7 +683,7 @@
 <svelte:window onkeydown={onGlobalKey} />
 
 {#if ready && $project}
-  <div class="shell">
+  <div class="shell" class:with-explainer={$showExplainer}>
     <ProjectTabBar
       onselect={selectProject}
       onclose={closeProjectHandle}
@@ -678,6 +704,9 @@
     <main class="pane">
       <TerminalPane />
     </main>
+    {#if $showExplainer}
+      <ExplainerPanel />
+    {/if}
     <BottomBar />
   </div>
   {#if $showPalette}
@@ -737,6 +766,17 @@
       "side pane"
       "bottom bottom";
     height: 100%;
+  }
+  /* The Explainer is a real third column: the pane narrows, its ResizeObserver
+     refits, and every PTY workspace-wide follows (one geometry — the same class
+     of resize as dragging the window edge). */
+  .shell.with-explainer {
+    grid-template-columns: var(--sidebar-w) 1fr var(--explainer-w);
+    grid-template-areas:
+      "tabs tabs tabs"
+      "top top top"
+      "side pane explain"
+      "bottom bottom bottom";
   }
   .sidebar {
     grid-area: side;

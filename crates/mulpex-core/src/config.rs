@@ -11,8 +11,11 @@
 /// hooks for both the status dots and the file-locking coordinator.
 ///
 /// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
-/// `PreToolUse[AskUserQuestion]` → needs; `Stop` → waiting (via the helper, which
-/// also releases locks); the `permission_prompt`/`idle_prompt` notifications →
+/// `PreToolUse[AskUserQuestion]` → needs (via `<helper> hook askq`, which also
+/// hands the pending questions to the Explainer — it replaced a bare `printf
+/// needs` when the Explainer needed the payload); `Stop` → waiting (via the
+/// helper, which also releases locks); the `permission_prompt`/`idle_prompt`
+/// notifications →
 /// needs, via the helper rather than a bare `printf` because `idle_prompt` fires
 /// 60 s after every turn end *even when a background agent the instance launched
 /// is still running* — see `hook::notification`. `PreCompact` → working and
@@ -34,7 +37,7 @@ pub const HOOK_SETTINGS_JSON: &str = r#"{
       { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook posttooluse" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "printf needs > \"$MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID\"" } ] },
+      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook askq" } ] },
       { "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse", "timeout": 280 } ] },
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse" } ] }
     ],

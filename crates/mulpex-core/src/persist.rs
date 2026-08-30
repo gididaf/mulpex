@@ -75,10 +75,7 @@ impl SessionStore {
     /// of the path plus a stable FNV-1a hash of the full path, so it is unique
     /// per project, bounded in length, and stable across Mulpex rebuilds.
     pub fn new(project_dir: &Path) -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = home.join(".mulpex").join("sessions");
+        let dir = crate::mulpex_home().join("sessions");
 
         let raw = project_dir.to_string_lossy();
         let sanitized: String = raw

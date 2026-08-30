@@ -92,10 +92,36 @@ export interface ClaudeStatus {
   searched_path: string;
 }
 
+/** One Explainer feed item: the short Hebrew explanation of one finished turn.
+ *  `ok: false` marks a summarizer failure (the text says so — rendered dim).
+ *  Mirrors `snapshot.rs::ExplainEntry` (no codegen; keep in sync). */
+export interface ExplainEntry {
+  id: number;
+  /** Unix epoch milliseconds. */
+  ts: number;
+  text: string;
+  ok: boolean;
+  /** "turn" explains a finished turn; "question" explains a pending
+   *  AskUserQuestion (what's being asked + what each option means). */
+  kind: "turn" | "question";
+}
+
 // Scoped event payloads (mirror snapshot.rs).
 export interface HubUpdateEvent {
   handle: ProjectHandle;
   snapshot: HubSnapshot;
+}
+export interface ExplainUpdateEvent {
+  handle: ProjectHandle;
+  id: number;
+  entry: ExplainEntry;
+}
+/** Fires on transitions only: the Explainer started (active) or finished
+ *  (summary, failure, or skip — all end it) working on instance `id`. */
+export interface ExplainPendingEvent {
+  handle: ProjectHandle;
+  id: number;
+  active: boolean;
 }
 export interface SessionsChangedEvent {
   handle: ProjectHandle;
@@ -188,6 +214,12 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
+
+/** A project's whole Explainer feed, for the initial paint (thereafter pushed
+ *  per entry via the `explain-update` event). Entries carry their instance id;
+ *  the store groups them. */
+export const getExplains = (projectHandle: ProjectHandle) =>
+  invoke<ExplainEntry[]>("get_explains", { projectHandle });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the

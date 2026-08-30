@@ -68,6 +68,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str).unwrap_or("") {
         "pretooluse" => pretooluse(&ctx),
         "posttooluse" => posttooluse(&ctx),
+        "askq" => askq(&ctx),
         "stop" => stop(&ctx),
         "notification" => notification(&ctx),
         "precompact" => precompact(&ctx),
@@ -489,6 +490,11 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // The turn is really ending; reset the nudge high-water mark to the current
     // (now-read, usually 0) count so the next message re-nudges cleanly.
     let _ = std::fs::write(notified_marker(ctx), unread.to_string());
+    // Hand the finished turn to the Explainer. Placed after the mail block above
+    // on purpose: a blocked stop is a continuing turn, and writing here twice
+    // would explain the same turn twice. The summarizer itself must never run in
+    // this hook — a Stop hook blocks the claude's turn end.
+    write_explain_request(ctx, payload.as_ref());
     // Preserve the sidebar status the old `printf waiting` Stop hook produced —
     // unless work this instance started is still running, in which case the turn
     // ended but the instance did not, and `waiting` (a green "ready" dot, and 60 s
@@ -496,6 +502,59 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     let status = if busy { "working" } else { "waiting" };
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), status);
     Ok(())
+}
+
+/// `PreToolUse[AskUserQuestion]`: the instance stopped to ask the user
+/// something. Writes the `needs` status word (this handler replaced the inline
+/// `printf needs` matcher, and must keep doing its job) and hands the pending
+/// questions — the payload's `tool_input`, which carries the `questions` array
+/// with options — to the Explainer via `explainq/<id>`, so the panel can
+/// explain what is being asked while the question sits on screen. A payload
+/// without questions still gets its status write and nothing else.
+fn askq(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "needs");
+    write_question_request(ctx, serde_json::from_str(&input).ok().as_ref());
+    Ok(())
+}
+
+/// The Explainer half of `askq`: hand the payload's `tool_input` (the
+/// `questions` array with options) to the app via `explainq/<id>`. A payload
+/// without a questions array writes nothing.
+fn write_question_request(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let Some(tool_input) = payload
+        .and_then(|j| j.get("tool_input"))
+        .filter(|t| t.get("questions").is_some_and(|q| q.is_array()))
+    else {
+        return;
+    };
+    let file = crate::question_request_path(&ctx.state_dir, ctx.instance);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, tool_input.to_string());
+}
+
+/// Record where this turn's transcript lives, for the Explainer. The `Stop`
+/// payload carries `transcript_path` (measured on a real session, 2026-08-30;
+/// the field is on every hook event per Claude Code's hook contract). The app's
+/// poll loop consumes `explainreq/<id>` and summarizes the turn off-process. A
+/// payload without the field writes nothing — that turn simply gets no
+/// explanation, which is better than guessing at the transcript's location.
+fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let Some(path) = payload
+        .and_then(|j| j.get("transcript_path"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let file = crate::explain_request_path(&ctx.state_dir, ctx.instance);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, path);
 }
 
 /// Does this `Stop` payload say work the instance started is still running?
@@ -1215,6 +1274,65 @@ mod tests {
         assert!(background_work_running(
             &ctx, payload(r#"{"background_tasks":[{"id":"x"}]}"#).as_ref()
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Stop` payload as measured 2026-08-30 (probe0): `transcript_path` is
+    /// present alongside the fields the mail/background logic already uses.
+    const STOP_WITH_TRANSCRIPT: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "session_id":"3562192c-a1ad-48c3-a94c-94b6e742499c",
+        "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
+        "background_tasks":[],"session_crons":[]}"#;
+
+    /// The Explainer request must mirror exactly what the payload says — and say
+    /// nothing when the payload doesn't. A missing or empty `transcript_path`
+    /// writes no file (that turn gets no explanation; better than a guessed path).
+    #[test]
+    fn a_finished_turn_hands_its_transcript_to_the_explainer() {
+        let dir = std::env::temp_dir().join(format!("mulpex-explain-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 3);
+
+        write_explain_request(&ctx, payload(STOP_WITH_TRANSCRIPT).as_ref());
+        let req = crate::explain_request_path(&ctx.state_dir, 3);
+        assert_eq!(
+            std::fs::read_to_string(&req).unwrap(),
+            "/Users/x/.claude/projects/-p/3562192c.jsonl"
+        );
+
+        // A second turn overwrites — latest-wins is the coalescing contract.
+        let redone = STOP_WITH_TRANSCRIPT.replace("3562192c.jsonl", "later.jsonl");
+        write_explain_request(&ctx, payload(&redone).as_ref());
+        assert!(std::fs::read_to_string(&req).unwrap().ends_with("later.jsonl"));
+
+        let _ = std::fs::remove_file(&req);
+        write_explain_request(&ctx, payload(STOP_IDLE).as_ref());
+        assert!(!req.exists(), "no transcript_path in the payload → no request file");
+        write_explain_request(&ctx, payload(r#"{"transcript_path":""}"#).as_ref());
+        assert!(!req.exists(), "an empty transcript_path is not a path");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pending AskUserQuestion reaches the Explainer as the tool_input JSON;
+    /// a payload with no questions array writes nothing (the status word is
+    /// askq's other, separate job).
+    #[test]
+    fn a_pending_question_reaches_the_explainer() {
+        let dir = std::env::temp_dir().join(format!("mulpex-askq-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 4);
+        let req = crate::question_request_path(&ctx.state_dir, 4);
+
+        let pretool = r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
+            "tool_input":{"questions":[{"question":"Which way?","header":"Way",
+            "options":[{"label":"A","description":"first"}],"multiSelect":false}]}}"#;
+        write_question_request(&ctx, payload(pretool).as_ref());
+        let written = std::fs::read_to_string(&req).unwrap();
+        assert!(written.contains(r#""question":"Which way?""#));
+
+        let _ = std::fs::remove_file(&req);
+        write_question_request(&ctx, payload(r#"{"tool_input":{"plan":"x"}}"#).as_ref());
+        assert!(!req.exists(), "no questions array → no request file");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

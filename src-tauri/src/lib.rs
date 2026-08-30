@@ -3,6 +3,7 @@
 
 mod claude_bin;
 mod commands;
+mod explainer;
 mod hub;
 mod menu;
 mod project;
@@ -43,6 +44,7 @@ fn is_forwarded(id: &str) -> bool {
             | "rename"
             | "mute"
             | "messages"
+            | "explainer"
             | "minimize"
             | "next"
             | "prev"
@@ -94,6 +96,7 @@ pub fn run() {
             commands::resize_terminals,
             commands::focus_session,
             commands::get_hub_snapshot,
+            commands::get_explains,
             commands::restart_app,
         ])
         .setup(|app| {

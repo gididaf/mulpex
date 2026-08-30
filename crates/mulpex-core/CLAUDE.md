@@ -18,7 +18,7 @@ Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `compacting/`, `armed/`,
-  `named/`, `namenudge/`, `spawning/`, `monitors/`, like `peers/` already does.
+  `named/`, `namenudge/`, `spawning/`, `monitors/`, `explainreq/`, like `peers/` already does.
 - **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>]]]`). Only
   *trailing* empties may be dropped, or the id is read back as the name.
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that

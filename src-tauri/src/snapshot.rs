@@ -187,6 +187,50 @@ pub struct ClaudeStatus {
     pub searched_path: String,
 }
 
+/// What an Explainer entry explains: a finished turn, or a pending
+/// `AskUserQuestion` (what the claude is asking right now and what each option
+/// means). The panel styles questions distinctly.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExplainKind {
+    Turn,
+    Question,
+}
+
+/// One Explainer feed item: the short Hebrew explanation of one finished turn
+/// of one instance. `ok: false` marks a summarizer failure — the text then says
+/// so instead of pretending (never round ignorance up to an explanation).
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ExplainEntry {
+    pub id: usize,
+    /// Unix epoch milliseconds of when the explanation was produced.
+    pub ts: u64,
+    pub text: String,
+    pub ok: bool,
+    pub kind: ExplainKind,
+}
+
+/// `explain-pending` event payload: whether the Explainer is currently working
+/// on `id` (a job queued or running). Emitted only on transitions (idle→busy,
+/// busy→idle), so the frontend just mirrors a boolean per instance.
+#[derive(Clone, Serialize)]
+pub struct ExplainPending {
+    pub handle: ProjectHandle,
+    pub id: usize,
+    pub active: bool,
+}
+
+/// `explain-update` event payload: one new entry for one instance's feed.
+/// Deliberately NOT part of `HubSnapshot` — a growing feed would inflate the
+/// 200 ms PartialEq compare and re-emit its whole history on every new entry,
+/// and the worker that produced the entry already knows exactly what changed.
+#[derive(Clone, Serialize)]
+pub struct ExplainUpdate {
+    pub handle: ProjectHandle,
+    pub id: usize,
+    pub entry: ExplainEntry,
+}
+
 /// `hub-update` event payload, now scoped to the project it describes.
 #[derive(Clone, Serialize)]
 pub struct HubUpdate {

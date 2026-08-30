@@ -126,6 +126,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let messages = MenuItemBuilder::with_id("messages", "Messages")
         .accelerator("Cmd+Shift+M")
         .build(app)?;
+    // The Hebrew turn-summary panel (docs/explainer.md).
+    let explainer = MenuItemBuilder::with_id("explainer", "Explainer")
+        .accelerator("Cmd+Shift+E")
+        .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
         .build(app)?;
@@ -137,6 +141,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&rename)
         .item(&mute)
         .item(&messages)
+        .item(&explainer)
         .separator()
         .item(&next)
         .item(&prev)

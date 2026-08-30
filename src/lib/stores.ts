@@ -10,6 +10,7 @@
 
 import { writable, derived, get } from "svelte/store";
 import type {
+  ExplainEntry,
   HubSnapshot,
   ProjectHandle,
   SessionInfo,
@@ -26,6 +27,10 @@ export interface ProjectState {
   sessions: SessionInfo[];
   statuses: Map<number, Status>;
   tasks: Map<number, string>;
+  /** id → that instance's Explainer feed, newest first (see ExplainerPanel). */
+  explains: Map<number, ExplainEntry[]>;
+  /** Instances the Explainer is currently working on (the panel's busy dot). */
+  explainPending: Set<number>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
 }
@@ -175,6 +180,20 @@ export const tasks = derived(
 );
 /** The active project's hub snapshot (locks / waiting / messages / pending). */
 export const hub = derived(activeProject, (p) => p?.hub ?? null);
+/** The Explainer feed of the active project's *focused* instance, newest first. */
+export const activeExplains = derived(activeProject, (p) =>
+  p && p.activeSessionId != null
+    ? (p.explains.get(p.activeSessionId) ?? [])
+    : [],
+);
+/** Whether the Explainer is working on the focused instance right now. */
+export const activeExplainBusy = derived(
+  activeProject,
+  (p) =>
+    p != null &&
+    p.activeSessionId != null &&
+    p.explainPending.has(p.activeSessionId),
+);
 /** Focused session id within the active project (null when none). */
 export const activeId = derived(activeProject, (p) => p?.activeSessionId ?? null);
 /** Non-null while any project is open — App.svelte's shell gate. */
@@ -312,6 +331,58 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   });
 }
 
+/** Prepend one Explainer entry to its instance's feed (the `explain-update`
+ *  event; the backend caps the feed, the frontend just mirrors it). */
+export function applyExplainFor(
+  handle: ProjectHandle,
+  id: number,
+  entry: ExplainEntry,
+): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  const explains = new Map(p.explains);
+  explains.set(id, [entry, ...(explains.get(id) ?? [])]);
+  patchProject(handle, { explains });
+}
+
+/** Replace a project's whole Explainer feed from `get_explains` (initial paint /
+ *  hot-reload). Entries arrive flat, each carrying its instance id. */
+export function setExplainsFor(
+  handle: ProjectHandle,
+  entries: ExplainEntry[],
+): void {
+  const explains = new Map<number, ExplainEntry[]>();
+  for (const e of entries) {
+    explains.set(e.id, [...(explains.get(e.id) ?? []), e]);
+  }
+  patchProject(handle, { explains });
+}
+
+/** Mirror an `explain-pending` transition (the panel's busy dot). */
+export function setExplainPendingFor(
+  handle: ProjectHandle,
+  id: number,
+  active: boolean,
+): void {
+  const p = get(projects).get(handle);
+  if (!p || p.explainPending.has(id) === active) return;
+  const explainPending = new Set(p.explainPending);
+  if (active) explainPending.add(id);
+  else explainPending.delete(id);
+  patchProject(handle, { explainPending });
+}
+
+/** Drop an exited instance's feed — its row is gone, so it's unreachable. */
+export function removeExplainsFor(handle: ProjectHandle, id: number): void {
+  const p = get(projects).get(handle);
+  if (!p || (!p.explains.has(id) && !p.explainPending.has(id))) return;
+  const explains = new Map(p.explains);
+  explains.delete(id);
+  const explainPending = new Set(p.explainPending);
+  explainPending.delete(id);
+  patchProject(handle, { explains, explainPending });
+}
+
 /** An already-open project whose dir matches `dir` (best-effort exact match; the
  * backend still dedups canonically). */
 export function findByDir(dir: string): ProjectState | undefined {
@@ -323,6 +394,10 @@ export function findByDir(dir: string): ProjectState | undefined {
 
 /** Whether the ⌘⇧M message reader panel is open. */
 export const showMessages = writable(false);
+
+/** Whether the ⌘⇧E Explainer column is visible. On by default — the panel's
+ *  whole point is being there after every turn; hide it for the current run. */
+export const showExplainer = writable(true);
 
 /** Whether the ⌘P project quick-switcher overlay is open. */
 export const showPalette = writable(false);

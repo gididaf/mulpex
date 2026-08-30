@@ -302,6 +302,11 @@ ones past their slot.
 
 Details worth not rediscovering:
 
+- **A debug build lives in `~/.mulpex-dev`, not `~/.mulpex`** (`mulpex_core::mulpex_home`, used
+  by both the session stores and `project.rs`'s recents/open lists; `MULPEX_HOME` overrides
+  either way). Added 2026-08-30 so `tauri dev` never reopens — or rewrites the stores of — the
+  live app's projects while it runs alongside. Release-script assets (`~/.mulpex/signing`,
+  `updater.key`) are not read by the app and stay on the literal path.
 - **Trailing empty columns are dropped on write**, so a store with no ids in it is written
   byte-identically to the old format — upgrading does not rewrite every project's file into
   something an older build would misread. Pinned by `a_store_with_no_ids_is_written_in_the_old_format`.

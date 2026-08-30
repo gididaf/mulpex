@@ -21,3 +21,7 @@ them without asking.
 
 Hidden terminals use `visibility: hidden`, **never** `display: none` — the latter zeroes their size
 and breaks `fit()`.
+
+The Explainer column (`ExplainerPanel.svelte`, the `explains` map in `stores.ts`) is documented in
+[../docs/explainer.md](../docs/explainer.md) — including why its text is hard `dir="rtl"` and never
+`dir="auto"` (entries often *start* with an English identifier, which flips auto to LTR).

@@ -82,6 +82,7 @@ pub fn close_project(
     let mut ws = state.ws.lock().unwrap();
     ws.close_project(project_handle);
     ws.persist_open();
+    crate::explainer::forget_project(project_handle);
     let wsinfo = ws.workspace_info();
     drop(ws);
     let _ = app.emit("projects-changed", wsinfo.clone());
@@ -276,4 +277,12 @@ pub fn get_hub_snapshot(
         .unwrap()
         .project(project_handle)
         .map(Core::hub_snapshot)
+}
+
+/// A project's whole Explainer feed for the initial paint (bootstrap / dev
+/// hot-reload; thereafter pushed per entry via the `explain-update` event).
+/// Per instance newest-first; the frontend groups entries by their `id`.
+#[tauri::command]
+pub fn get_explains(project_handle: ProjectHandle) -> Vec<crate::snapshot::ExplainEntry> {
+    crate::explainer::feed(project_handle)
 }

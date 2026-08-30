@@ -8,10 +8,9 @@ use std::path::PathBuf;
 const MAX_RECENTS: usize = 12;
 
 fn mulpex_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".mulpex")
+    // `~/.mulpex` in release, `~/.mulpex-dev` in a debug build (`tauri dev`),
+    // `MULPEX_HOME` overriding either — see `mulpex_core::mulpex_home`.
+    mulpex_core::mulpex_home()
 }
 
 fn recents_path() -> PathBuf {
