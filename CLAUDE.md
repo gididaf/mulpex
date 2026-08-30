@@ -60,6 +60,9 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
+  src/explainer.rs    the Explainer: worker queue summarizing each finished turn (and
+                      pending AskUserQuestions) into short Hebrew via headless
+                      `claude -p --model sonnet`; emits explain-update / explain-pending
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -70,7 +73,8 @@ src/                  Svelte/Vite frontend
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
   lib/updater.ts      update check/download/apply + the cross-project busy-session count
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename, ContextMenu, UpdateBanner…
+                      TerminalPane/View, ExplainerPanel, MessageReader, Rename,
+                      ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 docs/                 the deferred half of these notes — see the table above
 ```
@@ -154,7 +158,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
 **⌘⇧] / ⌘⇧[** next/prev project) are intercepted by the menu before xterm; Claude never uses ⌘,
 so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu accelerator — it's
 handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
@@ -294,4 +298,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`276659e5ca6b2dbaa0bb06e3394d4a177dc9eea2` — 2026-08-27
+`886469d27a66b682889b40cf90ba3af991b267f4` — 2026-08-30
