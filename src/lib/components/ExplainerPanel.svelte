@@ -1,5 +1,8 @@
 <!-- The Explainer: a persistent right-hand column showing the focused
-     instance's per-turn Hebrew explanations, newest first (docs/explainer.md).
+     instance's per-turn Hebrew explanations, oldest first — the newest entry is
+     at the BOTTOM, so the feed grows downward the way the claude transcript
+     beside it does. The backend store stays newest-first (its 50-entry cap is
+     a prepend-and-truncate); the reversal is render-time only.
      A real grid column, not an overlay — toggling it (⌘⇧E) resizes the
      terminal pane, which the TerminalPane ResizeObserver propagates
      workspace-wide like any window resize. RTL is per-entry via dir="auto":
@@ -19,6 +22,37 @@
   const label = $derived(
     cur && !isShell ? (cur.name ?? `claude #${cur.id}`) : null,
   );
+  // Newest last. `$activeExplains` is a fresh array per update (applyExplainFor
+  // rebuilds it), but reverse() mutates — copy first.
+  const ordered = $derived([...$activeExplains].reverse());
+
+  let bodyEl = $state<HTMLDivElement | null>(null);
+  // Chat-style stickiness: follow the newest entry only while the user is
+  // already parked at the bottom. Deliberately NOT $state — the scroll effect
+  // must not re-run just because this flipped.
+  let stuck = true;
+
+  function onScroll() {
+    if (!bodyEl) return;
+    // Slack for sub-pixel scroll positions and the in-flight "מסביר…" line.
+    stuck = bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight < 24;
+  }
+
+  // Switching rows shows a different feed from scratch — always start at its
+  // newest end, whatever the scroll position on the previous row was.
+  $effect(() => {
+    void cur?.id;
+    stuck = true;
+  });
+
+  // Runs after the DOM has the new entry, so scrollHeight is already grown.
+  $effect(() => {
+    void ordered.length;
+    void $activeExplainBusy;
+    const el = bodyEl;
+    if (!el || !stuck) return;
+    el.scrollTop = el.scrollHeight;
+  });
 
   function when(ts: number): string {
     return new Date(ts).toLocaleTimeString([], {
@@ -39,18 +73,15 @@
       aria-label="Hide Explainer (⌘⇧E)">✕</button
     >
   </header>
-  <div class="body">
-    {#if cur && !isShell && $activeExplainBusy}
-      <div class="working" dir="rtl">מסביר…</div>
-    {/if}
+  <div class="body" bind:this={bodyEl} onscroll={onScroll}>
     {#if !cur}
       <div class="empty">no session focused</div>
     {:else if isShell}
       <div class="empty">terminals aren't explained</div>
-    {:else if $activeExplains.length === 0 && !$activeExplainBusy}
+    {:else if ordered.length === 0 && !$activeExplainBusy}
       <div class="empty">nothing yet — explanations appear after each turn</div>
     {:else}
-      {#each $activeExplains as e, i (e.ts + "-" + i)}
+      {#each ordered as e, i (e.ts + "-" + i)}
         <article class:failed={!e.ok} class:question={e.kind === "question"}>
           <div class="ts">
             {when(e.ts)}{#if e.kind === "question"}<span class="qtag" dir="rtl"
@@ -66,6 +97,11 @@
           <div class="text" dir="rtl">{e.text}</div>
         </article>
       {/each}
+    {/if}
+    <!-- The in-flight line lives at the bottom, where the entry it is producing
+         will land. -->
+    {#if cur && !isShell && $activeExplainBusy}
+      <div class="working" dir="rtl">מסביר…</div>
     {/if}
   </div>
 </aside>
@@ -141,6 +177,16 @@
   article {
     padding: 0.5rem 0;
     border-bottom: 1px solid var(--border);
+    /* History recedes: only the newest entry (the last one, see below) reads at
+       full strength until the pointer enters the panel. */
+    opacity: 0.18;
+    transition: opacity 0.15s ease;
+  }
+  /* :last-of-type, not :last-child — the "מסביר…" line is the last child while
+     a summary is in flight. */
+  article:last-of-type,
+  .explainer:hover article {
+    opacity: 1;
   }
   article:last-child {
     border-bottom: none;

@@ -2,7 +2,8 @@
 
 A persistent right-hand column: after each claude turn ends, a headless Sonnet call produces a
 very short, very simple **Hebrew** explanation of what that claude said (English identifiers
-kept verbatim), and the panel shows a per-instance feed of them, newest first. Built 2026-08-30;
+kept verbatim), and the panel shows a per-instance feed of them, **oldest first — newest at the bottom**,
+the way the claude transcript beside it reads. Built 2026-08-30;
 every claim below marked *measured* was driven on a real session or transcript that day.
 
 ## The pipeline
@@ -13,7 +14,7 @@ claude turn ends
   → 200ms poll consumes-and-deletes (state.rs::take_explain_requests, namereq-style)
   → explainer.rs worker queue (2 threads, per-instance latest-wins coalescing)
       read transcript JSONL → extract the turn's assistant text → claude -p --model sonnet
-  → in-memory ExplainStore (per (handle,id), newest first, 50-entry cap)
+  → in-memory ExplainStore (per (handle,id), newest first, 50-entry cap)   ← storage order
   → `explain-update {handle, id, entry}` event → stores.ts::applyExplainFor → ExplainerPanel
 ```
 
@@ -127,6 +128,30 @@ when cut.
 | Feed cap | 50/instance, backend-capped | bounded memory, no UI jank |
 | Panel | real third grid column, visible by default, ⌘⇧E toggles | toggling refits every PTY workspace-wide — same class as a window resize (one geometry) |
 | Empty turn | skip, log, no Sonnet call | a call on nothing would invent something |
+| Feed order | oldest first, newest at the bottom, chat-sticky scroll | aligns with the claude transcript beside it |
+| Old entries | dimmed to 0.18, full opacity on panel hover (newest always full) | the panel is a glance; the backlog stays reachable |
+
+## Reading order and the dimming (the panel's own UI rules)
+
+- **Newest is at the bottom.** The store stays newest-first — its 50-entry cap is a
+  prepend-and-truncate, and `applyExplainFor` prepends — so the reversal is **render-time only**
+  (`ordered = [...$activeExplains].reverse()` in `ExplainerPanel.svelte`). Don't "fix" this by
+  flipping the store: the cap would then have to truncate the head.
+  Side benefit: in the oldest-first array an existing entry's index no longer shifts when a new
+  one arrives, so the `{#each}` key (`ts + "-" + i`) is finally stable and old rows stop being
+  recreated on every update.
+- **The "מסביר…" line moved to the bottom too**, where the entry it is producing will land. It is
+  the `.body`'s last *child*, which is why the newest-entry rule is `article:last-of-type` and
+  not `:last-child`.
+- **Scroll is chat-sticky:** follow the newest entry only while the user is parked at the bottom
+  (`scrollHeight - scrollTop - clientHeight < 24`, slack for sub-pixel positions and the busy
+  line). Scrolled up to read history → stay put. `stuck` is a plain `let`, **not** `$state`: the
+  scroll effect must not re-run just because it flipped. Switching rows resets it — a different
+  feed always opens at its newest end.
+- **History recedes.** Every entry sits at `opacity: 0.18`; the newest one, and *all* of them
+  while the pointer is over the panel (`.explainer:hover article`), read at full strength. The
+  panel is a glance at what the claude just said — the backlog is there when you go looking for
+  it, and quiet the rest of the time.
 
 ## RTL in the panel
 
