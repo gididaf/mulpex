@@ -104,6 +104,11 @@ The fix is that `Stop` is the only hook that can see the truth, so it records it
 - **`permission_prompt` is never suppressed** — a permission request is a question for the user
   whatever else is running — and `AskUserQuestion` never comes through here at all, since it writes
   `needs` from its own `PreToolUse` matcher. A genuinely blocked instance still shouts.
+- **A plan waiting for approval writes `needs` twice, from two places.** `PreToolUse[ExitPlanMode]`
+  (`hook plan`) writes it immediately, and the dialog's own `permission_prompt` notification writes
+  it again ~6 s later — measured 2026-09-01. The first is what makes the dot immediate; the second
+  is what would still be right if the hook ever stopped firing. Neither is load-bearing alone.
+  → [explainer.md](explainer.md)
 - **`session_crons` is deliberately not counted.** A scheduled future run is not work in flight;
   between firings the instance really is idle and a prompt really is what it wants.
 - A task entry with **no** `status` counts as running. The failure that matters is calling a busy

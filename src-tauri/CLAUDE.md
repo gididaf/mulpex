@@ -8,7 +8,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
 | `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
-| `explainer.rs` (turn extraction, the headless Sonnet child, the worker queue) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race, why not `--bare`, no-silent-skip rule |
+| `explainer.rs` (turn extraction, pending questions + plans, the headless Sonnet child, the worker queue) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race, why not `--bare`, one-sentence plans, no-silent-skip rule |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 
