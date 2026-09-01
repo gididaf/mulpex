@@ -208,6 +208,12 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   unsigned bundles above shipped for five releases. Worth checking after publishing too — re-fetch
   the served tarball, compare its SHA-256 to the local one, and run `codesign --verify --deep
   --strict` on the `.app` inside it.
+- **The banner used to lie about which mode you were in** (fixed 2026-09-01, `890225f`).
+  `${DRY_RUN:+ [dry run]}` expands whenever the variable is **set and non-empty**, and its
+  *non*-dry-run value is the string `0` — so every real release from v0.4.7 to v0.11.0 announced
+  itself as a dry run while publishing for real. The publish logic was always right (it tests
+  `-eq 0`); only the banner was wrong, on exactly the line you would trust while debugging a bad
+  release. It now branches explicitly on `-eq 1`.
 - **The signing-key gotcha, which costs a full release compile to rediscover:** `tauri signer
   generate` prints `TAURI_SIGNING_PRIVATE_KEY_PATH`, but the v2 bundler reads **only**
   `TAURI_SIGNING_PRIVATE_KEY` (contents or path). With just the `_PATH` form set, the build runs to
