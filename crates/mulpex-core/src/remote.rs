@@ -323,7 +323,12 @@ pub fn peer_rules(token: &str) -> String {
 /// very often entered as root. This deliberately bypasses a safety check Claude
 /// Code put there on purpose: a remote peer runs unattended and answers to
 /// another model, so it must not stop at a permission prompt no human will see.
-pub fn remote_launch_command(cwd: Option<&str>, rules_b64: &str, replace_shell: bool) -> String {
+pub fn remote_launch_command(
+    cwd: Option<&str>,
+    rules_b64: &str,
+    replace_shell: bool,
+    task_b64: Option<&str>,
+) -> String {
     let cd = match cwd {
         Some(dir) => format!("cd {} && ", quote_path(dir)),
         // No `cd` at all rather than `cd ~`: a login shell already starts in the
@@ -339,9 +344,23 @@ pub fn remote_launch_command(cwd: Option<&str>, rules_b64: &str, replace_shell: 
     // their ssh login dies with it and the terminal goes to `exited`, instead of
     // dropping them back at the prompt they started from.
     let exec = if replace_shell { "exec " } else { "" };
+    // The task rides the SAME base64-through-argv channel the rules already use,
+    // and for a stronger reason. It used to be TYPED into the remote claude's TUI
+    // after waiting for its input box; `claude` caps a fast burst at one tty read
+    // — measured at 1022 characters, whatever the input size (see
+    // ../../docs/hub.md) — so any brief over about a kilobyte arrived cut
+    // mid-word while the driver watched the spinner start and called it delivered.
+    // As an argv argument it cannot truncate, it cannot race the TUI, and there is
+    // no submit key to get wrong. Single-quoted because, unlike a fixed rules
+    // blob, this string is caller-supplied; base64 can only produce `A-Za-z0-9+/=`
+    // so the quotes are belt-and-braces rather than load-bearing.
+    let task = match task_b64 {
+        Some(b64) => format!(" \"$(printf %s '{b64}' | base64 -d)\""),
+        None => String::new(),
+    };
     format!(
         "{cd}export IS_SANDBOX=1 && {exec}claude --dangerously-skip-permissions \
-         --append-system-prompt \"$(printf %s {rules_b64} | base64 -d)\""
+         --append-system-prompt \"$(printf %s {rules_b64} | base64 -d)\"{task}"
     )
 }
 
@@ -363,15 +382,36 @@ fn quote_path(dir: &str) -> String {
 /// `-tt` forces a PTY even though ssh's stdin is not a terminal from its own
 /// point of view; without it the remote `claude` gets no tty, never draws its
 /// TUI, and there is nothing to read.
-pub fn ssh_command(ssh_target: &str, cwd: Option<&str>, rules_b64: &str) -> String {
+pub fn ssh_command(
+    ssh_target: &str,
+    cwd: Option<&str>,
+    rules_b64: &str,
+    task_b64: Option<&str>,
+) -> String {
     format!(
         "ssh -tt {} {}",
         shell_quote(ssh_target),
         // Mulpex opened this terminal for the ssh and nothing else, so the
         // remote shell may hand its slot straight to claude.
-        shell_quote(&remote_launch_command(cwd, rules_b64, true))
+        shell_quote(&remote_launch_command(cwd, rules_b64, true, task_b64))
     )
 }
+
+/// Longest task `hub_remote_open` will put on the remote command line.
+///
+/// Three ceilings sit above this and the smallest one is what it respects. The
+/// local terminal the command is typed into is NOT one of them: a real shell on a
+/// PTY was driven to **128,148 characters** with nothing lost. The real limits are
+/// `MAX_ARG_STRLEN` on a Linux remote (128 KiB for any single argument — and the
+/// decoded task is one argument) and `ARG_MAX` (1 MiB). Base64 inflates by 4/3, so
+/// this cap puts the whole command line near 43 KB: a third of the tightest hard
+/// limit, and a third of what was measured typing successfully.
+///
+/// It exists to make an absurd task FAIL LOUDLY rather than in some unmeasured
+/// way, not because a real brief approaches it — 32,000 characters is thousands of
+/// words. Refusing is the point: silently delivering part of a brief is the exact
+/// defect this whole change removes.
+pub const MAX_REMOTE_TASK_CHARS: usize = 32_000;
 
 /// Single-quote for a POSIX shell. Distinct from `escapePath` on the frontend,
 /// which backslash-escapes to match what a real terminal inserts on a drag —
@@ -690,10 +730,46 @@ mod tests {
         assert!(!out.contains("\n\n"), "stripping left a blank line: {out:?}");
     }
 
+    /// The task must ride the command line, base64'd, and a launch with no task
+    /// must not grow a stray empty argument.
+    ///
+    /// It used to be TYPED into the remote claude's TUI after waiting for its
+    /// input box. `claude` caps a fast burst at one tty read — 1022 characters
+    /// measured, whatever the input size — so any brief over about a kilobyte
+    /// arrived cut mid-word while the driver watched the spinner start and
+    /// reported success. There is no readiness to wait for on this path any more,
+    /// and nothing to submit.
+    #[test]
+    fn a_remote_task_travels_on_the_command_line_not_through_the_tui() {
+        let task = "word ".repeat(1200); // 6000 chars, way past the old 1022 cap
+        let b64 = b64(task.as_bytes());
+        let cmd = remote_launch_command(Some("/srv/app"), "RULES", true, Some(&b64));
+
+        assert!(cmd.contains(&b64), "the task is not on the command line");
+        assert!(
+            cmd.ends_with(&format!("\"$(printf %s '{b64}' | base64 -d)\"")),
+            "the task must be the LAST argument, decoded by the remote shell: {cmd}"
+        );
+        // The rules keep their own slot; the task must not have displaced them.
+        assert!(cmd.contains("--append-system-prompt \"$(printf %s RULES | base64 -d)\""));
+        assert!(cmd.contains("exec claude"), "an exec'd launch still execs");
+
+        // No task: no trailing argument at all, not an empty one. A bare `""`
+        // would be an empty first prompt, which is not the same as no prompt.
+        let bare = remote_launch_command(Some("/srv/app"), "RULES", true, None);
+        assert!(bare.ends_with("| base64 -d)\""), "unexpected tail: {bare}");
+        assert!(!bare.contains("''"), "an empty task argument leaked in: {bare}");
+        assert_eq!(bare.matches("base64 -d").count(), 1);
+
+        // And it survives the ssh wrapper's quoting intact.
+        let ssh = ssh_command("root@10.0.0.5", Some("/srv/app"), "RULES", Some(&b64));
+        assert!(ssh.contains(&b64), "the task did not survive ssh quoting");
+    }
+
     #[test]
     fn a_launch_into_the_users_own_session_leaves_their_shell_alive() {
-        let mine = remote_launch_command(Some("/opt/ticket-system"), "B64", true);
-        let theirs = remote_launch_command(Some("/opt/ticket-system"), "B64", false);
+        let mine = remote_launch_command(Some("/opt/ticket-system"), "B64", true, None);
+        let theirs = remote_launch_command(Some("/opt/ticket-system"), "B64", false, None);
         assert!(mine.contains("&& exec claude"), "{mine}");
         assert!(theirs.contains("&& claude"), "{theirs}");
         assert!(!theirs.contains("exec"), "the user's shell would be replaced: {theirs}");
@@ -705,7 +781,7 @@ mod tests {
         }
         // With no cwd there is no `cd`, so the launch inherits wherever the
         // user had already navigated to.
-        assert!(!remote_launch_command(None, "B64", false).contains("cd "));
+        assert!(!remote_launch_command(None, "B64", false, None).contains("cd "));
     }
 
     #[test]

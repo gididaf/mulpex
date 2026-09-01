@@ -148,14 +148,74 @@ only asserted that *a* wake arrived. An id is armed when input is sent to it and
 is delivered, so silence counts only while an answer is owed. Guarded by
 `silence_is_only_a_wake_when_an_answer_is_owed`, confirmed to fail with the guard removed.
 
-## Injection: the `\r` must be its own write
+## The task goes on the remote's command line
 
-`mcp::inject_task` types the task, pauses, then sends `\r` **separately**, verifies a turn actually
-started (the spinner, or an already-emitted signal), and retries up to `INJECT_ATTEMPTS` with a
-Ctrl-U clear first. This is the same rule `pty.rs` documents for locally spawned instances, and it
-was re-discovered here the hard way: sending `task + "\r"` in one write left the task **fully typed
-in the input box and never submitted**, so the driver waited on a remote that had never read it. The
-symptom is invisible unless you look at the screen — the bytes all arrived.
+`hub_remote_open` passes the task as `claude`'s positional prompt argument, base64'd through the
+same wrapper the rules already use:
+
+```
+cd <dir> && export IS_SANDBOX=1 && exec claude --dangerously-skip-permissions \
+  --append-system-prompt "$(printf %s <RULES_B64> | base64 -d)" \
+  "$(printf %s '<TASK_B64>' | base64 -d)"
+```
+
+So there is **nothing to type, no input box to wait for, and no submit key**. The base64 is what
+makes an arbitrary task safe to put in a shell command line typed into a terminal — it was already
+the answer for the rules blob, and the task's needs are identical.
+
+**What this replaced, and why.** The task used to be typed into the remote claude's TUI once
+`looks_like_claude_tui` saw it come up: one write of the text, 400 ms, then a separate `\r`, with
+up to three attempts and a Ctrl-U clear between them. That machinery existed because a `\r` at the
+tail of a fast burst is read as *paste content* rather than Enter, so the task would sit fully
+typed and unsubmitted — a real failure, correctly diagnosed at the time. What nobody looked for was
+what happened to the text that *did* submit: **`claude` caps a burst at one tty read — measured at
+1022 characters, at every input size from 1200 to 6000** (see [hub.md](hub.md)). A remote brief
+over about a kilobyte therefore arrived cut mid-word, the spinner started, and the driver reported
+`task_delivered: true`. Locally spawned children had the same defect and were fixed first; this
+path was the last one left typing.
+
+`inject_task`, `INJECT_ATTEMPTS` and the pre-typing readiness wait are deleted. What remains is a
+start confirmation: wait up to `REMOTE_READY_TIMEOUT_MS` for the TUI, a spinner, or an
+already-emitted signal, and report **`task_started`** — renamed from `task_delivered`, deliberately.
+
+**The reply cannot claim more than that, and says so.** A locally spawned child verifies its own
+delivery: `hook::verify_spawn_delivery` compares the prompt `claude` received against the one
+Mulpex sent. A remote has no Mulpex hook, so nothing on this side can read back what the far side
+got. `started` is the honest word for what was observed. The compensation is that argv, unlike
+typing, has no failure mode to detect.
+
+### The one length limit in the system
+
+`remote::MAX_REMOTE_TASK_CHARS` = **32,000**, and `hub_remote_open` **refuses** above it rather
+than sending part of a brief — clipping to fit would be the original bug with a different number.
+The error names the way through: open the remote with a short task and `hub_terminal_send` the
+full text.
+
+The local terminal the command is typed into is **not** what constrains this. A real shell driven
+on a PTY took a **128,148-character** command line with nothing lost, so the tty is nowhere near
+being the limit. The real ceilings are on the far side: `MAX_ARG_STRLEN` (128 KiB for any single
+argument on a Linux remote — and the decoded task is one argument) and `ARG_MAX` (1 MiB). Base64
+inflates by 4/3, so 32,000 characters puts the whole command line near 43 KB: a third of the
+tightest hard limit. It is set to make an absurd task fail in a defined way, not because a real
+brief comes close.
+
+**Measured end-to-end, including the ssh hop.** Two runs, both typing the command the code really
+generates into a real `zsh -l -i` on a PTY, exactly as a Mulpex terminal does:
+
+- *Locally, real claude.* `remote_launch_command` for a 6,000-character task (8,352 bytes) — the
+  `claude` it launched received the task **byte-exact**, read from that child's own transcript
+  `.jsonl`.
+- *Over ssh to a real Ubuntu x86_64 box.* `ssh_command` with a stub `claude` on the remote `PATH`
+  recording its argv. The remote process received **argc 4** — the two flags, the decoded rules,
+  and the task as the **last** argument — with `cwd` and `IS_SANDBOX=1` correct. At 6,000
+  characters the task came back byte-identical; **at the full 32,000-character cap** (a 42,921-byte
+  ssh command line) it came back with a matching FNV-1a hash on both sides. Nothing about the ssh
+  hop, the remote login shell, or the `printf | base64 -d` round trip alters a byte.
+
+Pinned by `remote::a_remote_task_travels_on_the_command_line_not_through_the_tui` (the task is the
+last argument, the rules keep their slot, a task-less launch grows no empty argument, and it
+survives the ssh wrapper's quoting) and
+`mcp::an_oversized_remote_task_is_refused_rather_than_trimmed`.
 
 ## Root, and what it costs
 

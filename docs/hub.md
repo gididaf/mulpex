@@ -197,44 +197,56 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   republishes on removal; added sessions ride the same event via `TerminalPane`'s keyed
   `{#each}`). The drip-feed **never sleeps** — this runs on the shared poll loop, so blocking
   would stall every project's UI. Staggering exists because N simultaneous `claude` cold starts
-  contend hard enough to blow any injection deadline (see below).
-- **Seeding + link:** the child's one-shot PTY prompt (`pty.rs::spawn_prompt`) is just the task:
+  contend hard enough that a cold start can take tens of seconds (which used to blow the
+  injection deadline; it now only delays the first turn).
+- **Seeding + link:** the child's first prompt (`pty.rs::spawn_prompt`, passed as argv) is just the task:
   start it, then `hub_send` a summary back to the spawner when done (listener arming is *not* in
   this prompt — it comes from the `UserPromptSubmit` hook like every instance). Still
   `[mulpex:hub]`-sentinel-prefixed (skips the sidebar task-capture) and a single line (task
   whitespace collapsed). The child is **auto-named** `name_from_task(task)` so the sidebar labels
   it, and is **not** focused — the user stays on their pane while children appear. Recursion is
   inherent (children also have `hub_spawn`); only the per-call cap bounds a single call.
-- **Injection is verified, not fire-and-forget** (`pty.rs`). Typing the task in requires the
-  child's input box to actually exist, and nothing about the PTY stream says so directly. The
-  injector therefore: (1) waits for a *drawn input box* — `input_box_ready` looks for that chrome
-  in a rolling `TAIL_CAP` tail of output — rather than for "painted then quiet", which
-  a mid-startup lull while MCP servers load imitates perfectly; (2) types the prompt, then sends
-  `\r` separately (a `\r` at the tail of a fast burst is treated as paste content, not a submit);
-  (3) **verifies** via `turn_started`, which reads the child's own `state_dir/<id>` status file —
-  the `UserPromptSubmit` hook writes `working` there the moment a prompt submits, so this is
-  positive proof the text landed; (4) retries up to `INJECT_ATTEMPTS`, clearing the box with
-  Ctrl-U first so partial attempts can't concatenate.
+- **The task goes on the child's COMMAND LINE, and must never be typed into its TUI again**
+  (`pty.rs`). `claude` takes an initial prompt as a positional argv argument, so `spawn_prompt`'s
+  text is handed over at `exec` time: no readiness detection, no retries, no submit key, and
+  nothing that can race the TUI. Verified end-to-end against a real `claude` v2.1.252 — 3,000 and
+  12,000-character prompts arrive **byte-exact**, argv coexists with `--session-id`/`--settings`/
+  `--mcp-config`, the `UserPromptSubmit` hook fires with the whole text, and the child can call
+  `mcp__mulpex__hub_instances` **on its first turn** (so MCP servers are up before the prompt runs
+  — measured against the real `mulpex-helper mcp`, not assumed).
 
-  **Why it's built this way:** the original injector waited on a quiet-window heuristic with an
-  8 s hard cap, then typed regardless. That survived the one-child case but failed *every* child
-  of a six-way spawn — six concurrent cold starts all exceeded 8 s, so each typed into a TUI with
-  no input box and the bytes were dropped, leaving six idle instances with no task and no way to
-  recover (their hub listeners arm from the first turn, which never came, so even `hub_send`
-  couldn't reach them). Readiness detection alone would not be enough — it can always be wrong on
-  a future `claude` whose chrome differs — which is why verification plus retry is the part that
-  actually makes this robust.
+  **Why the typing path is gone.** It silently truncated every task over ~1 KB. Driving a real
+  `claude` v2.1.252 on a PTY exactly the way `pty.rs` did — one `write_all` of the whole prompt,
+  400 ms, then a separate `\r` — and reading ground truth from the child's own transcript
+  `.jsonl` rather than off the screen:
 
-  **But the readiness check cannot afford to be casually wrong, which these notes used to claim it
-  could.** A false negative is not free: it costs the full `READY_TIMEOUT` (90 s) of a child
-  sitting there with no task, which is long enough that its spawner gives up and concludes the
-  task was lost. Measured in the field — see **A slow spawn must not look like a lost one**.
-  `input_box_ready` therefore accepts **both** chrome styles claude v2.1.235 was observed drawing
-  *on the same machine*: the rounded box (`╭` … `╰`) and a pair of plain `─` rules, either of them
-  plus a `>`/`❯`. In the project the field report came from, the child emitted **zero** `╭`/`╰`
-  and 408 `─`, so requiring the corners made the fast path a coin flip decided by the project.
-  Pinned by `the_input_box_is_recognised_in_both_chrome_styles`, confirmed to fail (*"ruled input
-  area not detected"*) with the corners-only rule restored.
+  | sent | received |
+  | --- | --- |
+  | 1200 | 1022 |
+  | 1998 | 1022 |
+  | 3000 | 1022 |
+  | 6000 | 1022 |
+
+  1022 is the macOS tty input-queue size (1024) minus two. `claude` collapses a fast burst into a
+  `[Pasted text #1]` placeholder and submits only the first chunk it read; the rest is dropped,
+  cutting mid-word. **Neither of the two obvious suspects was at fault**, and both were ruled out
+  by measurement before the TUI was: nothing in Mulpex caps the string (the chain
+  `hub_spawn` → `spawn/<uuid>.json` → poll loop → spawn spec was traced and grepped), and the
+  kernel loses nothing either (600–12,000-byte writes into a raw-mode PTY whose slave reads late
+  all arrive in full — the master write simply blocks).
+
+  **This contradicts the note below**, which recorded 2 k / 8 k / 9 k-char tasks landing intact on
+  claude **v2.1.235**, and a 10,213-character prompt reaching a child's transcript whole. Both
+  measurements stand; the difference is the `claude` version. Treat that as the lesson rather than
+  as a discrepancy to resolve: **the TUI is someone else's UI, and delivering data through it is a
+  contract that can be withdrawn by an upgrade you did not make.** argv is an interface; typing
+  into a text box is not.
+
+  The old machinery is deleted, not disabled: `input_box_ready` and its two chrome styles,
+  `RULE_RUN`, the rolling `TAIL_CAP` output tail, `READY_FALLBACK`, the 90 s `READY_TIMEOUT`,
+  `INJECT_ATTEMPTS`, `VERIFY_WINDOW` and the Ctrl-U retry loop. What survives is one **delivery
+  watchdog** thread whose only job is the case the hook cannot cover: a child that never reaches a
+  first turn at all. Everything else about delivery is now answered by the child itself.
 
 ### A slow spawn must not look like a lost one
 
@@ -242,6 +254,10 @@ Reported from the field: two consecutive `hub_spawn` calls each returned `ok: tr
 the instance appeared, and it sat there doing nothing. The spawner checked `hub_instances`, saw
 `{"status":"waiting","task":""}`, concluded the seeding had silently dropped its 9,000-character
 assignment, and re-sent the whole thing by hand with `hub_send`.
+
+*(Historical — this is the v2.1.235 investigation that produced the readiness machinery. That
+machinery is gone; the reasoning about what a spawner can and cannot read is why the delivery
+verdicts above exist, and still applies.)*
 
 **Nothing was ever dropped.** The child's own transcript has the injected prompt arriving intact,
 all 10,213 characters of it, **91 s after the spawn** — i.e. at the `READY_TIMEOUT` ceiling, the
@@ -258,8 +274,8 @@ lost task would say:
   that has not taken a turn yet has no status file. It is not reporting idleness; it is reporting
   ignorance, in the same word.
 - **`task: ""`** is what a spawn child shows for its *whole life*, not just at startup: the
-  injected prompt carries the `[mulpex:hub]` sentinel precisely so `hook::userpromptsubmit` skips
-  capturing it. Every other row in the listing has a task, so the empty one reads as broken.
+  prompt carries the `[mulpex:hub]` sentinel precisely so `hook::userpromptsubmit` skips capturing
+  it (that same sentinel is now what routes the prompt into the delivery check). Every other row in the listing has a task, so the empty one reads as broken.
 - **`ok: true`** was answered as soon as the child *process* existed. Creating a process is not
   delivering a task, and the two were minutes apart.
 
@@ -268,25 +284,60 @@ So the spawn path now publishes what it knows, and the API stops asserting what 
 - **`spawn_instance_with_task` seeds `tasks/<id>` with the assignment before the child exists**, so
   `hub_instances` shows what it was sent instead of `""`. (Removed again if the spawn itself
   fails, so a number handed to somebody else can't inherit it.)
-- **The injector publishes its verdict to `spawning/<id>`** (`pty::spawn_delivery_path`):
-  `pending` written synchronously by the spawn path, cleared on the `turn_started` proof, and
-  `failed` when the retries are exhausted or the child dies during startup. That thread is the
-  only thing in the system that ever knows the task was lost, and **returning quietly was the
-  defect** — same shape as every other silent failure in these notes (**How this codebase fails**
-  in [../CLAUDE.md](../CLAUDE.md)). A subdir for the usual reason:
-  a bare integer at the state-dir root is scanned as a status file (`mcp::live_ids`).
-- **`hub_instances` reports `task_delivery`** (`pending`/`failed`, absent once delivered) with a
-  note saying what to do about it — wait, or `hub_send` it yourself. An instance nobody spawned
-  carries no delivery claim at all.
+- **Delivery publishes a verdict to `spawning/<id>`** (`mulpex_core::spawn_delivery_path`):
+  `pending` written synchronously by the spawn path, then one of three outcomes. Returning
+  quietly was the original defect — same shape as every other silent failure in these notes
+  (**How this codebase fails** in [../CLAUDE.md](../CLAUDE.md)). A subdir for the usual reason: a
+  bare integer at the state-dir root is scanned as a status file (`mcp::live_ids`).
+- **The child rules on its own delivery, because it is the only one who can.** Mulpex knows what
+  it sent; `claude` knows what it got; **only the `UserPromptSubmit` hook sees both**. So the
+  spawn path writes the exact prompt to `spawning/<id>.expected`
+  (`mulpex_core::spawn_expected_path`) and `hook::verify_spawn_delivery` compares it with the
+  prompt that actually arrived: equal clears the verdict (delivered, *and verified so*), unequal
+  writes **`partial`**. The watchdog in `pty.rs` never overrules a verdict the hook reached — it
+  only writes `failed` for a child that never began a turn, or died before one.
+
+  **`partial` is the state this whole mechanism exists for.** `failed` is loud by nature: the
+  instance sits there doing nothing. A mangled brief is the opposite — the instance is *working*,
+  looks healthy, and produces confident output about the wrong task. Under the typing path that
+  case was completely invisible: a turn had genuinely started, so every signal the app could read
+  said success, and the spawner was told `ok: true` while its child worked from the first
+  kilobyte of a 6 KB brief. Delivery is argv now and cannot truncate; the check stays anyway,
+  because it is what keeps the *next* delivery mechanism honest.
+- **`hub_instances` reports `task_delivery`** (`pending`/`failed`/`partial`, absent once
+  delivered and verified) with a note saying what to do about it — wait, `hub_send` it yourself,
+  or (for `partial`) interrupt the instance, re-send, and report the bug. An instance nobody
+  spawned carries no delivery claim at all.
 - **`hub_spawn` waits for delivery** (`await_delivery`, capped at `SPAWN_DELIVERY_WAIT` = 60 s) and
-  **`ok` now tracks the task, not the process**: `tasks_delivered` / `tasks_not_delivered_yet` /
-  `tasks_never_delivered`, with `ok` true only when every task landed. The injector's own worst
-  case is longer than that wait, which is exactly why an unresolved wait is reported as `pending`
-  rather than rounded up to success; the no-response fallback reply is now `ok: false` too. The
-  tool description says all of this, including that a brand-new instance showing `status: waiting`
-  is *normal* while delivery is pending.
+  **`ok` tracks the task, not the process**: `tasks_delivered` / `tasks_not_delivered_yet` /
+  `tasks_never_delivered` / `tasks_delivered_mangled`, with `ok` true only when every task landed
+  intact. `partial` is a **terminal** verdict, deliberately not folded into `pending` — rolling
+  the worst outcome into the most benign one is the exact error this section is about. An
+  unresolved wait is still reported as `pending` rather than rounded up to success; the
+  no-response fallback reply is `ok: false` too. The tool description says all of this, including
+  that a brand-new instance showing `status: waiting` is *normal* while delivery is pending.
 
 Pinned by `hub_instances_says_whether_a_spawned_task_actually_arrived` (three instances, none with
-a status file, so they are indistinguishable without the marker) and
-`hub_spawn_never_claims_ok_for_a_task_that_did_not_arrive`.
+a status file, so they are indistinguishable without the marker),
+`hub_spawn_never_claims_ok_for_a_task_that_did_not_arrive` (all four verdicts, including a
+`partial` that must not read as pending), `hook::a_mangled_spawn_task_is_caught_by_the_child_itself`
+(the 1022-character cut, checked by the real comparison the child runs) and
+`pty::a_long_task_reaches_the_child_whole`.
+
+The one that actually guards the mechanism is
+`state::a_spawned_child_receives_its_whole_task_on_its_command_line`: it runs the real production
+path (`spawn_instance_with_task` → `Session::spawn` → `CommandBuilder` → `exec`) against a stub
+`claude` on `PATH` that records its argv, and asserts a 6,000-character task arrives whole. A unit
+test on the prompt builder cannot catch a return to typing — only reading the child's real argv
+can. It is `#[ignore]`d because it must own the process (`claude_bin`'s `merged_path` and
+`resolve_claude` are `OnceLock`s, so the stub has to be resolved before any other test resolves the
+real binary); run it alone:
+
+```
+cargo test --lib -- --ignored --exact \
+  state::tests::a_spawned_child_receives_its_whole_task_on_its_command_line
+```
+
+Confirmed non-vacuous: with the `cmd.arg(prompt)` line removed it fails, reporting the
+append-system-prompt as the last argument instead of the task.
 

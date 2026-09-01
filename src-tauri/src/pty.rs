@@ -261,13 +261,29 @@ const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// chunk of a burst (typically the shell prompt itself) would sit unpublished.
 const RECORDER_SETTLE: Duration = Duration::from_millis(200);
 
-/// The one-shot task prompt injected into a `hub_spawn` child's PTY once `claude`
-/// is up: its assignment plus a report-back-to-spawner instruction. Returns `None`
-/// for a normal (non-spawned) instance — which gets NO injected prompt and starts
-/// clean; its hub listener is armed later by the `UserPromptSubmit` hook. Kept to a
-/// SINGLE line (the task's whitespace is collapsed, never truncated — the child
-/// needs the full task text) and prefixed with the `[mulpex:hub]` sentinel so the
-/// hook skips it for the sidebar task (the child is auto-named from the task).
+/// The first prompt a `hub_spawn` child starts on: its assignment plus a
+/// report-back-to-spawner instruction. Returns `None` for a normal (non-spawned)
+/// instance — which gets no prompt at all and starts clean; its hub listener is
+/// armed later by the `UserPromptSubmit` hook. Prefixed with the `[mulpex:hub]`
+/// sentinel so the hook skips it for the sidebar task (the child is auto-named
+/// from the task).
+///
+/// **This goes on `claude`'s command line, and must never be typed into its TUI
+/// again.** It used to be: the injector waited for the input box to appear, wrote
+/// the whole prompt to the PTY in one burst and pressed Enter. `claude` treats a
+/// fast burst as a paste, and a paste is capped at the size of one tty input-queue
+/// read — measured against `claude` v2.1.252 by reading the child's own transcript
+/// `.jsonl`, sending 1200 / 1998 / 3000 / 6000 characters produced **1022 received
+/// every time**, cutting mid-word. The kernel was not at fault (a raw-mode PTY
+/// delivers every byte; the master write just blocks) and nothing in Mulpex
+/// truncated the string — the loss was entirely inside the TUI's paste handling.
+/// The spawner meanwhile saw `ok: true`, because a turn had genuinely started; it
+/// had just started on the first ~1 KB of its brief. argv has no such limit: 3,000
+/// and 12,000 characters both arrive byte-exact, and the `UserPromptSubmit` hook
+/// still fires with the whole text.
+///
+/// The whitespace collapse stays. It is no longer load-bearing for delivery, but a
+/// single-line prompt is what keeps the pane readable and the auto-name sane.
 fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
     let t = task?;
     let task = t.task.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -280,67 +296,25 @@ fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
     ))
 }
 
-/// How much of the tail of a child's PTY output we keep for readiness detection.
-/// Only needs to span the last repaint of the input box, so a few KB is plenty.
-const TAIL_CAP: usize = 8192;
-
-/// After this long we stop waiting for the input box to be positively identified
-/// and fall back to the old "painted then went quiet" heuristic. Cold starts get
-/// slow when several `claude`s boot at once, so this is generous.
-const READY_FALLBACK: Duration = Duration::from_secs(20);
-
-/// Hard ceiling on waiting for readiness — inject anyway past this. Deliberately
-/// far above any plausible cold start: an 8s cap here is what let six concurrent
-/// spawns each type into a TUI that had no input box yet, losing every task.
-const READY_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// How many times to type the task in before giving up. Each attempt is verified
-/// against the child's own status file, so a retry only happens when the previous
-/// attempt provably did not submit.
-const INJECT_ATTEMPTS: usize = 4;
-
-/// How long to wait for proof that an injected prompt actually submitted.
-const VERIFY_WINDOW: Duration = Duration::from_secs(6);
-
-/// Whether `claude`'s interactive input box appears in the recent PTY output.
-/// The TUI draws a rounded box (`╭` … `╰`) around the `>` prompt once it is ready
-/// to accept typing; before that the pane holds only startup banner text. Matched
-/// on the box-drawing characters rather than `>` alone, since `>` shows up in
-/// banner and MCP-startup lines too.
-///
-/// Best-effort only: a false negative just delays until the fallback, and a false
-/// positive is caught by `turn_started` verification and retried. Neither loses
-/// the task, which is why this can afford to key off TUI chrome that may change
-/// between `claude` versions.
-fn input_box_ready(tail: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(tail);
-    // Two chrome styles have both been observed from claude v2.1.235 on the SAME
-    // machine, differing by project: a rounded box ('╭' … '╰') and a pair of plain
-    // horizontal rules. Requiring the corners alone made this a coin flip — in the
-    // project the field report came from, the child emitted ZERO '╭'/'╰' and 408
-    // '─', so readiness was never detected and the task was typed in only when
-    // READY_TIMEOUT expired — 90 s after the instance appeared in the sidebar, by
-    // which point its spawner had long since concluded the task was lost.
-    let framed = (s.contains('╭') && s.contains('╰')) || s.contains(RULE_RUN);
-    framed && (s.contains('>') || s.contains('❯'))
-}
-
-/// A run of the box-drawing horizontal line claude rules the input area with.
-/// Long enough that a stray table border in banner text cannot pass for it.
-const RULE_RUN: &str = "────────────────";
+/// How long to wait for a spawned child to reach its first turn before declaring
+/// the task undelivered. The task is on `claude`'s command line from the start, so
+/// this only has to cover a cold start plus MCP server load — but that cold start
+/// is genuinely slow when several children boot at once, so it stays generous. A
+/// `claude` that has not begun a turn after this long is broken, not slow.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where a spawned child's task-delivery state is published, so the rest of the
-/// system can tell "its task has not landed YET" from "its task never landed".
+/// system can tell "its task has not landed YET" from "its task never landed"
+/// from "it started on the WRONG text". The path shape is a two-process contract
+/// (the child's own hook writes the verdict), so it lives in `mulpex_core`.
 ///
-/// Injection runs on a background thread long after `hub_spawn` has answered, and
-/// until this existed nothing anywhere recorded how it went: a child that had not
-/// been typed into yet was indistinguishable from one whose task was lost — both
+/// Until this existed nothing anywhere recorded how delivery went: a child that
+/// had not started yet was indistinguishable from one whose task was lost — both
 /// show `status: waiting` (`mcp::status_of`'s default for a missing status file)
-/// and an empty task (the injected prompt is sentinel-prefixed, so
-/// `hook::userpromptsubmit` deliberately skips capturing it). A subdir for the
-/// usual reason: a bare integer at the state-dir root is scanned as a status file.
+/// and an empty task (the prompt is sentinel-prefixed, so
+/// `hook::userpromptsubmit` deliberately skips capturing it).
 pub fn spawn_delivery_path(state_dir: &Path, id: usize) -> PathBuf {
-    state_dir.join("spawning").join(id.to_string())
+    mulpex_core::spawn_delivery_path(state_dir, id)
 }
 
 /// Mark a spawned child's task as not-yet-delivered. Written synchronously by the
@@ -354,24 +328,40 @@ pub fn mark_delivery_pending(state_dir: &Path, id: usize) {
     let _ = std::fs::write(p, "pending");
 }
 
+/// Publish the exact prompt this child was launched with, for its own
+/// `UserPromptSubmit` hook to check against what it actually received. See
+/// `mulpex_core::spawn_expected_path` for why that check exists.
+fn publish_expected_prompt(state_dir: &Path, id: usize, prompt: &str) {
+    let p = mulpex_core::spawn_expected_path(state_dir, id);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, prompt);
+}
+
+/// Drop both delivery files for an instance — the verdict and the expected
+/// prompt. Used when a spawn fails outright and when a session is reaped, so a
+/// recycled id never inherits a stale verdict.
+pub fn clear_delivery(state_dir: &Path, id: usize) {
+    let _ = std::fs::remove_file(spawn_delivery_path(state_dir, id));
+    let _ = std::fs::remove_file(mulpex_core::spawn_expected_path(state_dir, id));
+}
+
 fn mark_delivery(state_dir: &Path, id: usize, state: &str) {
-    let p = spawn_delivery_path(state_dir, id);
     if state.is_empty() {
-        let _ = std::fs::remove_file(p);
+        clear_delivery(state_dir, id);
     } else {
-        let _ = std::fs::write(p, state);
+        let _ = std::fs::write(spawn_delivery_path(state_dir, id), state);
     }
 }
 
-/// Whether the child has actually begun a turn. The `UserPromptSubmit` hook writes
-/// `working` into `state_dir/<id>` the instant a prompt is submitted (see
-/// `hook.rs::userpromptsubmit`), so this is positive proof the injected text was
-/// received — as opposed to being swallowed by a TUI that wasn't listening yet,
-/// which is indistinguishable from success by looking at the PTY alone.
-fn turn_started(state_dir: &Path, id: usize) -> bool {
-    std::fs::read_to_string(state_dir.join(id.to_string()))
-        .map(|s| s.trim() == "working")
-        .unwrap_or(false)
+/// Whether the child's hook has already published a verdict on its own delivery.
+/// The hook is the authority — it is the only thing that sees the prompt `claude`
+/// actually received — so the watchdog must not overwrite a verdict it reached.
+fn delivery_settled(state_dir: &Path, id: usize) -> bool {
+    std::fs::read_to_string(spawn_delivery_path(state_dir, id))
+        .map(|s| s.trim() != "pending")
+        .unwrap_or(true)
 }
 
 /// Where a session's PTY output goes. Before the frontend has created its xterm
@@ -492,6 +482,18 @@ impl Session {
                 cmd.arg(state_dir.join("mcp.json"));
                 cmd.arg("--append-system-prompt");
                 cmd.arg(format!("{HUB_RULES}\n{PLANNING_RULES}"));
+                // A spawned child's task is handed over as `claude`'s POSITIONAL
+                // prompt argument. It used to be TYPED into the child's TUI once
+                // that TUI looked ready, and that silently truncated every task
+                // over ~1 KB — see `spawn_prompt` for the measurement. argv has
+                // no such limit, needs no readiness detection and cannot race the
+                // TUI: the prompt is submitted before the process finishes
+                // starting, and the `UserPromptSubmit` hook fires with the whole
+                // text (verified against a real `claude` at 12,000 characters).
+                if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
+                    publish_expected_prompt(state_dir, id, &prompt);
+                    cmd.arg(prompt);
+                }
                 // Each mulpex-spawned `claude` is a genuine TOP-LEVEL session
                 // (Mulpex owns its `--session-id`), not a sub-session. If Mulpex
                 // itself was launched from inside another Claude Code session,
@@ -560,19 +562,11 @@ impl Session {
         // has painted and then settled before typing into it.
         let saw_output = Arc::new(AtomicBool::new(false));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
-        // Rolling tail of what the child has painted, so the injector can tell a
-        // drawn input box from a still-booting one. Only maintained for spawned
-        // children — a normal session never injects, so it pays nothing for this.
-        let out_tail: Option<Arc<Mutex<Vec<u8>>>> = initial_task
-            .as_ref()
-            .map(|_| Arc::new(Mutex::new(Vec::with_capacity(TAIL_CAP))));
-
         {
             let sink = Arc::clone(&sink);
             let alive = Arc::clone(&alive);
             let saw_output = Arc::clone(&saw_output);
             let last_activity = Arc::clone(&last_activity);
-            let out_tail = out_tail.clone();
             let recorder = recorder.clone();
             let tty_dev = Arc::clone(&tty_dev);
             thread::spawn(move || {
@@ -597,15 +591,6 @@ impl Session {
                             if let Some(rec) = &recorder {
                                 if let Ok(mut r) = rec.lock() {
                                     r.push(&buf[..n]);
-                                }
-                            }
-                            if let Some(tail) = &out_tail {
-                                if let Ok(mut t) = tail.lock() {
-                                    t.extend_from_slice(&buf[..n]);
-                                    let overflow = t.len().saturating_sub(TAIL_CAP);
-                                    if overflow > 0 {
-                                        t.drain(..overflow);
-                                    }
                                 }
                             }
                         }
@@ -673,108 +658,44 @@ impl Session {
             });
         }
 
-        // Task injection (`hub_spawn` children only): once `claude` is up and its
-        // initial paint has settled, type the child's assigned task in as its first
-        // prompt (see `spawn_prompt`). A NORMAL instance gets `None` here and no
-        // injection — it starts clean; its hub listener is armed from the
-        // `UserPromptSubmit` hook on the user's first real turn. Runs in its own
-        // thread so `spawn` returns now.
-        if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
-            let writer = Arc::clone(&writer);
+        // Delivery watchdog (`hub_spawn` children only). The task is already on
+        // `claude`'s command line by the time we get here, so nothing has to be
+        // typed and there is no readiness to detect.
+        //
+        // The child's own `UserPromptSubmit` hook publishes the verdict, because it
+        // is the only thing in the system that sees the prompt `claude` ACTUALLY
+        // received — this thread cannot tell a correct turn from a turn started on
+        // mangled text, and the old code's habit of calling the first one success
+        // is exactly how a truncated brief was reported as delivered. So the
+        // watchdog covers only the case the hook cannot: a child that never reaches
+        // its first turn at all, because it died starting up or simply never got
+        // there. Silence is not success — an unresolved wait ends in `failed`.
+        //
+        // A NORMAL instance gets `None` here and no watchdog: it starts clean, and
+        // its hub listener is armed from the `UserPromptSubmit` hook on the user's
+        // own first turn.
+        if initial_task.is_some() {
             let alive = Arc::clone(&alive);
-            let saw_output = Arc::clone(&saw_output);
-            let last_activity = Arc::clone(&last_activity);
-            let out_tail = out_tail.clone();
             let state_dir: PathBuf = state_dir.to_path_buf();
             thread::spawn(move || {
-                // Phase 1 — wait for a *drawn input box*, not merely a quiet pane.
-                // A booting `claude` goes quiet for well over a second while it
-                // loads MCP servers, so "output then silence" alone mistakes a
-                // mid-startup lull for readiness.
-                let start = Instant::now();
-                loop {
+                let deadline = Instant::now() + DELIVERY_TIMEOUT;
+                while Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(150));
+                    if delivery_settled(&state_dir, id) {
+                        return; // the hook has ruled; it outranks us
+                    }
                     if !alive.load(Ordering::Relaxed) {
-                        mark_delivery(&state_dir, id, "failed");
-                        return; // died during startup — nothing to bootstrap
-                    }
-                    let elapsed = start.elapsed();
-                    let quiet = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
-
-                    let box_drawn = out_tail
-                        .as_ref()
-                        .and_then(|t| t.lock().ok().map(|t| input_box_ready(&t)))
-                        .unwrap_or(false);
-                    if box_drawn && quiet >= Duration::from_millis(300) {
-                        break;
-                    }
-                    // Fallback for a `claude` whose chrome we no longer recognise.
-                    if elapsed >= READY_FALLBACK
-                        && saw_output.load(Ordering::Relaxed)
-                        && quiet >= Duration::from_millis(600)
-                    {
-                        break;
-                    }
-                    if elapsed >= READY_TIMEOUT {
-                        break; // ceiling: try anyway rather than never
-                    }
-                }
-
-                // Phase 2 — type it in, then verify it actually submitted, and retry
-                // if it didn't. Verification is what makes this robust: readiness
-                // detection can be wrong, but a child that never flipped to `working`
-                // provably never received the prompt, so retrying is always correct.
-                for attempt in 0..INJECT_ATTEMPTS {
-                    if !alive.load(Ordering::Relaxed) {
+                        // Died before its first turn. One last look: the hook may
+                        // have ruled in the instant before the exit.
+                        if !delivery_settled(&state_dir, id) {
+                            mark_delivery(&state_dir, id, "failed");
+                        }
                         return;
                     }
-                    if attempt > 0 {
-                        // Clear anything a partial earlier attempt left in the box so
-                        // retries can't concatenate into one garbled prompt.
-                        if let Ok(mut w) = writer.lock() {
-                            let _ = w.write_all(b"\x15"); // Ctrl-U, kill line
-                            let _ = w.flush();
-                        }
-                        thread::sleep(Duration::from_millis(250));
-                    }
-
-                    // Deliver the prompt text, then submit with a SEPARATE Enter after
-                    // a short delay. `claude`'s input treats a fast byte burst as a
-                    // paste, and a `\r` at the tail of a paste becomes a literal
-                    // newline in the buffer rather than a submit — so the text would
-                    // sit in the box unsent. Sending the Enter on its own, once the
-                    // paste-coalescing window has closed, registers as a real Enter
-                    // keypress and fires it.
-                    if let Ok(mut w) = writer.lock() {
-                        let _ = w.write_all(prompt.as_bytes());
-                        let _ = w.flush();
-                    }
-                    thread::sleep(Duration::from_millis(400));
-                    if !alive.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    if let Ok(mut w) = writer.lock() {
-                        let _ = w.write_all(b"\r");
-                        let _ = w.flush();
-                    }
-
-                    let deadline = Instant::now() + VERIFY_WINDOW;
-                    while Instant::now() < deadline {
-                        thread::sleep(Duration::from_millis(150));
-                        if !alive.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        if turn_started(&state_dir, id) {
-                            mark_delivery(&state_dir, id, ""); // landed
-                            return;
-                        }
-                    }
                 }
-                // Every attempt typed the task in and none provably submitted.
-                // Say so on disk rather than returning quietly: this thread is the
-                // only thing that ever knows the task was lost, and its silence is
-                // what made a lost task look like a slow start.
-                mark_delivery(&state_dir, id, "failed");
+                if !delivery_settled(&state_dir, id) {
+                    mark_delivery(&state_dir, id, "failed");
+                }
             });
         }
 
@@ -1264,24 +1185,49 @@ fn b64encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The readiness check is what decides whether a spawned child is typed into
-    /// in a couple of seconds or only when `READY_TIMEOUT` expires 90 s later.
-    /// Both of these frames were captured from a real claude v2.1.235 — the
-    /// rounded box in a scratch project, the plain rules in the project the field
-    /// report came from, which emitted ZERO rounded corners. Requiring the
-    /// corners made the fast path a coin flip decided by the project.
+    /// The task a spawner writes must reach the child WHOLE. This is the
+    /// regression that cost two instances their briefs: the prompt used to be
+    /// typed into `claude`'s TUI, which capped it at one tty read — 1022
+    /// characters, measured — and both the spawner and the child were told
+    /// everything had gone fine. Nothing in this builder may ever cap, elide or
+    /// summarise the task; delivery is argv, which has no such limit.
     #[test]
-    fn the_input_box_is_recognised_in_both_chrome_styles() {
-        let rounded = "╭──────────────────────────────╮\n│ > Try \"edit users.ts\"        │\n╰──────────────────────────────╯";
-        let ruled = "────────────────────────────────\n ❯ Try \"edit users.ts to...\"\n────────────────────────────────";
-        assert!(input_box_ready(rounded.as_bytes()), "rounded box not detected");
-        assert!(input_box_ready(ruled.as_bytes()), "ruled input area not detected");
+    fn a_long_task_reaches_the_child_whole() {
+        // Comfortably past the 1022-character paste cap that used to eat it, and
+        // past any plausible "round number" a future cap would pick.
+        let task: String = (0..1000).map(|i| format!("{i:05}.")).collect();
+        assert_eq!(task.len(), 6000);
 
-        // Still-booting output must NOT pass: typing before the box exists is
-        // what the retry machinery exists to survive, not something to invite.
-        let booting = "Loading MCP servers…\n  connecting > mulpex\n";
-        assert!(!input_box_ready(booting.as_bytes()), "a booting pane read as ready");
+        let prompt = spawn_prompt(Some(&SpawnTask {
+            parent_id: 2,
+            task: task.clone(),
+        }))
+        .expect("a spawned child gets a prompt");
+
+        assert!(prompt.contains(&task), "the task was altered in transit");
+        assert!(prompt.contains("00000."), "the head of the task was lost");
+        assert!(prompt.contains("00999."), "the tail of the task was lost");
+        assert!(
+            prompt.starts_with("[mulpex:hub]"),
+            "the sentinel the UserPromptSubmit hook keys off must lead"
+        );
+        assert!(
+            prompt.contains("claude#2"),
+            "the child must be told who to report back to"
+        );
+        // One line: a spawned child's pane stays readable, and `name_from_task`
+        // has something sane to auto-name the row from.
+        assert!(!prompt.contains('\n'), "the prompt must stay a single line");
     }
+
+    /// A normal (⌘T) instance is NOT a spawned child and must start clean — no
+    /// prompt, no auto-started turn. Its hub listener is armed later, by the
+    /// `UserPromptSubmit` hook on the user's own first turn.
+    #[test]
+    fn an_unspawned_instance_gets_no_prompt() {
+        assert!(spawn_prompt(None).is_none());
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     /// The preflight must actually recognise an unreadable directory, and say

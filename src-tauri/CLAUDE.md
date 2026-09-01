@@ -4,7 +4,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 
 | You are editing | Read first |
 | --- | --- |
-| `pty.rs` (spawn, geometry, injection, `kill`), `claude_bin.rs` | [../docs/sessions.md](../docs/sessions.md) — binary resolution, login env forwarding, status words; [../docs/rendering.md](../docs/rendering.md) — one geometry; [../docs/shell-terminals.md](../docs/shell-terminals.md) — the tty sweep behind a terminal's `running`/`cwd` |
+| `pty.rs` (spawn, geometry, task delivery, `kill`), `claude_bin.rs` | [../docs/sessions.md](../docs/sessions.md) — binary resolution, login env forwarding, status words; [../docs/rendering.md](../docs/rendering.md) — one geometry; [../docs/shell-terminals.md](../docs/shell-terminals.md) — the tty sweep behind a terminal's `running`/`cwd` |
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
 | `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
@@ -25,6 +25,11 @@ Traps that live in this directory specifically:
   → [../docs/sessions.md](../docs/sessions.md)
 - **Never `wait()` a terminal's child to learn it exited.** Liveness is reader-thread EOF; a zombie
   keeps the pid unrecyclable, which is what makes the `killpg` in teardown safe.
+- **A task is an argv argument, not keystrokes** — for a spawned child here and for a remote peer
+  in `mcp.rs`. Typing it into the TUI capped it at 1022 characters with no error anywhere. If you
+  need to hand an ALREADY-RUNNING instance text, `hub_send` it — that path is a file the
+  recipient's MCP server reads, and has never truncated.
+  → [../docs/hub.md](../docs/hub.md), [../docs/remote-peers.md](../docs/remote-peers.md)
 - **A spawned child must not inherit `MULPEX_*`, `CLAUDE_CODE_CHILD_SESSION` or
   `CLAUDE_CODE_ENTRYPOINT`.** The first corrupts the hub, the second silently disables transcript
   saving and only shows up at the *next* launch.

@@ -960,6 +960,37 @@ fn write_seen_peers(ctx: &Ctx, ids: &[usize]) {
     let _ = std::fs::write(&file, body);
 }
 
+/// Rule on whether this instance's spawn task actually arrived, by comparing the
+/// prompt `claude` really received against what Mulpex put on its command line.
+///
+/// This runs in the child, and it is the ONLY vantage point in the system with
+/// that comparison available: the app knows what it sent, `claude` knows what it
+/// got, and nothing else sees both. That gap is what let a truncated brief be
+/// reported as delivered — the task used to be typed into the TUI, `claude` capped
+/// the paste at one tty read (measured: 1022 characters regardless of input size),
+/// and a turn started, so every signal the app could check said success.
+///
+/// Absent expectation file = not a spawned child (or already ruled on): stay out
+/// of the way. Delivery is argv now and cannot truncate; this is the detector that
+/// keeps the next mechanism honest.
+fn verify_spawn_delivery(ctx: &Ctx, received: &str) {
+    let expected_path = crate::spawn_expected_path(&ctx.state_dir, ctx.instance);
+    let Ok(expected) = std::fs::read_to_string(&expected_path) else {
+        return;
+    };
+    let verdict_path = crate::spawn_delivery_path(&ctx.state_dir, ctx.instance);
+    if received.trim() == expected.trim() {
+        let _ = std::fs::remove_file(&verdict_path); // delivered, and verified so
+    } else {
+        // Started, but not on what was sent. Distinct from `failed` (never
+        // started): the instance IS working, which is precisely what makes this
+        // the dangerous case — left unsaid it looks like a healthy child, and the
+        // spawner would never think to check.
+        let _ = std::fs::write(&verdict_path, "partial");
+    }
+    let _ = std::fs::remove_file(&expected_path);
+}
+
 /// Handle a UserPromptSubmit event: (a) mark this instance `working` (preserving
 /// the old `printf` status hook), (b) capture the submitted prompt as this
 /// instance's baseline task for the hub, and (c) inject a compact snapshot of the
@@ -981,7 +1012,9 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 // job completion arrives as a synthetic `<task-notification>…`
                 // prompt. Neither should overwrite the task.
                 let p = prompt.trim_start();
-                if !p.starts_with(crate::MULPEX_SENTINEL) && !p.starts_with("<task-notification") {
+                if p.starts_with(crate::MULPEX_SENTINEL) {
+                    verify_spawn_delivery(ctx, prompt);
+                } else if !p.starts_with("<task-notification") {
                     let task = crate::mcp::summarize(prompt);
                     if !task.is_empty() {
                         let _ = std::fs::write(ctx.tasks_dir.join(ctx.id_str()), &task);
@@ -1253,6 +1286,53 @@ pub(crate) fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delivery check must tell three things apart: the task arrived exactly,
+    /// the task arrived MANGLED, and there is nothing to check.
+    ///
+    /// The middle one is the whole point. When the task was typed into the TUI,
+    /// `claude` capped it at one tty read — 1022 characters, measured, whatever the
+    /// input size — and the child then worked, confidently, on the first kilobyte
+    /// of its brief. The app could not see that: it knows what it sent, the child
+    /// knows what it got, and only this hook sees both.
+    #[test]
+    fn a_mangled_spawn_task_is_caught_by_the_child_itself() {
+        let dir = std::env::temp_dir().join(format!("mulpex-deliv3-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join(crate::SPAWNING_DIR)).unwrap();
+        let ctx = test_ctx(&dir, 4);
+        let verdict = crate::spawn_delivery_path(&dir, 4);
+        let expected_at = crate::spawn_expected_path(&dir, 4);
+
+        let sent = format!(
+            "{} Begin the following task, which was assigned to you by claude#2: {}",
+            crate::MULPEX_SENTINEL,
+            "word ".repeat(1200)
+        );
+        assert!(sent.len() > 1022, "the fixture must exceed the old paste cap");
+
+        // (a) Nothing expected — not a spawned child. Must not invent a verdict.
+        std::fs::write(&verdict, "pending").unwrap();
+        verify_spawn_delivery(&ctx, &sent);
+        assert_eq!(std::fs::read_to_string(&verdict).unwrap(), "pending");
+
+        // (b) Truncated exactly the way the TUI used to truncate it.
+        std::fs::write(&expected_at, &sent).unwrap();
+        verify_spawn_delivery(&ctx, &sent[..1022]);
+        assert_eq!(
+            std::fs::read_to_string(&verdict).unwrap(),
+            "partial",
+            "a child working on the first 1022 characters of its brief must not read as delivered"
+        );
+
+        // (c) The whole thing. Both files go: delivered, and verified so.
+        std::fs::write(&verdict, "pending").unwrap();
+        std::fs::write(&expected_at, &sent).unwrap();
+        verify_spawn_delivery(&ctx, &sent);
+        assert!(!verdict.exists(), "a verified delivery leaves no verdict behind");
+        assert!(!expected_at.exists(), "the expectation is consumed once ruled on");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn test_ctx(dir: &Path, instance: usize) -> Ctx {
         let state_dir = dir.to_path_buf();

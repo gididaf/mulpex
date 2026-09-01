@@ -88,10 +88,35 @@ pub fn plan_request_path(state_dir: &std::path::Path, id: usize) -> std::path::P
     state_dir.join(EXPLAINPLAN_DIR).join(id.to_string())
 }
 
+/// A spawned child's task-delivery verdict: `<state_dir>/spawning/<id>`, holding
+/// `pending` (created, not started yet), `failed` (never began a turn) or
+/// `partial` (began a turn, but on text that is not what Mulpex sent). Absent
+/// means delivered and verified. Written by the app's watchdog and by the child's
+/// own `UserPromptSubmit` hook; read by `mcp::delivery_of` to answer `hub_spawn`.
+pub fn spawn_delivery_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(SPAWNING_DIR).join(id.to_string())
+}
+
+/// The exact prompt Mulpex put on a spawned child's command line, so the child's
+/// own hook can check what it ACTUALLY received against it.
+///
+/// This exists because the previous delivery mechanism failed silently. The task
+/// was typed into the child's TUI, `claude` capped the paste at one tty read
+/// (measured: 1022 characters, whatever the input size), and every signal said
+/// success — a turn had genuinely started, just on the first kilobyte of the
+/// brief. The `UserPromptSubmit` hook is the ONLY place in the system that sees
+/// what the child really got, so it is the only place that can tell delivery from
+/// the appearance of delivery. Delivery is argv now and cannot truncate, but the
+/// check stays: it is what turns a future silent corruption into a loud one.
+pub fn spawn_expected_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(SPAWNING_DIR).join(format!("{id}.expected"))
+}
+
 /// These live here, next to `MULPEX_SENTINEL`, for the same reason: they are
 /// a contract between two *processes*, so a copy in each would be a contract that
 /// can silently drift out of agreement.
 pub const NAMEREQ_DIR: &str = "namereq";
+pub const SPAWNING_DIR: &str = "spawning";
 pub const NAMED_DIR: &str = "named";
 pub const EXPLAINREQ_DIR: &str = "explainreq";
 pub const EXPLAINQ_DIR: &str = "explainq";

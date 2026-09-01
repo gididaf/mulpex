@@ -629,7 +629,7 @@ impl Core {
                 // Nothing to deliver to; don't leave the markers behind for a
                 // number that will be handed to somebody else.
                 let _ = std::fs::remove_file(tasks_dir.join(id.to_string()));
-                let _ = std::fs::remove_file(pty::spawn_delivery_path(&self.state_dir, id));
+                pty::clear_delivery(&self.state_dir, id);
                 return Err(e);
             }
         };
@@ -1481,7 +1481,7 @@ impl Core {
     fn forget_session_files(&self, id: usize) {
         let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
         let _ = std::fs::remove_file(self.state_dir.join("tasks").join(id.to_string()));
-        let _ = std::fs::remove_file(crate::pty::spawn_delivery_path(&self.state_dir, id));
+        crate::pty::clear_delivery(&self.state_dir, id);
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_frames_path(&self.state_dir, id));
@@ -2529,6 +2529,98 @@ mod tests {
         )
         .unwrap();
         (root, core)
+    }
+
+    /// END-TO-END: the task a spawner hands `hub_spawn` must reach the child's
+    /// process WHOLE, through the real production path — `spawn_instance_with_task`
+    /// -> `Session::spawn` -> `CommandBuilder` -> `exec`.
+    ///
+    /// This is the regression that ate two instances' briefs. The task used to be
+    /// TYPED into the child's TUI, and `claude` caps a fast burst at one tty read:
+    /// measured against v2.1.252 by reading the child's own transcript, sending
+    /// 1200 / 1998 / 3000 / 6000 characters produced 1022 received EVERY time,
+    /// cutting mid-word — while `hub_spawn` answered `ok: true`, because a turn had
+    /// genuinely started, just on the first kilobyte of the brief. A unit test on
+    /// the prompt builder cannot catch a return to typing; only reading the child's
+    /// real argv can.
+    ///
+    /// `#[ignore]`d because it has to own the process: `claude_bin`'s `merged_path`
+    /// and `resolve_claude` are `OnceLock`s, so the stub must be resolved before
+    /// any other test resolves the real binary. Run it alone:
+    ///   cargo test --lib -- --ignored --exact \
+    ///     state::tests::a_spawned_child_receives_its_whole_task_on_its_command_line
+    #[test]
+    #[ignore]
+    fn a_spawned_child_receives_its_whole_task_on_its_command_line() {
+        let _env = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-argv-{}", persist::new_uuid()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let argv_out = root.join("argv.txt");
+
+        // A stub `claude` that records its argv NUL-separated and then stays up,
+        // so the session looks alive exactly as the real one would.
+        let stub = bin.join("claude");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > {}\nsleep 30\n",
+                argv_out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The stub must win the PATH search. `merged_path` puts the LOGIN shell's
+        // PATH ahead of ours, so point SHELL at something that cannot answer.
+        std::env::set_var("SHELL", "/usr/bin/false");
+        std::env::set_var(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin.display()),
+        );
+
+        let (_root, mut core) = scratch_core_inner("argvspawn");
+
+        // Comfortably past the 1022-character cap that used to eat it.
+        let task: String = (0..1000).map(|i| format!("{i:05} ")).collect();
+        assert_eq!(task.len(), 6000);
+        core.spawn_instance_with_task(2, task.clone()).unwrap();
+
+        assert!(
+            wait_until(|| argv_out.exists()),
+            "the stub claude never ran — PATH injection failed, so this test proved nothing"
+        );
+        // Give the redirect a moment to land in full before reading it.
+        assert!(wait_until(|| std::fs::read(&argv_out).map(|b| b.len()) .unwrap_or(0) > 6000));
+        let raw = std::fs::read_to_string(&argv_out).unwrap();
+        let args: Vec<&str> = raw.split('\0').filter(|a| !a.is_empty()).collect();
+
+        let prompt = args
+            .last()
+            .expect("claude was given no arguments at all");
+        let collapsed = task.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            prompt.contains(&collapsed),
+            "the task did not reach the child's command line whole: got {} chars, \
+             wanted the full {} — head {:?}, tail {:?}",
+            prompt.len(),
+            collapsed.len(),
+            &prompt[..40.min(prompt.len())],
+            &prompt[prompt.len().saturating_sub(40)..],
+        );
+        assert!(
+            prompt.starts_with("[mulpex:hub]"),
+            "the sentinel the UserPromptSubmit hook keys off must lead the prompt"
+        );
+        // The old path is gone: nothing may wait for a TUI and type this in.
+        assert!(
+            args.iter().any(|a| *a == "--session-id"),
+            "a spawned child must still get its own session id for --resume"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A session's PTY must spawn at the geometry the frontend is going to build
@@ -3946,7 +4038,7 @@ mod remote_peer_live {
         let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
         // false: this is the user's own ssh session in the live test too, so
         // their shell must outlive the claude.
-        let cmd = remote::remote_launch_command(Some("/tmp/mpx-probe"), &rules_b64, false);
+        let cmd = remote::remote_launch_command(Some("/tmp/mpx-probe"), &rules_b64, false, None);
         remote::RemoteMeta {
             token: token.clone(),
             ssh_target: String::new(),
@@ -4035,7 +4127,7 @@ mod remote_peer_live {
 
         let token = remote::new_token(driver.id, 42);
         let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
-        let cmd = remote::ssh_command(&target, Some("/tmp/mpx-probe"), &rules_b64);
+        let cmd = remote::ssh_command(&target, Some("/tmp/mpx-probe"), &rules_b64, None);
         let remote_term = core
             .spawn_terminal(Some(cmd), Some(format!("ssh {target}")), false)
             .unwrap();
@@ -4065,9 +4157,14 @@ mod remote_peer_live {
 
         let task = "Print the current working directory using pwd, then follow your signalling \
                     instructions.";
-        // Text and Enter as SEPARATE writes — a `\r` on the tail of the same
-        // burst is swallowed as paste content and the task is never submitted.
-        // See `mcp::inject_task`; this is the shape that failed live.
+        // NOTE: this is no longer how a remote gets its INITIAL task —
+        // `hub_remote_open` puts that on the launch command line, because typing
+        // capped it at 1022 characters (see ../../docs/remote-peers.md). What is
+        // exercised here is talking to an ALREADY-RUNNING remote, which is still
+        // typed (`hub_terminal_send`), and the signalling round-trip that follows.
+        // Keep the task short for that reason, and keep the two writes separate:
+        // a `\r` on the tail of the same burst is swallowed as paste content and
+        // nothing is ever submitted. That is the shape that failed live.
         let send = |core: &mut Core, data: &str| {
             core.apply_terminal_request(
                 &serde_json::json!({ "op": "send", "from": driver.id, "id": remote_term.id,

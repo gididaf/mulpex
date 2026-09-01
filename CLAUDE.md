@@ -258,6 +258,11 @@ and cost real time; each links to the measurement that settled it.
 - **`--dangerously-skip-permissions` is on, and hub instances share one working tree.** See
   **Shared-tree guardrail** above; remote peers run unattended on someone else's box.
   → [docs/remote-peers.md](docs/remote-peers.md)
+- **A task goes on `claude`'s COMMAND LINE, never typed into its TUI** — locally spawned children
+  (`pty.rs`) and remote peers (`remote::remote_launch_command`, base64'd) alike. Typing silently
+  truncated every task over ~1 KB (measured: 1022 characters received, whatever was sent) while
+  every signal said success. A TUI is not an interface; argv is.
+  → [docs/hub.md](docs/hub.md), [docs/remote-peers.md](docs/remote-peers.md)
 - **A child must not inherit a hub identity or `CLAUDE_CODE_CHILD_SESSION`.** The former corrupts
   the hub; the latter silently disables transcript saving, so the breakage only appears at the
   *next* launch as an unrestorable session. → [docs/sessions.md](docs/sessions.md)
@@ -288,10 +293,16 @@ new work more than any individual fix is.
   bare environment; reproduce with `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
 - **The one-item case passes.** Six concurrent `hub_spawn` children blew a timeout that one child
   never approached; a `hub_terminal` bug appeared only on the second command. **Test the plural.**
+- **Someone else's UI is not an interface.** Delivering data by typing it into `claude`'s input box
+  worked for months and then silently started truncating at 1022 characters, because that program
+  changed how it handles a paste. Nothing in this repo moved. Prefer the contract that is declared
+  (argv, a file, a flag) over the one that merely happens to work.
 - **Measure; don't reason.** The list of things that were *wrong* by inspection and *right* by
   measurement is long: the Shift+Enter byte (never the problem — the stray `keypress` `\r` was), the
-  `__MPX__` marker (markdown ate the underscores), task truncation (it was a 91 s readiness stall),
-  and reading Hebrew off a screenshot (transcription re-applies BiDi and hides which end is which).
+  `__MPX__` marker (markdown ate the underscores), the spawn-truncation bug (neither Mulpex nor the
+  kernel touched the string — the TUI did, and only the child's transcript could show it), the
+  earlier task-truncation report (it was a 91 s readiness stall), and reading Hebrew off a
+  screenshot (transcription re-applies BiDi and hides which end is which).
   Drive a real `claude` on a PTY, replay real bytes through the real xterm build, and read the live
   scratch dir — `armed/` present with `named/` absent distinguishes "never called" from "refused" in
   one listing. → [docs/verification-log.md](docs/verification-log.md)

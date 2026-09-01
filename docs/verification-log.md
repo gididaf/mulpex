@@ -402,3 +402,92 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
   no overlap with the timestamp; question keeps cyan). Finally **confirmed by the user in a dev
   build**: a real plan on screen, the row red, the one-line explanation in the panel.
   `cargo test --workspace` green (78 app + 87 core), `svelte-check` 122 files 0 errors.
+
+- **`hub_spawn` task truncation, 2026-09-01.** Reported second-hand from another project: spawned
+  children were starting on a fragment of their brief. Root-caused and fixed by measurement only —
+  every theory formed by reading code was wrong, in order:
+
+  1. *"A length cap in Mulpex."* Wrong. The chain `hub_spawn` → `spawn/<uuid>.json` → poll loop →
+     spawn spec was traced and grepped; nothing truncates the task string.
+  2. *"The tty input queue drops bytes on overflow."* Wrong. A python `pty.fork` harness with the
+     slave in libuv-style raw mode reading 1 s late, written 600 / 1200 / 3000 / 6000 / 12000
+     bytes in one `write`: **every byte arrived, at both `IMAXBEL` settings.** The master write
+     just blocks. (The plausible-looking BSD `ttyflush`-on-overflow path never fires here.)
+  3. **The TUI.** Driving a real `claude` v2.1.252 on a PTY exactly as `pty.rs` did — one
+     `write_all`, 400 ms, a separate `\r` — and reading **the child's own transcript `.jsonl`**:
+     sent 1200 / 1998 / 3000 / 6000 → **received 1022 every time**, cut mid-word. 1022 = macOS
+     `TTYHOG` (1024) − 2. `claude` renders the burst as `[Pasted text #1]` and submits one chunk.
+
+  **Reading the pane could not have found this**, and two attempts to do so wasted time: at ≥1200
+  characters the input box shows only the placeholder, so the content is nowhere on screen; and
+  asking the child to echo its own prompt back produced a generic greeting. The transcript is the
+  only ground truth for "what did `claude` actually receive".
+
+  **Fix verified before writing it** (argv positional prompt): 3,000 and 12,000-character prompts
+  arrive **byte-exact**; argv coexists with `--session-id` + `--settings`; the `UserPromptSubmit`
+  hook fires with the **full** 3,000-character prompt (so delivery verification and sidebar naming
+  survive); and with the **real `mulpex-helper mcp`** wired in via `--mcp-config`, a child given a
+  2,107-character argv prompt called `mcp__mulpex__hub_instances` **on its first turn** — MCP
+  readiness before the prompt runs is measured, not assumed.
+
+  **Delivery verification verified through the real `mulpex-helper` binary**, fed a
+  `UserPromptSubmit` payload the way `claude` invokes it: a 6,124-character expected prompt
+  truncated to 1022 → verdict `partial`; the whole prompt → verdict cleared. Both cases consume
+  the expectation file.
+
+  **The shell-seed path (`hub_terminal_open`) was measured too, and is NOT affected**: a real
+  `zsh -l -i` on a PTY ran seeded commands of 348 / 1048 / 1648 / 4148 / **9148** characters, all
+  in full. zsh's ZLE appends input chunks; `claude`'s paste handling replaces. No change made.
+
+  **Contradiction worth keeping:** [hub.md](hub.md) records 2 k / 8 k / 9 k tasks landing intact
+  on claude **v2.1.235**, and a 10,213-character prompt reaching a child's transcript whole. That
+  measurement was not wrong — the behaviour changed under an upgrade nobody here made. Which is
+  the actual lesson: a TUI is not an interface.
+
+  **NOT verified:** the tail-keeping variant the field report described (its brief began mid-word
+  and ended with Mulpex's trailing boilerplate). Only head-keeping reproduced here, across every
+  size tested. The retry loop submitting a later fragment as a second queued prompt is a
+  *hypothesis*, never measured; that loop is deleted, so the question is now unanswerable rather
+  than answered. Also not verified in the running app: the fix has not been exercised through the
+  GUI, because the user was working inside Mulpex and it was not restarted.
+  `cargo test --workspace` green (79 app + 88 core) plus the `#[ignore]`d argv end-to-end test.
+
+- **Remote task truncation (`hub_remote_open`), 2026-09-01.** The same defect as the local spawn
+  bug above, in the last remaining typing path: `mcp::inject_task` typed a remote claude's task
+  into its TUI with the identical byte pattern (one write, 400 ms, a separate `\r`) into the
+  identical program, so the same **1022-character** cap applied.
+
+  **Fixed the same way** — base64 through argv, reusing the wrapper the rules blob already used, so
+  none of the shell-quoting questions that delayed this were actually open.
+
+  **The typed command line is not the constraint.** A real `zsh -l -i` on a PTY was driven with
+  seeded command lines of 9,148 / 16,148 / 24,148 / 32,148 / 48,148 / 64,148 / **128,148**
+  characters — every one executed in full. (This also supersedes the older "the PTY starts
+  discarding above ~25 KB" note: not reproducible for a blocking `write_all` into a shell.) The
+  real ceilings are on the far side — `MAX_ARG_STRLEN` (128 KiB per single argument on Linux) and
+  `ARG_MAX` (1 MiB) — hence `MAX_REMOTE_TASK_CHARS` = 32,000, which **refuses** rather than trims.
+
+  **Verified end-to-end without a remote box.** The exact command line
+  `remote::remote_launch_command` generates for a 6,000-character task (8,352 bytes) was typed into
+  a real `zsh -l -i` on a PTY, and the `claude` it launched received the task **byte-exact**
+  (`exact: true`), read from that child's own transcript `.jsonl`.
+
+  **The ssh hop was then verified too**, on a throwaway Ubuntu 6.8 x86_64 box the user provided.
+  Method: install a key (the production path is `ssh -tt` with key auth — there is nowhere to type
+  a password), move the real `claude` aside and put a stub on the remote `PATH` that writes its
+  argv NUL-separated to a file, type the command `ssh_command` really generates into a real local
+  `zsh -l -i` on a PTY, then read the argv back over ssh. Results: the remote process got
+  **argc 4** — `--dangerously-skip-permissions`, `--append-system-prompt`, the decoded rules, and
+  the task as the **last** argument — with `cwd=/tmp/mpx-probe` and `IS_SANDBOX=1` correct. A
+  6,000-character task returned byte-identical; **at the full 32,000-character cap** (42,921-byte
+  ssh command line) it returned with a matching FNV-1a hash computed independently on each side.
+  So neither ssh, nor the remote login shell, nor the `printf | base64 -d` round trip alters a
+  byte. `/root/.local/bin/claude` was restored (verified: `claude --version` → 2.1.226) and every
+  `/tmp/mpx-*` artifact removed.
+
+  **Why a stub rather than a real remote claude:** the local run already proved a real `claude`
+  receives an argv prompt byte-exact, so the only untested link was transport. A stub isolates
+  exactly that, needs no auth on the far side, and spends no model turns.
+
+  **NOT verified:** anything through the GUI — Mulpex was not restarted, the user was working
+  inside it. `cargo test --workspace` green (79 app + 90 core).

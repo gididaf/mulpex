@@ -207,7 +207,7 @@ fn tool_defs() -> Value {
                     "ssh_target": { "type": "string", "description": "Where to ssh, e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. Key-based auth must already work — there is nowhere to type a password. Optional ONLY when 'terminal_id' names a terminal that is already logged in to the remote machine." },
                     "terminal_id": { "type": "integer", "description": "Use an EXISTING terminal instead of opening a new one. Two uses: a terminal sitting at a local shell (give ssh_target too and it will ssh from there), or one the user has ALREADY ssh'd in on (omit ssh_target — only claude is started, on the far side). Useful when the login needed a password, a VPN or a jump host. Refused if that terminal is busy or already running a claude." },
                     "cwd": { "type": "string", "description": "Directory ON THE REMOTE machine to start in (its project dir). Defaults to the login directory." },
-                    "task": { "type": "string", "description": "What the remote should do, sent once its prompt is ready. Include everything it needs: it cannot see your conversation, your files, or the user." },
+                    "task": { "type": "string", "description": "What the remote should do. Include everything it needs: it cannot see your conversation, your files, or the user. Delivered on the remote claude's command line, so it cannot be truncated however long it is - up to a hard 32,000 characters, past which this call is REFUSED rather than sent in part (open with a short task and hub_terminal_send the rest). Note the reply says task_started, not delivered: a remote has no Mulpex hook, so nothing here can read back what it received." },
                 },
                 "required": ["ssh_target"],
             },
@@ -787,12 +787,25 @@ fn hub_spawn(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // the assignment had landed at a moment when it provably had not, and
             // every signal it could check said the same thing a LOST task says.
             // So wait for the injector's own verdict before answering.
-            let (delivered, pending, failed) = await_delivery(ctx, &ids);
-            let ok = !ids.is_empty() && failed.is_empty() && pending.is_empty();
+            let d = await_delivery(ctx, &ids);
+            let (delivered, pending, failed, mangled) = (d.done, d.pending, d.failed, d.mangled);
+            let ok = !ids.is_empty()
+                && failed.is_empty()
+                && pending.is_empty()
+                && mangled.is_empty();
             let note = if ok {
-                "Their tasks have been delivered and they are working on them. They will \
-                 hub_send their results back to you when done."
+                "Their tasks have been delivered — each instance was verified to have received \
+                 the exact task you wrote — and they are working on them. They will hub_send \
+                 their results back to you when done."
                     .to_string()
+            } else if !mangled.is_empty() {
+                format!(
+                    "WARNING — these instances ARE working, but NOT on the task you wrote: \
+                     {mangled:?}. The prompt each one received does not match what Mulpex sent, \
+                     so the brief was truncated or altered in transit. Do not wait for their \
+                     results: send each the full task with hub_send, and tell the user Mulpex \
+                     mangled a spawn task — that is a bug worth reporting, not a normal outcome."
+                )
             } else if !failed.is_empty() {
                 format!(
                     "WARNING — these instances exist but NEVER received their task: {failed:?}. \
@@ -813,6 +826,7 @@ fn hub_spawn(ctx: &Ctx, args: &Value) -> Result<String, String> {
                 "tasks_delivered": delivered,
                 "tasks_not_delivered_yet": pending,
                 "tasks_never_delivered": failed,
+                "tasks_delivered_mangled": mangled,
                 "note": note,
             })
             .to_string());
@@ -840,22 +854,37 @@ const SPAWN_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Poll the injector's on-disk verdict for each new instance until every one has
 /// resolved or the wait runs out. Returns (delivered, still-pending, failed).
-fn await_delivery(ctx: &Ctx, ids: &[u64]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+fn await_delivery(ctx: &Ctx, ids: &[u64]) -> Delivery {
     let deadline = std::time::Instant::now() + SPAWN_DELIVERY_WAIT;
     loop {
-        let (mut done, mut pending, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+        let mut d = Delivery::default();
         for &id in ids {
             match delivery_of(ctx, id as usize) {
-                None => done.push(id),
-                Some(("failed", _)) => failed.push(id),
-                Some(_) => pending.push(id),
+                None => d.done.push(id),
+                Some(("failed", _)) => d.failed.push(id),
+                // A mangled brief is a TERMINAL verdict, not a slow one. Rolling it
+                // into `pending` would make the worst case — an instance confidently
+                // working on the wrong task — read as the most benign one.
+                Some(("partial", _)) => d.mangled.push(id),
+                Some(_) => d.pending.push(id),
             }
         }
-        if pending.is_empty() || std::time::Instant::now() >= deadline {
-            return (done, pending, failed);
+        if d.pending.is_empty() || std::time::Instant::now() >= deadline {
+            return d;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// How each spawned instance's task actually landed. Four outcomes, because
+/// "started" and "started on what we sent" are different questions and collapsing
+/// them is the whole history of this bug.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Delivery {
+    done: Vec<u64>,
+    pending: Vec<u64>,
+    failed: Vec<u64>,
+    mangled: Vec<u64>,
 }
 
 // ---- terminals ------------------------------------------------------------
@@ -1161,17 +1190,35 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
             .into());
     }
 
+    if let Some(t) = task {
+        if t.chars().count() > remote::MAX_REMOTE_TASK_CHARS {
+            return Err(format!(
+                "task is too long for a remote launch: {} characters (max {}). It goes on the \
+                 remote `claude`'s command line, and past this it stops fitting reliably. \
+                 Refusing rather than sending part of it. Open the remote with a SHORT task \
+                 (e.g. \"await your brief before starting\") and send the full text with \
+                 hub_terminal_send once it is up.",
+                t.chars().count(),
+                remote::MAX_REMOTE_TASK_CHARS,
+            ));
+        }
+    }
+
     let token = remote::new_token(ctx.instance, now_ms());
     let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
+    // The task goes on the remote claude's command line, not into its TUI. See
+    // `remote::remote_launch_command` for the measurement that forced this.
+    let task_b64 = task.map(|t| remote::b64(t.as_bytes()));
+    let task_b64 = task_b64.as_deref();
     // With an ssh target, this terminal is on THIS machine and has to travel;
     // without one, the caller is telling us the terminal is already on the far
     // side, so only the `claude` half is launched. Both attach the rules at
     // launch, which is the only thing that actually matters.
     let command = match ssh_target {
-        Some(target) => remote::ssh_command(target, cwd, &rules_b64),
+        Some(target) => remote::ssh_command(target, cwd, &rules_b64, task_b64),
         // No ssh hop means this terminal is the user's own remote session, so
         // the launch must NOT exec: their shell has to survive the claude.
-        None => remote::remote_launch_command(cwd, &rules_b64, false),
+        None => remote::remote_launch_command(cwd, &rules_b64, false, task_b64),
     };
 
     // The command carries NO completion marker. `; printf …` marks the end of a
@@ -1215,25 +1262,32 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
 
     clear_mark(ctx, id);
 
-    // Wait for the remote's input box before typing the task in. This is the
-    // same problem `pty.rs` solves for spawned local instances, and for the same
-    // reason: nothing in the byte stream announces "the TUI is ready", and text
-    // typed before it is simply dropped — leaving a remote with no task and no
-    // way to be given one, since it never takes a first turn.
-    let mut ready = false;
+    // Nothing has to be typed: the task is already on the remote claude's command
+    // line, so it is submitted the moment that process starts. What is left to
+    // find out is whether it started AT ALL — ssh can be asking for a password, a
+    // host key or a passphrase, the directory can be wrong, `claude` can be
+    // missing. So wait for evidence of a running claude and report that, no more.
+    //
+    // Note the honest ceiling on what can be claimed here. A locally spawned child
+    // verifies its own delivery through Mulpex's `UserPromptSubmit` hook, which
+    // compares the prompt received against the one sent. A remote has no Mulpex
+    // hook, so nothing on this side can read what the far side got. This is
+    // "started", not "verified" — and the field is named accordingly.
+    let mut started = false;
     if task.is_some() {
         let deadline = now_ms() + REMOTE_READY_TIMEOUT_MS;
         while now_ms() < deadline {
             let screen = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
                 .unwrap_or_default();
-            if remote::looks_like_claude_tui(&screen) {
-                ready = true;
+            // Any of three: its TUI is up, it is visibly working, or it already
+            // finished and signalled — a very short turn can beat the first poll.
+            let signalled = remote::RemoteMeta::read(&ctx.state_dir, id)
+                .is_some_and(|m| !remote::find_signals(&screen, &m.token).is_empty());
+            if remote::looks_like_claude_tui(&screen) || remote::has_spinner(&screen) || signalled {
+                started = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        if ready {
-            ready = inject_task(ctx, id, task.unwrap_or_default())?;
         }
     }
 
@@ -1241,17 +1295,22 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         "ok": true,
         "terminal_id": id,
         "ssh_target": ssh_target,
-        "task_sent": task.is_some() && ready,
-        "task_delivered": task.is_some() && ready,
-        "note": match (task.is_some(), ready) {
+        "task_started": task.is_some() && started,
+        "note": match (task.is_some(), started) {
             (true, true) =>
-                "Remote claude started and your task was sent to it. It will signal when it is \
-                 done, blocked, or has a question — you will be woken with a hub message, so you \
-                 do NOT need to poll. To watch it anyway, use hub_terminal_read with wait_ms.",
+                "Remote claude started on your task, which was passed on its command line — so it \
+                 cannot have been truncated in transit, however long it was. It will signal when \
+                 it is done, blocked, or has a question, and you will be woken with a hub \
+                 message, so you do NOT need to poll. To watch it anyway, use hub_terminal_read \
+                 with wait_ms. One thing this cannot tell you: a remote has no Mulpex hook, so \
+                 nothing here read back what it actually received — 'started' is what was \
+                 observed, not 'verified'.",
             (true, false) =>
-                "Terminal opened, but the task could not be confirmed as started — the remote's \
-                 prompt may not have appeared in time, or ssh may be asking something. Call \
-                 hub_terminal_read(id) to see what state it is in before re-sending.",
+                "Terminal opened and the task went out on the launch command line, but no running \
+                 claude was seen in time — ssh may be asking for a password or a host key, the \
+                 directory may not exist, or claude may not be installed there. Call \
+                 hub_terminal_read(id) to see what state it is in. Do NOT re-send the task by \
+                 typing: if a claude did come up, it already has it.",
             _ =>
                 "Remote claude is starting. Give it a task with hub_terminal_send; it will signal \
                  when done, blocked, or asking, and you will be woken by a hub message.",
@@ -1320,63 +1379,6 @@ fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), Strin
                 "data": format!("{command}\r") }),
     )?;
     Ok(())
-}
-
-/// How many times to try getting a task into a remote claude's input box.
-const INJECT_ATTEMPTS: usize = 3;
-
-/// Type a task into a remote claude and confirm it actually started a turn.
-///
-/// Three things here are load-bearing, and all three were measured against the
-/// real remote rather than assumed:
-///
-/// 1. **The `\r` must be a separate write.** Sent as the tail of the same burst
-///    as the text, Claude Code treats it as *paste content* rather than as
-///    Enter: the task lands in the input box, sits there fully typed, and is
-///    never submitted. That is precisely what the first live run did — the
-///    driver then waited on a remote that had been given a task it had not read.
-///    `pty.rs` documents the same rule for locally spawned instances.
-/// 2. **Submission is verified, not assumed.** A remote that is still finishing
-///    its startup silently drops what it is given, so the reply is only honest
-///    if something confirms the turn began. The spinner is that proof: it
-///    animates continuously while a turn runs.
-/// 3. **A retry clears the box first** (Ctrl-U), or a half-landed attempt
-///    concatenates with the next one into gibberish.
-fn inject_task(ctx: &Ctx, id: usize, task: &str) -> Result<bool, String> {
-    for attempt in 0..INJECT_ATTEMPTS {
-        if attempt > 0 {
-            // Ctrl-U: discard whatever the previous attempt left behind.
-            terminal_request(
-                ctx,
-                json!({ "op": "send", "from": ctx.instance, "id": id, "data": "\x15" }),
-            )?;
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-        terminal_request(
-            ctx,
-            json!({ "op": "send", "from": ctx.instance, "id": id, "data": task }),
-        )?;
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        terminal_request(
-            ctx,
-            json!({ "op": "send", "from": ctx.instance, "id": id, "data": "\r" }),
-        )?;
-
-        let deadline = now_ms() + 8_000;
-        while now_ms() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let screen = std::fs::read_to_string(terminals_dir(ctx).join(format!("{id}.screen")))
-                .unwrap_or_default();
-            // Either it is visibly working, or it already finished and said so —
-            // a very short turn can be over before the first poll.
-            let signalled = remote::RemoteMeta::read(&ctx.state_dir, id)
-                .is_some_and(|m| !remote::find_signals(&screen, &m.token).is_empty());
-            if remote::has_spinner(&screen) || signalled {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn hub_terminal_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
@@ -2185,20 +2187,32 @@ fn status_of(ctx: &Ctx, id: usize) -> String {
 /// Whether a spawned instance has actually received the task it was created
 /// with. `None` once it has landed (and for every instance nobody spawned).
 ///
-/// Written by the injector thread in `pty.rs`; see `pty::spawn_delivery_path`.
+/// `pending` is written by the app at spawn time; the terminal verdict comes from
+/// whichever side can prove it — the child's own `UserPromptSubmit` hook, which is
+/// the only place the received prompt can be compared with the sent one, or the
+/// app's watchdog for a child that never reached a first turn to be compared.
+/// See `crate::spawn_expected_path`.
 fn delivery_of(ctx: &Ctx, id: usize) -> Option<(&'static str, &'static str)> {
-    let raw = std::fs::read_to_string(ctx.state_dir.join("spawning").join(id.to_string())).ok()?;
+    let raw = std::fs::read_to_string(crate::spawn_delivery_path(&ctx.state_dir, id)).ok()?;
     match raw.trim() {
         "pending" => Some((
             "pending",
-            "This instance was spawned with a task that has NOT been typed into it yet — it is \
+            "This instance was spawned with a task and has not begun its first turn yet — it is \
              still starting up. It is not idle and it is not stuck; wait and re-check rather \
              than re-sending the task.",
         )),
         "failed" => Some((
             "failed",
-            "This instance NEVER received the task it was spawned with — delivery was attempted \
-             and could not be confirmed. Send it the task yourself with hub_send.",
+            "This instance NEVER began work on the task it was spawned with. Send it the task \
+             yourself with hub_send; do NOT assume it is working.",
+        )),
+        "partial" => Some((
+            "partial",
+            "This instance IS working, but NOT on the task it was sent — the prompt it received \
+             does not match what Mulpex put on its command line, so its brief was truncated or \
+             altered in transit. Treat whatever it produces as untrustworthy: interrupt it, send \
+             it the full task with hub_send, and report the mismatch — this is a Mulpex bug, not \
+             a normal outcome.",
         )),
         _ => None,
     }
@@ -2500,23 +2514,72 @@ mod tests {
     }
 
     /// The defect that hid this for months: `hub_spawn` answered `ok: true` the
-    /// moment the child PROCESS existed, which is before its task has been typed
-    /// in and says nothing about whether it ever will be. `ok` must track the
-    /// task, not the process.
+    /// moment the child PROCESS existed, which is before its task has reached it
+    /// and says nothing about whether it ever will. `ok` must track the task, not
+    /// the process — and, since a task can arrive MANGLED, not merely the fact
+    /// that some turn started.
     #[test]
     fn hub_spawn_never_claims_ok_for_a_task_that_did_not_arrive() {
         let dir = std::env::temp_dir().join(format!("mulpex-deliv2-{}", new_uuid()));
         std::fs::create_dir_all(dir.join("spawning")).unwrap();
         let ctx = test_ctx(&dir, 1);
 
-        // Delivered: the marker is gone, which is what the injector does on
-        // verified submission.
-        assert_eq!(await_delivery(&ctx, &[7]), (vec![7], vec![], vec![]));
+        // Delivered: the marker is gone, which is what the child's own hook does
+        // once it has checked the prompt it received against the one Mulpex sent.
+        assert_eq!(
+            await_delivery(&ctx, &[7]),
+            Delivery { done: vec![7], ..Default::default() }
+        );
 
-        // Lost: the injector exhausted its retries. Reported, not rounded up.
+        // Lost: never began a turn at all. Reported, not rounded up.
         std::fs::write(dir.join("spawning").join("8"), "failed").unwrap();
-        let (done, pending, failed) = await_delivery(&ctx, &[7, 8]);
-        assert_eq!((done, pending, failed), (vec![7], vec![], vec![8]));
+        // Mangled: began a turn, but on text that is not what was sent. This is
+        // the case that used to be invisible — the instance looks healthy and
+        // busy, and every signal short of comparing the prompt says success.
+        std::fs::write(dir.join("spawning").join("9"), "partial").unwrap();
+        assert_eq!(
+            await_delivery(&ctx, &[7, 8, 9]),
+            Delivery {
+                done: vec![7],
+                failed: vec![8],
+                mangled: vec![9],
+                pending: vec![],
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An over-long remote task must be REFUSED, not trimmed to fit.
+    ///
+    /// This is the one place a length limit is unavoidable — the task rides the
+    /// remote `claude`'s command line, and `MAX_ARG_STRLEN` caps a single argument
+    /// at 128 KiB on a Linux remote. Given that the bug being fixed here was a
+    /// silent truncation, quietly clipping to the cap would reproduce it with a
+    /// different number. It has to say no, and say what to do instead.
+    #[test]
+    fn an_oversized_remote_task_is_refused_rather_than_trimmed() {
+        let dir = std::env::temp_dir().join(format!("mulpex-remotecap-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 1);
+
+        let too_long = "x".repeat(remote::MAX_REMOTE_TASK_CHARS + 1);
+        let err = hub_remote_open(
+            &ctx,
+            &json!({ "ssh_target": "root@10.0.0.5", "task": too_long }),
+        )
+        .expect_err("an oversized task must not be accepted");
+
+        assert!(err.contains("too long"), "the refusal must say why: {err}");
+        assert!(
+            err.contains("hub_terminal_send"),
+            "a refusal has to name the way through: {err}"
+        );
+        // Nothing may have been queued on the way to refusing.
+        assert!(
+            !dir.join("termreq").exists()
+                || std::fs::read_dir(dir.join("termreq")).unwrap().next().is_none(),
+            "a refused launch still asked Mulpex to open a terminal"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
