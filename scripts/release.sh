@@ -77,7 +77,13 @@ if [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
-echo "==> releasing Mulpex $VERSION (tag $TAG)${DRY_RUN:+ [dry run]}"
+# NOT `${DRY_RUN:+ [dry run]}`: that expands whenever DRY_RUN is set and
+# NON-EMPTY, and its non-dry-run value is the string "0" — so every real
+# release from v0.4.7 to v0.11.0 announced itself as a dry run. The publish
+# itself was always correct (it tests `-eq 0`); only this line lied, which is
+# the worst kind of line to lie while you are debugging a bad release.
+if [ "$DRY_RUN" -eq 1 ]; then DRY_LABEL=" [dry run]"; else DRY_LABEL=""; fi
+echo "==> releasing Mulpex $VERSION (tag $TAG)$DRY_LABEL"
 
 # ---- build -----------------------------------------------------------------
 # The KEY CONTENTS, not the path. `tauri signer generate` advertises
