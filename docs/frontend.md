@@ -141,14 +141,16 @@ widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the it
   it runs.
 - **It acts on the row you clicked, which is not the focused row.** Right-click does *not* select —
   renaming or closing a background instance must not yank the center pane away from what you were
-  reading. That is also why **⌘R / ⌘M / ⌘W hints are printed only when the clicked row is the
+  reading. That is also why **⌘R / ⌘⇧R / ⌘M / ⌘W hints are printed only when the clicked row is the
   focused one**: those keys act on the focused row, so printing them beside an item aimed at a
   different instance would advertise a key that does something else. An absent hint means "no hint
   here", never "no shortcut exists".
 - **Items:** Rename… (opens the same `RenameDialog`, which already takes an explicit `(handle, id)`
-  and works for terminals), Mute/Unmute, Copy address, a separator, Close. **Mute is absent on a
-  terminal row** rather than greyed out — the backend drops the flag for a shell, so the item would
-  be dead weight. Close does not confirm, matching ⌘W.
+  and works for terminals), Mute/Unmute, Copy address, a separator, Restart…, Close. **Mute and
+  Restart are absent on a terminal row** rather than greyed out — the backend drops the mute flag
+  for a shell, and a shell has no conversation to resume, so both would be dead weight. Close does
+  not confirm, matching ⌘W; **Restart does**, because it kills a process that may be mid-turn and
+  sits one shift away from Rename (see [sessions.md](sessions.md#restarting-an-instance-in-place-r)).
 - **Copy address copies the hub's own written form** — `claude#3` / `term#5` — so it pastes straight
   into a `hub_send` or a prompt. Not the cross-project `<project>#<n>` form. There is no clipboard
   plugin (and adding one means another capability entry, the same allowlist shape as above), so it
