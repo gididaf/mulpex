@@ -36,22 +36,33 @@ use crate::snapshot::{ExplainEntry, ExplainKind, ExplainPending, ExplainUpdate, 
 /// at a glance; English identifiers stay as-is because translating them is how
 /// you lose track of what the claude actually touched. Tone/length approved on
 /// real turns (probe0, 2026-08-30).
+///
+/// **First person, always.** The panel is Claude talking to the user about his
+/// own turn — "בדקתי… ועכשיו אני צריך ממך" — not a narrator describing "הוא".
+/// A third-person summarizer also drifts into calling the *user* the one who
+/// did the work ("אתה ממתין לשני agents"), which is exactly backwards; pinning
+/// אני to the claude and אתה to the human kills both problems at once.
 const HEBREW_PROMPT: &str = "אתה \"המסביר\" של Mulpex. תקבל את הטקסט שכתב Claude Code בסיום תור עבודה.\n\
-כתוב הסבר קצר בעברית פשוטה מאוד — משפט אחד עד שלושה, כמו הסבר בעל־פה לחבר.\n\
+כתוב הסבר קצר בעברית פשוטה מאוד — משפט אחד עד שלושה, כמו הסבר בעל־פה לחבר, בגוף ראשון יחיד — כאילו Claude עצמו אומר אותו למשתמש.\n\
 כללים:\n\
+- גוף ראשון תמיד: בדקתי, תיקנתי, עכשיו אני מריץ, אני צריך ממך. אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
+- אתה, אותך, ממך, שלך — מתייחסים אך ורק למשתמש האנושי. לעולם לא לעבודה שאני עצמי עשיתי.\n\
+- זה סיכום, לא שכתוב: משפט אחד עד שלושה, רק העיקר. פסקה אחת, בלי לעבור על כל הפרטים.\n\
 - מונחים טכניים, שמות קבצים, פקודות ושמות functions/branches נשארים באנגלית כמו שהם.\n\
 - בלי הקדמה, בלי \"לסיכום\", בלי כותרות ובלי bullet points. רק ההסבר עצמו.\n\
 - טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`.\n\
-- אם Claude שואל שאלה או מחכה להחלטה — פתח בזה: מה הוא צריך ממך עכשיו.\n\
-- אם Claude נכשל או נתקע — אמור את זה ישירות.\n\
+- אם אני שואל שאלה או מחכה להחלטה — פתח בזה: מה אני צריך ממך עכשיו.\n\
+- אם נכשלתי או נתקעתי — אמור את זה ישירות.\n\
 - אל תוסיף שום דבר שלא מופיע בטקסט.";
 
 /// The question-mode prompt: Claude stopped mid-turn on `AskUserQuestion` and
 /// the panel should say what is being asked and what each option means, while
-/// the question sits on screen waiting.
-const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude עצר באמצע העבודה ושואל את המשתמש שאלה לפני שימשיך.\n\
-תקבל את השאלות והאפשרויות. הסבר בעברית פשוטה מאוד: מה הוא שואל, ומה המשמעות של כל אפשרות — משפט קצר לכל אחת.\n\
+/// the question sits on screen waiting. First person, same as the turn prompt.
+const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude עצר באמצע העבודה ושואל את המשתמש שאלה לפני שימשיך, ואתה מנסח את השאלה בגוף ראשון — כאילו Claude עצמו פונה למשתמש.\n\
+תקבל את השאלות והאפשרויות. הסבר בעברית פשוטה מאוד: מה אני שואל, ומה המשמעות של כל אפשרות — משפט קצר לכל אחת.\n\
 כללים:\n\
+- גוף ראשון יחיד תמיד: אני צריך ממך להחליט, אני שואל (לא \"נעשה\" ולא \"נציג\"). אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
+- אתה, ממך, שלך — המשתמש האנושי בלבד. לעולם לא אני.\n\
 - מונחים טכניים, שמות קבצים, פקודות ושמות functions/branches נשארים באנגלית כמו שהם.\n\
 - בלי הקדמה ובלי סיכום. שורה לשאלה, ואז שורה קצרה לכל אפשרות שמתחילה ב\"- \".\n\
 - טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`.\n\
@@ -62,10 +73,12 @@ const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude עצ�
 /// dialog is on screen. A plan is long, structured and technical by
 /// construction — headings, file paths, code fences — and the panel's job here
 /// is the opposite of reproducing it: ONE sentence saying what he intends to
-/// do. The detail is two inches away in the terminal if the user wants it.
-const PLAN_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude סיים לתכנן, ומחכה לאישור של המשתמש לפני שיתחיל לעבוד.\n\
-תקבל את התוכנית המלאה. כתוב משפט אחד בעברית פשוטה מאוד: מה הוא מתכוון לעשות, בגדול.\n\
+/// do, in his own voice. The detail is two inches away in the terminal if the
+/// user wants it.
+const PLAN_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude סיים לתכנן ומחכה לאישור של המשתמש לפני שיתחיל לעבוד, ואתה מנסח את התוכנית בגוף ראשון — כאילו Claude עצמו אומר אותה.\n\
+תקבל את התוכנית המלאה. כתוב משפט אחד בעברית פשוטה מאוד: מה אני מתכוון לעשות, בגדול.\n\
 כללים:\n\
+- גוף ראשון יחיד: אני מתכוון ל… אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי. אתה/ממך — המשתמש בלבד.\n\
 - משפט אחד. שניים רק אם באמת אי אפשר אחרת. כמה שיותר קצר.\n\
 - בלי שלבים, בלי רשימות, בלי שמות קבצים ובלי פרטים טכניים — רק המטרה.\n\
 - מונחים ושמות באנגלית שאי אפשר בלעדיהם נשארים באנגלית כמו שהם.\n\

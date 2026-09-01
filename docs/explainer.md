@@ -217,6 +217,21 @@ bullets, open with what the claude needs from the user when it's waiting on a de
 failures directly, add nothing not in the text. Tone approved by the user on four real turns
 (mulpex + dreamvps samples) before any code was written.
 
+**All three speak in the first person, as the claude himself** (2026-09-01): "בדקתי… ועכשיו אני
+צריך ממך לאשר", never "הוא בדק". Third person had a second failure mode beyond the tone the user
+disliked: with nobody pinned to "אני", the summarizer regularly handed the *user* the claude's own
+work — "אתה ממתין לשני agents נוספים" — which is exactly backwards. The prompts therefore pin both
+pronouns at once: **אני = the claude, אתה/ממך/שלך = the human, always**, plus "גוף ראשון יחיד" so
+Sonnet doesn't drift into the editorial "נציג/נעשה".
+
+The person change had to be a *minimal* diff. A first draft opened with "תסכם… כאילו Claude עצמו
+מספר מה עשה", and on a real 1.3 KB turn Sonnet answered with five paragraphs where the old prompt
+gave one — "מספר מה עשה" reads as retell, not summarize. The shipped version keeps the original two
+opening lines verbatim, adds the person as a clause plus two rules, and re-states brevity as
+"זה סיכום, לא שכתוב: משפט אחד עד שלושה, רק העיקר. פסקה אחת". Re-measured on three real
+dreamvps turns + a real `AskUserQuestion` payload + a real plan: one paragraph each, first person
+throughout, options still one-per-`- ` line, `(מומלץ)` still only where the input marked it.
+
 Two hardenings, both measured on real multi-question output and re-verified after the fix:
 
 - **"No markdown symbols" must be explicit.** The panel renders plain text; without the rule,
