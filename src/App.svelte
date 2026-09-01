@@ -2,7 +2,7 @@
   import { onMount, tick } from "svelte";
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
-  import { open as openFolder } from "@tauri-apps/plugin-dialog";
+  import { open as openFolder, confirm } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -18,6 +18,7 @@
     createSession,
     createTerminal,
     closeSession,
+    restartSession,
     focusSession,
     getHubSnapshot,
     getExplains,
@@ -217,6 +218,17 @@
         run: () => copyText(`${shell ? "term" : "claude"}#${s.id}`),
       },
       { sep: true },
+      // Terminals have no conversation to resume, so the item is absent rather
+      // than present-and-refused (same reasoning as Mute above).
+      ...(shell
+        ? []
+        : [
+            {
+              label: "Restart…",
+              hint: key("⌘⇧R"),
+              run: () => void restartInstance(h, s.id),
+            },
+          ]),
       { label: "Close", hint: key("⌘W"), danger: true, run: () => closeSession(h, s.id) },
     ];
     ctx = { x: e.clientX, y: e.clientY, items };
@@ -434,6 +446,71 @@
   }
 
   /**
+   * ⌘⇧R — quit a claude and bring it straight back on the same row, resuming the
+   * same conversation.
+   *
+   * Why it exists: a `claude` reads its world once, at exec. A rotated
+   * CLAUDE_CODE_OAUTH_TOKEN, a skill installed a minute ago, an edited
+   * settings.json reach a running instance never. ⌘W + ⌘T does pick them up but
+   * hands back a *different* instance — new number, no name, empty inbox, and the
+   * conversation to go and find.
+   *
+   * Confirmed, unlike ⌘W, and for a reason that isn't squeamishness: ⌘W closes a
+   * session you were looking at and meant to be rid of, while this key sits one
+   * shift away from ⌘R (Rename) and kills a process that may be mid-turn. The
+   * native dialog gives Enter = Restart and Esc = Cancel for free.
+   *
+   * `handle`/`id` are passed in rather than read off the focus, because the
+   * sidebar's context menu aims this at the row you right-clicked — which is
+   * usually not the focused one.
+   */
+  async function restartInstance(handle: ProjectHandle, id: number) {
+    const s = get(projects)
+      .get(handle)
+      ?.sessions.find((x) => x.id === id);
+    if (!s) return;
+    if (s.kind === "shell") {
+      // The menu item is always enabled, so a ⌘⇧R on a terminal has to say why
+      // nothing happened rather than look like a dead key.
+      flashNotice(
+        `term #${id} can't be restarted — only a claude has a conversation to resume.`,
+        4000,
+      );
+      return;
+    }
+    const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
+    const ok = await confirm(
+      `Quit ${who} and start it again, resuming the same conversation?\n\n` +
+        `It comes back with its number, name and unread messages intact, but ` +
+        `anything it is doing right now is lost.`,
+      {
+        title: "Restart Session",
+        kind: "warning",
+        okLabel: "Restart",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!ok) {
+      terminals.refocus();
+      return;
+    }
+    try {
+      await restartSession(handle, id);
+    } catch (e) {
+      // The backend refuses without killing anything when there is no transcript
+      // to resume yet, which is the message worth showing — the instance the user
+      // was about to lose is still running.
+      flashNotice(`Could not restart claude #${id}: ${e}`, 8000);
+      terminals.refocus();
+      return;
+    }
+    // Same row, different process: the pane has to be wiped and bound to the new
+    // PTY, which the backend is buffering until we do.
+    terminals.reattach(handle, id);
+    terminals.refocus();
+  }
+
+  /**
    * Cycle sessions within the active project, in the order the sidebar shows
    * them — claudes, then terminals. What you see is what you cycle.
    *
@@ -501,6 +578,11 @@
       case "close_session": {
         const cur = get(activeId);
         if (h != null && cur != null) closeSession(h, cur);
+        break;
+      }
+      case "restart": {
+        const cur = get(activeId);
+        if (h != null && cur != null) await restartInstance(h, cur);
         break;
       }
       case "rename": {

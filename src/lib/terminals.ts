@@ -205,6 +205,29 @@ class TerminalManager {
     }
   }
 
+  /** Rebind (handle, id) to the process that replaced it (⌘⇧R restart): wipe the
+   *  pane and hand the backend a fresh `Channel`, since the old session — and the
+   *  channel it was streaming into — is gone.
+   *
+   *  The xterm itself is deliberately kept rather than rebuilt. It is already at
+   *  the one shared geometry, and the new PTY spawned at that same geometry, so
+   *  reusing it is the only path that cannot put an emulator and a claude at
+   *  different sizes (see `create`). `reset()` is what makes the wipe safe: the
+   *  dead claude was drawing on the alt screen and left the pane mid-frame, and
+   *  the resumed one repaints from scratch — so keeping those bytes would leave
+   *  debris under a screen nothing will ever redraw.
+   *
+   *  Output the new child produces before this runs is not lost: the backend
+   *  buffers a session's bytes until something attaches. */
+  reattach(handle: number, id: number): void {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return;
+    e.term.reset();
+    const channel = new Channel<string>();
+    channel.onmessage = (chunk) => e.term.write(b64ToBytes(chunk));
+    attachSession(handle, id, channel);
+  }
+
   dispose(handle: number, id: number): void {
     const key = keyOf(handle, id);
     const e = this.entries.get(key);

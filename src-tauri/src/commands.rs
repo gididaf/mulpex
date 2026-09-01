@@ -154,6 +154,22 @@ pub fn close_session(state: State<AppState>, project_handle: ProjectHandle, id: 
     }
 }
 
+/// Restart one claude in place (⌘⇧R): kill it and relaunch on the same row with
+/// `--resume`, so it re-reads its environment (a rotated auth token, a newly
+/// installed skill) without the user losing the conversation, the instance number
+/// or its undelivered mail. Refuses — killing nothing — when that instance has no
+/// transcript to resume yet; the frontend shows the reason.
+#[tauri::command]
+pub fn restart_session(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+) -> Result<(), String> {
+    let mut ws = state.ws.lock().unwrap();
+    let core = ws.project_mut(project_handle).ok_or("no such project")?;
+    core.restart_instance(id).map_err(|e| e.to_string())
+}
+
 /// Commit a new sidebar order after the user drags a session row. `ids` is the
 /// full top-to-bottom order within that project; the backend is the source of
 /// truth for persistence, so this also rewrites the session store (see

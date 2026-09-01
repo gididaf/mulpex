@@ -1283,6 +1283,103 @@ impl Core {
         }
     }
 
+    /// Relaunch one claude **in place** (⌘⇧R): kill the child, then spawn a new
+    /// one on the same row with `--resume`, so the conversation carries on inside
+    /// a process that has just re-read the world.
+    ///
+    /// That re-reading is the whole point. A `claude` resolves its environment
+    /// once, at exec — a rotated `CLAUDE_CODE_OAUTH_TOKEN`, a skill installed
+    /// five minutes ago, an edited `~/.claude/settings.json` reach a running
+    /// instance never. ⌘W then ⌘T already picks them up, but hands back a
+    /// *different* instance: new number, no name, empty inbox, and a conversation
+    /// to go and find. This keeps everything that identifies the row — its id and
+    /// therefore its hub address, its name, its mute, its place in the sidebar,
+    /// its undelivered mail and its Explainer feed — and replaces only the
+    /// process.
+    ///
+    /// It **refuses** rather than kills when there is nothing to resume. An
+    /// instance that has never had a prompt submitted has no transcript on disk,
+    /// so `claude --resume <uuid>` exits within seconds (measured — see the
+    /// ghost-uuid test below) and the row would come back dead, having killed a
+    /// perfectly good claude to get there. `worked` answers exactly that question:
+    /// it latches when the first `UserPromptSubmit` hook writes the status file.
+    pub fn restart_instance(&mut self, id: usize) -> anyhow::Result<()> {
+        let pos = self
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| anyhow::anyhow!("claude#{id} is not open"))?;
+        if self.sessions[pos].is_shell() {
+            anyhow::bail!("term#{id} is a terminal — only a claude can be restarted");
+        }
+        let session_id = self.sessions[pos].session_id.clone();
+        if session_id.is_empty() || !self.worked.contains(&id) {
+            anyhow::bail!(
+                "claude#{id} has no conversation to resume yet — send it a prompt first, \
+                 or close it with ⌘W and open a new one"
+            );
+        }
+        // Same check ⌘T makes, for the same reason: if macOS is withholding the
+        // folder, the respawn would fail *after* we had already killed the
+        // instance the user still has.
+        if let Some(reason) = pty::dir_access_error(&self.project_dir) {
+            anyhow::bail!(reason);
+        }
+        self.ensure_state_dir()?;
+
+        // Stamped BEFORE the kill, not after a successful spawn. If the respawn
+        // fails, these are what make `reap_dead` read the corpse as a failed
+        // *restore*: the row is kept with the reason printed into its own pane,
+        // and `persist_sessions` still writes its `session_id`. Without them the
+        // dead session is an ordinary exit — removed from the list, and the
+        // conversation's uuid gone from the store along with it.
+        self.started.insert(id, Instant::now());
+        self.restored.insert(id, Instant::now());
+
+        // Kill first, and finish killing before spawning: two claudes appending
+        // to one transcript is not a state `--resume` can be asked to make sense
+        // of afterwards.
+        self.sessions[pos].kill();
+
+        // The status file is an assertion left by a process that no longer
+        // exists. An instance killed while it was waiting on the user would go on
+        // telling the sidebar, the dock badge and every peer that it `needs`
+        // something. Removing it reads as `waiting` (`mcp::status_of`'s default),
+        // which is the truth about a claude that is booting. Deliberately NOT
+        // cleared: the inbox, the task line and the `named` marker — those
+        // describe the instance, which is the thing being kept.
+        let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
+        // `armed/<id>` tracks a *live* hub-listener Monitor, and that process is
+        // gone with the old child. Left behind, the `UserPromptSubmit` hook sees
+        // the flag, skips the arm nudge for good, and the resumed instance is
+        // never woken by hub mail again — with nothing anywhere to say so.
+        let _ = std::fs::remove_file(self.state_dir.join("armed").join(id.to_string()));
+
+        let settings_path = self.settings_path.clone();
+        let state_dir = self.state_dir.clone();
+        let session = Session::spawn(
+            id,
+            &self.project_dir,
+            self.geometry.1,
+            self.geometry.0,
+            SpawnSpec::Claude {
+                settings_path: &settings_path,
+                state_dir: &state_dir,
+                session_id: &session_id,
+                resume: true,
+                initial_task: None,
+            },
+        )?;
+        // Dropping the old `Session` here `kill`s it a second time, which is
+        // idempotent by contract.
+        self.sessions[pos] = session;
+        // A row that had failed to start is a live peer again — `live_instances`
+        // (hence the peer list on disk and the hub snapshot) filters on this.
+        self.failed.remove(&id);
+        self.write_live_instances();
+        Ok(())
+    }
+
     /// Set the focused instance (persistence/order bookkeeping).
     pub fn set_active(&mut self, id: usize) {
         if let Some(pos) = self.sessions.iter().position(|s| s.id == id) {
@@ -2747,6 +2844,91 @@ mod tests {
             assert_eq!(core.display_name(session.id).as_deref(), want.name.as_deref());
         }
         assert_eq!(core.next_id, 16, "a fresh ⌘T would collide with a restored id");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⌘⇧R must never kill what it cannot bring back.
+    ///
+    /// An instance that has never had a prompt submitted has no transcript on
+    /// disk, so `--resume` would exit within seconds and the row would come back
+    /// dead — having killed a working claude to get there. The refusal has to
+    /// happen before anything is touched.
+    #[test]
+    fn restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it() {
+        let saved = [record("nothing to resume", Some(1))];
+        let (_env, root, mut core) = core_from_store("restartguard", &saved);
+        let id = core.sessions[0].id;
+        let sid = core.sessions[0].session_id.clone();
+        // The restore path seeds `worked`; a claude nobody has prompted yet is
+        // exactly the case this guards, so put it back in that state.
+        core.worked.remove(&id);
+
+        let err = core
+            .restart_instance(id)
+            .expect_err("it agreed to resume a conversation that does not exist");
+        assert!(
+            err.to_string().contains("no conversation to resume"),
+            "unexpected refusal: {err}"
+        );
+        assert_eq!(core.sessions.len(), 1, "the row it refused to restart is gone");
+        assert_eq!(core.sessions[0].session_id, sid, "the conversation was replaced");
+        assert!(
+            core.sessions[0].is_alive(),
+            "it killed the instance it had just refused to restart"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A restart replaces the *process* and nothing else.
+    ///
+    /// Same position in the sidebar, same number (so every `claude#N` an
+    /// instance or the user wrote down still points here), same conversation,
+    /// same name — and the state the dead child left on disk cleared, because a
+    /// status file and an `armed` flag are both assertions about a process that
+    /// no longer exists.
+    #[test]
+    fn restarting_an_instance_keeps_its_row_and_clears_the_dead_childs_state() {
+        let saved = [record("one", Some(1)), record("two", Some(2)), record("three", Some(3))];
+        let (_env, root, mut core) = core_from_store("restartinplace", &saved);
+        let id = core.sessions[1].id;
+        let sid = core.sessions[1].session_id.clone();
+        // What a live instance leaves behind: the status the sidebar, the dock
+        // badge and every peer read, and the flag tracking its hub listener.
+        std::fs::write(core.state_dir.join(id.to_string()), "needs").unwrap();
+        std::fs::write(core.state_dir.join("armed").join(id.to_string()), "").unwrap();
+        // A row that had failed to start must come back as a live peer.
+        core.failed.insert(id, "an earlier failure".into());
+
+        core.restart_instance(id).expect("the restart failed");
+
+        assert_eq!(core.sessions.len(), 3, "the restart changed the row count");
+        assert_eq!(core.sessions[1].id, id, "the instance moved or was renumbered");
+        assert_eq!(
+            core.sessions[1].session_id, sid,
+            "it came back on a different conversation"
+        );
+        assert!(core.sessions[1].is_alive(), "nothing was spawned in its place");
+        assert_eq!(
+            core.display_name(id).as_deref(),
+            Some("two"),
+            "the row lost the name the user gave it"
+        );
+        assert!(
+            !core.state_dir.join(id.to_string()).exists(),
+            "a killed child's `needs` still stands, so the sidebar and the dock badge lie"
+        );
+        assert!(
+            !core.state_dir.join("armed").join(id.to_string()).exists(),
+            "the resumed instance will never be nudged to re-arm its hub listener"
+        );
+        assert!(
+            !core.failed.contains_key(&id),
+            "still marked as failed to start, so it is not offered as a live peer"
+        );
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

@@ -176,6 +176,15 @@ export const createTerminal = (projectHandle: ProjectHandle) =>
 export const closeSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("close_session", { projectHandle, id });
 
+/** Restart one claude in place (⌘⇧R): the backend kills it and relaunches on the
+ *  same row with `--resume`, so it re-reads its environment while keeping its
+ *  conversation, number, name and inbox. Rejects (having killed nothing) when
+ *  that instance has no transcript to resume yet — the caller shows the reason.
+ *  The PTY behind the row is a different process afterwards, so the pane has to
+ *  be rebound with `terminals.reattach`. */
+export const restartSession = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("restart_session", { projectHandle, id });
+
 /** Commit a new sidebar order after a session-row drag. The backend persists it
  *  to the session store, so the arrangement survives relaunch (and ⌘[ / ⌘]
  *  follow it). */

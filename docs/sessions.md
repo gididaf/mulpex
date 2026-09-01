@@ -383,3 +383,51 @@ transcript resumes fine, through Mulpex's full invocation; and quitting preserve
 **Note the tests take `env_guard()`** — `HOME` is process-global and the session store path is
 derived from it, so the tests that repoint it must take turns or they race.
 
+## Restarting an instance in place (⌘⇧R)
+
+A `claude` reads its world exactly **once, at exec**: `CLAUDE_CODE_OAUTH_TOKEN` and the rest of the
+login environment `claude_bin` reconstructed, the skills installed under `~/.claude`, the
+`--settings` file. Rotate the token or install a skill and the running instance never hears about
+it. ⌘W + ⌘T does pick it all up, but it hands back a *different* instance — new number (so every
+`claude#N` written down elsewhere now points somewhere else), no name, empty inbox, and the
+conversation to go and find.
+
+`Core::restart_instance` (`commands::restart_session`, menu id `restart`) kills the child and spawns
+a new one **on the same row** with the same `session_id` and `resume: true`. Everything that
+identifies the instance survives because none of it lives in the process: the id and therefore its
+hub address, its name and mute, its position in the sidebar, its `inbox/<id>` mail, its Explainer
+feed. It is the restore path from `Core::open`, aimed at one row while the app runs.
+
+Four things it does that are not obvious:
+
+- **It refuses rather than kills when there is nothing to resume.** An instance that has never had a
+  prompt submitted has no transcript, so `--resume` would print `No conversation found` and exit in
+  ~1.6 s — the row would come back dead, having killed a working claude to get there. `worked` is
+  exactly that question (it latches when the first `UserPromptSubmit` hook writes the status file),
+  so it is the guard, and the refusal happens before anything is touched.
+- **`started`/`restored` are stamped BEFORE the kill.** If the respawn then fails, that is what makes
+  `reap_dead` read the corpse as a *failed restore* — row kept with the reason in its own pane,
+  `session_id` still written to the store. Stamped after a successful spawn instead, a failed
+  respawn is an ordinary exit: the row is removed and the conversation's uuid goes with it.
+- **The status file and `armed/<id>` are deleted.** Both are assertions about a process that no
+  longer exists. A claude killed while it was waiting on the user would go on telling the sidebar,
+  the dock badge and every peer that it `needs` something (removing the file reads as `waiting`,
+  `mcp::status_of`'s default, which is the truth about a claude that is booting). `armed/` is worse:
+  it tracks a live hub-listener Monitor, so left behind, the hook skips the arm nudge for good and
+  the resumed instance is never woken by hub mail again — silently. The inbox, the task line and
+  `named/<id>` are deliberately kept: they describe the *instance*, which is the thing being kept.
+- **The frontend keeps the xterm and rebinds it** (`terminals.reattach`): `reset()` to wipe the
+  half-drawn alt screen the dead child left, then a fresh `Channel` to the new PTY (whose output the
+  backend is buffering until something attaches). Rebuilding the terminal instead would put a new
+  emulator at whatever size it defaulted to in front of a PTY that spawned at the shared geometry —
+  the permanent-debris class in [rendering.md](rendering.md).
+
+Confirmed before it kills anything (a native dialog — Enter restarts, Esc cancels), which ⌘W
+deliberately is not: ⌘W closes a session you were looking at and meant to be rid of, while ⌘⇧R sits
+one shift away from ⌘R (Rename) and kills a process that may be mid-turn. Reachable from the Session
+menu, ⌘P and a row's right-click menu; the context-menu route aims at the row you clicked, not the
+focused one. Terminals are excluded everywhere — a shell has no conversation to resume.
+
+Guarded by `restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it` and
+`restarting_an_instance_keeps_its_row_and_clears_the_dead_childs_state`. **Not yet driven in the
+real app** — the reattach half is unverified in the GUI; see [verification-log.md](verification-log.md).

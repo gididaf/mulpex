@@ -115,6 +115,13 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let rename = MenuItemBuilder::with_id("rename", "Rename Session…")
         .accelerator("Cmd+R")
         .build(app)?;
+    // Quit and relaunch the focused claude on the same row, resuming its
+    // conversation — the one way to make a running instance re-read its
+    // environment (a rotated token, a newly installed skill). ⌘⇧R sits beside
+    // ⌘R the way ⌘⇧T sits beside ⌘T; the frontend confirms before killing.
+    let restart = MenuItemBuilder::with_id("restart", "Restart Session…")
+        .accelerator("Cmd+Shift+R")
+        .build(app)?;
     // A check item so the menu reports the *active* session's state; the
     // frontend keeps the tick in sync via `set_mute_menu_checked` whenever the
     // focus or the flag changes.
@@ -139,6 +146,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Sessions are navigated with ⌘[ / ⌘] only — ⌘1–9 belong to projects.
     let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&rename)
+        .item(&restart)
         .item(&mute)
         .item(&messages)
         .item(&explainer)

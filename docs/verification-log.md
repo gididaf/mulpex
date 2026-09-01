@@ -491,3 +491,27 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
 
   **NOT verified:** anything through the GUI — Mulpex was not restarted, the user was working
   inside it. `cargo test --workspace` green (79 app + 90 core).
+
+- **Restart an instance in place (⌘⇧R), 2026-09-01.** Verified **offline only**, and the split is
+  worth being precise about.
+
+  **Verified:** the two new `state.rs` tests drive a real `Core` with real `claude` children —
+  `restarting_an_instance_keeps_its_row_and_clears_the_dead_childs_state` kills the middle of three
+  restored instances and asserts the replacement is alive at the same index with the same id,
+  `session_id` and name, with `state_dir/<id>` and `armed/<id>` gone and `failed` cleared;
+  `restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it` asserts the guard
+  refuses *and leaves the instance alive*. `cargo test` green (81 passed, 5 pre-existing ignores);
+  `svelte-check` 0 errors; `vite build` clean.
+
+  **Not re-verified because it is the same code path as the proven one:** `--resume` itself. The
+  restart spawns the identical `SpawnSpec::Claude { resume: true }` that `Core::open` has used for
+  every launch since v0.1, and "`--resume` appends to the same transcript rather than forking a new
+  id" was measured against the real CLI earlier (see [sessions.md](sessions.md)). What the unit
+  tests exercise is the in-place *replacement*, not whether the conversation comes back.
+
+  **NOT verified:** anything through the GUI. Mulpex was not restarted — the user was working
+  inside it — so the frontend half (`terminals.reattach`: `reset()` + a fresh `Channel`), the native
+  confirm dialog, the ⌘⇧R accelerator reaching `is_forwarded`, and the resumed pane repainting at
+  the right geometry are all **unproven in the real app**. The `is_forwarded` allowlist entry in
+  particular is this repo's classic silent failure: the item builds, shows its accelerator, and
+  nothing happens.

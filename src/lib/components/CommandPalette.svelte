@@ -153,6 +153,9 @@
       ["new_session", "New Session", "⌘T", true],
       ["new_terminal", "New Terminal", "⌘⇧T", true],
       ["rename", "Rename Session…", "⌘R", cur != null],
+      // Confirmed even from here, unlike ⌘W/⌘⇧W: it kills a process that may be
+      // mid-turn, so the dialog is part of the command rather than of the menu.
+      ["restart", "Restart Session…", "⌘⇧R", isClaude],
       // Mute is meaningless for a terminal — it produces none of the signals mute
       // silences, and the backend refuses to record the flag (see InstanceList).
       ["mute", cur?.muted ? "Unmute Session" : "Mute Session", "⌘M", isClaude],

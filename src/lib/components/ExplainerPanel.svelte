@@ -73,7 +73,14 @@
       aria-label="Hide Explainer (⌘⇧E)">✕</button
     >
   </header>
-  <div class="body" bind:this={bodyEl} onscroll={onScroll}>
+  <!-- `explaining` is what dims the previous entry the MOMENT a new summary
+       starts, instead of at the moment its replacement lands. -->
+  <div
+    class="body"
+    class:explaining={cur && !isShell && $activeExplainBusy}
+    bind:this={bodyEl}
+    onscroll={onScroll}
+  >
     {#if !cur}
       <div class="empty">no session focused</div>
     {:else if isShell}
@@ -189,8 +196,20 @@
   }
   /* :last-of-type, not :last-child — the "מסביר…" line is the last child while
      a summary is in flight. */
-  article:last-of-type,
-  .explainer:hover article {
+  article:last-of-type {
+    opacity: 1;
+  }
+  /* While a new turn is being explained the entry above it is already history,
+     so it recedes right away — the panel shouldn't keep pointing at the old
+     summary for the seconds it takes the new one to arrive. Same specificity
+     game as below: (0,3,1) here, (0,3,1) later for hover, so hover wins on
+     source order. */
+  .body.explaining article:last-of-type {
+    opacity: 0.18;
+  }
+  /* Pointer in the panel reads the whole history at full strength, in flight
+     or not. */
+  .explainer:hover .body article {
     opacity: 1;
   }
   article:last-child {
