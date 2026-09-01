@@ -25,6 +25,16 @@ Traps that live in this crate specifically:
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
   ambiguity once made a 91 s spawn stall indistinguishable from a lost task.
   → [../../docs/hub.md](../../docs/hub.md)
+- **The hook is the only thing that sees what `claude` actually received.** Mulpex knows the prompt
+  it sent, the child knows the prompt it got, and `hook::verify_spawn_delivery` is the single point
+  where those meet — which is why a task truncated in transit was invisible for as long as it was.
+  When you need to prove something about a child's input rather than assume it, that comparison is
+  the only honest place to make it. → [../../docs/hub.md](../../docs/hub.md)
+- **A task is delivered as an argv argument, never typed.** True for a locally spawned child
+  (`pty.rs`) and for a remote peer (`remote::remote_launch_command`, base64'd). Typing capped it at
+  1022 characters with no error anywhere. Only text for an ALREADY-RUNNING instance is typed, and
+  that is still capped — keep it short.
+  → [../../docs/hub.md](../../docs/hub.md), [../../docs/remote-peers.md](../../docs/remote-peers.md)
 - **`HUB_RULES`/`config.rs` templates are `--append-system-prompt` text**, re-sent every turn, so
   they survive compaction — that is why contracts with instances live there and not in an injected
   prompt. Anything whose grammar is also parsed in code (the remote `<<<MPX …>>>` marker) has a test
