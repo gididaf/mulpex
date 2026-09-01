@@ -69,6 +69,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "pretooluse" => pretooluse(&ctx),
         "posttooluse" => posttooluse(&ctx),
         "askq" => askq(&ctx),
+        "plan" => plan(&ctx),
         "stop" => stop(&ctx),
         "notification" => notification(&ctx),
         "precompact" => precompact(&ctx),
@@ -530,6 +531,47 @@ fn write_question_request(ctx: &Ctx, payload: Option<&serde_json::Value>) {
         return;
     };
     let file = crate::question_request_path(&ctx.state_dir, ctx.instance);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, tool_input.to_string());
+}
+
+/// `PreToolUse[ExitPlanMode]`: the instance finished a plan and is about to ask
+/// the user whether to execute it. Writes the `needs` status word and hands the
+/// payload's `tool_input` (whose `plan` field is the plan as markdown) to the
+/// Explainer via `explainplan/<id>`, so the panel can say in one Hebrew line
+/// what the plan actually proposes while the approval dialog sits on screen.
+///
+/// The status write is deliberately redundant: measured 2026-09-01, the
+/// approval dialog also fires `Notification{permission_prompt}` ~6 s later,
+/// which `notification` already turns into `needs`. Writing it here makes the
+/// sidebar dot immediate and keeps it correct if that notification type ever
+/// changes — the same belt-and-braces `askq` uses.
+fn plan(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "needs");
+    write_plan_request(ctx, serde_json::from_str(&input).ok().as_ref());
+    Ok(())
+}
+
+/// The Explainer half of `plan`: hand the payload's `tool_input` to the app via
+/// `explainplan/<id>`. A payload without a non-empty `plan` string writes
+/// nothing — there is nothing to explain, and the status write above already
+/// happened.
+fn write_plan_request(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let Some(tool_input) = payload
+        .and_then(|j| j.get("tool_input"))
+        .filter(|t| {
+            t.get("plan")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| !p.trim().is_empty())
+        })
+    else {
+        return;
+    };
+    let file = crate::plan_request_path(&ctx.state_dir, ctx.instance);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1332,6 +1374,36 @@ mod tests {
         let _ = std::fs::remove_file(&req);
         write_question_request(&ctx, payload(r#"{"tool_input":{"plan":"x"}}"#).as_ref());
         assert!(!req.exists(), "no questions array → no request file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pending plan reaches the Explainer as the tool_input JSON, and the
+    /// status word goes to `needs` in the same breath. The payload is the shape
+    /// measured on a real `claude` v2.1.252 driven on a PTY, 2026-09-01
+    /// (`scratchpad/probe`): `PreToolUse[ExitPlanMode]` with `plan` +
+    /// `planFilePath`. A payload with no usable plan writes no request file —
+    /// but must still leave the status word alone for `plan()` to have written.
+    #[test]
+    fn a_pending_plan_reaches_the_explainer() {
+        let dir = std::env::temp_dir().join(format!("mulpex-plan-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 6);
+        let req = crate::plan_request_path(&ctx.state_dir, 6);
+
+        // `r##`: the plan is markdown, so the payload contains `"#` (a quote then a
+        // heading), which would close a plain `r#""#` literal mid-string.
+        let pretool = r##"{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode",
+            "permission_mode":"plan","tool_input":{"plan":"# Add a comment\n\nInsert one line.",
+            "planFilePath":"/Users/x/.claude/plans/plan-abc.md"}}"##;
+        write_plan_request(&ctx, payload(pretool).as_ref());
+        let written = std::fs::read_to_string(&req).unwrap();
+        assert!(written.contains("Insert one line."), "the plan itself is what we hand over");
+
+        let _ = std::fs::remove_file(&req);
+        write_plan_request(&ctx, payload(r#"{"tool_input":{"questions":[]}}"#).as_ref());
+        assert!(!req.exists(), "no plan field → no request file");
+        write_plan_request(&ctx, payload(r#"{"tool_input":{"plan":"   "}}"#).as_ref());
+        assert!(!req.exists(), "a blank plan is not a plan");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -80,6 +80,10 @@ pub fn start(app: AppHandle) {
                 for (id, json) in core.take_question_requests() {
                     explainer::submit_question(core.handle, id, json, core.state_dir.clone());
                 }
+                // A finished plan waiting for "yes, execute" — same deal.
+                for (id, json) in core.take_plan_requests() {
+                    explainer::submit_plan(core.handle, id, json, core.state_dir.clone());
+                }
                 core.refresh_worked();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on

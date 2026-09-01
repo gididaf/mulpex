@@ -58,6 +58,20 @@ const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude עצ�
 - סמן אפשרות כמומלצת רק אם כתוב בה (Recommended) במפורש. אם לא כתוב — אל תסמן שום אפשרות, ואל תרמוז מה עדיף.\n\
 - אל תוסיף שום דבר שלא מופיע בשאלות.";
 
+/// The plan-mode prompt: Claude finished planning and the "ready to code?"
+/// dialog is on screen. A plan is long, structured and technical by
+/// construction — headings, file paths, code fences — and the panel's job here
+/// is the opposite of reproducing it: ONE sentence saying what he intends to
+/// do. The detail is two inches away in the terminal if the user wants it.
+const PLAN_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude סיים לתכנן, ומחכה לאישור של המשתמש לפני שיתחיל לעבוד.\n\
+תקבל את התוכנית המלאה. כתוב משפט אחד בעברית פשוטה מאוד: מה הוא מתכוון לעשות, בגדול.\n\
+כללים:\n\
+- משפט אחד. שניים רק אם באמת אי אפשר אחרת. כמה שיותר קצר.\n\
+- בלי שלבים, בלי רשימות, בלי שמות קבצים ובלי פרטים טכניים — רק המטרה.\n\
+- מונחים ושמות באנגלית שאי אפשר בלעדיהם נשארים באנגלית כמו שהם.\n\
+- בלי הקדמה ובלי סיכום. טקסט פשוט בלבד — בלי **, בלי #, בלי `backticks`.\n\
+- אל תוסיף שום דבר שלא כתוב בתוכנית, ואל תחווה דעה אם היא טובה.";
+
 /// Feed cap per instance. The panel is a "what just happened" glance, not an
 /// archive; the transcript itself is the archive.
 const MAX_ENTRIES: usize = 50;
@@ -65,6 +79,11 @@ const MAX_ENTRIES: usize = 50;
 /// Cap on the turn text handed to Sonnet, keeping the **tail** — the end of a
 /// turn is where conclusions live. Byte-based, trimmed to a char boundary.
 const MAX_TURN_BYTES: usize = 24_000;
+
+/// Cap on the plan handed to Sonnet, keeping the **head** — the opposite end
+/// from a turn. A plan opens with its goal and descends into steps and file
+/// lists, and the goal is the only part the one-line summary needs.
+const MAX_PLAN_BYTES: usize = 12_000;
 
 /// Summarizer wall-clock budget. Measured runs take 6–13 s; anything past this
 /// is a hang, and the turn gets a failure entry rather than a stuck queue.
@@ -91,6 +110,9 @@ enum Input {
     Turn { transcript: PathBuf },
     /// A pending `AskUserQuestion`: the tool's `tool_input` JSON.
     Question { json: String },
+    /// A pending `ExitPlanMode`: the tool's `tool_input` JSON (its `plan` field
+    /// is the plan as markdown).
+    Plan { json: String },
 }
 
 struct Job {
@@ -167,6 +189,13 @@ pub fn submit(handle: ProjectHandle, id: usize, transcript: String, cwd: PathBuf
 /// contract, within its own kind.
 pub fn submit_question(handle: ProjectHandle, id: usize, json: String, cwd: PathBuf) {
     enqueue(handle, id, Input::Question { json }, cwd);
+}
+
+/// Queue one pending `ExitPlanMode` (the `tool_input` JSON). Same latest-wins
+/// contract, within its own kind — a plan job is never coalesced away by the
+/// turn or question that follows it.
+pub fn submit_plan(handle: ProjectHandle, id: usize, json: String, cwd: PathBuf) {
+    enqueue(handle, id, Input::Plan { json }, cwd);
 }
 
 fn enqueue(handle: ProjectHandle, id: usize, input: Input, cwd: PathBuf) {
@@ -293,6 +322,16 @@ fn process(inner: &Inner, job: Job) {
             None => {
                 eprintln!(
                     "[explainer] project {} claude#{}: question skipped (unparseable payload)",
+                    job.handle, job.id
+                );
+                return;
+            }
+        },
+        Input::Plan { json } => match plan_text(json) {
+            Some(t) => (ExplainKind::Plan, PLAN_PROMPT, t),
+            None => {
+                eprintln!(
+                    "[explainer] project {} claude#{}: plan skipped (no plan in payload)",
                     job.handle, job.id
                 );
                 return;
@@ -470,6 +509,28 @@ fn question_text(json: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The plan out of an `ExitPlanMode` `tool_input`: its `plan` field, markdown
+/// and all — Sonnet reads markdown fine, and stripping it would only cost the
+/// structure that says which line is the goal. Head-capped (see
+/// `MAX_PLAN_BYTES`). `None` when the payload carries no usable plan; the
+/// payload also has a `planFilePath` pointing at the same text on disk, which
+/// is deliberately ignored: one source, and no file read on this path.
+fn plan_text(json: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let plan = v.get("plan")?.as_str()?.trim();
+    if plan.is_empty() {
+        return None;
+    }
+    if plan.len() <= MAX_PLAN_BYTES {
+        return Some(plan.to_string());
+    }
+    let mut cut = MAX_PLAN_BYTES;
+    while !plan.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}\n[…truncated…]", &plan[..cut]))
+}
+
 /// `extract_turn_text` with the flush race absorbed: an initial pause (the
 /// final assistant entry lands within ~a second of the Stop hook), then retries
 /// while the turn reads as empty. Runs on a worker thread — the waiting costs
@@ -538,6 +599,41 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mulpex-explain-{tag}.jsonl"));
         std::fs::write(&path, lines.join("\n")).unwrap();
         path
+    }
+
+    /// The measured `ExitPlanMode` tool_input shape (a real `claude` v2.1.252 on
+    /// a PTY, 2026-09-01): the plan comes through as markdown, `planFilePath` is
+    /// ignored, and anything without a real plan is a skip rather than a Sonnet
+    /// call on nothing.
+    #[test]
+    fn plan_payloads_yield_the_plan_or_nothing() {
+        // `r##`: a plan is markdown, so the JSON contains `"#` — which would
+        // close a plain `r#""#` literal early.
+        let json = r##"{"plan":"# Add a comment\n\nInsert one line at the top.",
+            "planFilePath":"/Users/x/.claude/plans/plan-abc.md"}"##;
+        let text = plan_text(json).unwrap();
+        assert!(text.starts_with("# Add a comment"), "markdown is kept; sonnet reads it fine");
+        assert!(!text.contains("planFilePath"), "the file path is not part of the plan");
+
+        assert!(plan_text(r#"{"planFilePath":"/x.md"}"#).is_none(), "no plan field → skip");
+        assert!(plan_text(r#"{"plan":"   "}"#).is_none(), "a blank plan → skip");
+        assert!(plan_text("not json").is_none(), "an unparseable payload → skip");
+    }
+
+    /// A long plan is cut from the END, the opposite of a turn: a plan opens
+    /// with its goal and descends into steps and file lists, and the one-line
+    /// summary only needs the opening. The cut lands on a char boundary — a
+    /// plan is full of Hebrew and box-drawing characters in practice.
+    #[test]
+    fn a_long_plan_keeps_its_head_not_its_tail() {
+        let plan = format!("GOAL FIRST. {}END LAST.", "מטרה ועוד פרטים. ".repeat(2000));
+        assert!(plan.len() > MAX_PLAN_BYTES, "the fixture has to actually be too long");
+        let json = serde_json::json!({ "plan": plan }).to_string();
+        let text = plan_text(&json).unwrap();
+        assert!(text.starts_with("GOAL FIRST."), "the head survived");
+        assert!(!text.contains("END LAST."), "the tail was cut");
+        assert!(text.ends_with("[…truncated…]"), "and says so");
+        assert!(text.len() < plan.len());
     }
 
     /// The shape measured on real transcripts (probe0): the boundary is the last
@@ -704,10 +800,15 @@ mod tests {
         submit(H, 2, "/tmp/b.jsonl".into(), PathBuf::from("/tmp"));
         submit(H, 1, "/tmp/c.jsonl".into(), PathBuf::from("/tmp"));
         submit_question(H, 1, r#"{"questions":[]}"#.into(), PathBuf::from("/tmp"));
+        submit_plan(H, 1, r#"{"plan":"do the thing"}"#.into(), PathBuf::from("/tmp"));
         {
             let q = inner().queue.lock().unwrap();
             let mine: Vec<_> = q.iter().filter(|j| j.handle == H).collect();
-            assert_eq!(mine.len(), 3, "turn replaced within kind; question queued alongside");
+            assert_eq!(
+                mine.len(),
+                4,
+                "turn replaced within kind; question and plan queued alongside"
+            );
             let turn1 = mine
                 .iter()
                 .find(|j| j.id == 1 && matches!(j.input, Input::Turn { .. }))
@@ -716,11 +817,15 @@ mod tests {
                 Input::Turn { transcript } => {
                     assert_eq!(transcript, &PathBuf::from("/tmp/c.jsonl"), "the newer request won")
                 }
-                Input::Question { .. } => unreachable!(),
+                Input::Question { .. } | Input::Plan { .. } => unreachable!(),
             }
             assert!(
                 mine.iter().any(|j| j.id == 1 && matches!(j.input, Input::Question { .. })),
                 "the question job survived the turn submits"
+            );
+            assert!(
+                mine.iter().any(|j| j.id == 1 && matches!(j.input, Input::Plan { .. })),
+                "the plan job survived the turn and question submits"
             );
         }
         forget_project(H); // also drains this test's queue entries

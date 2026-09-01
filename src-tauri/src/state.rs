@@ -415,6 +415,7 @@ fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<()> 
         mulpex_core::NAMEREQ_DIR,
         mulpex_core::EXPLAINREQ_DIR,
         mulpex_core::EXPLAINQ_DIR,
+        mulpex_core::EXPLAINPLAN_DIR,
         "terminals",
         "terminals/cursors",
         "termreq",
@@ -1117,6 +1118,13 @@ impl Core {
     /// screen.
     pub fn take_question_requests(&mut self) -> Vec<(usize, String)> {
         self.drain_request_dir(mulpex_core::EXPLAINQ_DIR)
+    }
+
+    /// Same handshake for `explainplan/<id>` — the pending `ExitPlanMode`
+    /// payload the `plan` hook wrote, to be explained while the "ready to code?"
+    /// approval dialog is on screen.
+    pub fn take_plan_requests(&mut self) -> Vec<(usize, String)> {
+        self.drain_request_dir(mulpex_core::EXPLAINPLAN_DIR)
     }
 
     /// Consume-and-delete every `<subdir>/<id>` file, keeping only live claudes'

@@ -187,14 +187,16 @@ pub struct ClaudeStatus {
     pub searched_path: String,
 }
 
-/// What an Explainer entry explains: a finished turn, or a pending
+/// What an Explainer entry explains: a finished turn, a pending
 /// `AskUserQuestion` (what the claude is asking right now and what each option
-/// means). The panel styles questions distinctly.
+/// means), or a pending `ExitPlanMode` plan (what it is proposing to do, before
+/// you approve it). The panel styles each kind distinctly.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExplainKind {
     Turn,
     Question,
+    Plan,
 }
 
 /// One Explainer feed item: the short Hebrew explanation of one finished turn

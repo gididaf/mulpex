@@ -102,8 +102,9 @@ export interface ExplainEntry {
   text: string;
   ok: boolean;
   /** "turn" explains a finished turn; "question" explains a pending
-   *  AskUserQuestion (what's being asked + what each option means). */
-  kind: "turn" | "question";
+   *  AskUserQuestion (what's being asked + what each option means); "plan"
+   *  explains a pending ExitPlanMode plan in one line, before you approve it. */
+  kind: "turn" | "question" | "plan";
 }
 
 // Scoped event payloads (mirror snapshot.rs).

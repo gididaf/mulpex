@@ -82,10 +82,15 @@
       <div class="empty">nothing yet — explanations appear after each turn</div>
     {:else}
       {#each ordered as e, i (e.ts + "-" + i)}
-        <article class:failed={!e.ok} class:question={e.kind === "question"}>
+        <article
+          class:failed={!e.ok}
+          class:question={e.kind === "question"}
+          class:plan={e.kind === "plan"}
+        >
           <div class="ts">
-            {when(e.ts)}{#if e.kind === "question"}<span class="qtag" dir="rtl"
+            {when(e.ts)}{#if e.kind === "question"}<span class="tag" dir="rtl"
                 >שאלה</span
+              >{:else if e.kind === "plan"}<span class="tag" dir="rtl">תוכנית</span
               >{/if}
           </div>
           <!-- Hard rtl, NOT dir="auto": auto resolves from the first strong
@@ -212,15 +217,26 @@
     color: var(--text-faint);
     font-style: italic;
   }
-  /* A question entry: the claude is waiting on the user right now — accent
-     edge on the reading (right) side, matching the panel's RTL. */
-  .question {
+  /* A question or a plan entry: the claude is waiting on the user right now —
+     accent edge on the reading (right) side, matching the panel's RTL. The
+     colour is what separates them at a glance: cyan is a question to answer,
+     green a finished plan waiting for "yes, execute" (the same green the
+     sidebar uses for ready, and deliberately NOT the amber the in-flight dot
+     owns). */
+  .question,
+  .plan {
     border-right: 2px solid var(--accent);
     padding-right: 0.5rem;
   }
-  .qtag {
+  .plan {
+    border-right-color: var(--dot-ready);
+  }
+  .tag {
     color: var(--accent);
     margin-left: 0.5rem;
     float: right;
+  }
+  .plan .tag {
+    color: var(--dot-ready);
   }
 </style>

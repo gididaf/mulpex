@@ -384,3 +384,21 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
   **Not verified in the real window** — the fix only takes effect for instances spawned after a
   relaunch, which was deliberately not done while the user was working inside the app.
 
+- **Plan explanations (`ExitPlanMode`), 2026-09-01.** Driven on a real `claude` v2.1.252 on a PTY
+  with Mulpex's own flags before a line of product code was written (`scratchpad/probe`: catch-all
+  hook settings + a python `openpty` driver). Measured: `PreToolUse[ExitPlanMode]` fires with
+  `tool_input = {plan, planFilePath}` at 09:47:18.2 and the approval dialog +
+  `Notification{permission_prompt}` land at 09:47:24.2 — the hook is **~6 s ahead of the dialog**;
+  `Stop` does **not** fire while the plan waits; `permission_prompt` already resolves to `needs`
+  through the existing `notify_status`, so the plan hook's own `needs` write is redundancy, not a
+  fix. **The trap this cost two probe runs:** `--dangerously-skip-permissions` silently overrides
+  `--permission-mode plan` (every payload read `bypassPermissions`, no `ExitPlanMode` ever fired,
+  Claude just wrote prose); plan mode is reachable **only by shift+tab**, four presses from bypass
+  (measured cycle bypass → auto → manual → accept edits → plan). The pipe was then verified
+  **through the real `mulpex-helper` binary** fed that captured payload (writes `needs` + a
+  well-formed `explainplan/3`), the **real summarizer** with the real flags on two plans (1.5 KB
+  each → one Hebrew sentence, 4–5 s), and the panel CSS in **headless Chrome** against the
+  component's own `<style>` (plan = 2px `rgb(152,195,121)` edge + green `תוכנית` tag flush right,
+  no overlap with the timestamp; question keeps cyan). Finally **confirmed by the user in a dev
+  build**: a real plan on screen, the row red, the one-line explanation in the panel.
+  `cargo test --workspace` green (78 app + 87 core), `svelte-check` 122 files 0 errors.

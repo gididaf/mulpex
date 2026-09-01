@@ -13,7 +13,9 @@
 /// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
 /// `PreToolUse[AskUserQuestion]` → needs (via `<helper> hook askq`, which also
 /// hands the pending questions to the Explainer — it replaced a bare `printf
-/// needs` when the Explainer needed the payload); `Stop` → waiting (via the
+/// needs` when the Explainer needed the payload);
+/// `PreToolUse[ExitPlanMode]` → needs the same way (via `<helper> hook plan`),
+/// which also hands the pending plan to the Explainer; `Stop` → waiting (via the
 /// helper, which also releases locks); the `permission_prompt`/`idle_prompt`
 /// notifications →
 /// needs, via the helper rather than a bare `printf` because `idle_prompt` fires
@@ -38,6 +40,7 @@ pub const HOOK_SETTINGS_JSON: &str = r#"{
     ],
     "PreToolUse": [
       { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook askq" } ] },
+      { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook plan" } ] },
       { "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse", "timeout": 280 } ] },
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook pretooluse" } ] }
     ],

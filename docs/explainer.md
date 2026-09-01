@@ -1,6 +1,7 @@
 # The Explainer — the Hebrew turn-summary panel
 
-A persistent right-hand column: after each claude turn ends, a headless Sonnet call produces a
+A persistent right-hand column: after each claude turn ends — and while a question or a plan sits
+on screen waiting for you — a headless Sonnet call produces a
 very short, very simple **Hebrew** explanation of what that claude said (English identifiers
 kept verbatim), and the panel shows a per-instance feed of them, **oldest first — newest at the bottom**,
 the way the claude transcript beside it reads. Built 2026-08-30;
@@ -11,6 +12,7 @@ every claim below marked *measured* was driven on a real session or transcript t
 ```
 claude turn ends
   → Stop hook writes transcript_path → <state_dir>/explainreq/<id>      (hook.rs::write_explain_request)
+  (a pending AskUserQuestion → explainq/<id>; a pending ExitPlanMode plan → explainplan/<id>)
   → 200ms poll consumes-and-deletes (state.rs::take_explain_requests, namereq-style)
   → explainer.rs worker queue (2 threads, per-instance latest-wins coalescing)
       read transcript JSONL → extract the turn's assistant text → claude -p --model sonnet
@@ -45,6 +47,48 @@ when the turn really ends.
 Coalescing is **per kind**: a queued question job is never replaced by a turn job for the same
 instance (or vice versa) — `std::mem::discriminant` on the job input. A payload with no usable
 `questions` array is skipped with a log line, same no-silent-branch rule as turns.
+
+## Plans are explained too (`ExitPlanMode`)
+
+The `PreToolUse[ExitPlanMode]` matcher runs `<helper> hook plan`: it writes the `needs` status
+word and hands the payload's `tool_input` to the app via `explainplan/<id>`, drained by the poll
+loop through the same `Core::drain_request_dir`. Entries carry `kind: "plan"`, and the panel
+gives them a **green** accent edge and a `תוכנית` tag — the green the sidebar uses for *ready*,
+because the dialog literally asks "ready to code?", and deliberately not the amber the in-flight
+dot owns.
+
+**The prompt is the whole point of the feature.** A plan is long, structured and technical by
+construction — headings, absolute paths, code fences — and reproducing any of that in the panel
+would defeat it. `PLAN_PROMPT` demands **one sentence**: what he intends to do, no steps, no
+lists, no file names. The user chose this shape over "goal + 3 bullets" and over the
+question-mode line-per-section form.
+
+Everything measured on a real `claude` v2.1.252 on a PTY, 2026-09-01 (`scratchpad/probe`):
+
+- **`tool_input` is `{plan, planFilePath}`** — `plan` is the plan as markdown. `planFilePath`
+  points at the same text under `~/.claude/plans/`; it is deliberately ignored (one source, and
+  no file read on this path).
+- **The hook fires ~6 s *before* the approval dialog paints** (hook 09:47:18.2, dialog +
+  `Notification{permission_prompt}` 09:47:24.2). With the summarizer's 6–13 s that puts the
+  Hebrew line on screen a few seconds after the plan — not half a minute.
+- **`Stop` does not fire while the plan waits**, so a plan gets no turn explanation and there is
+  no overlap to dedup. After you approve, the turn carries on and its eventual `Stop` is
+  explained normally — the user chose to leave both rather than suppress the follow-up.
+- **The `needs` write is redundant belt-and-braces.** `Notification{permission_prompt}` already
+  becomes `needs` via `hook::notify_status`, 6 s later; writing it in the plan hook makes the
+  dot immediate and survives a change to that notification type.
+- **The plan is head-capped at 12 KB** (`MAX_PLAN_BYTES`), the opposite end from a turn's
+  tail-cap: a plan opens with its goal and descends into detail, and only the opening matters
+  to a one-line summary.
+
+### Plan mode is not reachable the way you would guess
+
+`--dangerously-skip-permissions` (which every Mulpex claude runs with) **silently overrides**
+`--permission-mode plan`: every hook payload still reads `permission_mode: bypassPermissions`,
+no `ExitPlanMode` is ever called, and Claude just writes a plan as prose. Plan mode is reached
+**only by shift+tab**, four presses from bypass — measured cycle: bypass → auto → manual →
+accept edits → **plan**. Two probe runs found nothing before this was understood; if you are
+driving a plan on a PTY, this is the trap.
 
 ## Why a dedicated event, not a HubSnapshot field
 
@@ -128,6 +172,9 @@ when cut.
 | Feed cap | 50/instance, backend-capped | bounded memory, no UI jank |
 | Panel | real third grid column, visible by default, ⌘⇧E toggles | toggling refits every PTY workspace-wide — same class as a window resize (one geometry) |
 | Empty turn | skip, log, no Sonnet call | a call on nothing would invent something |
+| Plan explanation | ONE sentence, the goal only | a plan is all technical detail; the terminal beside it holds the detail |
+| Plan + the turn that follows | both explained, no dedup | the post-approval turn is usually the part worth reading |
+| Plan attention | `needs` written by the hook too | immediate dot, independent of the notification type |
 | Feed order | oldest first, newest at the bottom, chat-sticky scroll | aligns with the claude transcript beside it |
 | Old entries | dimmed to 0.18, full opacity on panel hover (newest always full) | the panel is a glance; the backlog stays reachable |
 
@@ -163,7 +210,8 @@ touches the xterm CSS — the `.xterm-rows span` rule stays sacred (docs/renderi
 
 ## The Hebrew prompt
 
-Lives as `HEBREW_PROMPT` in `explainer.rs` (turns) and `QUESTION_PROMPT` (pending questions):
+Lives as `HEBREW_PROMPT` in `explainer.rs` (turns), `QUESTION_PROMPT` (pending questions) and
+`PLAN_PROMPT` (pending plans — see above; it is the strictest of the three, one sentence):
 one to three sentences of dead-simple Hebrew, English terms verbatim, no preamble/headers/
 bullets, open with what the claude needs from the user when it's waiting on a decision, state
 failures directly, add nothing not in the text. Tone approved by the user on four real turns

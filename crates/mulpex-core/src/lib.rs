@@ -77,6 +77,17 @@ pub fn question_request_path(state_dir: &std::path::Path, id: usize) -> std::pat
     state_dir.join(EXPLAINQ_DIR).join(id.to_string())
 }
 
+/// Where the `ExitPlanMode` PreToolUse hook hands the pending plan to the
+/// Explainer: one file per instance under `<state_dir>/explainplan/`, holding
+/// the tool's `tool_input` JSON (its `plan` field is the plan as markdown).
+/// Written by the helper (`hook plan`), consumed-and-deleted by the app's poll
+/// loop. Measured 2026-09-01: `PreToolUse[ExitPlanMode]` fires ~6 s *before*
+/// the approval dialog paints, so the explanation is already in flight while
+/// the user is still reading the plan.
+pub fn plan_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(EXPLAINPLAN_DIR).join(id.to_string())
+}
+
 /// These live here, next to `MULPEX_SENTINEL`, for the same reason: they are
 /// a contract between two *processes*, so a copy in each would be a contract that
 /// can silently drift out of agreement.
@@ -84,3 +95,4 @@ pub const NAMEREQ_DIR: &str = "namereq";
 pub const NAMED_DIR: &str = "named";
 pub const EXPLAINREQ_DIR: &str = "explainreq";
 pub const EXPLAINQ_DIR: &str = "explainq";
+pub const EXPLAINPLAN_DIR: &str = "explainplan";
