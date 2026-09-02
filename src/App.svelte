@@ -57,6 +57,7 @@
     setExplainPendingFor,
     removeExplainsFor,
     displayOrder,
+    claudeInAnotherProject,
     flashNotice,
     reorderProjects as reorderProjectsLocal,
     reorderSessions as reorderSessionsLocal,
@@ -187,6 +188,35 @@
     }
   }
 
+  /**
+   * What Copy address puts on the clipboard for `s`.
+   *
+   * With no claude in any other project, `claude#3` / `term#5` — the hub's own
+   * local form, pasteable straight into a hub_send or a prompt.
+   *
+   * Once another project has a claude, a *bare* `claude#3` is the dangerous
+   * string: it is a valid LOCAL address in every project, so a claude reading it
+   * elsewhere sends to its own instance 3 and the message is silently delivered
+   * to the wrong one. `<project>#<n>` cannot do that — and it is not a
+   * cross-project-only form: `mcp.rs::send_foreign` resolves a qualifier naming
+   * the sender's own project back to a local send, so one string is exact from
+   * everywhere, and is the same one `hub_instances` reports.
+   *
+   * Terminals invert that. There is no cross-project address for one at all, and
+   * `registry::parse_address` refuses every `term#…` outright (pointing at
+   * hub_terminal_send), so nothing here can mis-deliver and the project is free
+   * to be a readable parenthetical rather than an address that doesn't exist.
+   */
+  function instanceAddress(s: SessionInfo): string {
+    const h = get(activeProjectHandle);
+    const shell = s.kind === "shell";
+    const bare = `${shell ? "term" : "claude"}#${s.id}`;
+    if (h == null || !claudeInAnotherProject(h)) return bare;
+    const name = get(projects).get(h)?.name;
+    if (!name) return bare;
+    return shell ? `${bare} (in ${name})` : `${name}#${s.id}`;
+  }
+
   function openRowMenu(e: MouseEvent, s: SessionInfo) {
     const h = get(activeProjectHandle);
     if (h == null) return;
@@ -211,11 +241,10 @@
             },
           ]),
       {
-        // The address the hub itself uses (`claude#3` / `term#5`), so it can be
-        // pasted straight into a hub_send or a prompt. The cross-project
-        // `<project>#<n>` form is deliberately not what this copies.
+        // The address the hub itself uses, qualified with the project as soon as
+        // another project has a claude in it — see `instanceAddress`.
         label: "Copy address",
-        run: () => copyText(`${shell ? "term" : "claude"}#${s.id}`),
+        run: () => copyText(instanceAddress(s)),
       },
       { sep: true },
       // Terminals have no conversation to resume, so the item is absent rather
@@ -554,6 +583,25 @@
     if (next != null) selectProject(next);
   }
 
+  /**
+   * Slide the active project one slot left/right in the tab bar (⌘⇧← / ⌘⇧→),
+   * committing through the same path a drag does — so the new order is persisted
+   * to `open.txt` and ⌘1–⌘9 remap with it.
+   *
+   * Clamped, not wrapped: the edges are a no-op. Moving is not cycling — a tab
+   * teleporting from one end of the strip to the other reads as a mistake, and
+   * the tab you just moved has to stay where your eye left it.
+   */
+  function moveProject(delta: number) {
+    const order = [...get(projects).keys()];
+    const cur = get(activeProjectHandle);
+    const from = order.findIndex((h) => h === cur);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= order.length) return;
+    order.splice(to, 0, ...order.splice(from, 1));
+    applyProjectOrder(order);
+  }
+
   async function handleMenu(id: string) {
     const h = get(activeProjectHandle);
     switch (id) {
@@ -568,6 +616,12 @@
         break;
       case "prev_project":
         cycleProject(-1);
+        break;
+      case "move_project_right":
+        moveProject(1);
+        break;
+      case "move_project_left":
+        moveProject(-1);
         break;
       case "new_session":
         if (h != null) await newSession();
@@ -662,7 +716,60 @@
     if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
       if (get(projects).size > 0) showPalette.update((v) => !v);
+      return;
     }
+    // ⌘⇧[ / ⌘⇧] — Next/Previous Project. These ARE declared as menu accelerators
+    // (menu.rs) and the menu shows them, but they were REPORTED not to fire while
+    // their unshifted twins ⌘[ / ⌘] (sessions) work. Not measured: the suspected
+    // cause is AppKit matching a key equivalent against the event's *shifted*
+    // character, so an item whose keyEquivalent is "]" never matches a ⌘⇧] whose
+    // character is "}" — letters survive it because AppKit case-folds them and
+    // punctuation has no case to fold. Treat that as the hypothesis, not the
+    // finding; what is certain is only that the menu path did not reach here.
+    //
+    // Catching it in the webview rather than re-keying the menu keeps the
+    // advertised shortcut true, and is safe either way: a key equivalent AppKit
+    // *does* match is consumed by the menu and never reaches the webview, so this
+    // arm cannot double-fire — it simply stops seeing the key.
+    if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
+      // `code` is the physical key — `key` is "}"/"{" here, and layout-dependent.
+      const back = e.code === "BracketLeft";
+      if (back || e.code === "BracketRight") {
+        e.preventDefault();
+        cycleProject(back ? -1 : 1);
+        return;
+      }
+      // ⌘⇧← / ⌘⇧→ — Move Project Left/Right. Also declared as menu accelerators,
+      // and unlike the brackets those DO fire — but only while focus is outside
+      // the terminal. With the terminal focused the keys land on xterm's hidden
+      // textarea, where ⌘⇧←/→ is a standard AppKit text-selection command
+      // (`moveToLeftEndOfLineAndModifySelection:`); WebKit performs it and
+      // reports the event handled, so AppKit never falls through to the main
+      // menu. A DOM keydown runs *before* that default action, so claiming the
+      // key here is what makes the shortcut work with the terminal focused —
+      // which is where focus almost always is.
+      const left = e.code === "ArrowLeft";
+      if ((left || e.code === "ArrowRight") && !inTextField(e.target)) {
+        e.preventDefault();
+        moveProject(left ? -1 : 1);
+      }
+    }
+  }
+
+  /**
+   * A field where ⌘⇧←/→ really is a selection gesture — the rename box, the
+   * palette's query — so the shortcut must be left alone there.
+   *
+   * xterm's helper textarea is deliberately excluded: it is not a text field you
+   * can see or edit, it's how the terminal receives keys, and its selection is
+   * never rendered. Stealing the key there costs nothing.
+   */
+  function inTextField(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el?.tagName) return false;
+    const editable =
+      el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+    return editable && !el.classList.contains("xterm-helper-textarea");
   }
 
   onMount(() => {

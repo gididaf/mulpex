@@ -148,6 +148,21 @@ export function unreadCount(p: ProjectState): number {
 }
 
 /**
+ * Is there a claude in some project *other* than `handle`?
+ *
+ * The one condition that makes a bare `claude#3` ambiguous, so it is what
+ * decides whether Copy address qualifies an instance with its project name
+ * (`App.svelte::openRowMenu`). Terminals elsewhere deliberately don't count: a
+ * terminal is never a hub peer and one in another project can't be driven from
+ * here either, so a project holding only shells adds nobody you could address.
+ */
+export function claudeInAnotherProject(handle: ProjectHandle | null): boolean {
+  return [...get(projects).values()].some(
+    (p) => p.handle !== handle && p.sessions.some((s) => s.kind === "claude"),
+  );
+}
+
+/**
  * Claudes blocked on the user across **every** open project — the dock badge.
  *
  * Deliberately `needs` only, not `needs + waiting`: a finished (`waiting`)

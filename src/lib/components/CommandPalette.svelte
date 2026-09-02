@@ -168,6 +168,8 @@
       ["close_project", "Close Project", "⌘⇧W", true],
       ["next_project", "Next Project", "⌘⇧]", $projects.size > 1],
       ["prev_project", "Previous Project", "⌘⇧[", $projects.size > 1],
+      ["move_project_left", "Move Project Left", "⌘⇧←", $projects.size > 1],
+      ["move_project_right", "Move Project Right", "⌘⇧→", $projects.size > 1],
       // No accelerator by design, so the palette is its only keyboard route.
       ["check_updates", "Check for Updates…", "", true],
     ];

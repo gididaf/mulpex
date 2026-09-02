@@ -158,10 +158,34 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project and
-**⌘⇧] / ⌘⇧[** next/prev project) are intercepted by the menu before xterm; Claude never uses ⌘,
-so there's zero collision. **⌘P** (the project quick-switcher) is *not* a menu accelerator — it's
-handled in the webview (`svelte:window` keydown, `preventDefault` stops the print dialog).
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+**⌘⇧] / ⌘⇧[** next/prev project and **⌘⇧← / ⌘⇧→** move the active project's tab) are intercepted
+by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
+quick-switcher) is *not* a menu accelerator — it's handled in the webview (`svelte:window` keydown,
+`preventDefault` stops the print dialog).
+
+**A menu accelerator is not reached while the terminal has focus.** Observed: ⌘⇧← / ⌘⇧→ move the
+project tab with the sidebar focused and do nothing with the terminal focused. Keys then land on
+xterm's hidden textarea, where ⌘⇧←/→ is a standard AppKit text-selection command
+(`moveToLeftEndOfLineAndModifySelection:`) — WebKit performs it and reports the event handled, so
+AppKit never falls through to the main menu. Since focus is almost always in the terminal, an
+accelerator that competes with a text-editing binding is effectively dead.
+
+So **⌘⇧] / ⌘⇧[ and ⌘⇧← / ⌘⇧→ are declared in the menu but claimed in the webview**
+(`App.svelte::onGlobalKey`), where a DOM keydown runs *before* that default action. Matched on
+`e.code` — `e.key` is `}`/`{` for the brackets and layout-dependent. Why the brackets failed is
+*not* established (they are not a text-editing binding; AppKit matching a shifted-punctuation key
+equivalent against the shifted character `}` is only a hypothesis). Declaring both is deliberate
+and cannot double-fire: whichever layer claims the key consumes it. The arrows guard
+`inTextField` so the rename box and the palette query keep the real selection gesture — xterm's
+helper textarea is excluded from that check, since its selection is never rendered.
+
+**Move Project Left/Right use arrows, not another bracket pair** — an arrow key equivalent is a
+function key with no shifted variant, so it sidesteps the (suspected) bracket problem entirely.
+
+Moving is **clamped, not wrapped** (the edges are a no-op), unlike ⌘⇧[ / ⌘⇧] cycling: a tab
+teleporting from one end of the strip to the other reads as a mistake. It commits through
+`applyProjectOrder`, the same path a tab drag uses, so it persists to `open.txt` and remaps ⌘1–⌘9.
 
 **⌘M is Mute Session; the message reader moved to ⌘⇧M.** ⌘M has a *third* claimant nobody
 declares: muda hard-binds `PredefinedMenuItem::minimize` to ⌘M and exposes no accelerator setter.

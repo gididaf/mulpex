@@ -69,6 +69,17 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let prev_project = MenuItemBuilder::with_id("prev_project", "Previous Project")
         .accelerator("Cmd+Shift+[")
         .build(app)?;
+    // Arrow keys, not another bracket pair: an arrow key equivalent is a function
+    // key (\u{F702}/\u{F703}) with no shifted variant, so there is no shifted
+    // character for AppKit to match against instead — the thing ⌘⇧[ / ⌘⇧] are
+    // suspected of tripping over (see `App.svelte::onGlobalKey`, which catches
+    // those in the webview because the menu path did not reach the frontend).
+    let move_project_left = MenuItemBuilder::with_id("move_project_left", "Move Project Left")
+        .accelerator("Cmd+Shift+Left")
+        .build(app)?;
+    let move_project_right = MenuItemBuilder::with_id("move_project_right", "Move Project Right")
+        .accelerator("Cmd+Shift+Right")
+        .build(app)?;
     let new_session = MenuItemBuilder::with_id("new_session", "New Session")
         .accelerator("Cmd+T")
         .build(app)?;
@@ -84,6 +95,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&next_project)
         .item(&prev_project)
+        .item(&move_project_left)
+        .item(&move_project_right)
         .separator();
     // ⌘1–⌘9 switch to the Nth open project (tab-bar order), matching the
     // browser/terminal convention where ⌘N selects a tab.

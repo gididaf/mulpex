@@ -38,6 +38,8 @@ fn is_forwarded(id: &str) -> bool {
             | "close_project"
             | "next_project"
             | "prev_project"
+            | "move_project_left"
+            | "move_project_right"
             | "new_session"
             | "new_terminal"
             | "close_session"
