@@ -515,3 +515,32 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
   the right geometry are all **unproven in the real app**. The `is_forwarded` allowlist entry in
   particular is this repo's classic silent failure: the item builds, shows its accelerator, and
   nothing happens.
+
+- **Qualified Copy address + ⌘⇧←/→ move-project (2026-09-02).** Verified **offline only**:
+  `svelte-check` 0 errors, `cargo build` clean. `instanceAddress` / `claudeInAnotherProject` /
+  `moveProject` have **no test at all** — the clamp, the `applyProjectOrder` round-trip and the
+  qualifier's trigger condition are unproven by anything but reading. Worth knowing that the
+  address *claims* in [frontend.md](frontend.md) are not guesses: `send_foreign`'s "naming my own
+  project by name is simply a local send" branch and `parse_address`'s `term#…` refusal were read
+  in `mulpex-core`, and `registry.rs`'s own tests already pin `p.address(3) == "central-one#3"`.
+
+  **NOT verified:** anything driven through the GUI. Two macOS permissions the agent's shell did
+  not hold blocked it — Screen Recording (fixed mid-session by relaunching Mulpex) and then
+  Assistive Access, which `osascript` needs to place a synthetic keystroke; without it no key can
+  be sent to the app at all, so the accelerators were never fired by anyone but the user. A
+  `tauri dev` build *was* launched against `~/.mulpex-dev` with three projects open, which is the
+  rig to reuse — the seed is `~/.mulpex-dev/open.txt`, and tab reordering persists straight back
+  into that file, which makes it a clean textual oracle for a move (no screenshot needed). Project
+  *switching* has no such oracle: nothing on disk records the active project.
+
+- **A menu accelerator loses to xterm's textarea (2026-09-02, observed by the user).** ⌘⇧← / ⌘⇧→
+  moved the project tab with the sidebar focused and did nothing with the terminal focused. That
+  is the whole reason the shortcut is claimed in the webview; it is a *report*, not an
+  instrumented measurement, but it is a clean A/B and the cause (⌘⇧←/→ is an AppKit
+  text-selection binding WebKit performs and reports handled) explains it exactly.
+
+  **Still unexplained:** why ⌘⇧[ / ⌘⇧] were dead. They are not a text-editing binding, so the
+  focus story above does not cover them, and the AppKit shifted-punctuation hypothesis in
+  [../CLAUDE.md](../CLAUDE.md) is untested. **The experiment that would settle it takes ten
+  seconds:** click the sidebar (so focus is out of the terminal) and press ⌘⇧]. If it switches
+  project, the brackets had the same focus cause as the arrows and the hypothesis is wrong.

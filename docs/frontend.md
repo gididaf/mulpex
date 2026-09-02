@@ -152,9 +152,21 @@ widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the it
   not confirm, matching ⌘W; **Restart does**, because it kills a process that may be mid-turn and
   sits one shift away from Rename (see [sessions.md](sessions.md#restarting-an-instance-in-place-r)).
 - **Copy address copies the hub's own written form** — `claude#3` / `term#5` — so it pastes straight
-  into a `hub_send` or a prompt. Not the cross-project `<project>#<n>` form. There is no clipboard
-  plugin (and adding one means another capability entry, the same allowlist shape as above), so it
-  is `navigator.clipboard.writeText` with a hidden-textarea `execCommand` fallback.
+  into a `hub_send` or a prompt. There is no clipboard plugin (and adding one means another
+  capability entry, the same allowlist shape as above), so it is `navigator.clipboard.writeText`
+  with a hidden-textarea `execCommand` fallback.
+- **It qualifies the address once another open project has a claude in it**
+  (`stores.ts::claudeInAnotherProject`, `App.svelte::instanceAddress`): `mulpex#1` for a claude,
+  `term#4 (in mulpex)` for a terminal. The bare `claude#1` is the *unsafe* string here, not the
+  safe one — it is a valid **local** address in every project, so a claude reading it elsewhere
+  sends to its own instance 1 and the message is silently delivered to the wrong instance.
+  `<project>#<n>` cannot do that, and it is **not cross-project-only**: `mcp.rs::send_foreign`
+  resolves a qualifier naming the sender's own project back to a local send, so the one string is
+  exact from everywhere and is what `hub_instances` itself reports. Terminals invert the argument —
+  they have no cross-project address at all and `registry::parse_address` refuses every `term#…`
+  outright, so nothing there can mis-deliver and the project is free to be readable prose. Only
+  claudes elsewhere arm the qualifier; a project holding nothing but terminals adds nobody you
+  could address.
 - **`focus()` is ignored on a `visibility: hidden` element.** The menu is hidden until it has been
   measured and flipped away from the window edge, and focusing it in that same effect run silently
   did nothing — no error, nothing visible, it just meant every keystroke went on reaching the
@@ -218,6 +230,14 @@ the `Map`, since insertion order *is* tab order) and the `reorder_projects` comm
 `Workspace::projects` and re-runs `persist_open()` — so the arrangement survives relaunch. Tab
 order is also what ⌘1–9 index into, so a drag remaps them by design. Handles missing from the
 submitted order are appended rather than dropped, so a stale caller can't make a project vanish.
+
+**⌘⇧← / ⌘⇧→ are the keyboard route to the same thing** (File ▸ Move Project Left/Right, and the
+palette). `App.svelte::moveProject` splices the active handle one slot and commits through
+`applyProjectOrder` — the identical path a drop takes — so persistence and the ⌘1–9 remap come for
+free. **Clamped, not wrapped:** the edges are a no-op, unlike ⌘⇧[ / ⌘⇧] cycling, because a tab
+teleporting from one end of the strip to the other reads as a mistake. The keys are claimed in the
+webview rather than left to the menu accelerator; see **Keyboard** in [../CLAUDE.md](../CLAUDE.md)
+for why a menu accelerator loses to xterm's textarea.
 
 ## Attention: dock badge + notifications
 
