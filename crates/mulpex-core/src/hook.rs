@@ -996,10 +996,22 @@ fn verify_spawn_delivery(ctx: &Ctx, received: &str) {
 /// instance's baseline task for the hub, and (c) inject a compact snapshot of the
 /// other instances into this turn via `additionalContext`.
 fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
-    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
+    let status_path = ctx.state_dir.join(ctx.id_str());
+    // Read before overwriting: a turn we block never runs, so no `Stop` hook will
+    // fire to correct this, and the row would sit on `working` forever.
+    let prior_status = std::fs::read_to_string(&status_path).ok();
+    let _ = std::fs::write(&status_path, "working");
     clear_compacting(ctx);
 
     let mut input = String::new();
+    // Whether this turn is the runtime injecting an event rather than the user
+    // talking. Kept out of the parse block because the nudges below need it.
+    let mut system_turn = false;
+    // ...and whether it is the one system turn we *asked* for. ⌘⇧R lets the wake
+    // through precisely so the nudges can ride on it, so this has to re-open the
+    // gate `system_turn` closes — without it the exemption buys a turn that still
+    // never re-arms, which is the whole thing it exists to prevent.
+    let mut sanctioned_resume = false;
     if std::io::stdin().read_to_string(&mut input).is_ok() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
             // Claude Code's UserPromptSubmit payload carries the text under
@@ -1012,12 +1024,38 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 // job completion arrives as a synthetic `<task-notification>…`
                 // prompt. Neither should overwrite the task.
                 let p = prompt.trim_start();
+                system_turn = p.starts_with("<task-notification");
                 if p.starts_with(crate::MULPEX_SENTINEL) {
                     verify_spawn_delivery(ctx, prompt);
-                } else if !p.starts_with("<task-notification") {
+                } else if !system_turn {
                     let task = crate::mcp::summarize(prompt);
                     if !task.is_empty() {
                         let _ = std::fs::write(ctx.tasks_dir.join(ctx.id_str()), &task);
+                    }
+                }
+                // The restart wake. Swallow it unless ⌘⇧R asked for it — see
+                // `orphaned_task_wake` for why this is the whole bug.
+                if orphaned_task_wake(p) {
+                    sanctioned_resume = take_resumed_in_place(ctx);
+                    if !sanctioned_resume {
+                        match prior_status {
+                            Some(s) => {
+                                let _ = std::fs::write(&status_path, s);
+                            }
+                            // Absent reads as `waiting` (`mcp::status_of`'s
+                            // default), the truth about a claude that just booted.
+                            None => {
+                                let _ = std::fs::remove_file(&status_path);
+                            }
+                        }
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "decision": "block",
+                                "reason": ORPHAN_WAKE_BLOCK_REASON,
+                            })
+                        );
+                        return Ok(());
                     }
                 }
             }
@@ -1028,11 +1066,20 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // listener (only until it's armed), then the peer snapshot. This replaces the
     // old visible PTY bootstrap prompt — a normal instance now starts clean and
     // arms its listener from here, invisibly, on the user's first turn.
+    //
+    // The two nudges are asked of the USER's turns only. Injected on a
+    // `<task-notification>` they are worse than useless: the arm nudge makes the
+    // instance start a fresh persistent Monitor, which is precisely the orphan
+    // that produces the next restart's wake — the reminder manufacturing the
+    // artifact that causes the next reminder. (Measured; see `docs/hub.md`.) The
+    // peer snapshot below is NOT gated — a hub wake *is* a task-notification, and
+    // it is the turn that most needs to know about unread mail.
+    let welcome = nudges_welcome(system_turn, sanctioned_resume);
     let mut parts: Vec<String> = Vec::new();
-    if !listener_armed(ctx) {
+    if welcome && !listener_armed(ctx) {
         parts.push(ARM_LISTENER_NUDGE.to_string());
     }
-    if !instance_named(ctx) {
+    if welcome && !instance_named(ctx) {
         parts.push(AUTO_NAME_NUDGE.to_string());
     }
     if let Some(context) = crate::mcp::peers_context(ctx) {
@@ -1068,6 +1115,57 @@ on your inbox, exactly as described under \"INCOMING MESSAGES\" in your instruct
 arming it your whole response and do not narrate it beyond a brief mention; just arm it and then \
 continue with what I actually asked. (You'll see this reminder each turn only until the listener \
 is armed.)";
+
+/// Whether this turn may carry the arm/name nudges.
+///
+/// A function rather than an inline `||` because getting it wrong is silent both
+/// ways, and it was in fact wrong once: gating on `system_turn` alone suppressed
+/// the nudges on ⌘⇧R's *sanctioned* wake too, so the exemption bought a turn that
+/// still never re-armed — the precise failure it exists to prevent, and invisible
+/// except by reading the hook's stdout.
+fn nudges_welcome(system_turn: bool, sanctioned_resume: bool) -> bool {
+    !system_turn || sanctioned_resume
+}
+
+/// Shown in the pane in place of the swallowed wake. Claude Code renders a blocked
+/// `UserPromptSubmit` as a warning that also dumps the original prompt, and neither
+/// `suppressOutput` nor an empty reason removes it (measured, 2026-09-03) — so the
+/// reason is written to explain the notice the user is going to see anyway.
+const ORPHAN_WAKE_BLOCK_REASON: &str =
+    "[Mulpex hub] Ignored: this is the previous Mulpex run's hub listener being \
+reported dead, not a message and not work. Nothing to do.";
+
+/// The restart wake, and the reason idle instances "open by themselves" after every
+/// Mulpex update.
+///
+/// Mulpex kills each `claude`'s whole process group at teardown, so the persistent
+/// Monitor backing the hub listener dies with no completion record. On the next
+/// launch the resumed session is handed a synthetic
+/// `<task-notification><status>stopped</status>… No completion record was found …`
+/// prompt, which is a **real turn**: the model wakes, the `UserPromptSubmit` hook
+/// fires, its arm nudge lands, and the instance dutifully starts a fresh persistent
+/// Monitor — the orphan that does this again next launch. Measured end-to-end in a
+/// live transcript (`bvpgm5lxl` → `bjwjmo0kw`, 2026-09-03).
+///
+/// The match is deliberately narrow. Only the `stopped`-with-no-completion-record
+/// shape is swallowed, because that one is *provably* stale: it describes a task
+/// belonging to a process this app already killed, so it can never be actionable.
+/// Everything else a `<task-notification>` carries goes through untouched — a hub
+/// wake (`<event>mulpex: N new hub message(s)</event>`), a background job that
+/// genuinely completed or failed, a Monitor the user stopped themselves.
+fn orphaned_task_wake(prompt: &str) -> bool {
+    prompt.starts_with("<task-notification")
+        && prompt.contains("<status>stopped</status>")
+        && prompt.contains("No completion record was found")
+}
+
+/// Consume the ⌘⇧R flag, reporting whether it was there. Deleted on read: it
+/// sanctions exactly one wake, so a later app restart of the same instance is back
+/// to being ordinary restart noise.
+fn take_resumed_in_place(ctx: &Ctx) -> bool {
+    let path = crate::resumed_in_place_path(&ctx.state_dir, ctx.instance);
+    path.exists() && std::fs::remove_file(&path).is_ok()
+}
 
 /// Whether this instance's hub listener is armed: the persistent Monitor `touch`es
 /// `armed/<id>` when it starts, so the file's presence tracks the real listener. A
@@ -1643,6 +1741,116 @@ mod tests {
         assert_eq!(compaction_end_status(&ctx), "waiting");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The verbatim prompt a resumed session is handed for a background task its
+    /// dead predecessor never finished — captured from a live transcript
+    /// (`bplozny5z`, 2026-09-03), which is the only place its exact wording lives.
+    const ORPHAN_WAKE: &str = "<task-notification>\n<task-id>bplozny5z</task-id>\n\
+<tool-use-id>toolu_01HwAgQuhcWwmQQFyWHX8eAh</tool-use-id>\n<status>stopped</status>\n\
+<summary>No completion record was found for this background shell command from the \
+previous session. It may have been stopped (via the UI, Monitor timeout, or agent \
+teardown — these leave no transcript marker), or it may have been running when the \
+previous Claude Code process exited. Check the output file for partial results before \
+assuming it completed.</summary>\n</task-notification>";
+
+    /// A hub wake, which is *also* a `<task-notification>` and must survive every
+    /// check the orphan wake is caught by. Captured from this project's own pane.
+    const HUB_WAKE: &str = "<task-notification>\n<task-id>bbmig56dj</task-id>\n\
+<summary>Monitor event: \"mulpex hub inbox\"</summary>\n\
+<event>mulpex: 1 new hub message(s)</event>\n</task-notification>";
+
+    /// The restart loop, pinned at its narrowest point.
+    ///
+    /// Every instance "opening by itself" after a Mulpex update was this: the
+    /// orphaned-Monitor wake is a real turn, the arm nudge rides in on it, and the
+    /// instance arms the Monitor that becomes the next update's orphan. Both halves
+    /// have to hold — recognising the wake, and *not* recognising anything else.
+    #[test]
+    fn the_restart_wake_is_swallowed_but_every_other_notification_is_not() {
+        assert!(
+            orphaned_task_wake(ORPHAN_WAKE),
+            "the wake that reopens every instance after an update went unrecognised"
+        );
+
+        // The plural case, which is where this class of bug survives: these are all
+        // task-notifications too, and swallowing any of them loses real news.
+        for (label, prompt) in [
+            ("a hub wake — the whole point of the listener", HUB_WAKE),
+            (
+                "a background job that genuinely finished",
+                "<task-notification>\n<status>completed</status>\n<summary>Build \
+                 finished</summary>\n</task-notification>",
+            ),
+            (
+                "a background job that failed",
+                "<task-notification>\n<status>failed</status>\n<summary>No completion \
+                 record was found</summary>\n</task-notification>",
+            ),
+            (
+                "a Monitor the user stopped themselves",
+                "<task-notification>\n<status>killed</status>\n<summary>Monitor \
+                 \"watching CI\" stopped</summary>\n</task-notification>",
+            ),
+            ("the user simply talking", "fix the login bug"),
+            (
+                "the user quoting the notification at us",
+                "why do I keep seeing No completion record was found?",
+            ),
+        ] {
+            assert!(
+                !orphaned_task_wake(prompt),
+                "swallowed {label} — that is real news the user never hears"
+            );
+        }
+    }
+
+    /// ⌘⇧R and an app launch both `--resume`, and the same wake means opposite
+    /// things: noise after an update, the only path back to an armed listener
+    /// after a restart-in-place. The flag is one-shot, so the *next* update does
+    /// not inherit the exemption.
+    #[test]
+    fn a_restart_in_place_is_allowed_the_wake_an_app_launch_is_not() {
+        let dir =
+            std::env::temp_dir().join(format!("mulpex-orphanwake-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join(crate::RESUMED_DIR)).unwrap();
+        let ctx = test_ctx(&dir, 3);
+
+        assert!(
+            !take_resumed_in_place(&ctx),
+            "an app launch claimed a restart-in-place it never performed"
+        );
+
+        std::fs::write(crate::resumed_in_place_path(&dir, 3), "").unwrap();
+        assert!(take_resumed_in_place(&ctx), "⌘⇧R's own wake was swallowed");
+        assert!(
+            !take_resumed_in_place(&ctx),
+            "the exemption outlived its one wake, so the loop comes back next update"
+        );
+
+        // The flag is per instance: claude#3's restart must not speak for claude#4.
+        std::fs::write(crate::resumed_in_place_path(&dir, 3), "").unwrap();
+        assert!(!take_resumed_in_place(&test_ctx(&dir, 4)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate that decides whether a turn is allowed to be asked to arm.
+    #[test]
+    fn only_a_wake_we_asked_for_is_allowed_to_re_arm() {
+        assert!(
+            nudges_welcome(false, false),
+            "the user talking stopped being nudged — instances never arm or name themselves"
+        );
+        assert!(
+            !nudges_welcome(true, false),
+            "restart noise is still asked to arm, which is the loop itself"
+        );
+        assert!(
+            nudges_welcome(true, true),
+            "\u{2318}\u{21e7}R's own wake was not allowed to re-arm, so the restarted \
+             instance stays deaf to hub mail with nothing to say so"
+        );
     }
 
     /// `SessionStart` fires for startup, resume and clear as well as compaction,

@@ -112,10 +112,28 @@ pub fn spawn_expected_path(state_dir: &std::path::Path, id: usize) -> std::path:
     state_dir.join(SPAWNING_DIR).join(format!("{id}.expected"))
 }
 
+/// The flag that says "this child was resumed in place (⌘⇧R), so the orphaned
+/// background task it is about to be told about is *expected*". Written by the app
+/// in `Core::restart_instance`, consumed-and-deleted by the `UserPromptSubmit`
+/// hook (`hook::take_resumed_in_place`).
+///
+/// It exists because the two ways a `claude` gets `--resume`d need opposite
+/// answers to the same notification. An app launch builds a **fresh** `state_dir`,
+/// so the inbox is empty and the wake carries nothing to act on — it is pure
+/// restart noise and is blocked. ⌘⇧R reuses the **same** `state_dir` and
+/// deliberately keeps the inbox while clearing `armed/<id>`, so that same wake is
+/// the only thing that re-arms the listener and drains any mail waiting for it.
+/// Blocking it there would leave the restarted instance unarmed and its mail
+/// undelivered, with nothing anywhere to say so.
+pub fn resumed_in_place_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(RESUMED_DIR).join(id.to_string())
+}
+
 /// These live here, next to `MULPEX_SENTINEL`, for the same reason: they are
 /// a contract between two *processes*, so a copy in each would be a contract that
 /// can silently drift out of agreement.
 pub const NAMEREQ_DIR: &str = "namereq";
+pub const RESUMED_DIR: &str = "resumed";
 pub const SPAWNING_DIR: &str = "spawning";
 pub const NAMED_DIR: &str = "named";
 pub const EXPLAINREQ_DIR: &str = "explainreq";

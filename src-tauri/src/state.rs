@@ -413,6 +413,7 @@ fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<()> 
         "armed",
         mulpex_core::NAMED_DIR,
         mulpex_core::NAMEREQ_DIR,
+        mulpex_core::RESUMED_DIR,
         mulpex_core::EXPLAINREQ_DIR,
         mulpex_core::EXPLAINQ_DIR,
         mulpex_core::EXPLAINPLAN_DIR,
@@ -1354,6 +1355,19 @@ impl Core {
         // the flag, skips the arm nudge for good, and the resumed instance is
         // never woken by hub mail again — with nothing anywhere to say so.
         let _ = std::fs::remove_file(self.state_dir.join("armed").join(id.to_string()));
+        // ...and because it was cleared, the resumed child has to re-arm — which,
+        // with no task on its command line, only happens if it takes a turn. The
+        // one thing that makes it take one is the "orphaned background task" wake
+        // the dead Monitor is about to produce, and the `UserPromptSubmit` hook
+        // swallows that wake by default (it is what made every instance open
+        // itself after an app update). This flag is the exception: it tells the
+        // hook that *this* wake was asked for, so the instance comes back armed
+        // with its inbox drained instead of silently deaf to hub mail.
+        let _ = std::fs::create_dir_all(self.state_dir.join(mulpex_core::RESUMED_DIR));
+        let _ = std::fs::write(
+            mulpex_core::resumed_in_place_path(&self.state_dir, id),
+            "",
+        );
 
         let settings_path = self.settings_path.clone();
         let state_dir = self.state_dir.clone();
