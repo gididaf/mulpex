@@ -42,6 +42,74 @@ against the *local* hub:
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
 
+### The nudge that fed itself: why instances opened by themselves after an update
+
+The arming nudge is self-healing by design, and for a while it healed a wound it was itself
+inflicting. Every Mulpex update made idle instances — including ones in *other* projects the user
+wasn't looking at — wake up and take a turn nobody asked for.
+
+The loop, traced end-to-end in a live transcript (`bvpgm5lxl` → `bjwjmo0kw`, 2026-09-03) rather
+than reasoned about:
+
+1. Teardown `killpg`s each `claude`, so the listener's **persistent Monitor dies with no completion
+   record**.
+2. On the next launch the resumed session is handed a synthetic
+   `<task-notification><status>stopped</status>… No completion record was found …` prompt. **That
+   is a real turn** — not a notice. It is what "the session opened by itself" actually was.
+3. `UserPromptSubmit` fires on it (measured: the injected turn carries `origin.kind:
+   "task-notification"`, `promptSource: "system"`, and a `hook_additional_context` attachment), so
+   `ARM_LISTENER_NUDGE` rides in.
+4. The instance dutifully arms a fresh persistent Monitor — **the orphan that repeats this at the
+   next update.**
+
+The nudge manufactured the artifact that caused the next nudge, so it never settled. Note where the
+miss was: `userpromptsubmit` *already* recognised `<task-notification>` (to keep event turns from
+overwriting the sidebar task); the nudges below it just weren't gated on the same fact. A
+discriminator that exists but is only half-applied is the cheapest kind of bug to keep.
+
+Two halves fix it, and both matter:
+
+- **The nudges are asked of the user's turns only** (`nudges_welcome`). The **peer snapshot is
+  deliberately not gated** — a hub wake *is* a `<task-notification>`, and it is the very turn that
+  most needs the unread-mail count. Verified: mail planted in `inbox/<id>/` still arrives on a
+  Monitor-event wake with the arm nudge suppressed.
+- **The orphan wake is blocked outright** (`orphaned_task_wake` → `{"decision":"block"}`), so no
+  turn happens at all. Measured on a real PTY session: `num_turns: 0`, zero output tokens, no
+  assistant row, `preventContinuation: true`.
+
+The match is narrow on purpose: `stopped` **and** the "No completion record was found" wording.
+That shape is *provably* stale — it describes a task belonging to a process this app already killed
+— so it can never be actionable. A completion, a failure, a Monitor the user stopped, and a hub
+wake all pass through, and `the_restart_wake_is_swallowed_but_every_other_notification_is_not`
+asserts each one still does. Blocking is also why the hook now **restores the prior status**: a
+blocked turn never runs, so no `Stop` hook follows to clear the `working` it just wrote.
+
+**⌘⇧R is the exception, and inverting it would have been a silent regression.** Restart-in-place
+reuses the *same* `state_dir`, deliberately keeps the inbox and clears `armed/<id>`
+(`Core::restart_instance`) — so there, that same wake is the **only** path back to an armed
+listener and a drained inbox. It is exempted by a one-shot `resumed/<id>` flag
+(`resumed_in_place_path`), consumed on read so the *next* app restart is ordinary noise again. The
+exemption must also re-open the nudge gate, not just let the turn through: gating on `system_turn`
+alone bought a turn that still never re-armed — the exact failure the exemption exists to prevent,
+and invisible except by reading the hook's stdout. That is what `nudges_welcome` is a named
+function for.
+
+**What is deliberately not fixed.** Claude Code renders a blocked prompt as a warning block that
+also dumps the original prompt; `suppressOutput` and an empty `reason` were both measured not to
+remove it (an empty reason just becomes "Blocked by hook"), so `ORPHAN_WAKE_BLOCK_REASON` is
+written to explain the notice the user will see anyway. The only way to remove it entirely would be
+to forge a completion record in Claude Code's private task dir — an undeclared interface, which is
+the dependency this repo has already been burned by twice.
+
+Also settled while diagnosing this, against two plausible-sounding suggestions:
+
+- **`sweep_stale_state_roots` already works.** Of 59 `mulpex-*` dirs in `$TMPDIR`, 58 were our own
+  **test fixtures** (`mulpex-oldfmt-*`, `mulpex-argvspawn-*`, `mulpex-vtgrid-test-*`…), which it
+  skips by design because they don't parse as a pid; the single real dir was the *live* app's.
+- **Making `armed/<id>` survive restarts would be a bug, not a fix.** The Monitor genuinely is dead
+  after a restart. A surviving flag means the instance believes it is armed when it isn't, and it
+  is never woken by hub mail again — with nothing anywhere to say so.
+
 ## Naming a row (`hub_set_name`), and the two backstops behind it
 
 An instance labels its own sidebar row with `hub_set_name`, which is a **fire-and-forget file

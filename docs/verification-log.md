@@ -573,3 +573,39 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
   lines of noise in a 400-line change, and it re-wrapped hand-formatted single-line struct
   literals). There is no `rustfmt.toml`. It was reverted per-file; see the trap in
   [../src-tauri/CLAUDE.md](../src-tauri/CLAUDE.md).
+
+## The restart wake (2026-09-03)
+
+**Driven, not inferred.** The report that arrived described steps 2-4 as inferred from notification
+text; all four were then confirmed against real artifacts before any code changed.
+
+- **The loop, in a live transcript.** `~/.claude/projects/…-dreamvps-cloud/b17543f0….jsonl`:
+  IDX 256 the injected turn (`origin.kind: "task-notification"`, `promptSource: "system"`), IDX 257
+  the `hook_additional_context` attachment carrying `ARM_LISTENER_NUDGE`, IDX 259 the model arming a
+  fresh persistent Monitor. `bvpgm5lxl` (armed the previous day, reported dead on this launch) →
+  `bjwjmo0kw` (armed on that wake) is the self-perpetuation, in the log.
+- **A `UserPromptSubmit` block really does suppress the turn.** Headless probe: `num_turns: 0`,
+  `output_tokens: 0`, `duration_api_ms: 0`, no assistant message.
+- **…and it works on a task-notification specifically, which headless could NOT show.** Under
+  `claude -p --resume` the notification arrives as `promptSource: "sdk"` and **the hook does not
+  fire for it** — only for the real prompt. Reproduced properly on a PTY instead: orphan a
+  persistent Monitor by SIGKILL, resume interactively → the hook fires, blocks, and the transcript
+  shows `preventContinuation: true` with **no assistant row after it**.
+- **End-to-end through the real `mulpex-helper`.** Real `claude` on a PTY, helper wired as the
+  `UserPromptSubmit` hook: the wake produced no assistant turn, `armed/1` stayed absent (no new
+  orphan — the loop is dead), and the status file was still `waiting`, blocked by the helper's own
+  reason string.
+- **The non-regression that mattered most.** Mail planted in `inbox/1/` still arrives on a
+  Monitor-event wake while the arm nudge is suppressed — the peer snapshot is not gated.
+
+Two traps worth keeping from the session:
+
+- **`CLAUDE_CODE_CHILD_SESSION=1` is in a Mulpex instance's own environment**, so a `claude` spawned
+  from a Bash tool inherits it and **writes no transcript at all** — the interactive probe silently
+  produced nothing until the variable was scrubbed. Exactly the failure `src-tauri/CLAUDE.md`
+  warns about, met from the other side.
+- **SIGKILL alone loses the transcript.** The first orphan attempt left no `.jsonl`; matching
+  teardown's real SIGHUP→grace→SIGKILL sequence was needed before the session flushed.
+- **A stale `target/debug/mulpex-helper` will happily answer probes with the old behaviour.** The
+  first helper-level run reported the pre-fix output because the binary predated the edit. Check its
+  mtime before believing a probe.
