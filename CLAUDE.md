@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/explainer.md](docs/explainer.md) | Hebrew turn-summary panel: Stop→`explainreq` handshake, pending questions + plans (`ExitPlanMode`, and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs::stop`/`askq`/`plan`, `ExplainerPanel.svelte`, turn extraction |
+| [docs/explainer.md](docs/explainer.md) | Hebrew turn-summary panel: Stop→`explainreq` handshake, pending questions + plans (`ExitPlanMode`, and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs::stop`/`askq`/`plan`, `ExplainerPanel.svelte`, turn extraction |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
@@ -311,7 +311,10 @@ new work more than any individual fix is.
   dispatcher, find its allowlist.**
 - **A default that reads as an assertion.** `status: waiting` is `mcp::status_of`'s default for a
   *missing* file — it reports ignorance in the same word it reports idleness. `ok: true` used to
-  mean the process existed, not that its task arrived. **Say what you know; don't round it up.**
+  mean the process existed, not that its task arrived. The Explainer's `ההסבר נכשל (exit 1)` was
+  the same shape from the other end: it read only the child's **stderr**, and `claude -p` prints
+  its own failure on **stdout**, so the panel showed a code with the diagnosis thrown away.
+  **Say what you know; don't round it up — and check which stream the reason is actually on.**
 - **It reproduces only in the shipped `.app`.** `tauri dev` inherits your terminal's environment, so
   the whole `PATH` / `TERM` / login-token class is invisible there. Finder gives LaunchServices'
   bare environment; reproduce with `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
@@ -333,4 +336,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`993ce7b55fa3ca5e2b2cb5bdca9754e530cf15e6` — 2026-09-02
+`0df3661e068d95094b3c03925d27486075767074` — 2026-09-03

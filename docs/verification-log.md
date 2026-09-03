@@ -544,3 +544,32 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
   [../CLAUDE.md](../CLAUDE.md) is untested. **The experiment that would settle it takes ten
   seconds:** click the sidebar (so focus is out of the terminal) and press ⌘⇧]. If it switches
   project, the brackets had the same focus cause as the arrows and the hypothesis is wrong.
+
+- **The Explainer's failure reason, auto-retry and `נסה שוב` (2026-09-03).** The one thing that
+  *was* measured is the thing the fix turns on: driving the real `claude -p` with the summarizer's
+  exact flags, a bad `CLAUDE_CODE_OAUTH_TOKEN` exits **1** with `Failed to authenticate. API Error:
+  401 OAuth access token is invalid.` on **stdout** and an **empty stderr**, and an unknown
+  `--model` likewise puts its user-facing sentence on stdout (its stderr carries a different,
+  catalog-level message). That is why a real failure entry could only say `exit 1`, and it is
+  pinned by `a_dead_summarizer_reports_the_reason_not_just_the_code` over those exact strings.
+  The retry's bookkeeping — in-place replace, no coalescing, the stash dying with its row — is
+  covered by `a_retry_replaces_its_row_in_place_and_its_stash_is_bounded_by_the_feed`, driving the
+  real module singleton. `svelte-check` 0 errors, `vite build` clean, 84 Rust tests pass.
+
+  **NOT verified:** anything in the running app. Mulpex was not rebuilt or relaunched (the user was
+  working inside it), so the button's rendering and RTL placement, the in-place `מסביר…`, the
+  `seq`-keyed upsert against a live `explain-update`, and `retry_explain` actually being reachable
+  through `invoke_handler` are **unproven in the real app** — the last one being this repo's
+  classic silent failure (a command absent from the allowlist fails only at runtime). Nothing here
+  needed a *summarizer failure to occur on demand*, which is the missing rig: two attempts at one
+  (a bogus token, an unreachable `ANTHROPIC_BASE_URL`) both failed — the first because `claude`
+  authenticated anyway from outside the env, the second because it retried until the 90 s timeout —
+  and that is why the reason logic was extracted into the pure `failure_reason()` and tested
+  there instead.
+
+- **`cargo fmt` is not safe to run here (2026-09-03, measured).** This tree is not
+  rustfmt-default-clean: one `cargo fmt` reformatted `claude_bin.rs`, `menu.rs`, `pty.rs`,
+  `state.rs`, `vtgrid.rs` and parts of `commands.rs`/`explainer.rs` that no one had touched (~700
+  lines of noise in a 400-line change, and it re-wrapped hand-formatted single-line struct
+  literals). There is no `rustfmt.toml`. It was reverted per-file; see the trap in
+  [../src-tauri/CLAUDE.md](../src-tauri/CLAUDE.md).

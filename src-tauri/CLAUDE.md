@@ -8,7 +8,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
 | `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
-| `explainer.rs` (turn extraction, pending questions + plans, the headless Sonnet child, the worker queue) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race, why not `--bare`, one-sentence plans, no-silent-skip rule |
+| `explainer.rs` (turn extraction, pending questions + plans, the headless Sonnet child, the worker queue, failure reason + retry) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race, why not `--bare`, one-sentence plans, no-silent-skip rule, and why a retry re-runs the *stashed* input rather than the transcript |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 
@@ -23,6 +23,14 @@ Traps that live in this directory specifically:
 - **`reap_dead`'s early return tests *removability*, not liveness**, and the failure mark must latch
   — otherwise the body's two disk writes run on every 200 ms tick forever.
   → [../docs/sessions.md](../docs/sessions.md)
+- **Don't run `cargo fmt` here.** This tree is not rustfmt-default-clean and there is no
+  `rustfmt.toml`; one run (2026-09-03) reformatted five files nobody had touched — `state.rs`,
+  `pty.rs`, `vtgrid.rs`, `claude_bin.rs`, `menu.rs` — and re-wrapped hand-written single-line
+  struct literals, burying a small change in ~700 lines of noise. Match the surrounding style by
+  hand instead. → [../docs/verification-log.md](../docs/verification-log.md)
+- **A child process's failure reason may be on stdout.** `claude -p` exits 1 and prints
+  `API Error: 401 …` on **stdout** with an empty stderr (measured). Reading stderr alone is how the
+  Explainer shipped a failure entry that said only `exit 1`. → [../docs/explainer.md](../docs/explainer.md)
 - **Never `wait()` a terminal's child to learn it exited.** Liveness is reader-thread EOF; a zombie
   keeps the pid unrecyclable, which is what makes the `killpg` in teardown safe.
 - **A task is an argv argument, not keystrokes** — for a spawned child here and for a remote peer
