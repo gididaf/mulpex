@@ -157,8 +157,47 @@ when cut.
   a full pipe while the parent only `try_wait`s reads as a timeout (the classic self-inflicted
   deadlock). Timeout 90s → kill + `wait()` (reap) + failure entry.
 - Measured latency 6–13s per turn; three concurrent calls fine.
-- Failures become `ExplainEntry { ok: false, text: "ההסבר נכשל (exit N / timeout / …)" }` —
-  rendered dim, never retried, never silently dropped. Say what you know.
+- Failures become `ExplainEntry { ok: false, text: "ההסבר נכשל (exit N: <reason> / timeout / …)" }`
+  — rendered dim, never silently dropped, and **retryable** (below). Say what you know.
+
+## When the summarizer dies (the reason, the auto-retry, the button)
+
+Added 2026-09-03, after a real failure entry read `ההסבר נכשל (exit 1)` and there was nothing in
+it to act on and nothing in it to diagnose.
+
+- **`claude -p` prints its own failure on stdout, not stderr.** *Measured 2026-09-03*: with a bad
+  token it exits 1 with `Failed to authenticate. API Error: 401 OAuth access token is invalid.` on
+  **stdout** and an **empty stderr**; an unknown `--model` likewise puts its user-facing sentence
+  on stdout. Reading stderr alone is exactly how the reason got thrown away and only `exit 1`
+  survived — a default reporting ignorance in the same words it reports a diagnosis.
+  `failure_reason()` now prefers stderr (more specific when present) and falls back to stdout,
+  capped to the first non-blank line and 200 chars. Guarded by
+  `a_dead_summarizer_reports_the_reason_not_just_the_code` over the measured strings.
+- **One automatic second attempt** (`run_summarizer_twice`, `AUTO_RETRY_DELAY` = 2 s): most of what
+  kills the child is transient — a 401/429, the CLI self-updating out from under it — and only the
+  second failure ever reaches the panel. The first is logged (two failures for *different* reasons
+  is a different bug from two for the same one, and the entry can only show one).
+- **A failed row carries a `נסה שוב` button** that re-runs *the same summarizer input*, never the
+  transcript. `process` stashes `(kind, prompt, text, cwd)` in `Inner::retries` keyed by the
+  entry's `seq`; the button calls `retry_explain(handle, id, seq)` → `explainer::retry`, which
+  enqueues an `Input::Retry`. Going back to the transcript instead would be a real bug: by the
+  time the user clicks, that claude may have finished two more turns, and `extract_turn_text`
+  reads the **last** one — the row would quietly explain a different turn.
+- **`ExplainEntry::seq`** is a process-wide monotonic id and the whole addressing story: it is the
+  retry address, and it is what makes a retry *replace its row in place* — the backend
+  `replace_entry`s at the same index and `applyExplainFor` upserts by `seq` rather than
+  prepending. The panel keys `{#each}` on it too, so a returned row is patched, not rebuilt.
+  The retry's entry carries the **retry's** `ts` (which is also how the panel notices its row came
+  back and drops the in-place `מסביר…`).
+- **A retry cannot be coalesced.** `enqueue`'s latest-wins is per kind, and two retries name two
+  different rows — collapsing them would leave one failure row spinning forever. The stash is
+  *kept*, not taken: a retry that fails again writes itself back under the same `seq`, so the
+  button survives. It is dropped when the retry succeeds, when the row falls off the 50-entry cap
+  (`push_entry` prunes what it truncates), and on `forget` / `forget_project`.
+- `retry_explain` returns **false** when nothing is stashed under that seq (aged-out row, gone
+  instance). The panel puts the button back rather than spinning on an update that is never
+  coming — and `retry_explain` is registered in `lib.rs`'s `invoke_handler` list, which is an
+  allowlist like every other dispatcher here.
 
 ## Decisions (confirmed with the user)
 
@@ -177,6 +216,9 @@ when cut.
 | Plan attention | `needs` written by the hook too | immediate dot, independent of the notification type |
 | Feed order | oldest first, newest at the bottom, chat-sticky scroll | aligns with the claude transcript beside it |
 | Old entries | dimmed to 0.18, full opacity on panel hover (newest always full) | the panel is a glance; the backlog stays reachable |
+| A failed explanation | one silent auto-retry, then a `נסה שוב` button on the row | most failures are transient; the rest are one click, not a dead row |
+| A retry's result | replaces the failed row in place, with the retry's timestamp | the feed is a history of turns, not of attempts |
+| A failure's text | shows the reason `claude` printed, not just the exit code | "exit 1" is a code with the diagnosis thrown away |
 
 ## Reading order and the dimming (the panel's own UI rules)
 

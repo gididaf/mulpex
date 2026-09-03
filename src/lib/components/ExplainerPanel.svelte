@@ -9,13 +9,16 @@
      Hebrew paragraphs read right-to-left while inline English identifiers sit
      correctly inside them. Nothing here touches the xterm CSS. -->
 <script lang="ts">
+  import { untrack } from "svelte";
   import {
     activeExplains,
     activeExplainBusy,
+    activeProjectHandle,
     sessions,
     activeId,
     showExplainer,
   } from "../stores";
+  import { retryExplain } from "../ipc";
 
   const cur = $derived($sessions.find((s) => s.id === $activeId) ?? null);
   const isShell = $derived(cur?.kind === "shell");
@@ -54,6 +57,55 @@
     el.scrollTop = el.scrollHeight;
   });
 
+  // Rows with a retry in flight: entry `seq` → the `ts` it had when the button
+  // was pressed. The backend replaces a retried row in place and stamps it with
+  // the retry's time, so a changed `ts` under the same `seq` is exactly "your
+  // retry came back" — success or a fresh failure alike.
+  let retrying = $state<Record<number, number>>({});
+  // Only retries of rows in the feed on screen suppress the bottom in-flight
+  // line — a retry left running on another instance says nothing about this one.
+  const anyRetrying = $derived($activeExplains.some((e) => retrying[e.seq]));
+
+  $effect(() => {
+    const live = $activeExplains;
+    untrack(() => {
+      const next = { ...retrying };
+      let changed = false;
+      for (const key of Object.keys(next)) {
+        const seq = Number(key);
+        const e = live.find((x) => x.seq === seq);
+        // Only a *returned* row clears the marker. A seq that is simply absent
+        // belongs to another instance's feed (the user switched rows mid-retry)
+        // and must survive, or coming back would show the failure again with
+        // its button while the retry is still running.
+        if (e && e.ts !== next[seq]) {
+          delete next[seq];
+          changed = true;
+        }
+      }
+      if (changed) retrying = next;
+    });
+  });
+
+  async function retry(seq: number, ts: number, id: number) {
+    const handle = $activeProjectHandle;
+    if (handle === null) return;
+    retrying = { ...retrying, [seq]: ts };
+    let queued = false;
+    try {
+      queued = await retryExplain(handle, id, seq);
+    } catch {
+      queued = false;
+    }
+    // Nothing stashed under that seq any more (or the call failed): no update is
+    // coming, so give the button back instead of spinning forever.
+    if (!queued) {
+      const next = { ...retrying };
+      delete next[seq];
+      retrying = next;
+    }
+  }
+
   function when(ts: number): string {
     return new Date(ts).toLocaleTimeString([], {
       hour: "2-digit",
@@ -77,7 +129,7 @@
        starts, instead of at the moment its replacement lands. -->
   <div
     class="body"
-    class:explaining={cur && !isShell && $activeExplainBusy}
+    class:explaining={cur && !isShell && $activeExplainBusy && !anyRetrying}
     bind:this={bodyEl}
     onscroll={onScroll}
   >
@@ -88,7 +140,9 @@
     {:else if ordered.length === 0 && !$activeExplainBusy}
       <div class="empty">nothing yet — explanations appear after each turn</div>
     {:else}
-      {#each ordered as e, i (e.ts + "-" + i)}
+      <!-- Keyed by seq: a retry rewrites its row in place (same seq, new ts), and
+           keying on ts would tear the article down and rebuild it instead. -->
+      {#each ordered as e (e.seq)}
         <article
           class:failed={!e.ok}
           class:question={e.kind === "question"}
@@ -106,13 +160,31 @@
                paragraph out LTR (measured: scrambled line order, trailing period
                on the wrong side). The panel's language is Hebrew by contract;
                inline English sits correctly inside an RTL paragraph. -->
-          <div class="text" dir="rtl">{e.text}</div>
+          {#if retrying[e.seq]}
+            <div class="text working" dir="rtl">מסביר…</div>
+          {:else}
+            <div class="text" dir="rtl">{e.text}</div>
+            {#if !e.ok}
+              <!-- A failed row is the one place the panel is actionable: the
+                   summarizer child died (most often on a transient the automatic
+                   second attempt didn't outlive), and the turn's text is still
+                   stashed backend-side, so one click re-runs exactly it. -->
+              <div class="actions">
+                <button
+                  class="retry"
+                  dir="rtl"
+                  title="להריץ שוב את ההסבר לתור הזה"
+                  onclick={() => retry(e.seq, e.ts, e.id)}>נסה שוב</button
+                >
+              </div>
+            {/if}
+          {/if}
         </article>
       {/each}
     {/if}
     <!-- The in-flight line lives at the bottom, where the entry it is producing
          will land. -->
-    {#if cur && !isShell && $activeExplainBusy}
+    {#if cur && !isShell && $activeExplainBusy && !anyRetrying}
       <div class="working" dir="rtl">מסביר…</div>
     {/if}
   </div>
@@ -235,6 +307,31 @@
   .failed .text {
     color: var(--text-faint);
     font-style: italic;
+  }
+  /* The retry lives under its failed row, hugging the RTL reading edge. */
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.35rem;
+  }
+  .retry {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 0.72rem;
+    padding: 0.1rem 0.45rem;
+    cursor: pointer;
+  }
+  .retry:hover {
+    color: var(--text);
+    border-color: var(--text-dim);
+  }
+  /* The in-place "מסביר…" reuses the bottom line's look, minus its padding —
+     it stands in for the entry text, inside a row that already has its own. */
+  .text.working {
+    padding: 0;
   }
   /* A question or a plan entry: the claude is waiting on the user right now —
      accent edge on the reading (right) side, matching the panel's RTL. The

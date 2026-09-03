@@ -346,8 +346,10 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   });
 }
 
-/** Prepend one Explainer entry to its instance's feed (the `explain-update`
- *  event; the backend caps the feed, the frontend just mirrors it). */
+/** Apply one `explain-update`: an entry whose `seq` is already in the feed
+ *  **replaces** it where it sits (a retry of a failed row lands in place, not as
+ *  a second row at the top); anything else is prepended. The backend caps the
+ *  feed, the frontend just mirrors it. */
 export function applyExplainFor(
   handle: ProjectHandle,
   id: number,
@@ -356,7 +358,14 @@ export function applyExplainFor(
   const p = get(projects).get(handle);
   if (!p) return;
   const explains = new Map(p.explains);
-  explains.set(id, [entry, ...(explains.get(id) ?? [])]);
+  const feed = explains.get(id) ?? [];
+  const at = feed.findIndex((e) => e.seq === entry.seq);
+  explains.set(
+    id,
+    at === -1
+      ? [entry, ...feed]
+      : [...feed.slice(0, at), entry, ...feed.slice(at + 1)],
+  );
   patchProject(handle, { explains });
 }
 

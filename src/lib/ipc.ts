@@ -97,7 +97,8 @@ export interface ClaudeStatus {
  *  Mirrors `snapshot.rs::ExplainEntry` (no codegen; keep in sync). */
 export interface ExplainEntry {
   id: number;
-  /** Unix epoch milliseconds. */
+  /** Unix epoch milliseconds. A retry that replaced a failed entry carries the
+   *  retry's time, which is also how the panel notices its row came back. */
   ts: number;
   text: string;
   ok: boolean;
@@ -105,6 +106,10 @@ export interface ExplainEntry {
    *  AskUserQuestion (what's being asked + what each option means); "plan"
    *  explains a pending ExitPlanMode plan in one line, before you approve it. */
   kind: "turn" | "question" | "plan";
+  /** Unique, stable id of this feed item: the retry address of a failed entry,
+   *  and what an incoming `explain-update` matches to replace a row in place
+   *  instead of prepending a new one. */
+  seq: number;
 }
 
 // Scoped event payloads (mirror snapshot.rs).
@@ -230,6 +235,16 @@ export const getHubSnapshot = (projectHandle: ProjectHandle) =>
  *  the store groups them. */
 export const getExplains = (projectHandle: ProjectHandle) =>
   invoke<ExplainEntry[]>("get_explains", { projectHandle });
+
+/** Re-run the summarizer for one failed entry; its result replaces that row in
+ *  place (an ordinary `explain-update` carrying the same `seq`). False means the
+ *  backend has nothing stashed under that seq any more — the row aged out of the
+ *  50-entry feed, or its instance is gone — and the button should come back. */
+export const retryExplain = (
+  projectHandle: ProjectHandle,
+  id: number,
+  seq: number,
+) => invoke<boolean>("retry_explain", { projectHandle, id, seq });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the

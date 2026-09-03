@@ -201,15 +201,22 @@ pub enum ExplainKind {
 
 /// One Explainer feed item: the short Hebrew explanation of one finished turn
 /// of one instance. `ok: false` marks a summarizer failure — the text then says
-/// so instead of pretending (never round ignorance up to an explanation).
+/// so instead of pretending (never round ignorance up to an explanation), and
+/// the panel offers a retry on it.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ExplainEntry {
     pub id: usize,
-    /// Unix epoch milliseconds of when the explanation was produced.
+    /// Unix epoch milliseconds of when the explanation was produced. A retry
+    /// that replaces a failed entry carries the retry's time, not the failure's.
     pub ts: u64,
     pub text: String,
     pub ok: bool,
     pub kind: ExplainKind,
+    /// Process-wide unique id of this feed item. It is the retry address (a
+    /// failed entry's summarizer input is stashed under it) and it is what a
+    /// retry's `explain-update` matches to *replace* the failed row in place
+    /// rather than prepend a second one. Stable across a retry.
+    pub seq: u64,
 }
 
 /// `explain-pending` event payload: whether the Explainer is currently working

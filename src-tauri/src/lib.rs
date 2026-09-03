@@ -101,6 +101,7 @@ pub fn run() {
             commands::focus_session,
             commands::get_hub_snapshot,
             commands::get_explains,
+            commands::retry_explain,
             commands::restart_app,
         ])
         .setup(|app| {

@@ -106,6 +106,14 @@ const SUMMARIZER_TIMEOUT: Duration = Duration::from_secs(90);
 /// just races more Sonnet calls for a panel the user reads one row at a time.
 const WORKERS: usize = 2;
 
+/// Every summarizer call gets one automatic second attempt after this pause,
+/// and only a second failure reaches the panel. Measured 2026-09-03: `claude -p`
+/// exits 1 on a transient — a 401/429 from the API, a CLI self-update swapping
+/// the install out from under the child — as readily as on anything permanent,
+/// and the user's only recourse for those was a failure row they couldn't act
+/// on. Cheap: it costs an extra call only on a call that already failed.
+const AUTO_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// The Stop hook races Claude Code's own transcript flush: measured 2026-08-30,
 /// the turn's final assistant entry hit the JSONL at 11:55:15.346 while the
 /// Stop hook fired inside the same second — the first read then sees the turn's
@@ -126,6 +134,14 @@ enum Input {
     /// A pending `ExitPlanMode`: the tool's `tool_input` JSON (its `plan` field
     /// is the plan as markdown).
     Plan { json: String },
+    /// A manual retry of the failed entry `seq` (the panel's "נסה שוב").
+    ///
+    /// It carries the *already-extracted* summarizer input, stashed when the
+    /// entry failed — it does not go back to the transcript. By the time the
+    /// user clicks, that claude may have finished two more turns, and
+    /// `extract_turn_text` reads the LAST one: re-extracting would silently
+    /// explain a different turn under the failed row's timestamp.
+    Retry { seq: u64, kind: ExplainKind, prompt: &'static str, text: String },
 }
 
 struct Job {
@@ -146,6 +162,23 @@ struct Inner {
     /// idle when only the first finishes. `explain-pending` fires on the 0↔1+
     /// transitions only.
     pending: Mutex<HashMap<(ProjectHandle, usize), u32>>,
+    /// `seq` of a **failed** entry → everything needed to run its summarizer
+    /// call again. Written when a failure entry is pushed, dropped when the
+    /// retry succeeds, when the entry falls off the end of its feed, and when
+    /// the instance or project is forgotten — so it can only ever hold inputs
+    /// for failure rows currently on screen.
+    retries: Mutex<HashMap<u64, Retryable>>,
+}
+
+/// The stashed input of one failed entry: exactly the arguments
+/// [`run_summarizer`] took, plus who it belongs to.
+struct Retryable {
+    handle: ProjectHandle,
+    id: usize,
+    kind: ExplainKind,
+    prompt: &'static str,
+    text: String,
+    cwd: PathBuf,
 }
 
 static INNER: OnceLock<Arc<Inner>> = OnceLock::new();
@@ -158,6 +191,7 @@ fn inner() -> &'static Arc<Inner> {
             wake: Condvar::new(),
             store: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            retries: Mutex::new(HashMap::new()),
         })
     })
 }
@@ -213,11 +247,15 @@ pub fn submit_plan(handle: ProjectHandle, id: usize, json: String, cwd: PathBuf)
 
 fn enqueue(handle: ProjectHandle, id: usize, input: Input, cwd: PathBuf) {
     let kind = std::mem::discriminant(&input);
+    // Latest-wins is per *kind*, and a Retry has no "latest": each one names a
+    // different failed row, so two of them must both run. Coalescing them would
+    // leave one failure row spinning on its busy dot forever.
+    let coalesce = !matches!(input, Input::Retry { .. });
     let job = Job { handle, id, input, cwd };
     let inner = inner();
     let mut q = inner.queue.lock().unwrap();
     let replaced = if let Some(existing) = q.iter_mut().find(|j| {
-        j.handle == handle && j.id == id && std::mem::discriminant(&j.input) == kind
+        coalesce && j.handle == handle && j.id == id && std::mem::discriminant(&j.input) == kind
     }) {
         *existing = job;
         true
@@ -274,6 +312,7 @@ pub fn forget(handle: ProjectHandle, id: usize) {
     let inner = inner();
     inner.queue.lock().unwrap().retain(|j| !(j.handle == handle && j.id == id));
     inner.store.lock().unwrap().remove(&(handle, id));
+    inner.retries.lock().unwrap().retain(|_, r| !(r.handle == handle && r.id == id));
     // The row is gone; so is its busy dot. A still-running job's own
     // finish_pending later finds no entry and stays silent.
     if inner.pending.lock().unwrap().remove(&(handle, id)).is_some() {
@@ -287,6 +326,7 @@ pub fn forget_project(handle: ProjectHandle) {
     inner.queue.lock().unwrap().retain(|j| j.handle != handle);
     inner.store.lock().unwrap().retain(|(h, _), _| *h != handle);
     inner.pending.lock().unwrap().retain(|(h, _), _| *h != handle);
+    inner.retries.lock().unwrap().retain(|_, r| r.handle != handle);
 }
 
 /// The whole feed of one project, for the frontend's initial paint (bootstrap /
@@ -303,6 +343,15 @@ pub fn feed(handle: ProjectHandle) -> Vec<ExplainEntry> {
     out
 }
 
+/// Process-wide entry ids. Monotonic and never reused, so a `seq` the frontend
+/// is holding can only ever mean the entry it came from — the retry address has
+/// to survive a feed that reorders and truncates under it.
+fn next_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -317,9 +366,11 @@ fn now_ms() -> u64 {
 /// debugging round (the flush race above looked like the whole feature not
 /// working).
 fn process(inner: &Inner, job: Job) {
-    let (kind, prompt, text) = match &job.input {
+    // `replace` is the seq of the failed row this job is redoing, if any: a
+    // retry lands *in place of* its failure rather than as a second row.
+    let (kind, prompt, text, replace) = match &job.input {
         Input::Turn { transcript } => match extract_turn_text_settled(transcript) {
-            Some(t) => (ExplainKind::Turn, HEBREW_PROMPT, t),
+            Some(t) => (ExplainKind::Turn, HEBREW_PROMPT, t, None),
             None => {
                 eprintln!(
                     "[explainer] project {} claude#{}: turn skipped (no assistant text in {})",
@@ -331,7 +382,7 @@ fn process(inner: &Inner, job: Job) {
             }
         },
         Input::Question { json } => match question_text(json) {
-            Some(t) => (ExplainKind::Question, QUESTION_PROMPT, t),
+            Some(t) => (ExplainKind::Question, QUESTION_PROMPT, t, None),
             None => {
                 eprintln!(
                     "[explainer] project {} claude#{}: question skipped (unparseable payload)",
@@ -341,7 +392,7 @@ fn process(inner: &Inner, job: Job) {
             }
         },
         Input::Plan { json } => match plan_text(json) {
-            Some(t) => (ExplainKind::Plan, PLAN_PROMPT, t),
+            Some(t) => (ExplainKind::Plan, PLAN_PROMPT, t, None),
             None => {
                 eprintln!(
                     "[explainer] project {} claude#{}: plan skipped (no plan in payload)",
@@ -350,33 +401,117 @@ fn process(inner: &Inner, job: Job) {
                 return;
             }
         },
+        Input::Retry { seq, kind, prompt, text } => (*kind, *prompt, text.clone(), Some(*seq)),
     };
-    let entry = match run_summarizer(prompt, &text, &job.cwd) {
-        Ok(text) => ExplainEntry { id: job.id, ts: now_ms(), text, ok: true, kind },
-        Err(why) => ExplainEntry {
-            id: job.id,
-            ts: now_ms(),
-            text: format!("ההסבר נכשל ({why})"),
-            ok: false,
-            kind,
-        },
+    let seq = replace.unwrap_or_else(next_seq);
+    let entry = match run_summarizer_twice(prompt, &text, &job.cwd) {
+        Ok(summary) => {
+            // It worked: the stashed input has no reader left.
+            inner.retries.lock().unwrap().remove(&seq);
+            ExplainEntry { id: job.id, ts: now_ms(), text: summary, ok: true, kind, seq }
+        }
+        Err(why) => {
+            // Stash (or refresh) what the panel's retry button will re-run.
+            let stash = Retryable {
+                handle: job.handle,
+                id: job.id,
+                kind,
+                prompt,
+                text: text.clone(),
+                cwd: job.cwd.clone(),
+            };
+            inner.retries.lock().unwrap().insert(seq, stash);
+            ExplainEntry {
+                id: job.id,
+                ts: now_ms(),
+                text: format!("ההסבר נכשל ({why})"),
+                ok: false,
+                kind,
+                seq,
+            }
+        }
     };
     // Dev-visible trace (stderr): the one place a summary — or its failure — can
     // be seen before the panel exists, and after it exists the place to check
     // when the panel shows nothing.
     eprintln!("[explainer] project {} claude#{}: {}", job.handle, job.id, entry.text);
-    push_entry(inner, job.handle, job.id, entry.clone());
+    if replace.is_some() {
+        replace_entry(inner, job.handle, job.id, entry.clone());
+    } else {
+        push_entry(inner, job.handle, job.id, entry.clone());
+    }
     if let Some(app) = APP.get() {
         let _ = app.emit("explain-update", ExplainUpdate { handle: job.handle, id: job.id, entry });
     }
 }
 
-/// Append to one instance's feed: newest first, capped.
+/// Re-run the failed entry `seq`: the panel's "נסה שוב". Returns false if there
+/// is nothing stashed under it (the entry aged out of its feed, or its instance
+/// is gone) — the caller is a click, and a click that finds nothing must not
+/// fabricate a job.
+///
+/// The stash is *kept*, not taken: if this attempt fails too, `process` writes
+/// it straight back under the same seq and the button lives on.
+pub fn retry(handle: ProjectHandle, id: usize, seq: u64) -> bool {
+    let inner = inner();
+    let (job, cwd) = {
+        let retries = inner.retries.lock().unwrap();
+        match retries.get(&seq) {
+            // The (handle, id) check is not paranoia: seq comes from the
+            // frontend, and a stale panel could address another row's entry.
+            Some(r) if r.handle == handle && r.id == id => (
+                Input::Retry { seq, kind: r.kind, prompt: r.prompt, text: r.text.clone() },
+                r.cwd.clone(),
+            ),
+            _ => return false,
+        }
+    };
+    enqueue(handle, id, job, cwd);
+    true
+}
+
+/// Append to one instance's feed: newest first, capped. Entries pushed off the
+/// end take their stashed retry input with them — the row is unreachable, so
+/// nothing can ever ask for it again.
 fn push_entry(inner: &Inner, handle: ProjectHandle, id: usize, entry: ExplainEntry) {
     let mut store = inner.store.lock().unwrap();
     let feed = store.entry((handle, id)).or_default();
     feed.insert(0, entry);
+    let dropped: Vec<u64> = feed.iter().skip(MAX_ENTRIES).map(|e| e.seq).collect();
     feed.truncate(MAX_ENTRIES);
+    drop(store);
+    let mut retries = inner.retries.lock().unwrap();
+    for seq in dropped {
+        retries.remove(&seq);
+    }
+}
+
+/// Overwrite the entry carrying `entry.seq` in place — a retry's result takes
+/// the failed row's position in the feed, not a new one at the top. If the row
+/// is gone (its instance was forgotten mid-run) the result is dropped: the
+/// alternative, prepending it, would resurrect a feed the user closed.
+fn replace_entry(inner: &Inner, handle: ProjectHandle, id: usize, entry: ExplainEntry) {
+    let mut store = inner.store.lock().unwrap();
+    if let Some(feed) = store.get_mut(&(handle, id)) {
+        if let Some(slot) = feed.iter_mut().find(|e| e.seq == entry.seq) {
+            *slot = entry;
+        }
+    }
+}
+
+/// [`run_summarizer`] with one automatic second attempt (see
+/// [`AUTO_RETRY_DELAY`]). Only the second failure reaches the panel; the first
+/// is logged, because "it failed twice for the same reason" and "it failed for
+/// two different reasons" are different bugs and the entry shows only one.
+fn run_summarizer_twice(prompt: &str, turn: &str, cwd: &Path) -> Result<String, String> {
+    match run_summarizer(prompt, turn, cwd) {
+        Ok(text) => Ok(text),
+        Err(first) => {
+            eprintln!("[explainer] attempt 1 failed ({first}); retrying once");
+            std::thread::sleep(AUTO_RETRY_DELAY);
+            run_summarizer(prompt, turn, cwd)
+        }
+    }
 }
 
 /// Run the headless Sonnet call, input text on stdin, `prompt` choosing the
@@ -451,15 +586,41 @@ fn run_summarizer(prompt: &str, turn: &str, cwd: &Path) -> Result<String, String
     let err = err_reader.join().unwrap_or_default();
 
     if !status.success() {
-        let code = status.code().map_or("killed".into(), |c| format!("exit {c}"));
-        let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        return Err(if first.is_empty() { code } else { format!("{code}: {first}") });
+        return Err(failure_reason(status.code(), &out, &err));
     }
     let text = out.trim();
     if text.is_empty() {
         return Err("empty output".into());
     }
     Ok(text.to_string())
+}
+
+/// What the panel says a dead summarizer died of.
+///
+/// **`claude -p` reports its own failures on stdout, not stderr** — measured
+/// 2026-09-03: a bad OAuth token exits 1 with "Failed to authenticate. API
+/// Error: 401 OAuth access token is invalid." on stdout and an *empty* stderr.
+/// Reading stderr alone is what left a real failure entry saying "ההסבר נכשל
+/// (exit 1)" — the exit code with the reason thrown away, a code reporting
+/// ignorance in the same breath as a diagnosis. So: prefer stderr, which
+/// carries the more specific message when there is one, and fall back to
+/// stdout.
+fn failure_reason(code: Option<i32>, out: &str, err: &str) -> String {
+    let code = code.map_or("killed".to_string(), |c| format!("exit {c}"));
+    match first_line(err).or_else(|| first_line(out)) {
+        Some(reason) => format!("{code}: {reason}"),
+        None => code,
+    }
+}
+
+/// First non-blank line of a child's output, trimmed and length-capped — the
+/// panel row is two inches wide and an API error can be a paragraph.
+fn first_line(s: &str) -> Option<String> {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(match line.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
 }
 
 /// Is this transcript entry a real human prompt — a turn boundary? Measured on
@@ -757,6 +918,7 @@ mod tests {
             text: format!("e{n}"),
             ok: true,
             kind: ExplainKind::Turn,
+            seq: next_seq(),
         };
         for n in 0..(MAX_ENTRIES as u64 + 5) {
             push_entry(inner(), H, 1, entry(1, n));
@@ -776,6 +938,106 @@ mod tests {
         assert!(feed(H).is_empty());
         assert_eq!(feed(H2).len(), 1, "other project survives");
         forget_project(H2);
+    }
+
+    /// A retry replaces its failed row where it sits and takes its stash with
+    /// it when the row leaves the feed. Drives the real singleton the way the
+    /// panel does — stash, retry, replace — without spawning a summarizer.
+    #[test]
+    fn a_retry_replaces_its_row_in_place_and_its_stash_is_bounded_by_the_feed() {
+        const H: ProjectHandle = 99005;
+        let stash = |id: usize, seq: u64| {
+            let r = Retryable {
+                handle: H,
+                id,
+                kind: ExplainKind::Turn,
+                prompt: HEBREW_PROMPT,
+                text: "the turn".into(),
+                cwd: PathBuf::from("/tmp"),
+            };
+            inner().retries.lock().unwrap().insert(seq, r);
+        };
+        let failed = |id: usize, seq: u64| ExplainEntry {
+            id,
+            ts: 1,
+            text: "ההסבר נכשל (exit 1)".into(),
+            ok: false,
+            kind: ExplainKind::Turn,
+            seq,
+        };
+
+        // Two failed rows, oldest first.
+        let (a, b) = (next_seq(), next_seq());
+        stash(1, a);
+        stash(1, b);
+        push_entry(inner(), H, 1, failed(1, a));
+        push_entry(inner(), H, 1, failed(1, b));
+
+        assert!(!retry(H, 1, next_seq()), "an unknown seq queues nothing");
+        assert!(!retry(H, 2, a), "another instance cannot retry this row");
+        assert!(retry(H, 1, a));
+        assert!(retry(H, 1, b), "a second retry is not coalesced away by the first");
+        {
+            let q = inner().queue.lock().unwrap();
+            assert_eq!(q.iter().filter(|j| j.handle == H).count(), 2);
+        }
+        assert!(retry(H, 1, a), "the stash survives, so the row stays retryable");
+
+        // The result lands where the failed row was — its position, not the top.
+        let ok = ExplainEntry {
+            id: 1,
+            ts: 9,
+            text: "הסבר".into(),
+            ok: true,
+            kind: ExplainKind::Turn,
+            seq: a,
+        };
+        replace_entry(inner(), H, 1, ok);
+        let f = feed(H);
+        assert_eq!(f.len(), 2, "replaced, not prepended");
+        assert_eq!(f[0].seq, b, "order untouched: b is still the newer row");
+        assert!(f[1].ok && f[1].seq == a);
+
+        // Pushed off the end, the stash goes with it — nothing can address it.
+        for _ in 0..MAX_ENTRIES {
+            push_entry(inner(), H, 1, failed(1, next_seq()));
+        }
+        assert!(!retry(H, 1, b), "an aged-out row is no longer retryable");
+        assert!(inner().retries.lock().unwrap().get(&b).is_none());
+
+        forget_project(H);
+        assert!(inner().retries.lock().unwrap().values().all(|r| r.handle != H));
+    }
+
+    /// The failure text is only useful if it says why: `claude -p` reports its
+    /// own errors on stdout, so a bare "exit 1" is a reason thrown away.
+    #[test]
+    fn a_failure_reason_is_a_capped_first_nonblank_line() {
+        assert_eq!(first_line("\n\n  boom  \nsecond\n").as_deref(), Some("boom"));
+        assert_eq!(first_line("   \n\t\n"), None, "no reason is None, not an empty line");
+        let long = first_line(&"x".repeat(400)).unwrap();
+        assert_eq!(long.chars().count(), 201, "capped, with the ellipsis");
+        assert!(long.ends_with('…'));
+    }
+
+    /// The regression that sent the user here: the reason a summarizer died has
+    /// to reach the panel, and `claude -p` puts it on stdout. Strings are the
+    /// ones measured 2026-09-03 from a real `claude -p` with a bad token.
+    #[test]
+    fn a_dead_summarizer_reports_the_reason_not_just_the_code() {
+        let real = "Failed to authenticate. API Error: 401 OAuth access token is invalid.";
+        assert_eq!(
+            failure_reason(Some(1), &format!("{real}\n"), ""),
+            format!("exit 1: {real}"),
+            "stdout carries the reason when stderr is empty"
+        );
+        assert_eq!(
+            failure_reason(Some(1), "some output", "boom\n"),
+            "exit 1: boom",
+            "stderr wins when it has something to say"
+        );
+        assert_eq!(failure_reason(Some(1), "  \n", " \n"), "exit 1", "nothing to add, nothing said");
+        assert_eq!(failure_reason(None, "", ""), "killed");
     }
 
     /// The busy dot's bookkeeping: a coalesced re-submit doesn't double-count,
@@ -830,7 +1092,9 @@ mod tests {
                 Input::Turn { transcript } => {
                     assert_eq!(transcript, &PathBuf::from("/tmp/c.jsonl"), "the newer request won")
                 }
-                Input::Question { .. } | Input::Plan { .. } => unreachable!(),
+                Input::Question { .. } | Input::Plan { .. } | Input::Retry { .. } => {
+                    unreachable!()
+                }
             }
             assert!(
                 mine.iter().any(|j| j.id == 1 && matches!(j.input, Input::Question { .. })),
