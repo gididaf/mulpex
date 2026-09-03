@@ -293,6 +293,11 @@ and cost real time; each links to the measurement that settled it.
 - **A terminal is never a hub peer.** Excluding shells from `statuses` is what keeps the dock badge,
   the tab badges and the updater's busy guard correct for free.
   → [docs/shell-terminals.md](docs/shell-terminals.md)
+- **A runtime-injected turn is not a user turn.** A `<task-notification>` fires `UserPromptSubmit`
+  exactly like a prompt, so anything the hook *asks the model to do* must be gated on
+  `nudges_welcome` — the arm nudge landing there is what made every instance open itself after an
+  app update. The peer snapshot is the one deliberate exception, because a hub wake *is* a
+  task-notification. → [docs/hub.md](docs/hub.md)
 - **`to: "all"` and locks stay project-local**, and `hub_spawn` only creates instances in its own
   project. Only `hub_send`/`hub_inbox`/`hub_instances` cross the boundary.
   → [docs/hub.md](docs/hub.md)
@@ -320,6 +325,12 @@ new work more than any individual fix is.
   bare environment; reproduce with `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
 - **The one-item case passes.** Six concurrent `hub_spawn` children blew a timeout that one child
   never approached; a `hub_terminal` bug appeared only on the second command. **Test the plural.**
+- **A self-healing reminder that fires on the wrong turn heals a wound it inflicts.** The arm nudge
+  re-injects until the listener is armed, which is right; injected on the *restart* turn it made the
+  instance arm the Monitor whose orphaned death causes the next restart turn. Nothing looked broken
+  at any single step — each part did exactly its job — and it never settled. When a nudge asks for
+  an action, check whether that action recreates the nudge's own trigger.
+  → [docs/hub.md](docs/hub.md)
 - **Someone else's UI is not an interface.** Delivering data by typing it into `claude`'s input box
   worked for months and then silently started truncating at 1022 characters, because that program
   changed how it handles a paste. Nothing in this repo moved. Prefer the contract that is declared
@@ -336,4 +347,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`0df3661e068d95094b3c03925d27486075767074` — 2026-09-03
+`c7219c184575fc2b11c82d01cf1446c18effa58e` — 2026-09-03

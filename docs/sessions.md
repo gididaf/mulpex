@@ -154,7 +154,8 @@ per line, deduped), and `background_work_running` subtracts those ids. Consequen
   Bash output); the substring scan keeps the common path a memchr rather than a full serde parse.
 - **An instance that armed its listener before the fix shipped stays `working` until it re-arms** —
   its task id was never recorded. It self-heals at the next app launch, since the scratch dir is
-  per-run, `armed/<id>` is therefore absent, and the arm nudge fires again.
+  per-run and `armed/<id>` is therefore absent — but only once the user actually talks to it, since
+  the arm nudge now rides on genuine user turns and no longer on the restart wake ([hub.md](hub.md)).
 
 Pinned by `the_hub_listener_is_a_watcher_not_work_in_flight` (confirmed to fail with the
 subtraction removed, on *"an instance idle at its prompt with only its hub listener running is NOT
@@ -398,7 +399,7 @@ identifies the instance survives because none of it lives in the process: the id
 hub address, its name and mute, its position in the sidebar, its `inbox/<id>` mail, its Explainer
 feed. It is the restore path from `Core::open`, aimed at one row while the app runs.
 
-Four things it does that are not obvious:
+Five things it does that are not obvious:
 
 - **It refuses rather than kills when there is nothing to resume.** An instance that has never had a
   prompt submitted has no transcript, so `--resume` would print `No conversation found` and exit in
@@ -416,6 +417,15 @@ Four things it does that are not obvious:
   it tracks a live hub-listener Monitor, so left behind, the hook skips the arm nudge for good and
   the resumed instance is never woken by hub mail again — silently. The inbox, the task line and
   `named/<id>` are deliberately kept: they describe the *instance*, which is the thing being kept.
+- **…and `resumed/<id>` is written, which is what lets it re-arm at all.** Clearing `armed/<id>`
+  only creates the obligation; something still has to make the resumed child take a turn, and with
+  no task on its command line the only thing that does is the "orphaned background task" wake its
+  dead Monitor produces. The `UserPromptSubmit` hook **swallows that wake by default** — it is what
+  made every instance open itself after an app update — so ⌘⇧R has to mark its own wake as wanted.
+  The flag is consumed on read, so the *next* app restart of that instance is ordinary noise again.
+  This is the one place the two `--resume` paths need opposite answers to the identical
+  notification: an app launch builds a fresh `state_dir` (empty inbox, nothing to act on), while
+  ⌘⇧R reuses the same one and keeps the mail. → [hub.md](hub.md)
 - **The frontend keeps the xterm and rebinds it** (`terminals.reattach`): `reset()` to wipe the
   half-drawn alt screen the dead child left, then a fresh `Channel` to the new PTY (whose output the
   backend is buffering until something attaches). Rebuilding the terminal instead would put a new

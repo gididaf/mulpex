@@ -18,8 +18,13 @@ Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `compacting/`, `armed/`,
-  `named/`, `namenudge/`, `spawning/`, `monitors/`, `explainreq/`, `explainq/`, `explainplan/`,
-  like `peers/` already does.
+  `named/`, `namenudge/`, `spawning/`, `monitors/`, `resumed/`, `explainreq/`, `explainq/`,
+  `explainplan/`, like `peers/` already does.
+- **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
+  fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be
+  gated on it (`nudges_welcome`) — an arm nudge injected there made the instance start the very
+  Monitor whose death causes the next one. The peer snapshot is the deliberate exception: a hub
+  wake *is* a task-notification. → [../../docs/hub.md](../../docs/hub.md)
 - **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>]]]`). Only
   *trailing* empties may be dropped, or the id is read back as the name.
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
