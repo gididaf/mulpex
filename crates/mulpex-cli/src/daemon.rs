@@ -155,10 +155,13 @@ pub fn run(state_root: &Path, conf: PathBuf) -> Result<()> {
     let mut fan = crate::fanout::Fanout::default();
     // ...and the remote peers we are waiting on an answer from.
     let mut rem = crate::remotes::Remotes::default();
+    // ...and the last thing written to each project's session store, so an idle
+    // project costs a string compare rather than a disk write every 200 ms.
+    let mut saver = crate::restore::Saver::default();
 
     let mut ticked_once = false;
     loop {
-        match tick(&t, state_root, &mut rec, &mut fan, &mut rem) {
+        match tick(&t, state_root, &mut rec, &mut fan, &mut rem, &mut saver) {
             Ok(sessions) => {
                 // Exit only after a successful tick, so we never race our own
                 // startup against a tmux server that is still coming up.
@@ -178,12 +181,14 @@ pub fn run(state_root: &Path, conf: PathBuf) -> Result<()> {
 }
 
 /// One pass. Returns how many projects are open.
+#[allow(clippy::too_many_arguments)]
 fn tick(
     t: &Tmux,
     state_root: &Path,
     rec: &mut crate::recorder::Recorder,
     fan: &mut crate::fanout::Fanout,
     rem: &mut crate::remotes::Remotes,
+    saver: &mut crate::restore::Saver,
 ) -> Result<usize> {
     let projects = core::scan(t)?;
 
@@ -196,6 +201,7 @@ fn tick(
         projects.iter().map(|p| (p.dir.clone(), p.next_id())).collect();
 
     for p in &projects {
+        let mut removed = 0usize;
         for inst in &p.instances {
             if inst.dead {
                 match core::reap_dead(t, inst) {
@@ -203,12 +209,18 @@ fn tick(
                         eprintln!("[daemon] {} {} failed to start, row kept", p.session, inst.window_name)
                     }
                     Ok(core::Reaped::Removed) => {
+                        removed += 1;
                         eprintln!("[daemon] {} {} exited, row removed", p.session, inst.window_name)
                     }
                     Ok(core::Reaped::Nothing) => {}
                     Err(e) => eprintln!("[daemon] reaping {}: {e:#}", inst.window),
                 }
             }
+        }
+        // The last claude exited on its own (`/exit`, or a crash past its grace
+        // period), which destroys the session. Same event as closing it by hand.
+        if removed > 0 && removed == p.instances.len() {
+            closed_its_last_row(p);
         }
         if let Err(e) = core::publish_instances(p) {
             eprintln!("[daemon] {}: {e:#}", p.session);
@@ -241,6 +253,14 @@ fn tick(
     // signal is never a tick staler than the output that carried it.
     rem.tick(&projects);
 
+    // The conversations, so a reboot or an `mpx down` is recoverable. Like the
+    // recorder above it works from the scan taken at the top of the tick, so a
+    // window created or killed by this tick's requests is accounted for on the
+    // next one — which is the right lag in both directions: a brand-new claude has
+    // not worked yet and would not be saved anyway, and a closed one drops out of
+    // the store because you closed it.
+    saver.tick(&projects);
+
     write_registry(state_root, &projects);
 
     for (path, req) in crate::ipc::take_all(state_root) {
@@ -254,6 +274,26 @@ fn tick(
 
     let _ = std::fs::write(heartbeat_path(state_root), "");
     Ok(projects.len())
+}
+
+/// A project leaves the reopen set when its **last row goes**, and only then.
+///
+/// Keyed on the deliberate act, never on the session being absent — which is the
+/// distinction this got wrong first time, expensively. A killed tmux server makes
+/// every project vanish at once, and read as "the user closed them" it emptied
+/// `open.txt`: the reopen set was wiped by exactly the event it exists for.
+/// Measured 2026-09-07, in the probe written to prove the opposite.
+///
+/// The two facts are not distinguishable from the outside a tick later, so this
+/// does not try. Removing the last instance is something the daemon *does* — via
+/// `mpx close`, Ctrl-W, or reaping a claude that exited on its own — and a server
+/// dying is something it never sees. Only the first touches the file.
+///
+/// The store is untouched either way: reopen the project by name and its claudes
+/// come back. Stop is not forget.
+fn closed_its_last_row(p: &Project) {
+    crate::openset::remove(&p.dir);
+    eprintln!("[daemon] {} closed its last instance, left the reopen set", p.dir.display());
 }
 
 /// Publish every open project so `<project>#<n>` addressing resolves.
@@ -323,6 +363,11 @@ fn handle(
             let id: usize = req.arg.trim().parse().context("close needs an instance id")?;
             let inst = p.find(id).with_context(|| format!("no instance #{id}"))?;
             t.kill_window(&inst.window)?;
+            // Killing the only window destroys the session, so this *is* closing
+            // the project — the same act as `mpx down`, reached a different way.
+            if p.instances.len() == 1 {
+                closed_its_last_row(p);
+            }
             Ok(format!("closed #{id}"))
         }
         "ping" => Ok(format!("pid {} root {}", std::process::id(), state_root.display())),

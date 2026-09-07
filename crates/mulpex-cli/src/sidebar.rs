@@ -923,6 +923,8 @@ mod tests {
                 current_command: "zsh".into(),
                 current_path: "/p".into(),
                 muted: false,
+                session_id: String::new(),
+                restored: false,
             }],
             active_window: String::new(),
             active_pane: String::new(),

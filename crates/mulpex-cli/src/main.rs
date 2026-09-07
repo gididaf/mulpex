@@ -20,10 +20,12 @@ mod fanout;
 mod ipc;
 mod layout;
 mod messages;
+mod openset;
 mod picker;
 mod recents;
 mod recorder;
 mod remotes;
+mod restore;
 mod sidebar;
 mod spec;
 mod statedir;
@@ -115,7 +117,8 @@ fn print_help() {
          \n\
          USAGE\n\
          \x20 mpx                  open Mulpex (this is the one to remember) —\n\
-         \x20                      rejoins what is running, else offers a project\n\
+         \x20                      rejoins what is running, else reopens what you\n\
+         \x20                      had open, else offers a project\n\
          \x20 mpx up [dir]         open a project by path, no questions (default: cwd)\n\
          \x20 mpx new [dir]        add another claude to it\n\
          \x20 mpx term [label]     open a shell terminal in the current project\n\
@@ -124,7 +127,7 @@ fn print_help() {
          \x20 mpx mute|unmute <id> quieten a row without touching the claude\n\
          \x20 mpx ls               what is running, everywhere\n\
          \x20 mpx messages [n]     the hub message feed, with reply-able addresses\n\
-         \x20 mpx down [dir]       tear this project down (other projects keep running)\n\
+         \x20 mpx down [dir]       stop this project (other projects keep running)\n\
          \x20 mpx doctor           check tmux, claude and auth before anything else runs\n\
          \x20 mpx daemon           run the poll loop in the foreground (it starts itself)\n\
          \n\
@@ -138,6 +141,11 @@ fn print_help() {
          mail per row, updating on its own. Everything else is a command you type\n\
          in a terminal — `mpx term`, `mpx mute <id>`, `mpx restart <id>`,\n\
          `mpx messages`.\n\
+         \n\
+         Nothing is lost by stopping. `mpx down`, closing the last instance, a\n\
+         reboot or a killed tmux server all leave the conversations saved: reopen\n\
+         the project and its claudes come back, with their numbers and names, each\n\
+         resumed where it was. Only closing an instance ends that one for good.\n\
          \n\
          A claude you exit closes its row; one that dies in its first 10 seconds\n\
          is kept, marked ✗, because that row is the only place the error is shown.\n\
@@ -555,6 +563,10 @@ fn ensure_session(t: &tmux::Tmux, dir: &Path) -> Result<String> {
     // Opening a project is what makes it recent — including re-opening one, which
     // is why this is here and not only on the create path.
     recents::add(dir);
+    // ...and what puts it in the set `mpx` reopens after a reboot. Same reasoning:
+    // re-attaching to a project you already had open is still having it open, and
+    // an entry that is already there is left where it is.
+    openset::add(dir);
 
     // Re-attaching is the common case over ssh: the whole point of tmux here is
     // that a dropped connection left everything running.
@@ -591,7 +603,17 @@ fn ensure_session(t: &tmux::Tmux, dir: &Path) -> Result<String> {
         active_window: String::new(),
         active_pane: String::new(),
     };
-    claudewin::spawn(t, &p, 1, None)?;
+    // What was open here last time, `--resume`d. tmux already carries a project
+    // across a detach or an ssh drop; this is for the cases where the server itself
+    // went — a reboot, an `mpx down`, a `kill-server`.
+    //
+    // Nothing saved means a genuinely new project, and that gets one claude. The
+    // desktop app opens with *zero* instances and waits for ⌘T, which is the better
+    // behaviour and is not available here: a tmux session with no windows does not
+    // exist, so a project must be at least one thing.
+    if restore::spawn_all(t, &p) == 0 {
+        claudewin::spawn(t, &p, 1, None)?;
+    }
     core::publish_instances(&p)?;
 
     // The placeholder window `new-session` created has served its purpose.
@@ -613,6 +635,20 @@ fn down(dir_arg: Option<&str>) -> Result<()> {
         println!("mpx: nothing running for {}", dir.display());
         return Ok(());
     }
+    // Save the conversations BEFORE killing, for the same reason as the ttys below:
+    // a destroyed session answers nothing. `mpx down` means stop, not forget — the
+    // next `mpx up <dir>` resumes exactly these claudes. The daemon's last write is
+    // almost always current; "almost" is a claude created and spoken to inside the
+    // same 200 ms as the teardown.
+    if let Ok(projects) = core::scan(&t) {
+        if let Some(p) = projects.iter().find(|p| p.dir == dir) {
+            restore::save_now(p);
+        }
+    }
+    // Closing a project is a deliberate act, so it leaves the set `mpx` reopens.
+    // Its store is untouched: reopen it by name and the claudes come back.
+    openset::remove(&dir);
+
     // Collect the ttys BEFORE killing, because a dead session reports no panes
     // and the sweep would then have nothing to look at.
     let ttys = t.session_ttys(&session).unwrap_or_default();
@@ -720,11 +756,47 @@ fn open_workspace() -> Result<()> {
         unreachable!()
     }
 
-    // Nothing open, so **offer rather than guess**. `mpx` used to create a project
-    // for whatever directory the shell happened to be in, which is wrong for the
-    // same reason an IDE does not do it: the odds are good but not good enough, and
-    // the cost of being wrong is a project you now have to notice and close. The
-    // picker puts that directory at the top of the list and waits — one keystroke
-    // when the guess would have been right, and a list when it would not.
+    // No tmux server: the machine rebooted, or everything was torn down. Put back
+    // the projects that were open, each with the claudes it had. This is the case
+    // that actually bites on a server — the alternative is reopening four projects
+    // by hand from the picker and remembering which conversations belonged where.
+    //
+    // Only when nothing is running, deliberately. With a server up, the live
+    // sessions are a better answer than a file describing the last shutdown, and
+    // reconciling the two would mean deciding what a project *missing* from tmux
+    // means — a question with no good answer and no way for the user to see it
+    // being asked.
+    let saved = openset::list();
+    if !saved.is_empty() {
+        let here = std::env::current_dir().ok();
+        let mut land: Option<String> = None;
+        for dir in &saved {
+            let session = match ensure_session(&t, dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    // One unopenable project must not cost you the other three.
+                    eprintln!("mpx: could not reopen {}: {e:#}", dir.display());
+                    continue;
+                }
+            };
+            // Land on the project you are standing in, as `mpx` does when the
+            // sessions are already up; otherwise the first one that opened.
+            if here.as_deref() == Some(dir.as_path()) || land.is_none() {
+                land = Some(session);
+            }
+        }
+        if let Some(session) = land {
+            t.attach(&session)?;
+            unreachable!("attach replaces the process")
+        }
+    }
+
+    // Nothing open and nothing to reopen, so **offer rather than guess**. `mpx` used
+    // to create a project for whatever directory the shell happened to be in, which
+    // is wrong for the same reason an IDE does not do it: the odds are good but not
+    // good enough, and the cost of being wrong is a project you now have to notice
+    // and close. The picker puts that directory at the top of the list and waits —
+    // one keystroke when the guess would have been right, and a list when it would
+    // not.
     picker::run(conf_path())
 }

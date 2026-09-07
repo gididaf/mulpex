@@ -30,6 +30,9 @@ const SESSION_ID_OPT: &str = "@mpx_session_id";
 /// it is a property of the row, and the row is the window.
 pub const MUTED_OPT: &str = "@mpx_muted";
 
+/// Set on a window brought back by `restore`. See `core::Instance::restored`.
+const RESTORED_OPT: &str = "@mpx_restored";
+
 /// Start one `claude` in its own tmux window, and tag the window so tmux itself
 /// remembers which instance it is.
 pub fn spawn(t: &Tmux, p: &Project, id: usize, task: Option<SpawnTask>) -> Result<String> {
@@ -63,6 +66,35 @@ pub fn spawn(t: &Tmux, p: &Project, id: usize, task: Option<SpawnTask>) -> Resul
     t.set_user_option(&window, true, "@mpx_id", &id.to_string())?;
     t.set_user_option(&window, true, "@mpx_kind", "claude")?;
     t.set_user_option(&window, true, SESSION_ID_OPT, &session_id)?;
+    Ok(window)
+}
+
+/// Bring one saved conversation back in a **new** window: same uuid, same number,
+/// same name, same muted flag.
+///
+/// The difference from `restart` is which of the two is being kept. `restart`
+/// keeps the *window* and replaces the process in it; this keeps the *record* and
+/// builds a window around it, because after a reboot or an `mpx down` there is no
+/// window left to keep.
+///
+/// `--resume` on a conversation `claude` no longer has fails fast, and that is the
+/// intended outcome: the window stays (`remain-on-exit`), `reap_dead` keeps the row
+/// because it died inside its grace period, and the error is on screen. A restore
+/// that quietly produced a fresh empty claude under the old name would be worse.
+pub fn spawn_restored(t: &Tmux, p: &Project, saved: &mulpex_core::persist::SavedSession, id: usize) -> Result<String> {
+    let claude_bin = claude::resolve().context("cannot find `claude` — run `mpx doctor`")?;
+    mulpex_core::state_dir::write_state_dir(&p.state_dir, &claude::helper_path())?;
+
+    let name = saved.name.clone().unwrap_or_else(|| format!("claude#{id}"));
+    let argv = build_argv(&claude_bin, p, &saved.session_id, true, None, id);
+    let window = launch(t, p, id, &name, &argv, WindowSlot::New)?;
+    t.set_user_option(&window, true, "@mpx_id", &id.to_string())?;
+    t.set_user_option(&window, true, "@mpx_kind", "claude")?;
+    t.set_user_option(&window, true, SESSION_ID_OPT, &saved.session_id)?;
+    t.set_user_option(&window, true, RESTORED_OPT, "1")?;
+    if saved.muted {
+        t.set_user_option(&window, true, MUTED_OPT, "1")?;
+    }
     Ok(window)
 }
 

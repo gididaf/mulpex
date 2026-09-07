@@ -1380,3 +1380,91 @@ reads as a crash rather than a close. `off` switches to another session instead.
 projects open, closing tabB's only instance left the client attached on tabA and `mpx` still
 running; closing the last project then does end the client, which is correct — a tmux session with
 no windows cannot exist, so there is no zero-project state to sit in.
+
+## Session restore: `mpx down` is stop, not forget (2026-09-07)
+
+tmux already carried a project across a detach, an ssh drop and a closed laptop, so what was
+missing was narrower than "restore" usually means: the cases where **the tmux server itself goes
+away** — a reboot, `mpx down`, `kill-server`. The `--resume` uuid lived only on the window that had
+just been destroyed, so every conversation went with it.
+
+Four decisions, taken by the user before any code: `mpx down` keeps the conversations (the desktop
+app's rule — closing a project keeps its store); closing the last instance means the same thing,
+since it lands in the same place; the **open set** is remembered too, so `mpx` after a reboot puts
+every project back; and terminals are not restored, because a shell has no conversation to resume.
+
+One thing is settled by tmux rather than by preference: a session with no windows does not exist,
+so a project with nothing saved must still open one claude. The app's "zero instances, press ⌘T"
+state has no equivalent here.
+
+### A collision that had never fired
+
+`persist::SessionStore::new` resolves its home through `mulpex_core::mulpex_home()`, which reads
+`MULPEX_HOME` — and **`mpx` never sets it**. The first call to the store from the CLI would
+therefore have written into the desktop app's `~/.mulpex/sessions/`: exactly the silent
+conversation corruption `statedir.rs` exists to prevent, in the one file whose whole job is
+preventing it. It had gone unnoticed because nothing in `mpx` had ever called the store.
+
+`SessionStore::in_home(home, project_dir)` now takes the home explicitly and `new` delegates to it,
+so the CLI cannot reach the app's store by omission. Guarded by
+`restore::tests::the_store_lives_under_the_clis_own_home`, which asserts the two paths differ.
+
+### What the store contains, and the exception that makes it work
+
+Only a claude that has **actually worked** — `state_dir/<id>`, the file its hook writes on the first
+turn — is worth saving; an instance opened and never spoken to has no conversation. Driven and
+confirmed: alpha had `claude#1` (given a codeword) and `claude#2` (never used), and only #1 was in
+the store and only #1 came back.
+
+The exception is load-bearing rather than tidy. A restored claude has a **fresh state dir**, so it
+looks unworked, and the first tick after a restore would rewrite the store empty — deleting the
+conversations it had just brought back. The desktop app solves this with an in-memory `sticky` list;
+here `@mpx_restored` sits on the tmux window, so it survives the daemon dying too. Checked
+explicitly: the restored row is still in the store a tick later.
+
+### The bug this feature was built to prevent, caused by its own first version
+
+The daemon's first cut removed a project from `open.txt` when its session **disappeared** — reasoning
+that closing the last instance destroys the session, which is true. Then the probe killed the tmux
+server, and every project vanished at once: the daemon read that as "the user closed them all" and
+emptied the set. `mpx` reopened nothing. **The reopen set was wiped by exactly the event it exists
+for**, and the daemon log said so in plain words three times over.
+
+The premise was wrong. "The session is gone" and "the user closed it" are the same observation a
+tick later, so the fix is not to observe better — it is to key on the act instead. Closing the last
+row is something the daemon **does**: `mpx close`, `Ctrl-W`, or reaping a claude that exited on its
+own. A server dying is something it never sees, and now touches nothing.
+
+Another instance of a shape already in `CLAUDE.md` — *a default that reads as an assertion*. Absence
+was being reported in the same word as intent.
+
+### Measured
+
+Real `mpx`, real tmux, real `claude` children, under a scratch `MULPEX_HOME`
+(`scratchpad/ui2a/restore.py`). The decisive check is not that the process relaunched but that the
+**conversation is still there**: a codeword given before `mpx down`, asked for again after `mpx up`.
+
+- a new project opens with one claude; its uuid is on the window
+- the store is under the CLI's home, and the desktop app's was not written
+- only the claude that spoke is saved; the never-used one does not come back
+- mute survives, and so does the name the claude gave itself via `hub_set_name`
+- `mpx down` leaves the reopen set and keeps the store; `mpx up` restores `claude#1` as
+  `claude#1`, resuming the same uuid, marked restored
+- **the restored claude still knows the codeword**
+- killing the tmux server changes the reopen set not at all, and plain `mpx` reopens both projects
+- closing a project's last instance takes it out of the set on its own, keeping its store
+
+### Two probe bugs worth recording, because both are traps
+
+**A pane is not a transcript.** The first check looked for the codeword *on screen* after the
+restore, and it failed against working code: `--resume` repaints the conversation, then the hub's
+own task-notification scrolls it away, so the text is nowhere on the pane — not even in
+`capture-pane -S -`. The evidence was in `~/.claude/projects/…/<uuid>.jsonl` all along. The check
+now **asks** the restored claude what the codeword was, which is the only version of the question a
+user would recognise.
+
+**`.strip()` ate a field.** `tmux()` stripped the whole output of `list-panes -F`, and a
+tab-separated format whose last field is empty ends its line with a tab. Only the *last* line loses
+it, so that one row came back one field short and was silently dropped — and the row in question was
+the claude pane, whose `@mpx_restored` is empty precisely when it is a fresh spawn. It read exactly
+like "the project opened with no claude". `rstrip("\n")`, never `.strip()`.

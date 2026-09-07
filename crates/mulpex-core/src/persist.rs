@@ -71,11 +71,26 @@ impl SessionStore {
         &self.path
     }
 
-    /// Locate the store file for `project_dir`. The filename is a readable tail
-    /// of the path plus a stable FNV-1a hash of the full path, so it is unique
-    /// per project, bounded in length, and stable across Mulpex rebuilds.
+    /// Locate the store file for `project_dir` under Mulpex's default home.
     pub fn new(project_dir: &Path) -> Self {
-        let dir = crate::mulpex_home().join("sessions");
+        Self::in_home(&crate::mulpex_home(), project_dir)
+    }
+
+    /// The same, under an **explicitly given** home.
+    ///
+    /// The CLI needs this rather than `new`. `mulpex_home()` resolves through the
+    /// process-wide `MULPEX_HOME`, which `mpx` deliberately does not set — so a
+    /// store opened with `new` from `mpx` would land in the desktop app's
+    /// `~/.mulpex/sessions/`, and the two frontends would hand the same `--resume`
+    /// uuid to two claudes at once. That is silent conversation corruption, and it
+    /// is the exact case `mulpex-cli/src/statedir.rs` exists to prevent; passing
+    /// the home makes it impossible instead of merely documented.
+    ///
+    /// The filename is a readable tail of the path plus a stable FNV-1a hash of
+    /// the full path, so it is unique per project, bounded in length, and stable
+    /// across Mulpex rebuilds.
+    pub fn in_home(home: &Path, project_dir: &Path) -> Self {
+        let dir = home.join("sessions");
 
         let raw = project_dir.to_string_lossy();
         let sanitized: String = raw

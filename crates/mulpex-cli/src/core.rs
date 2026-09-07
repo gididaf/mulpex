@@ -48,6 +48,19 @@ pub struct Instance {
     /// and nothing else. The claude keeps running, keeps its inbox, and stays a
     /// peer.
     pub muted: bool,
+    /// The `claude` session uuid this window was launched with, so the store can
+    /// record something `--resume` will accept. Empty for a terminal, and for a
+    /// window made by an older build.
+    pub session_id: String,
+    /// This instance came back from the store rather than being created here.
+    ///
+    /// Kept because it is the one thing that stops a restore erasing itself: the
+    /// store is rewritten from instances that have *worked*, and a just-restored
+    /// claude has not worked yet (its state dir is fresh). One tick after a
+    /// restore, every restored conversation would be dropped from the store.
+    /// This is `persist_sessions`' `sticky` list, held on the window instead of
+    /// in the daemon's memory — which also means it survives the daemon dying.
+    pub restored: bool,
 }
 
 impl Instance {
@@ -131,7 +144,8 @@ pub fn scan(t: &Tmux) -> Result<Vec<Project>> {
          #{{pane_dead}}{SEP}#{{pane_dead_status}}{SEP}#{{history_size}}{SEP}\
          #{{alternate_on}}{SEP}#{{pane_current_command}}{SEP}#{{pane_current_path}}{SEP}\
          #{{@mpx_muted}}{SEP}#{{pane_id}}{SEP}#{{@mpx_side}}{SEP}\
-         #{{window_active}}{SEP}#{{pane_active}}"
+         #{{window_active}}{SEP}#{{pane_active}}{SEP}\
+         #{{@mpx_session_id}}{SEP}#{{@mpx_restored}}"
     );
     let lines = match t.list_panes_all(&fmt) {
         Ok(l) => l,
@@ -142,7 +156,7 @@ pub fn scan(t: &Tmux) -> Result<Vec<Project>> {
     let mut by_session: BTreeMap<String, Project> = BTreeMap::new();
     for line in lines {
         let f: Vec<&str> = line.split(SEP).collect();
-        if f.len() < 18 {
+        if f.len() < 20 {
             continue;
         }
         let (session, proj, sdir, win, id, kind, name, dead, status) =
@@ -197,6 +211,8 @@ pub fn scan(t: &Tmux) -> Result<Vec<Project>> {
             current_path: f[12].to_string(),
             muted: f[13] == "1",
             pane: f[14].to_string(),
+            session_id: f[18].to_string(),
+            restored: f[19] == "1",
         });
     }
     for p in by_session.values_mut() {
@@ -606,6 +622,8 @@ mod tests {
             current_command: "zsh".into(),
             current_path: "/p".into(),
             muted: false,
+            session_id: format!("uuid-{id}"),
+            restored: false,
         }
     }
     fn proj(instances: Vec<Instance>) -> Project {
