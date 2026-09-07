@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use mulpex_core::config::{HOOK_SETTINGS_JSON, MCP_CONFIG_JSON};
 use mulpex_core::persist::{self, SessionStore};
 use mulpex_core::registry;
 
@@ -373,59 +372,6 @@ struct PendingSpawn {
     ids: Vec<usize>,
 }
 
-/// Lay out (or repair) a project's scratch dir: the `--settings` / `--mcp-config`
-/// files every `claude` is spawned with, plus the subdirectories the hub writes
-/// into.
-///
-/// Idempotent, and called before **every** spawn rather than only at open,
-/// because the scratch root lives in `$TMPDIR` and macOS deletes anything there
-/// it has not seen touched in 3 days (`com.apple.bsd.dirhelper`,
-/// `CLEAN_FILES_OLDER_THAN_DAYS=3`, daily at 03:35). `settings.json` and
-/// `mcp.json` were the only write-once files in the tree — everything else is
-/// rewritten by the 200 ms poll or re-created by the hook binary — so in a
-/// Mulpex left open past three days they, and only they, were purged. Running
-/// instances kept working (both files are read once, at spawn); every new ⌘T
-/// died instantly with `Error: Settings file not found: …`. Reported from a
-/// v0.8 session that had been open since Aug 23.
-fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    let helper = helper_path.to_string_lossy();
-    std::fs::write(
-        state_dir.join("settings.json"),
-        HOOK_SETTINGS_JSON.replace("__MULPEX_BIN__", &helper),
-    )?;
-    std::fs::write(
-        state_dir.join("mcp.json"),
-        MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &helper),
-    )?;
-    // Every name here contains no bare integer at the top level, which is what
-    // keeps `mcp::live_ids`' integer-filename scan from mistaking one for an
-    // instance status file.
-    for sub in [
-        "locks",
-        "history",
-        "tasks",
-        "inbox",
-        "waiting",
-        "bg",
-        "compacting",
-        "spawn",
-        "armed",
-        mulpex_core::NAMED_DIR,
-        mulpex_core::NAMEREQ_DIR,
-        mulpex_core::RESUMED_DIR,
-        mulpex_core::EXPLAINREQ_DIR,
-        mulpex_core::EXPLAINQ_DIR,
-        mulpex_core::EXPLAINPLAN_DIR,
-        "terminals",
-        "terminals/cursors",
-        "termreq",
-    ] {
-        std::fs::create_dir_all(state_dir.join(sub))?;
-    }
-    Ok(())
-}
-
 impl Core {
     /// Open `project_dir` under its own isolated `state_dir` (so its hub is scoped
     /// to just this project): create the scratch dir, write the `--settings` /
@@ -441,7 +387,7 @@ impl Core {
         geometry: (u16, u16),
     ) -> anyhow::Result<Self> {
         let settings_path = state_dir.join("settings.json");
-        write_state_dir(&state_dir, helper_path)?;
+        mulpex_core::state_dir::write_state_dir(&state_dir, helper_path)?;
 
         let store = SessionStore::new(&project_dir);
         let mut sessions: Vec<Session> = Vec::new();
@@ -648,7 +594,7 @@ impl Core {
     /// out from under a long-running Mulpex. See `write_state_dir` for why this
     /// runs on every spawn and not just at open.
     pub fn ensure_state_dir(&self) -> anyhow::Result<()> {
-        write_state_dir(&self.state_dir, &self.helper_path).map_err(|e| {
+        mulpex_core::state_dir::write_state_dir(&self.state_dir, &self.helper_path).map_err(|e| {
             anyhow::anyhow!(
                 "could not write Mulpex's scratch dir at {}: {e}",
                 self.state_dir.display()

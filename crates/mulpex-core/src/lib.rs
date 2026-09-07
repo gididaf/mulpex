@@ -17,6 +17,8 @@ pub mod mcp;
 pub mod persist;
 pub mod registry;
 pub mod remote;
+pub mod rules;
+pub mod state_dir;
 pub mod termlog;
 
 /// Mulpex's persistent home: recents/open-project lists and the per-project
