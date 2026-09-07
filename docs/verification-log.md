@@ -609,3 +609,774 @@ Two traps worth keeping from the session:
 - **A stale `target/debug/mulpex-helper` will happily answer probes with the old behaviour.** The
   first helper-level run reported the pre-fix output because the binary predated the edit. Check its
   mtime before believing a probe.
+
+## `mpx` Phase 5 — terminals and the transcript (2026-09-06)
+
+`crates/mulpex-cli/src/recorder.rs` replaces `vtgrid.rs`'s 1,680-line VT emulator with ~470 lines of
+capture/diff/append. The on-disk format is unchanged, because `mulpex-core::mcp` reads these files
+from inside a `claude` and is shared with the desktop app.
+
+**tmux semantics, measured (not read off the man page):**
+
+- **`capture-pane -a` after a full-screen program exits answers `no alternate screen`.** tmux
+  discards it, so "the last frame is taken on the way out" is *not* recoverable after the fact. The
+  CLI keeps the newest alt capture in memory and flushes it when `alternate_on` drops — the exit
+  frame is up to one tick (200 ms) stale rather than absent. The one place the CLI is weaker than
+  the app, and bounded.
+- **A failing command aborts the rest of a tmux command sequence.** A window closing mid-tick would
+  otherwise blank every terminal after it in the batch, silently.
+- **20 sequential `capture-pane` calls: 263 ms. The same 20 batched: 12 ms.** At a 200 ms tick the
+  sequential form spends most of the tick in `fork`.
+- **`-J` is mandatory** — a 300-character line comes back as 80/80/80/60 without it.
+- **`clear` resets `history_size`** (measured 63 → 1).
+
+**Bugs the measurements found, none of which were visible by inspection:**
+
+- **Wrapped lines cut in half.** `-J` joins only *within* one capture, and a line longer than the
+  screen scrolls off over several ticks. A 300-character line reached the log as 180. Fixed with
+  `vtgrid::scroll_up`'s own rule — a row that continues is written without a terminator — detected
+  by capturing one row further (`-E 0`) and comparing line counts.
+- **Rows lost *and* duplicated under paced output.** History grows between the scan that reads
+  `history_size` and the capture ~10 ms later, so a window of exactly `delta` rows slides: `F_3`
+  lost, `F_11` written twice. The row count is fixed when the argv is built, so this cannot be made
+  atomic; the window now reaches back 64 rows and alignment comes from **content overlap** with the
+  transcript's own tail.
+- **`clear` read as "nothing new".** `history_size` goes backwards and `saturating_sub` returned 0,
+  then adopted the smaller number: `clear; seq 1 20000` reached the transcript starting at **27**.
+- **Frames filed against the wrong screen.** The alt flag was updated in a later pass than the
+  capture, so it lagged one tick — and it is wrong on exactly the two ticks that matter. The only
+  frame recorded for a full-screen program was the shell prompt drawn *after* it quit.
+- **A settled full-screen program never got its frame.** The interval flush was gated on the screen
+  changing *this tick*; a file open in a pager changes it once.
+- **`hub_terminal_read` immediately after `hub_terminal_open` answered "no term#N"** — the log was
+  created by the poll loop a tick later. The desktop app creates it synchronously; now so does this.
+
+**Driven end-to-end** (real tmux, real `mulpex-helper mcp` speaking JSON-RPC as a `claude` does):
+wrapped 300-character line intact; 43 paced lines with 0 lost and 0 duplicated; a 19,935-line
+firehose contiguous with 0 breaks; repaints collapsed; `command_running`/`cwd`; a seeded open; two
+readers with independent cursors; frames holding what the pager drew while the post-exit screen does
+not; an exited terminal still readable; and a completion marker surviving the transcript to yield
+exit 7.
+
+**Confirmed pre-existing and deliberately NOT fixed — this is shared `mcp.rs`, so it is the desktop
+app too.** `command_finished` and `wait_ms`'s completion wait **do not fire for a command that has
+finished.** The `__MPX_DONE_` marker is the last thing the shell prints, so it is still on screen,
+and `find_completion` searches the **log** only. Driven by hand against the shipped desktop app
+twice — `sleep 2; echo hi` and a 120-line command both returned `timed_out: true` and "The command
+you submitted is still running", with the output plainly visible on `current_screen`. It resolves
+only once later output pushes the marker into the history. The CLI reproduces this exactly.
+
+**Semantic change, documented rather than rediscovered:** `last_out_ms` is screen-change-based, not
+per-byte — a tick is the finest grain a poller has, and output that redraws the same screen is not
+counted as activity. `idle_ms` is therefore coarser, and larger for a repainting program, so
+`remote.rs`'s silence backstop fires slightly sooner — the safe direction, since it only ever asks
+whether a turn has ended.
+
+## `mpx` Phase 6 — fan-out, restart-in-place, mute, multi-project (2026-09-06)
+
+Driven with **six real spawned children**, because the one-item case always passes.
+
+**`hub_spawn` with six tasks.** All six created, drip-fed 500 ms apart; every one had its task
+**delivered and verified** (`tasks_delivered: [2,3,4,5,6,7]`, nothing mangled, nothing pending); all
+six named themselves through `hub_set_name` and got their `named/<id>` flag; all six armed their
+hub listener (`armed/` held 2–7); and all six reported back to `claude#1` with the right payload.
+
+**The bug that found:** the delivery watchdog treated *absent from the scan* as death, and the scan
+a tick runs on predates the windows that tick creates. So the **last child of every batch looked
+dead the instant it was born** — the six-task call came back after 3.9 s with `ok: false` and
+"these instances exist but NEVER received their task: [7]", while claude#7 went on to do the work
+and report back. A loud wrong answer is still a wrong answer. A just-spawned child now gets a grace
+period before its absence counts.
+
+**Restart-in-place** (`mpx restart 2`, the CLI's ⌘⇧R). tmux's `respawn-pane -k` replaces the
+process inside the window, so this is structural rather than careful bookkeeping: window id, window
+index, name and every `@mpx_*` option survive because the window is never destroyed. Verified — the
+pane pid changed (9013 → 27567) while `claude#2 ▸ ACK to claude#1` kept its number, its name, its
+position and its `@mpx_session_id`; `armed/2` was cleared and **came back** (the instance re-armed);
+`resumed/2` was written and consumed by the hook; and a message planted in its inbox beforehand was
+still delivered, draining to empty.
+
+**The session uuid lives on the window** (`@mpx_session_id`). Nothing else records it and nothing
+else has to: the window and the conversation live and die together, which is the same reason
+`@mpx_id`/`@mpx_kind` are there.
+
+**Mute** is a window option too. `mpx mute 3` shows in `mpx ls`, `unmute` clears it, and muting a
+terminal is **refused** rather than half-honoured — a terminal produces none of the signals mute
+silences.
+
+**Multi-project.** Two projects on one tmux server and one state root: `registry.json` listed both
+with terminals correctly absent (`p6other -> [1]`, `p6proj -> [1..7]`, no `term#8`);
+`hub_instances` reported `other_projects`; `hub_send` to `p6other#1` was delivered across;
+`to: "all"` went to `[2,3,4,5,6,7]` and left the other project untouched, confirmed in both
+projects' `messages.log`. Tearing down one project left the other running ("1 other project(s)
+still running") — never `kill-server`.
+
+**Teardown.** `mpx down` on the fanned-out project swept 7 processes that ignored the hangup and
+left zero claudes, zero `exec-spec` launchers and no daemon referencing that scratch root.
+
+## `mpx` Phase 7 — messages feed, RTL, remote peers (2026-09-06)
+
+### RTL is settled, and checked against Phase 0's reference
+
+`bidi.rs` calls the Unicode Bidirectional Algorithm (`unicode-bidi`) on text `mpx`
+itself prints — the messages feed and the instance list, both of which carry model-written
+text in the language the user works in. (A `hub_spawn` child named itself in Hebrew the first time
+Phase 6 was run, so this is not hypothetical.)
+
+Verified against `fribidi 1.0.16`, the reference Phase 0 used and the output the user confirmed
+readable, on Phase 0's own mixed case `תיקנתי את pty.rs ואת state.rs`:
+
+```
+mpx     : 0073 0074 0061 0074 0065 002E 0072 0073 0020 05EA 05D0 05D5 …
+fribidi : 0073 0074 0061 0074 0065 002E 0072 0073 0020 05EA 05D0 05D5 …
+IDENTICAL
+```
+
+Compared as codepoints, never read off a screen — transcription re-applies BiDi and hides which end
+is which. The Latin identifiers stay left-to-right inside the reversed Hebrew, which is exactly what
+the hand-rolled reverse-the-runs attempt got wrong in Phase 0. It stays a setting (`MPX_BIDI=off`):
+a terminal that implements the UBA itself would apply it twice and put the text back.
+
+### Remote peers, driven against a real box
+
+A real remote `claude` on `185.131.144.28` over ssh, signalling back to `claude#1`:
+
+- the signal reached the driver's inbox as `from: 0`, `from_terminal: 2`, with the
+  `<<<MPX …>>>` marker **stripped** and the reply instructions naming `hub_terminal_send`
+  (a remote is a terminal; `hub_send` can never reach it);
+- **the same signal woke it once, not once per tick** — the count held at 1 across ~60 ticks,
+  with the fingerprint on disk in `terminals/remote/2.seen.watch`;
+- a **new, distinct** signal woke it again, and advanced the fingerprint.
+
+**NOT verified live: the silence backstop.** It fires only when a remote finishes *without*
+signalling, and this remote signalled every time, including when told not to. Its bookkeeping — owed
+once when the driver speaks, settled once when anything is delivered — is unit-tested, but the live
+path was never entered. Say so rather than claiming it.
+
+### Three findings about shared code, none of them fixed here
+
+1. **`ssh -tt <host> '<cmd>'` does not source `.bashrc`, so the remote's token is invisible.**
+   Measured directly: `token via ssh -tt: MISSING` on a box whose `.bashrc` exports
+   `CLAUDE_CODE_OAUTH_TOKEN` from a token-manager block. `remote::ssh_command` builds exactly that
+   shape, so `hub_remote_open` with an `ssh_target` would launch a **logged-out** claude there. The
+   documented `terminal_id` path (ssh in yourself first, then hand the terminal over) works and is
+   what the whole verification above used. This is `mulpex-core`, so it is the desktop app too.
+2. **`hub_remote_open` timed out on a first-run trust prompt.** The remote claude asked
+   "Is this a project you created or one you trust?" and sat there; the 30 s readiness wait expired
+   and the note offered a guess-list — "ssh may be asking for a password or a host key, the
+   directory may not exist, or claude may not be installed there" — that does not include what
+   actually happened. Answering the prompt let everything proceed normally.
+3. **An echoed `<<<MPX` swallows the next real signal.** `find_signals` walks openers in order; a
+   *partial* marker with no closer of its own consumes forward to the next real marker's `>>>`, and
+   that real signal is lost. Provoked here by a probe message that contained the literal marker
+   text — which is the thing the code already warns about ("showing it to the reader invites it to
+   imitate it") — and it persisted for as long as the echoed line stayed on the remote's screen.
+   Cleared by `/clear` on the remote, after which the pending signal was delivered immediately.
+
+### Also
+
+`mpx messages` reads `messages.log` **straight from disk, never the daemon** — the feed is what you
+reach for when something looks stuck, so it must not be blockable by a busy poll loop. Every row
+carries a reply-able address (`claude#2`, `central-one#3`) because an inbox is drained the moment it
+is read: by the time anyone looks, the feed is the only record. `C-q M` opens it in a
+`display-popup -E`, which floats and resizes nothing — the one binding shipped ahead of the rest of
+the key scheme.
+
+---
+
+## UI-2a — the key scheme, measured (2026-09-06)
+
+The plan deferred the key scheme and said the open questions were "which prefix, whether a second
+tier of bindings is worth it at all". Both were settled by driving a real tmux client on a pty
+(`pty.fork()` → `tmux attach`) rather than by reading man pages, because **`send-keys` cannot test
+a key binding**: it writes bytes into a pane and never passes through the key tables at all. The
+first probe used it and proved nothing.
+
+### Which Ctrl keys can be bound with no prefix
+
+`bind -n <key>` in the root table, one key sent per second from an attached client, each binding
+appending its own name to a file:
+
+```
+C-]  C-\  C-^  C-_  C-Space  C-s  C-g  C-t     all fired
+C-[                                            fired the Escape binding
+```
+
+So a bare Ctrl key is available and costs no prefix — but `C-[` **is** byte `0x1b`, the same byte
+as Escape, and `C-M`/`C-I`/`C-H` are likewise Enter/Tab/Backspace. This is the same wall the legacy
+terminal Mulpex hit: its own `CLAUDE.md` records `Ctrl+]` (next) always working and `Ctrl+[` (prev)
+working *only* under the kitty protocol.
+
+**tmux hides this rather than reporting it.** `bind -n C-[ …` is accepted, exits 0, and
+`list-keys -T root` prints it on its own line next to a separately-bound `Escape` — so every signal
+says the binding exists. It simply never fires. A real event with nowhere to arrive, in the tool
+itself.
+
+### What was chosen, and why one key
+
+`Ctrl-]` focuses the sidebar and toggles back. Of the keys that do fire it is the only one that is
+not a signal character (`C-\` is QUIT), not claimed by readline or claude, and not a three-finger
+stretch (`C-^` is Ctrl-Shift-6). Everything else is a **plain unmodified letter inside the
+sidebar**, which is what makes one key enough: the free bare-Ctrl budget is about four keys and
+Mulpex has fifteen actions, but a pane that owns the keyboard has the whole alphabet.
+
+### Driven end to end
+
+`scratchpad/ui2a/drive.py`, two projects, one attached client, every assertion read back out of
+tmux rather than off the screen:
+
+- `Ctrl-]` into the sidebar and back, repeatedly, from the first second the client is attached.
+- `t` opened a terminal, `n` added a claude, both appearing as new `@mpx_id` windows.
+- The sidebar rendered all three rows plus the key hints.
+- `x` prompted `close claude#3?`; a key that was not `y` cancelled and closed nothing; `y` closed
+  exactly one.
+- `]` / `[` moved the client between projects.
+- `M` floated the feed, waited for a key, and handed the keyboard back to the sidebar.
+- `mpx down` on both left no session and no stray `claude`.
+
+### Two findings
+
+1. **`-f` is read once, when the server starts.** The first run of the new binding did nothing at
+   all with a correct config on disk: the tmux server had been up since before the file changed, and
+   `-f` is not re-read for a new session on an existing server. `mpx` now `source-file`s its own
+   config before every attach (`Tmux::source_conf`). Without it, an `mpx` updated underneath a live
+   session keeps the old keys until the last project is torn down — a bug report with no visible
+   cause.
+2. **`display-message -p -t =<session> '#{@mpx_side}'` does not resolve to the active pane.** It
+   returned the *other* pane's empty value while the sidebar was demonstrably active
+   (`pane_active=1` in `list-panes`), so the probe reported the toggle broken when the toggle was
+   fine. Read a per-pane option off `list-panes`, never off a session target. This cost one wrong
+   diagnosis and is the second time in this project that the measurement, not the product, was the
+   thing that was broken.
+
+### Not verified
+
+`x` on the last remaining instance, and `x` on the row whose own window the sidebar is drawing —
+the second kills the pane doing the asking. Both are reachable by hand; neither was driven.
+
+### A bug the probe found by accident
+
+Two zero-byte files, `instances` and `terminals/`, appeared **in the repository root** while the
+UI-2a driver ran. Cause: `up()` tags a new session with `@mpx_project` and `@mpx_state_dir` in two
+separate tmux calls, and the 200 ms poll can land between them. `core::scan` gated adoption on
+`@mpx_project` alone, so that one tick built a `Project` whose `state_dir` was `PathBuf::from("")`
+— which is not an error and not empty-checked anywhere downstream, because it **joins to a relative
+path**. Every write that tick went to the daemon's own working directory.
+
+The repo's own list of failure shapes already names this one: *a default that reads as an
+assertion*. Fixed at both ends — `@mpx_project` is now written **last**, so the field that gates
+adoption is the one written after everything it implies exists; and `core::is_ours` requires both
+tags, which also covers a session tagged by an older build. Guarded by
+`core::tests::a_session_is_ours_only_once_both_tags_are_written`.
+
+---
+
+## The three bare keys (2026-09-06, superseding UI-2a's single key)
+
+User feedback after trying UI-2a: *"the keyboard shortcuts still terrible. let's start with CTRL+[
+and CTRL+] to immediately move between instances (without focusing on the sidebar) and CTRL+T to
+open new instance."* So the sidebar is no longer the route to everything; three keys act directly.
+
+### `Ctrl-[` is bindable after all — but only sometimes
+
+The UI-2a measurement ("`C-[` fires the Escape binding") was correct and incomplete: it was made in
+a synthetic pty with no terminal emulator to negotiate with. Re-measured with the same harness,
+sending each encoding by hand:
+
+```
+raw 0x1b                      -> Escape
+ESC[91;5u     (kitty CSI-u)   -> C-[
+ESC[27;5;91~  (modifyOtherKeys) -> C-[
+```
+
+tmux understands **both** extended encodings, and — the part that makes this safe — raw `0x1b`
+still reaches the Escape binding, so `bind -n C-[` does not steal Escape. The failure mode where a
+terminal reports legacy keys is `C-[` doing nothing at all, not Escape breaking.
+
+`set -as terminal-features ',*:extkeys'` is what asks the outer terminal for them. tmux was *not*
+observed emitting the request in the synthetic pty with or without that line (only bracketed paste)
+— a pty that never answers a DA query may be why, but this is **not established**. Whether iTerm2
+3.6.10 negotiates it is therefore **unverified here and testable only by pressing the key**.
+
+### `claude` binds ctrl+t
+
+`grep -aoiE 'ctrl\+[a-z]'` over the `claude` binary: `ctrl+x` 48, `ctrl+o` 34, `ctrl+s` 30,
+`ctrl+e` 24, `ctrl+b` 22, `ctrl+a` 18, `ctrl+k` 14, `ctrl+d` 12, `ctrl+u`/`ctrl+r`/`ctrl+g` 11,
+**`ctrl+t` 10**, `ctrl+n`/`ctrl+f` 8, `ctrl+v` 7. (String counts in a binary, so this shows the key
+is referenced, not that it is live in every mode.) Taking `C-t` at the root table therefore costs a
+real claude binding — so `C-q C-t`, `C-q C-]` and `C-q C-[` send the literal key through.
+
+### `#{q:...}` is not shell quoting
+
+Measured: `run-shell -b "echo PROJ=#{q:@mpx_project}"` with the option set to
+`/tmp/a dir'with quotes` produced that string **raw** — `#{q:}` escapes tmux's own special
+characters, not the shell's. So a project directory must never reach a binding's command line. The
+binding passes a **pane id** (`%12`) and `mpx key` reads the path back out of tmux, where it stays
+a `String`.
+
+The binary's own path is substituted into the config at render time (`main.rs::render_conf`,
+`__MPX_BIN__`, single-quoted by us) rather than being looked up on `PATH`: `run-shell` is executed
+by the tmux **server**, which carries whatever environment it was first started with.
+
+### Driven end to end
+
+`scratchpad/ui2a/keys3.py` — Ctrl-T twice (the plural) each added a claude; Ctrl-] moved forward
+through three instances and wrapped, landing in the claude and never the sidebar strip; raw `0x1b`
+moved nothing; both extended encodings of Ctrl-[ moved back; `C-q C-t` and `C-q C-]` changed
+nothing in Mulpex; `mpx key new %99999` reported "not in a Mulpex project" rather than failing
+silently. Teardown left no session.
+
+### One consequence
+
+The sidebar's project keys moved from `[`/`]` to `<`/`>`. Ctrl-[ / Ctrl-] are root-table bindings
+that fire *inside* the sidebar too, so brackets would otherwise have meant "instance" or "project"
+depending on a modifier. The sidebar itself is back on `C-q s`; the bare key it had is now
+next-instance.
+
+### Not verified
+
+Whether the user's terminal negotiates extended keys — i.e. whether `Ctrl-[` does anything at all
+on their machine. `C-q p` is the same command and always works.
+
+### "[ and ] reversed" — they were not reversed, they were arbitrary (2026-09-06)
+
+User report after trying the three keys: *"working but [ and ] reversed."*
+
+`new-window -t "=session:"` with no index makes tmux pick the **lowest free index**, and `up()`
+frees index 0 when it kills the placeholder window. So on every project the *second* claude was
+created at index 0 — in front of the first — and the third at index 2. `next-window` walks index
+order; the sidebar sorts by instance id. With two instances the disagreement reads exactly as
+"reversed"; with four it is not reversed at all, it is arbitrary.
+
+**The previous probe could not have caught this.** It asserted that Ctrl-] *moved* to a different
+window and that it *wrapped*, and both were true in the wrong order. Direction was never checked.
+A test that walks a list must assert the sequence, not that the position changed.
+
+Fixed at both ends:
+
+1. `new_window` now passes `-a -t '={session}:{end}'`, so windows append and index order tracks id
+   order. Verified: four instances at indices 1,2,3,4.
+2. The keys no longer use `next-window` at all. `mpx key next|prev <window-id>` walks
+   `core::scan`'s instance list — the same list, in the same order, that the sidebar draws — and
+   focuses `Instance.pane`, which is the instance's own pane, so landing on the sidebar strip is
+   not a case that has to be handled. Verified forward `1→2→3→4→1` and backward `1→4→3→2→1`.
+
+Cost of routing a navigation key through a process: **46 ms** per move in a debug build (61 ms
+before batching `select-window` and `select-pane` into one tmux invocation and dropping a
+`display-message` call by passing `#{window_id}` instead of `#{pane_id}`). Release will be lower.
+`-f` is not re-rendered on the key path — it is read at server start and ignored by commands sent
+to a running server.
+
+### `run-shell` hijacks the pane you are looking at (2026-09-06)
+
+User screenshot after pressing Ctrl-T: the claude they were working in replaced by a black pane
+showing the single line `claude#2`, with a yellow `[0/0]` in the top-right corner.
+
+Nothing was broken — claude#2 had been created correctly, and the claude behind was untouched.
+`run-shell` **displays a command's output by putting the current pane into view-mode**, tmux's
+copy-mode overlay (`[0/0]` is its position indicator). `mpx new` prints its reply, `println!`ing
+`claude#2`, and one line of stdout was enough. Measured directly:
+
+```
+before run-shell -b 'echo …'   pane_in_mode=0
+after                          pane_in_mode=1  pane_mode=view-mode
+after 'echo … >/dev/null 2>&1' pane_in_mode=0
+```
+
+`-b` does not prevent it. **A key binding must produce no output at all**, which makes the
+status line (`display-message`) the only channel it has: `mpx key` now reports its own failures
+there and prints nothing on success, and the bindings redirect both streams.
+
+The feedback for a successful Ctrl-T is the new row appearing in the sidebar, which is always on
+screen. This is the same shape as the rest of this list — the mechanism that shows you an error is
+the one that also shows you nothing, and `>/dev/null` on the *error* stream is only safe once
+something else carries the words.
+
+Guarded by `scratchpad/ui2a/quiet.py`: after Ctrl-T, Ctrl-] and Ctrl-[, no pane in the project is
+in any mode; and `mpx key new @99999` puts "not in a Mulpex project" in tmux's message log without
+hijacking anything to say it.
+
+One thing that surfaced while testing the error path: **`@mpx_project` is a session option**, so
+every window inherits it — including one made with tmux's own `new-window`. "Is this window in a
+Mulpex project?" cannot be answered by reading it.
+
+---
+
+## Close, mute, rename, restart (2026-09-06)
+
+Four user decisions, then built: reap on exit mirroring the desktop; `Ctrl-W` with a confirm;
+`m`/`r`/`R` as sidebar letters rather than bare Ctrl keys; rename edited inline in the sidebar.
+
+### Reap policy, ported from `Workspace::reap_dead`
+
+A dead instance is **kept** if it is a terminal, or if it died within `EARLY_DEATH_GRACE` (10 s) of
+being launched — that row is the only place a failed start's error is ever shown. Anything else has
+its window killed. The `✗` prefix **latches** the decision, or a row kept for dying at 2 s becomes
+removable the moment the grace elapses and is silently reaped ten seconds later; the desktop hit
+exactly that and its comment says so.
+
+"When was this launched" needed somewhere to live: `@mpx_born`, a window option written in
+`claudewin::launch` — the one place a spawn and a restart both pass through, so **a restart is a
+birth too** and a relaunched claude that dies immediately keeps its row. Read only when an instance
+is already dead, so the scan every tick pays for is unchanged. A window with no stamp is treated as
+having died early: keeping a row that should have gone is recoverable, removing one holding the
+only copy of an error is not.
+
+Driven: three claudes; killing one that had been up 16 s removed its row with no `✗` left behind; a
+pane respawned to exit 3 inside the grace kept its row, was marked `✗ claude#2 (exit 3)`, still had
+`claude: bad flag` readable on screen, and was **still there 12 s later**.
+
+### `respawn-pane -t <window>` restarts the wrong pane
+
+Found by driving `R` from the sidebar. `restart` passed `inst.window`, and a window target resolves
+to that window's **active pane** — which, when you press `R` in the sidebar, is the sidebar. So
+`claude` was relaunched *into the instance list*, leaving the real claude running untouched beside
+it. Every outward signal was right: same window, same id, same name, same session uuid, daemon
+reported success.
+
+Fixed by targeting `inst.pane` (`core::scan` skips sidebar panes, so it is always the instance's
+own). `WindowSlot::Replace` now carries both — the pane to respawn and the window that holds the
+`@mpx_*` options.
+
+This is the same shape as the `#{q:}` and `display-message -t <session>` findings: **a tmux target
+that accepts what you give it and resolves to something else.** Three in two days. Give tmux the
+narrowest id that can express what you mean.
+
+### Rename writes a file, never a command line
+
+`r` opens the row itself as a field, pre-filled. On Enter the sidebar writes `namereq/<id>` — the
+same file `hub_set_name` uses — so the daemon's existing `process_name_requests` renames the window
+*and* writes the `named/<id>` flag that stops the hook nagging the instance to name itself (a human
+naming it counts). No new daemon op, and, the real reason: the typed text is arbitrary user input
+and `#{q:...}` is not shell quoting.
+
+The field takes **text, not keys** — `n` has to be a letter in a name — and decodes UTF-8 rather
+than bytes, because the names here are usually Hebrew and byte-wise backspace would split a
+character. Verified: `שלום` backspaces to `שלו`; a stray arrow key cancels rather than inserting
+`^[[A`; Esc does not commit.
+
+### Driven end to end
+
+`scratchpad/ui2a/manage.py` and `restart.py`: reap-on-exit and the failed-start keep; `r` typed a
+name that reached the tmux window and the sidebar, with Esc leaving it unchanged; `m` toggled
+`@mpx_muted` on and back; `Ctrl-W` prompted, cancelled on a key that was not `y`, and closed exactly
+one on `y`; `R` on a claude that had never spoken was **refused in words on the footer**, and after
+a real turn restarted it into the same window, same number, same name, same session uuid, a
+different pid, with the sidebar pane still running `mpx`.
+
+### A message that can only flash (2026-09-06)
+
+*"when we do mpx we see a message for half second something with 'nothing to open'"* —
+`mpx: nothing open yet — starting <dir>`, printed by `open_workspace` immediately before `exec`ing
+`tmux attach`, which clears the screen. It could never be read. `mpx: re-attaching to <session>`
+had the same shape on the other branch.
+
+Removed both, and the directory moved into `up()`'s **error context** instead — the one path where
+the screen is still there to say it on. Verified: `mpx` with tmux off `PATH` now answers
+`mpx: opening <dir> — nothing was already open, so mpx used the current directory: running 'tmux -V'
+(is tmux installed?)`, and a normal start shows no such text at all in its first three seconds.
+
+Which project opened is answered permanently by the tab along the top; it never needed a line of
+its own. A near-relative of *a real event with nowhere to arrive*: a real message, with nowhere to
+be seen.
+
+### Creating an instance lands you in it (2026-09-06)
+
+*"when we open new claude instance we should auto focus to that, exactly like the GUI"* — and the
+GUI's rule turns out to be **who asked**, not what was made. `Core::create_session` and
+`spawn_terminal` both take a `focus: bool`: `commands.rs` passes `true` (⌘T, ⌘⇧T — a person), and
+`state.rs`'s `hub_terminal_open` handler passes `false` (a claude).
+
+Mirrored without adding a flag, because in the CLI the *route* already carries the distinction:
+`Ctrl-T` and the sidebar's `n`/`t` go through `key_action`/`Actions::send` and now focus what they
+made; `hub_spawn` (`fanout.rs`) and `hub_terminal_open` (`terminals.rs`) never touch those paths.
+A parameter would have been a second answer to a question the call graph already answers.
+
+Which instance to focus is read back out of the daemon's own reply (`claude#3`, `term#12`) rather
+than re-derived — two answers to "what was just created" is one more than there should be.
+
+The sidebar's reply arrives on a worker thread, so the wish is *held* (`focus_want`) and spent by
+the draw loop once the row appears, with a 3 s bound so a wish that is never satisfiable cannot
+hijack a later keystroke. The cursor moves with the keyboard, so the list keeps agreeing with where
+you are.
+
+Driven: `Ctrl-T` twice landed in claude#2 then claude#3; `n` landed in claude#4 and `t` in term#5,
+in the instance pane and not the sidebar strip each time; and a `termreq/` request written by hand —
+which is exactly what a claude's `hub_terminal_open` does — created term#6 and **did not move the
+screen**.
+
+### The project picker (2026-09-06)
+
+UI-2b: `p` in the sidebar and `C-q p` anywhere open one popup that is both the switcher and the
+opener — open projects, then recents, then anything on disk.
+
+**The risk worth measuring was `switch-client` from inside a `display-popup`.** A popup can only
+run a command and close when it exits; there is nowhere for a chosen path to be *returned* to, so
+`mpx pick` has to do the switching itself. Whether tmux resolves a client from in there is exactly
+the shape that has gone wrong three times here — a target tmux accepts and then resolves to
+something other than what was meant (`#{q:...}` not shell-quoting, `display-message -t <session>`
+answering for the wrong pane, `respawn-pane -t <window>` hitting the active pane). Driven with a
+real attached client: it works, both for a session that already exists and for one the picker
+creates a second earlier.
+
+Also driven end to end: Esc closes the popup and changes nothing; typing an absolute path opens a
+project that had never been open, spawns its `claude#1`, and lands the keyboard **in the claude and
+not the sidebar strip** (the same "who asked" rule as `Ctrl-T`); switching back to a project that is
+open works; and the sidebar's `p` reaches the same popup.
+
+**A bug the probe found:** switching to an **already open** project skipped the recents update,
+because that branch never reaches `ensure_session`, which is where the recording lives. The list
+then said the last thing you *created* was the last thing you touched. Recents is ordered by what
+you chose to work in, so both branches record.
+
+The popup's *contents* cannot be captured by tmux — a popup is not a pane, so `capture-pane` cannot
+see one and `list-panes` does not list it. The picker's process is the only honest signal that a
+popup is open (`pgrep -f "mpx pick"`), and the screen itself was driven separately on a bare pty:
+a path lists directories but not files and not hidden ones, typing narrows, `↓` then `⇥` completes
+the highlighted row **and descends into it** (children listed, siblings gone), and a bare word with
+no `/` browses nothing at all.
+
+One probe lesson worth keeping: a `check` whose predicate was `lambda got: got or <fallback>`
+printed `False` and reported PASS. An assertion with an escape hatch is not an assertion.
+
+**Two decisions recorded with it.** The recents list reads mpx's own
+`~/.mulpex-cli/recents.txt` *and* the desktop app's `~/.mulpex/recents.txt`, read-only, so the first
+`p` on a Mac already knows your projects. This is **not** the collision `statedir.rs` avoids: that
+one is `persist::SessionStore`, keyed by project dir, where sharing would hand the same `--resume`
+uuid to two claudes and interleave one transcript. A recents file is a list of paths — nothing
+resumes off it and nothing is written back to it. And `bind p` overrides tmux's own prefix-`p`
+(previous-window) deliberately: that walks windows by *index*, which is an implementation detail
+nobody is looking at.
+
+`create_size` exists because the two callers sit on different ttys: `mpx up` is on the terminal the
+session is about to fill, while the picker is inside a popup whose tty is a 70%×60% box. Asking the
+tmux **client** (`#{client_width}`, no `-t` — a `-t` is a pane target and would be the same
+resolves-to-something-else mistake again) is what stops a project being created at the size of the
+popup that opened it.
+
+### Ctrl-P, and what a stolen key actually costs (2026-09-06)
+
+*"can we make it CTRL+P and block claude default behavior?"* — yes, and it turns out to be the
+cheapest key taken so far. A bare `bind -n` **is** the block: tmux consumes the key and claude never
+sees the byte.
+
+Counting references in the claude binary (2.1.263) is the measurement this project already used to
+pick `C-q`, but the raw count is the wrong number. What matters is whether the key is a **primary**
+binding or an **alias**:
+
+```
+ctrl+space  0    ctrl+j 3    ctrl+p 6    ctrl+g 8    ctrl+t 10    ctrl+o 20
+```
+
+All six `ctrl+p` uses are "move up", and every one sits beside an arrow and a `k`:
+`up:"select:previous", k:"select:previous", "ctrl+p":"select:previous"` — likewise
+`scroll:lineUp`, `footer:up`, `messageSelector:up`. zsh binds `^P` to `up-line-or-history`, which
+`↑` also does. So taking Ctrl-P removes an **alias** and no capability. Compare `C-w`: only 2 refs
+in claude, but readline's `delete-word-backward`, used while typing — by reference count it looks
+like the cheap one and it is the most expensive of the five.
+
+Bound as `display-popup` **directly, never through `run-shell`**: run-shell either blocks the whole
+tmux server (foreground) or shows its output by dropping the pane you are looking at into view-mode
+(background, measured earlier the same day). A popup is tmux's own async construct and has neither
+problem.
+
+Driven with a real client on a pty — `send-keys` cannot test a binding, it writes into a pane and
+never passes through the key tables. Ctrl-P opened the picker from inside claude and from the
+sidebar pane (the root table wins over the pane), Esc closed it, the other bare keys still fired,
+and the negative case held: **`C-q C-p` opened no popup**, sending the literal through instead.
+
+### The prefix stops being part of the scheme (2026-09-06)
+
+*"please omit all the C-q or the other shortcuts. i'm not going to use them anyway"* — and then,
+on being told `C-q s` was the only door to the sidebar: *"why do we need to open the sidebar?"*
+
+The right question, and the answer is mostly **you don't**. The sidebar is a *display*: it is on
+screen in every window and needs no key to be read. Focusing it only ever mattered for the five
+actions with no bare key — and four of them are commands (`mpx term`, `mpx mute <id>`,
+`mpx restart <id>`, `mpx messages`), which is where they now live. The fifth, rename, stays
+sidebar-only on purpose (the typed name must never reach a command line) and is parked.
+
+So the scheme is **four bare keys and nothing else**: `Ctrl-]` `Ctrl-[` `Ctrl-T` `Ctrl-W` `Ctrl-P`
+— five keys, four rows. The prefix bindings are all still *bound*, because unbinding them costs
+something and gains nothing: `C-q C-w` is the only way to get readline's delete-word back, and
+tmux's own pane navigation reaches the sidebar regardless. They are simply no longer advertised.
+
+**One hole this leaves, flagged rather than papered over:** from a claude pane with no terminal
+open there is no route to a shell. `mpx term` needs a shell to type it into, and `Ctrl-T` makes a
+claude. Today the answer is a second ssh session; if that turns out to bite, new-terminal wants the
+one remaining free key — `ctrl+space`, measured at **zero** references in claude and only
+`set-mark-command` in zsh.
+
+### A cursor on a pane that receives no keys (2026-09-06)
+
+*"what is the right arrow near claude#1? old icon we need to remove?"* — not old, but dead as of
+the same afternoon. The `▸` gutter is the **keyboard cursor**: which row `↑↓` is on. Once the
+sidebar stopped being something you focus, that cursor could never move off row one — a statement
+about where the next key lands, drawn on a pane that gets none.
+
+So the sidebar now asks tmux for two facts rather than one (`#{window_active}#{pane_active}`, one
+query) and draws the gutter **only while it holds the keyboard**. The reverse-video "you are in
+this window" mark is a different fact and does not depend on focus, so it stays either way — the
+two were always separate and this is where that pays.
+
+The footer follows the same rule, because which keys are worth writing down depends on which keys
+can arrive: unfocused it advertises `^] ^[ move · ^T new · ^W close · ^P project`, the four that
+work from anywhere, and the letter list comes back only when the letters can.
+
+Verified by reading the real pane with `capture-pane` on a driven client, in all three states: no
+`▸` with the claude focused, `▸` plus the letters after `C-q s`, and gone again after `q`.
+
+### "I tried to close a claude and the whole thing stuck" (2026-09-06)
+
+Nothing was stuck. The tmux server answered every query instantly; the project simply had one
+window, holding a dead pane with nothing in it.
+
+What the daemon's own log said: `cloud claude#1 died before it started`. What tmux said about the
+same pane: `dead=1  status=0  born=…` — a **clean exit**, seconds after the project was opened.
+`reap_dead` decided on age alone, so a claude the user had just quit was filed as a failed spawn
+and kept, marked `✗ claude#1 (exit 0)`.
+
+Then the second half: a claude drops the alternate screen on its way out, so the pane the policy
+preserved *to show the reason* was blank. Black rectangle, keyboard pointed at a pane that accepts
+nothing, `Ctrl-]`/`Ctrl-[` with nowhere to go because there was exactly one instance. `Ctrl-T` and
+`Ctrl-P` still worked the whole time — a live program that looks dead, which is this repo's
+"a real event with nowhere to arrive" seen from the user's side.
+
+**Fix: the exit status decides, together with the age.** `#{pane_dead_status}` was already on
+`Instance` and already recorded in the Phase 0 findings as free; the policy just never read it. A
+row is kept only when it is the sole record of something that went **wrong**:
+
+- `exit 0` → removed, however soon it came. You asked it to quit.
+- non-zero **and** young → kept, marked `✗` with the code. A spawn that fails and vanishes shows
+  you nothing.
+- non-zero and old → removed. SIGINT on an hour-old claude exits 130 and you meant it.
+
+Both halves are load-bearing: age alone keeps a clean quit, status alone keeps every claude you
+ever interrupted. The decision is now `keeps_its_row(is_shell, dead_status, age)`, a pure function
+with no tmux in it, so the table above is a test rather than a paragraph.
+
+**The bug the probe found while proving the fix — worth more than the fix.** The integration run
+still logged `died before it started` with the corrected binary in place. The **daemon does not
+pick up a new build**: `ensure_running` returns early whenever a daemon is alive, and that daemon
+runs whatever code it exec'd from, until every project closes ("no sessions left, exiting") or it
+is killed. Measured directly — daemon started 15:54:04, binary rebuilt 15:58:53, still serving the
+old policy. `Tmux::source_conf` exists precisely because the tmux *server* has this shape; the
+daemon has it too and nothing addresses it. Until it does, "I fixed it and it still does the old
+thing" is a false report waiting to happen, and it already produced one here.
+
+**A consequence to know before pressing Ctrl-W:** removing the row of a project's *last* instance
+kills its last window, and tmux destroys a session that has no windows (measured, on a throwaway
+session). So closing your last claude closes the project — the tab goes and the client lands on
+another project, or detaches if there is none. The desktop keeps a zero-session project alive with
+a "press ⌘T" empty state; tmux cannot, since a session with no windows does not exist.
+
+### `mpx` offers a project instead of opening one (2026-09-06)
+
+*"can we make `mpx` not auto open the current project, exactly like the IDE?"*
+
+It used to create a project for whatever directory the shell happened to be in. The odds are good
+and not good enough, and being wrong costs a project you now have to notice and close. With
+nothing running, `mpx` now shows the picker with **that directory at the top, marked `· here`**, and
+opens nothing until Enter. Attaching is untouched: with a project already running, `mpx` still
+rejoins it instantly — that is the ssh-reconnect case and the reason any of this exists. Only the
+auto-*create* went away.
+
+**The picker needed a second mode to be the front door.** In a popup there is a live client and
+choosing means `switch-client`; standalone there is no client and choosing means *becoming* one.
+Read off `$TMUX`, because it is a property of where the process is rather than of who called it.
+
+That split forced a structural change worth noting: `attach` **`exec`s**, and a replaced process
+runs no destructor — so the `RawMode` guard would never restore the terminal, handing the next
+program a tty in raw mode with a hidden cursor. The loop is therefore a function that *returns* a
+choice, with the attach performed by the caller after the guard has dropped.
+
+**A bug found by looking at the real screen rather than the test.** The `· here` label was appended
+after the path and the whole line then cut to width — so on a deep directory the one word
+explaining why that row is first was the first thing to vanish. Driven from a scratchpad path, the
+row read `…-mulpex/d7918b…` and nothing else. The path is now truncated to make room for the label:
+the path can afford to lose characters, the label cannot.
+
+**And a bad assertion, caught by its own failure.** The width check counted SGR escapes as
+characters. A frame is not its own width; the test now strips CSI sequences before measuring.
+
+Driven with **no tmux server at all**, which was previously unreachable: `mpx` in an unopened
+directory offered rather than opened, Esc left with nothing created, Enter opened the project and
+made that process its client, and a second `mpx` rejoined without showing the picker at all.
+
+### Two questions, two orders (2026-09-06)
+
+*"the auto complete should sort the opposite way, the short path at start"* — typing `~/docu`
+listed `~/Documents/Code/dreamvps/cloud` above `~/Documents`, which makes ⇥ useless for descending:
+you cannot complete *towards* a directory by jumping past it into something nested under it.
+
+The fix is not a sort tweak, it is noticing the list answers two different questions:
+
+- **A word is a name you are recalling.** The answer is grouped by what the rows *are* — what is
+  running, then what you have opened before, with the directory you are standing in pinned on top.
+  That grouping is what makes the picker a switcher and it stays exactly as it was.
+- **A path is a place you are navigating.** The list should read like a directory listing:
+  **shortest first**, whatever source a row came from — an open project included, and `here` no
+  longer pinned, because mid-path it is just another candidate.
+
+Length rather than component count: it is what "the short path" means, and a deep-but-terse path is
+genuinely quicker to reach. The full path breaks ties, so the order never depends on which source a
+row happened to come from.
+
+`is_path()` is now one function used by **both** the browse listing and the ordering. They have to
+agree — a list sorted for navigating but containing nothing to navigate to would be the same defect
+from the other side.
+
+Driven on a real screen, both shapes:
+
+```
+> ~/docu                          > clo
+   Documents   ~/Documents        ▸ ○ cloud  ~/Documents/Code/dreamvps/cloud
+ ○ test        ~/Documents/Code/test
+ ○ test2       ~/Documents/Code/test2
+ ○ cloud       ~/Documents/Code/dreamvps/cloud
+```
+
+### The sidebar's two lags, and closing a project's last tab (2026-09-06)
+
+*"the sidebar have weird lags. when we open new claude he turn black for a moment. when we close
+claude he keep showing in for a moment"* and *"when we close the last tab of a project, mulpex close
+immediately instead of focus on the other project"*.
+
+**Measured first, both of them:** a new claude's sidebar sat blank for **679 ms** and a closed row
+lingered **1.32 s**. 679 is not a coincidence — it is `IDLE_MS = 700`. A window is created
+**detached** and only then switched to, so a brand-new sidebar's first look finds itself hidden,
+goes to sleep, and is still asleep when you arrive in it.
+
+**The obvious fix was measured and rejected.** Polling faster is not free: a
+`tmux display-message` costs 10 ms wall and ~3.4 ms of CPU, and *every window runs a sidebar*, so
+seven hidden ones checking at 150 ms is about a sixth of a core, spent forever discovering that
+nothing changed.
+
+So the daemon publishes the answer instead. It already asks tmux this, once per tick, for every
+project — `core::publish_focus` writes `<active window> <active pane>` into the project's state dir
+and the sidebars read it. N polls become one, and each sidebar's check becomes a file read, which
+it can afford to do every 80 ms. A sidebar that finds no file falls back to asking tmux at the old
+700 ms, so a daemon that is down costs latency and nothing else. The first frame is now drawn
+whether or not anyone is looking yet, which is what removes the blank entirely.
+
+Result: **679 ms → 12 ms** blank, **1.32 s → 0.65 s** for a closed row.
+
+**A bug I introduced, and only measurement caught it.** Dropping the `\x1b[2J` from each frame — so
+the pane is overwritten rather than wiped — left the *blank filler lines* as bare `\r\n`, which
+move the cursor without erasing. Every visible line is padded to the full width and covers what was
+under it; those write nothing. A closed claude therefore stayed on the pane **for good** — ten
+seconds, twenty — on a sidebar that was repainting perfectly the whole time. The filler now carries
+`\x1b[K`, and only the filler: after a line that exactly fills the width the cursor has already
+wrapped, so an erase there would clear the line *below*.
+
+Worth separating what was measured from what was not: the 679 ms was measured and fully explains
+"turns black". That the `\x1b[2J` also caused a flash is a **hypothesis** — the no-clear repaint is
+kept because it is strictly less work, not because the flicker was demonstrated.
+
+**The last tab was one line.** A project *is* a tmux session, so closing its last instance kills its
+last window and tmux destroys the session — and tmux's default `detach-on-destroy on` then detaches
+the client. Closing one project dropped you out of Mulpex with the others still running, which
+reads as a crash rather than a close. `off` switches to another session instead. Driven: two
+projects open, closing tabB's only instance left the client attached on tabA and `mpx` still
+running; closing the last project then does end the client, which is correct — a tmux session with
+no windows cannot exist, so there is no zero-project state to sit in.
