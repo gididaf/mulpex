@@ -199,6 +199,23 @@ fn tool_defs() -> Value {
             },
         },
         {
+            "name": "hub_close",
+            "description": "Close Claude instances in this project and remove their sidebar rows — the inverse of hub_spawn. Use it to clean up after fanning work out: once a worker has reported its result and gone idle, close it rather than leaving a dead row behind for the user to tidy. Only instances in YOUR OWN project can be closed, never one in another project, and never yourself. An instance that is mid-turn is REFUSED rather than killed under its own task — wait for it to go idle, or pass force: true if you genuinely mean to interrupt it. Closing releases the instance's file locks, and any mail it never read is bounced back to whoever sent it. Terminals are not instances: close those with hub_terminal_close. The reply lists what was closed and, for anything refused, why.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "description": "Which instance(s) to close, in THIS project: the number (\"40\"), the address (\"claude#40\"), or an array of either to close several at once. \"all\" is not accepted — name the instances you mean.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Close even an instance that is mid-turn, killing whatever it is doing. Default false, which refuses a busy instance and tells you so.",
+                    },
+                },
+                "required": ["to"],
+            },
+        },
+        {
             "name": "hub_remote_open",
             "description": "Start a Claude Code instance on ANOTHER MACHINE over ssh, in a Mulpex terminal, and coordinate with it. Opens its own terminal by default; pass terminal_id to use one that already exists, including one the user ssh'd in on themselves. Use this when work has to happen on a remote server (a deploy, a staging box, anything that must run there rather than here). The remote instance is told it is being driven by you, works autonomously, and SIGNALS you when it finishes, gets blocked, or needs an answer — you are woken by a hub message, so do NOT sit polling it. Talk to it with hub_terminal_send and read it with hub_terminal_read, using the terminal id this returns. It is a terminal, NOT a hub instance: hub_send can never reach it. Requires working ssh key access to the target, and claude installed there.",
             "inputSchema": {
@@ -293,6 +310,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_send" => hub_send(ctx, &args),
         "hub_inbox" => Ok(hub_inbox(ctx)),
         "hub_spawn" => hub_spawn(ctx, &args),
+        "hub_close" => hub_close(ctx, &args),
         "hub_remote_open" => hub_remote_open(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
@@ -887,6 +905,158 @@ struct Delivery {
     mangled: Vec<u64>,
 }
 
+/// Close instances in this project — the inverse of `hub_spawn`. Mulpex owns the
+/// PTYs, so this rides the same request queue `hub_terminal_close` uses and the
+/// app decides who may actually be closed.
+///
+/// **The two halves of the refusal live on different sides on purpose.** Whether
+/// a target is open, is a claude rather than a terminal, and is mid-turn are all
+/// questions about Mulpex's own session list, so they are answered there against
+/// live state and come back as a per-id `refused` entry. What is answered *here*
+/// is only what this process alone knows or what is a caller error — a malformed
+/// address, a cross-project one, `"all"`, and closing yourself. Those abort the
+/// whole call rather than being reported per id: nothing was closed, and the fix
+/// is to write a different argument.
+///
+/// **Self-close is refused rather than deferred.** Killing the caller means this
+/// MCP call never returns — the instance is gone before it can say what it did,
+/// and whatever it was mid-way through reporting is lost with it. An orchestrator
+/// closes its workers; a worker that has reported is closed by whoever spawned it.
+fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let ids = close_targets(ctx, args)?;
+    let force = args
+        .get("force")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let reply = app_request(
+        ctx,
+        json!({ "op": "close_instance", "from": ctx.instance, "ids": ids, "force": force }),
+    )?;
+
+    let closed: Vec<u64> = reply
+        .get("closed")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|n| n.as_u64()).collect())
+        .unwrap_or_default();
+    let refused: Vec<Value> = reply
+        .get("refused")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Nothing closed is a failed call, not a partial success — the caller asked
+    // for rows to go away and none did.
+    if closed.is_empty() {
+        let why = refused
+            .iter()
+            .filter_map(|r| r.get("reason").and_then(|x| x.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(if why.is_empty() {
+            "nothing was closed.".to_string()
+        } else {
+            format!("nothing was closed. {why}")
+        });
+    }
+
+    let note = if refused.is_empty() {
+        "Closed. Their rows are gone, their file locks are released, and any mail they had not \
+         read has been bounced back to whoever sent it."
+            .to_string()
+    } else {
+        format!(
+            "Closed {} of {}. The rest are listed in `refused` with the reason for each — read \
+             it: an instance refused for being mid-turn is still working, so leave it be or \
+             close it later.",
+            closed.len(),
+            closed.len() + refused.len()
+        )
+    };
+    Ok(json!({
+        "ok": refused.is_empty(),
+        "closed": closed,
+        "refused": refused,
+        "note": note,
+    })
+    .to_string())
+}
+
+/// Resolve `hub_close`'s `to` into the local ids to ask Mulpex about, or the one
+/// error that aborts the whole call.
+///
+/// Pure, so the refusals above can be tested without a Mulpex on the other end —
+/// which matters, because every one of them exists to make sure nothing is queued
+/// at all. A request file written on the way to a refusal would be applied later
+/// by a poll loop that never sees any of this reasoning.
+fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
+    const HELP: &str = "Give an instance in THIS project: \"40\", \"claude#40\", or an array of \
+                        either.";
+    let raw: Vec<String> = match args.get("to") {
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::new();
+            for v in arr {
+                out.push(address_word(v).ok_or_else(|| {
+                    format!("'to' contains an entry that is not an address. {HELP}")
+                })?);
+            }
+            out
+        }
+        Some(v) => vec![
+            address_word(v).ok_or_else(|| format!("'to' is not an address. {HELP}"))?
+        ],
+        None => return Err(format!("missing 'to' — who to close. {HELP}")),
+    };
+    if raw.is_empty() {
+        return Err(format!("'to' is empty — name at least one instance. {HELP}"));
+    }
+
+    let mut ids: Vec<usize> = Vec::new();
+    for one in &raw {
+        match registry::parse_address(one)? {
+            Address::LocalAll => {
+                return Err(
+                    "\"all\" is not accepted by hub_close — closing every instance at once is not \
+                     something to spell in one word. Name the instances you mean, e.g. \
+                     to: [\"40\", \"41\"]."
+                        .into(),
+                )
+            }
+            Address::Foreign { qualifier, id } => {
+                return Err(format!(
+                    "{qualifier}#{id} is in ANOTHER project, and hub_close is project-local — an \
+                     instance must not be able to close rows in a project it cannot see. Ask an \
+                     instance over there to close it, with hub_send."
+                ))
+            }
+            Address::Local(id) if id == ctx.instance => {
+                return Err(format!(
+                    "claude#{id} is YOU, and an instance cannot close itself: this call would \
+                     never return and whatever you were about to report would be lost. Finish \
+                     your turn and let whoever spawned you close you."
+                ))
+            }
+            // Dedup: "40" and "claude#40" are one row, and asking Mulpex to close
+            // it twice would report the second attempt as "no claude#40 is open".
+            Address::Local(id) => {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// One `to` entry as text. A model writes an instance number as a JSON number as
+/// often as a string, and both mean the same row.
+fn address_word(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
+}
+
 // ---- terminals ------------------------------------------------------------
 //
 // Mulpex owns the PTYs, so creating a terminal or typing into one is a file
@@ -1105,7 +1275,13 @@ fn read_prefix(path: &Path, n: usize) -> Option<Vec<u8>> {
 }
 
 /// Post a request to Mulpex's poll loop and wait for its reply.
-fn terminal_request(ctx: &Ctx, body: Value) -> Result<Value, String> {
+///
+/// The directory is still called `termreq` because terminals were the first thing
+/// to need it; it is the general "ask the app to do something to a row" channel,
+/// and `hub_close` rides it too. The name is a wire format shared with a second
+/// process (and a third — the `mpx` daemon reads the same dir), so it is left
+/// alone rather than renamed for tidiness.
+fn app_request(ctx: &Ctx, body: Value) -> Result<Value, String> {
     let dir = ctx.state_dir.join("termreq");
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not reach Mulpex: {e}"))?;
     // The stamp leads the name so the poll loop's plain filename sort is time
@@ -1231,7 +1407,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
             id
         }
         None => {
-            let reply = terminal_request(
+            let reply = app_request(
                 ctx,
                 json!({
                     "op": "open",
@@ -1373,7 +1549,7 @@ fn launch_into_existing(ctx: &Ctx, id: usize, command: &str) -> Result<(), Strin
              with wait_ms), or call hub_remote_open without 'terminal_id'."
         ));
     }
-    terminal_request(
+    app_request(
         ctx,
         json!({ "op": "send", "from": ctx.instance, "id": id,
                 "data": format!("{command}\r") }),
@@ -1406,7 +1582,7 @@ fn hub_terminal_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         None => (None, None),
     };
 
-    let reply = terminal_request(
+    let reply = app_request(
         ctx,
         json!({ "op": "open", "from": ctx.instance, "seed": seed, "label": label }),
     )?;
@@ -1521,7 +1697,7 @@ fn hub_terminal_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
         Mark::Keep => {}
     }
 
-    terminal_request(
+    app_request(
         ctx,
         json!({ "op": "send", "from": ctx.instance, "id": id, "data": data }),
     )?;
@@ -2066,7 +2242,7 @@ fn hub_terminal_name(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .ok_or("missing 'name' — a short label for the sidebar row.")?;
     let name = summarize(name);
-    terminal_request(
+    app_request(
         ctx,
         json!({ "op": "name", "from": ctx.instance, "id": id, "label": name }),
     )?;
@@ -2084,7 +2260,7 @@ fn hub_terminal_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .get("id")
         .and_then(|x| x.as_u64())
         .ok_or("missing 'id' — the terminal to close.")? as usize;
-    terminal_request(ctx, json!({ "op": "close", "from": ctx.instance, "id": id }))?;
+    app_request(ctx, json!({ "op": "close", "from": ctx.instance, "id": id }))?;
     Ok(json!({ "ok": true, "terminal_id": id, "note": "Terminal closed." }).to_string())
 }
 
@@ -2580,6 +2756,49 @@ mod tests {
                 || std::fs::read_dir(dir.join("termreq")).unwrap().next().is_none(),
             "a refused launch still asked Mulpex to open a terminal"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- hub_close -----------------------------------------------------------
+
+    /// The refusals `hub_close` decides for itself, before Mulpex is asked
+    /// anything — and the fact that each one aborts the WHOLE call. A partial
+    /// close would be the worse answer: the caller wrote one argument and would
+    /// get back some rows gone and some not, with no way to tell which attempt
+    /// the error belonged to.
+    #[test]
+    fn hub_close_refuses_self_all_and_other_projects() {
+        let dir = std::env::temp_dir().join(format!("mulpex-close-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let err = |to: Value| close_targets(&ctx, &json!({ "to": to })).unwrap_err();
+
+        assert!(err(json!("claude#3")).contains("cannot close itself"));
+        // A model writes an id as a bare number as often as a string, and both
+        // name the same row — so both must hit the same refusal.
+        assert!(err(json!(3)).contains("cannot close itself"));
+        assert!(err(json!("all")).contains("not accepted"));
+        assert!(err(json!("central-one#3")).contains("ANOTHER project"));
+        assert!(err(json!("term#4")).contains("terminal"));
+        assert!(err(json!({})).contains("not an address"));
+        assert!(close_targets(&ctx, &json!({})).unwrap_err().contains("missing 'to'"));
+        // One bad entry fails the batch rather than closing the good ones.
+        assert!(err(json!(["4", "claude#3"])).contains("cannot close itself"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `"40"` and `"claude#40"` are one row. Left undeduped, Mulpex would be
+    /// asked to close it twice and would answer the second attempt with
+    /// "no claude#40 is open" — a refusal reported for a close that worked.
+    #[test]
+    fn hub_close_dedups_the_same_instance_written_two_ways() {
+        let dir = std::env::temp_dir().join(format!("mulpex-close-dedup-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 1);
+        let ids = close_targets(&ctx, &json!({ "to": ["40", "claude#40", 41] })).unwrap();
+        assert_eq!(ids, vec![40, 41]);
+        assert_eq!(close_targets(&ctx, &json!({ "to": 40 })).unwrap(), vec![40]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -280,6 +280,66 @@ fn apply(
                 None => (json!({ "ok": false, "error": format!("no term#{id}") }), false),
             }
         }
+        // `hub_close` — close claude rows, the inverse of `hub_spawn`. Ids are
+        // decided one at a time and reported individually: a batch cleaning up six
+        // workers must not lose the five it can close because the sixth is still
+        // mid-turn.
+        //
+        // Nothing prunes the store here. `restore::records` derives it from the
+        // live window list every tick, so a killed window leaves it on its own.
+        "close_instance" => {
+            let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
+            let ids: Vec<usize> = v
+                .get("ids")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_u64()).map(|n| n as usize).collect())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return (json!({ "ok": false, "error": "missing 'ids'" }), false);
+            }
+            let mut closed: Vec<usize> = Vec::new();
+            let mut refused: Vec<Value> = Vec::new();
+            for id in ids {
+                let Some(i) = p.find(id) else {
+                    refused.push(json!({
+                        "id": id,
+                        "reason": format!("no claude#{id} is open — it may already have been closed."),
+                    }));
+                    continue;
+                };
+                if i.is_shell() {
+                    refused.push(json!({
+                        "id": id,
+                        "reason": format!(
+                            "term#{id} is a terminal, not a claude — close it with hub_terminal_close."
+                        ),
+                    }));
+                    continue;
+                }
+                if !force {
+                    if let Some(reason) = mulpex_core::close_busy_reason(&p.state_dir, id) {
+                        refused.push(json!({ "id": id, "reason": reason }));
+                        continue;
+                    }
+                }
+                // Same order as the terminal close above, and for the same measured
+                // reason: collect the pids BEFORE `kill-window` releases the pty,
+                // or a `nohup`'d job survives with nothing left to ask about it.
+                let ttys = t.display(&i.pane, "#{pane_tty}").map(|s| vec![s]).unwrap_or_default();
+                let doomed = crate::sweep::pids_to_sweep(&ttys);
+                let r = t.kill_window(&i.window);
+                crate::sweep::kill_pids(&doomed);
+                match r {
+                    Ok(()) => closed.push(id),
+                    Err(e) => refused.push(json!({
+                        "id": id,
+                        "reason": format!("claude#{id} could not be closed: {e}"),
+                    })),
+                }
+            }
+            let changed = !closed.is_empty();
+            (json!({ "ok": true, "closed": closed, "refused": refused }), changed)
+        }
         other => (json!({ "ok": false, "error": format!("unknown op: {other}") }), false),
     }
 }

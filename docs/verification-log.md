@@ -1468,3 +1468,44 @@ tab-separated format whose last field is empty ends its line with a tab. Only th
 it, so that one row came back one field short and was silently dropped — and the row in question was
 the claude pane, whose `@mpx_restored` is empty precisely when it is a fresh spawn. It read exactly
 like "the project opened with no claude". `rstrip("\n")`, never `.strip()`.
+
+## `hub_close` (2026-09-08)
+
+### Driven
+
+- **The tool is exposed.** `tools/list` from the real `mulpex-helper mcp` binary lists `hub_close`
+  between `hub_spawn` and `hub_remote_open`, with the schema as written. Not inferred from the
+  source — the built helper was run and its stdout read.
+- **The caller-side refusals refuse, and queue nothing.** Real helper process, `MULPEX_INSTANCE_ID=3`:
+  `to: "claude#3"`, `to: "all"` and `to: "monorepo#7"` each come back `isError: true` with their
+  own reason, and `termreq/` is empty afterwards. That last part is the assertion that matters — a
+  request written on the way to a refusal would be applied later by a poll loop that never sees the
+  reasoning.
+- **The wire format between the two processes.** `to: ["7", "claude#7", 8]` queues exactly
+  `{"force":false,"from":3,"ids":[7,8],"op":"close_instance"}` — deduped, and the same shape
+  `state.rs::apply_terminal_request` parses in the passing app test. With nothing listening the
+  call ends in `Mulpex did not respond`, not a hang.
+- **The app half, against real sessions** (`close_instance_closes_idle_claudes_and_refuses_the_rest`):
+  two spawned claudes and one terminal; the idle claude closes, the busy one is refused **and is
+  still alive afterwards**, the terminal is refused with `hub_terminal_close` named in the reason,
+  an unknown id is refused, `force: true` then closes the busy one, and both rows disappear on the
+  next reap.
+
+### NOT driven
+
+- **The `mpx` (tmux) side.** `mulpex-cli/src/terminals.rs` mirrors the desktop arm and shares
+  `close_busy_reason`, and it compiles, but `mulpex-cli` has no tmux fixture and no live daemon was
+  driven. Unverified.
+- **Live in the shipped app.** Everything above ran against the debug build; the running Mulpex is
+  an older release and was deliberately not restarted.
+
+### A probe bug worth recording
+
+**The helper drops a tool-call reply if stdin closes immediately after the call.** `mcp::run`
+handles each `tools/call` on its own thread and returns as soon as `stdin.lock().lines()` ends,
+without joining `workers` — so a piped probe (`printf … | mulpex-helper mcp`) gets the `initialize`
+reply and *nothing else*, for every tool, including ones that were working perfectly. It reads
+exactly like "the new tool is not wired up". Keep stdin open (`{ printf …; sleep 8; }`) and the
+replies arrive. In production `claude` holds stdin open for the life of the instance, so this only
+bites at shutdown — where the side effect still happens and only the reply is lost. Left as-is;
+recorded so the next probe does not re-diagnose it.

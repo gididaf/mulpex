@@ -409,3 +409,61 @@ cargo test --lib -- --ignored --exact \
 Confirmed non-vacuous: with the `cmd.arg(prompt)` line removed it fails, reporting the
 append-system-prompt as the last argument instead of the task.
 
+
+## Closing instances (`hub_close`)
+
+The inverse of `hub_spawn`, and it exists for the same workflow: an orchestrator that fans six
+workers out could create them but not clean them up, so a finished fan-out left six idle rows for
+the user to close by hand. It rides the **same request channel** `hub_terminal_close` uses —
+`state_dir/termreq/<token>.json` → poll loop → `<token>.done` — because the helper is a separate
+process and cannot touch a PTY. (`mcp::terminal_request` is now `app_request` for that reason; the
+directory keeps its old name, which is a wire format three processes agree on rather than a
+description of what rides it. The `mpx` daemon reads the same dir and applies the same op in
+`mulpex-cli/src/terminals.rs`.)
+
+**Two halves of the decision, on two sides, on purpose.**
+
+- **The helper decides caller errors**, and any one of them aborts the whole call with nothing
+  queued: a malformed address, `"all"`, a `<project>#<n>` from another project, and closing
+  yourself. `close_targets` is split out and pure precisely so those can be tested without a
+  Mulpex on the other end — a request file written on the way to a refusal would be applied later
+  by a poll loop that never sees the reasoning. `"40"` and `"claude#40"` dedup to one id, or the
+  second attempt would come back as "no claude#40 is open" — a refusal reported for a close that
+  worked.
+- **The app decides everything about live state**, per id, and reports it: not open, is a terminal
+  (pointed at `hub_terminal_close`), or busy. A partly-refused batch is still `ok: true` at the
+  request layer — the refusals are a *report*. Only `hub_close` itself turns an **all**-refused
+  batch into a tool error, where nothing the caller asked for happened. Five workers must still
+  close when the sixth is mid-turn.
+
+**Self-close is refused, not deferred.** Killing the caller means the MCP call never returns: the
+instance is gone before it can say what it did, and whatever it was mid-way through reporting goes
+with it. An orchestrator closes its workers; a worker that has reported is closed by whoever
+spawned it.
+
+**Busy is `mulpex_core::close_busy_reason`, shared by both frontends** — a policy about when it is
+safe to kill someone's work must not exist in two copies that can drift. It checks the **delivery
+mark before the status**, and that order is the whole point: a just-spawned instance whose task is
+still in flight has written no status file, and a *missing* status file reads as `waiting` — the
+same word an idle instance gets (the `status_of` default trap again). By status alone, the moment a
+worker is least safe to close is indistinguishable from the moment it is most safe; `spawning/<id>`
+is what separates them. `needs` is deliberately **not** busy: an instance blocked on the user is
+going nowhere until someone answers it, which is exactly when closing it is the right call.
+`force: true` skips the check.
+
+Closing is `Core::close` — the same path ⌘W takes — so a closed instance's file locks release, its
+undelivered mail bounces back to its senders, and `closing` is what makes the killed claude
+*removable* by the next reap rather than kept as a failed start. Nothing prunes the store on
+either frontend: both derive it from the live session list every tick.
+
+Pinned by `mcp::hub_close_refuses_self_all_and_other_projects`,
+`mcp::hub_close_dedups_the_same_instance_written_two_ways`,
+`a_spawn_still_in_flight_is_busy_even_though_it_looks_idle` (the `waiting`-vs-in-flight case that
+motivates the check order) and `state::close_instance_closes_idle_claudes_and_refuses_the_rest`,
+which drives the whole handshake against real sessions: one idle claude closes, a busy one is
+refused *and left alive*, a terminal is refused with the tool that does close it, an unknown id is
+refused, and `force: true` then closes the busy one.
+
+**Not verified: the `mpx` (tmux) side.** It compiles and mirrors the desktop arm, and it shares
+`close_busy_reason`, but no test drives it — `mulpex-cli` has no tmux fixture, and this was not
+run against a live daemon.

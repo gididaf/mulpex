@@ -48,6 +48,13 @@ that it begins immediately. Use this to fan work out in parallel (e.g. one insta
 ticket/item). It returns the new instances' ids; each is told you spawned it and will hub_send \
 its result back to you when done. Max 8 per call — for more, call it again in batches, and prefer \
 spawning only as many as the work genuinely needs.\n\
+- mcp__mulpex__hub_close — close instances IN THIS PROJECT and remove their sidebar rows, the \
+inverse of hub_spawn. Clean up after fanning work out: once a worker has reported and gone idle, \
+close it rather than leaving a dead row for the user to tidy by hand. Pass to: \"40\", \
+\"claude#40\", or an array to close several. An instance that is mid-turn is REFUSED rather than \
+killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
+close YOURSELF (the call would never return), and you cannot close a row in another project. \
+Terminals are not instances: hub_terminal_close closes those.\n\
 OTHER PROJECTS — Mulpex can have several projects open at once, and the instances in them are \
 reachable by message. hub_instances lists them under other_projects with the exact address of \
 each one; address them <project>#<n> (e.g. \"central-one#3\") in hub_send's `to`, and a message \
@@ -60,8 +67,8 @@ SELF-CONTAINED: state the repo, quote the code or the interface rather than poin
 and say what you need in full. Use this when work genuinely spans both codebases (a shared API, \
 a contract both sides implement, a change that must land in step). Everything else stays \
 project-local: to: \"all\" broadcasts only within YOUR project, hub_spawn only creates instances \
-here, and you cannot read, edit or run anything over there — ask the instance that lives there \
-to do it.\n\
+here and hub_close only closes them here, and you cannot read, edit or run anything over there — \
+ask the instance that lives there to do it.\n\
 TERMINALS — Mulpex also hosts plain interactive shell terminals in this project, shown in its \
 sidebar next to the instances as term#1, term#2 …, and you can both create and drive them:\n\
 - mcp__mulpex__hub_terminal_open — open a NEW terminal, optionally starting a command in it. It \

@@ -24,7 +24,7 @@ reasoning in `docs/`.
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
-| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
+| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explainer.md](docs/explainer.md) | Hebrew turn-summary panel: Stop→`explainreq` handshake, pending questions + plans (`ExitPlanMode`, and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs::stop`/`askq`/`plan`, `ExplainerPanel.svelte`, turn extraction |
@@ -298,8 +298,8 @@ and cost real time; each links to the measurement that settled it.
   `nudges_welcome` — the arm nudge landing there is what made every instance open itself after an
   app update. The peer snapshot is the one deliberate exception, because a hub wake *is* a
   task-notification. → [docs/hub.md](docs/hub.md)
-- **`to: "all"` and locks stay project-local**, and `hub_spawn` only creates instances in its own
-  project. Only `hub_send`/`hub_inbox`/`hub_instances` cross the boundary.
+- **`to: "all"` and locks stay project-local**, and `hub_spawn`/`hub_close` only create and close
+  instances in their own project. Only `hub_send`/`hub_inbox`/`hub_instances` cross the boundary.
   → [docs/hub.md](docs/hub.md)
 
 ## How this codebase fails

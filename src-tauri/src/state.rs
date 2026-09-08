@@ -784,9 +784,14 @@ impl Core {
         spawned_any
     }
 
-    /// Fulfil the terminal requests instances left on disk (`hub_terminal_open` /
-    /// `_send` / `_close`): apply each one, then write a `<token>.done` reply the
-    /// waiting MCP tool reads. Returns whether a terminal was created or removed.
+    /// Fulfil the row requests instances left on disk (`hub_terminal_open` /
+    /// `_send` / `_close`, and `hub_close`): apply each one, then write a
+    /// `<token>.done` reply the waiting MCP tool reads. Returns whether a row was
+    /// created or removed.
+    ///
+    /// The dir is `termreq` because terminals were the first thing to need this
+    /// channel; it now carries instance ops too, and the name is a wire format the
+    /// helper agrees on rather than a description of the contents.
     ///
     /// Deliberately its own queue rather than sharing `process_spawn_requests`'
     /// drip-feed: that one is paced by `SPAWN_STAGGER` because concurrent `claude`
@@ -969,6 +974,62 @@ impl Core {
                         false,
                     ),
                 }
+            }
+            // `hub_close` — close claude rows, the inverse of `hub_spawn`. Ids are
+            // decided one at a time and reported individually: a batch cleaning up
+            // six workers must not lose the five it can close because the sixth is
+            // still mid-turn.
+            "close_instance" => {
+                let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
+                let ids: Vec<usize> = v
+                    .get("ids")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|n| n.as_u64()).map(|n| n as usize).collect())
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    return (
+                        serde_json::json!({ "ok": false, "error": "missing 'ids'" }),
+                        false,
+                    );
+                }
+                let mut closed: Vec<usize> = Vec::new();
+                let mut refused: Vec<serde_json::Value> = Vec::new();
+                for id in ids {
+                    // Resolved to a plain bool before any mutation, so the
+                    // immutable borrow is gone by the time `close` needs `&mut`.
+                    let is_shell = self.sessions.iter().find(|s| s.id == id).map(|s| s.is_shell());
+                    match is_shell {
+                        None => refused.push(serde_json::json!({
+                            "id": id,
+                            "reason": format!(
+                                "no claude#{id} is open — it may already have been closed."
+                            ),
+                        })),
+                        Some(true) => refused.push(serde_json::json!({
+                            "id": id,
+                            "reason": format!(
+                                "term#{id} is a terminal, not a claude — close it with \
+                                 hub_terminal_close."
+                            ),
+                        })),
+                        Some(false) => match mulpex_core::close_busy_reason(&self.state_dir, id)
+                            .filter(|_| !force)
+                        {
+                            Some(reason) => {
+                                refused.push(serde_json::json!({ "id": id, "reason": reason }))
+                            }
+                            None => {
+                                self.close(id);
+                                closed.push(id);
+                            }
+                        },
+                    }
+                }
+                let changed = !closed.is_empty();
+                (
+                    serde_json::json!({ "ok": true, "closed": closed, "refused": refused }),
+                    changed,
+                )
             }
             other => (
                 serde_json::json!({ "ok": false, "error": format!("unknown op: {other}") }),
@@ -4118,6 +4179,84 @@ mod tests {
         core.process_terminal_requests();
         assert_eq!(reply(&t)["ok"], true);
         assert!(wait_until(|| core.reap_dead() == vec![id]));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `hub_close`'s end of that same handshake.
+    ///
+    /// The point of the assertions below is the BATCH: an orchestrator cleaning
+    /// up six workers must not lose the five it can close because the sixth is
+    /// mid-turn. So every id is decided on its own and reported on its own, and
+    /// a request that refuses some of its targets is still `ok` — the refusals
+    /// are a report, not a failure. Only `hub_close` itself turns an all-refused
+    /// batch into an error, where nothing the caller asked for happened.
+    #[test]
+    fn close_instance_closes_idle_claudes_and_refuses_the_rest() {
+        let (_env, root, mut core) = scratch_core("close-req-test");
+        let dir = core.state_dir.join("termreq");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let post = |body: serde_json::Value| {
+            let token = persist::new_uuid();
+            std::fs::write(dir.join(format!("{token}.json")), body.to_string()).unwrap();
+            token
+        };
+        let reply = |token: &str| -> serde_json::Value {
+            let p = dir.join(format!("{token}.done"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let reason = |r: &serde_json::Value, id: usize| -> String {
+            r["refused"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"].as_u64() == Some(id as u64))
+                .unwrap_or_else(|| panic!("#{id} was neither closed nor refused: {r}"))["reason"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let idle = core.spawn_instance().unwrap().id;
+        let busy = core.spawn_instance().unwrap().id;
+        let t = post(serde_json::json!({ "op": "open", "from": 1, "label": "shell" }));
+        core.process_terminal_requests();
+        let term = reply(&t)["id"].as_u64().unwrap() as usize;
+
+        // What a mid-turn instance looks like on disk: the word its hook writes.
+        std::fs::write(core.state_dir.join(busy.to_string()), "working").unwrap();
+
+        let t = post(serde_json::json!({
+            "op": "close_instance", "from": 1, "ids": [idle, busy, term, 999],
+        }));
+        assert!(core.process_terminal_requests());
+        let r = reply(&t);
+        assert_eq!(r["ok"], true, "a partly-refused batch is still a served request");
+        assert_eq!(r["closed"], serde_json::json!([idle]));
+        assert!(reason(&r, busy).contains("mid-turn"));
+        assert!(
+            reason(&r, term).contains("hub_terminal_close"),
+            "a terminal must be refused with the tool that DOES close it"
+        );
+        assert!(reason(&r, 999).contains("no claude#999"));
+
+        // The busy one is untouched: refusing has to mean not killing it.
+        assert!(core.sessions.iter().any(|s| s.id == busy && s.is_alive()));
+
+        let t = post(serde_json::json!({
+            "op": "close_instance", "from": 1, "ids": [busy], "force": true,
+        }));
+        core.process_terminal_requests();
+        assert_eq!(reply(&t)["closed"], serde_json::json!([busy]));
+
+        // Both rows actually go away — `closing` is what makes a killed claude
+        // removable rather than kept as a failed start.
+        assert!(wait_until(|| {
+            core.reap_dead();
+            !core.sessions.iter().any(|s| s.id == idle || s.id == busy)
+        }));
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
