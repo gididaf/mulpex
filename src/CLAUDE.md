@@ -3,9 +3,11 @@
 Root rules: [../CLAUDE.md](../CLAUDE.md). Two things here are permanent-damage classes, so read the
 doc *before* the code:
 
-- **Never reintroduce the WebGL renderer**, and don't touch the `display: inline !important` rule on
-  `.xterm-rows span` in `styles.css`. Either one silently breaks Hebrew (the user works in Hebrew).
-  → [../docs/rendering.md](../docs/rendering.md)
+- **Never reintroduce the WebGL renderer**, and don't touch either RTL rule in `styles.css` —
+  `display: inline !important` on `.xterm-rows span` (words) or `unicode-bidi: plaintext` on
+  `.xterm-rows > div` (sentences). Any of the three silently breaks Hebrew, and they fix *different*
+  layers, so the pane can look half-right. The `plaintext` rule must stay on the row divs; on
+  `.xterm-rows` it does nothing. → [../docs/rendering.md](../docs/rendering.md)
 - **An xterm must never be built at a size that disagrees with its PTY.** `terminals.setGeometry()`
   runs before any `TerminalView` mounts, and resize is workspace-wide. Debris from a mismatch is
   permanent. → [../docs/rendering.md](../docs/rendering.md)

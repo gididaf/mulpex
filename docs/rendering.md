@@ -79,7 +79,7 @@ session + backend PTY (all PTYs share one size, as the TUI did) via a single wor
 different size is corrupted **permanently**, so the sizes are also matched before a terminal is
 ever attached — see **One geometry, or the pane is corrupted forever**.
 
-## RTL (Hebrew/Arabic) — two separate fixes, both load-bearing
+## RTL (Hebrew/Arabic) — three separate fixes, all load-bearing
 
 Terminals use xterm's **DOM renderer**. The WebGL addon was removed for this fix and **must not
 come back for speed** — it draws one glyph quad per cell, so column *n* always gets character *n* and
@@ -87,9 +87,8 @@ RTL text renders mirrored (Hebrew read backwards). The DOM renderer emits each s
 `<span>` of real text and the **browser's own BiDi engine** reorders it for free. Measured, same
 frame through the app's xterm 5.5.0 in headless Chrome: DOM → `שלום זאת בדיקה`, WebGL →
 `הקידב תאז םולש` (the reported bug, reproduced). xterm has **no BiDi of its own** (`grep -c
-"bidi\|rtl"` on `lib/xterm.js` is 0), so the browser is the only implementation available; a
-`unicode-bidi: plaintext` CSS override on the rows changes nothing (already the default behavior),
-and `direction: rtl` flips the box-drawing borders and is unusable. Dropping the addon also
+"bidi\|rtl"` on `lib/xterm.js` is 0), so the browser is the only implementation available, and
+`direction: rtl` flips the box-drawing borders and is unusable. Dropping the addon also
 deleted the GL-context juggling (attach-on-focus / dispose-on-blur, since browsers cap live
 contexts) and cut ~100 kB from the JS bundle.
 
@@ -103,6 +102,30 @@ required — the injected rule is more specific and lands in `<head>` later). Me
 row: `inline-block` → first word leftmost; `inline` → whole run mirrored, correct. `inline` rather
 than `display: contents` on purpose — the span keeps its box, so background colors, the block
 cursor and wide-char widths still paint (CJK/emoji x-positions verified byte-identical).
+
+**And that only fixed the words.** The *sentence* was still wrong whenever Hebrew and Latin shared
+a line, which for this user is most of them — every question, log line and status carries an English
+identifier. A row is a block box with the default `direction: ltr`, i.e. an **LTR paragraph**, so
+BiDi lays its runs out left-to-right in logical order: each Hebrew run internally perfect, the runs
+themselves in the wrong half of the line. Measured on a real `AskUserQuestion` picker,
+`הכרטיס של גישת התמיכה ל-VM עדיין מסומן PAUSED מ-7 בספטמבר — …?` came out as
+`[הכרטיס…ל][-VM][עדיין מסומן][PAUSED][מ-7 בספטמבר][?]` left to right — read from the right edge,
+the sentence runs backwards a phrase at a time, which is harder to read than mirrored letters ever
+was. `src/styles.css` fixes it with **`unicode-bidi: plaintext` on `.xterm-rows > div`**, which
+takes each row's base direction from its first strong character.
+
+Two things about that rule. It must land on **the row divs, not `.xterm-rows`** — the bidi
+paragraphs are the rows, so the container form is a silent no-op (this doc claimed for a while that
+`plaintext` "changes nothing"; that was the container form being measured). And it is deliberately
+a no-op for everything else: a Latin-first row, and a `────` rule with no strong character at all,
+render byte-identically. The accepted cost is that a Hebrew-first row is a real RTL paragraph, so
+its `❯ 1.` marker, `│` gutter and indentation sit on the right — correct RTL typography, but Claude
+Code's mixed lists then carry markers on both sides.
+
+**Do not "fix" this from the emitting side with bidi isolates.** `U+2068`/`U+2069` reorder
+correctly but occupy **a full cell each** in xterm (`getWidth() === 1`, measured), invisible but
+column-eating, so every box border on the line shifts. LRM/RLM are zero-width and cannot help —
+paragraph direction comes from CSS, not from the byte stream.
 
 How this was found, for the next RTL bug: a Python `pty.fork()` harness drove a real `claude`,
 typed the sentence keystroke-by-keystroke and captured the raw bytes; those bytes were replayed

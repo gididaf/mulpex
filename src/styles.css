@@ -67,3 +67,33 @@ button {
 .xterm-rows span {
   display: inline !important;
 }
+
+/* RTL, part two: give each ROW its own base direction instead of a hardcoded LTR.
+ *
+ * The rule above fixes the letters and the words. It does not fix the *sentence*: a row
+ * is a block box with the default `direction: ltr`, so it is an LTR paragraph, and BiDi
+ * lays its runs out left-to-right in logical order. Each Hebrew run is internally
+ * correct and the runs themselves are in the wrong half of the line, which is far more
+ * confusing than mirrored text — a Hebrew reader starting at the right edge reads the
+ * sentence's *last* run first. Measured on a real Claude Code AskUserQuestion picker
+ * (captured off a live claude on a PTY, replayed through this build in headless Chrome,
+ * x-position per character) for
+ *   "הכרטיס של גישת התמיכה ל-VM עדיין מסומן PAUSED מ-7 בספטמבר — הספקת…?"
+ *   ltr (default) → [הכרטיס…ל][-VM][עדיין מסומן][PAUSED][מ-7 בספטמבר][?]  left to right
+ *   plaintext     → the whole sentence, right to left, ל-VM welded correctly
+ * `plaintext` takes each row's direction from its first strong character, so it is a
+ * no-op for every Latin-first row — English prose, code, logs, and a pure `────` rule
+ * (no strong character at all) are byte-identical. Only Hebrew/Arabic-first rows move.
+ *
+ * `direction: rtl` also reads correctly and is NOT usable: it flips the whole grid,
+ * box-drawing borders included.
+ *
+ * Accepted cost: a Hebrew-first row is a real RTL paragraph, so its leading structure —
+ * `❯ 1.` markers, the `│` gutter bar, indentation — sits at the right. That is correct
+ * RTL typography, but in a list Claude Code renders half in Hebrew and half in English
+ * ("4. Type something.") the markers end up on both sides.
+ *
+ * No `!important`: nothing injects a competing `unicode-bidi`, unlike `display` above. */
+.xterm-rows > div {
+  unicode-bidi: plaintext;
+}

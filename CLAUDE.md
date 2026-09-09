@@ -272,9 +272,11 @@ and cost real time; each links to the measurement that settled it.
   every project spawns at, and the frontend adopts it *before* any `TerminalView` mounts. Resize is
   workspace-wide, never per project. → [docs/rendering.md](docs/rendering.md)
 - **The WebGL renderer must not come back.** It draws one glyph quad per cell, so RTL text renders
-  mirrored. The DOM renderer plus a `display: inline !important` override on `.xterm-rows span` is
-  what makes Hebrew read correctly, and the user works in Hebrew. Not negotiable for speed.
-  → [docs/rendering.md](docs/rendering.md)
+  mirrored. Hebrew reads correctly only with all three of: the DOM renderer, `display: inline
+  !important` on `.xterm-rows span` (letters → words), and `unicode-bidi: plaintext` on
+  `.xterm-rows > div` (words → sentences — a per-row base direction instead of a hardcoded LTR one).
+  They fix different layers, so dropping one leaves the pane half-right. The user works in Hebrew;
+  none of it is negotiable for speed. → [docs/rendering.md](docs/rendering.md)
 - **Never break the signing identity.** TCC folder grants are pinned to the bundle's designated
   requirement. The self-signed certificate at `~/.mulpex/signing/` (and `~/.mulpex/updater.key`) are
   as load-bearing as the source: lose either and every user's folder permissions reset, or no

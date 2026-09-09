@@ -1509,3 +1509,61 @@ exactly like "the new tool is not wired up". Keep stdin open (`{ printf …; sle
 replies arrive. In production `claude` holds stdin open for the life of the instance, so this only
 bites at shutdown — where the side effect still happens and only the reply is lost. Left as-is;
 recorded so the next probe does not re-diagnose it.
+
+## Bidi: the sentence, not the letters (2026-09-09)
+
+Reported second-hand by a claude in another project: a Claude Code `AskUserQuestion` picker whose
+question is Hebrew with English identifiers in it renders unreadably; Hebrew alone is fine. The
+guess in the report was "xterm has no bidi". It does not, but bidi was not what was missing.
+
+### Driven
+
+- **The base direction was the whole bug.** Nothing in the app sets `direction` or `unicode-bidi`
+  on the rows, so every row is an **LTR paragraph**. Real xterm 5.5.0 in headless Chrome, each
+  character's x measured with `Range.getBoundingClientRect` (never read off a screenshot — see the
+  RTL note in [rendering.md](rendering.md)), Hebrew letters mapped to order-preserving Latin so the
+  report itself cannot be re-bidi'd. For the reported sentence the visual order is
+  `[הכרטיס…ל][-VM][עדיין מסומן][PAUSED][מ-7 בספטמבר][?]` **left to right** — every Hebrew run
+  internally correct, the runs in the wrong half of the line. Read from the right edge that is
+  exactly the scramble reported, `?` first.
+- **On the real thing, not a mock.** A live `claude` was driven on a PTY at 120x32 until it rendered
+  an actual `AskUserQuestion` picker with that question (`scratchpad/bidi-repro/`, modelled on the
+  geometry harness), and those 13382 bytes were replayed into this build. With
+  `unicode-bidi: plaintext` per row: the question row reads right-to-left correctly end to end,
+  `ל-VM` and `ה-VM` weld to the right word, `'waiting for claude'` sits at the end of its
+  description instead of the start. The `────` separators, `4. Type something.` and the
+  `Enter to select · …` hint are **byte-identical** in both modes.
+- **`plaintext` is a no-op unless a row starts with a strong RTL character.** Measured:
+  `╭── Still paused ──╮` and `Ticket עדיין is PAUSED` (Latin first) render identically with and
+  without it. A pure box-drawing rule has no strong character at all and stays LTR.
+- **`direction: rtl` also reads correctly** and stays rejected: it flips the entire grid.
+- **The cost, measured and accepted:** a Hebrew-first row becomes a real RTL paragraph, so its
+  leading `❯ 1.`, `│` and indentation move to the right edge. In a list Claude Code renders half in
+  Hebrew and half in English the markers therefore land on both sides. Gidi chose this over a
+  toggle.
+
+### Bidi isolates are a trap in a terminal
+
+`U+2068 FSI` / `U+2069 PDI` **do** fix the ordering from the content side — wrapping the Latin runs
+made the whole line lay out as one correct RTL run even under an LTR paragraph. They are still the
+wrong answer: measured on `@xterm/headless` 5.5.0, each isolate lands in **its own cell with
+`getWidth() === 1`**. It draws nothing (the browser renders it zero-width), so it does not show up
+as a visible box — it silently eats a column, and both xterm's wrapping and Ink's own width math on
+the emitting side count it. `U+200E/U+200F` (LRM/RLM) and `U+200B` are free by comparison (merged
+into the previous cell at width 0) but cannot help: paragraph direction comes from CSS, not from
+content, so no character the emitter inserts can set it. Measured — RLM after each Latin run left
+the line messier than before.
+
+### A harness note
+
+The obvious `unicode-bidi: plaintext` on `.xterm-rows` **does nothing**, which is what the earlier
+RTL work recorded as "changes nothing (already the default behavior)". The bidi paragraphs are the
+**row divs**, not their container, so the property has to land on `.xterm-rows > div`. The first
+measurement of this bug repeated the same mistake and produced a clean "no effect" result.
+
+### Not verified
+
+- **Live in the shipped `.app`.** `npm run build` only; Mulpex was not restarted (the user is
+  working inside it).
+- **Arabic**, and any row mixing RTL text with the *cursor* — the caret is still column-based, the
+  residual limit already recorded in [rendering.md](rendering.md).
