@@ -34,8 +34,8 @@ against the *local* hub:
   is absent at startup, so restored instances re-arm on their first prompt. The full arming
   procedure + exact Monitor command still live in `HUB_RULES` (append-system-prompt, so the wake→act
   contract survives compaction). *(`hub_spawn` children are the one case that still gets an injected
-  PTY prompt — their assigned task — via `pty.rs::spawn_prompt`; they arm the listener from the
-  same hook on that first turn.)*
+  PTY prompt — their assigned task — via `mulpex-core`'s `rules.rs::spawn_prompt`; they arm the
+  listener from the same hook on that first turn.)*
 - **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
   autonomously, replies to the sender only when it adds value (no bare acks), and prefixes the
   self-triggered turn with a `⟳ hub message from <sender> →` marker so the human can tell it
@@ -267,7 +267,7 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   would stall every project's UI. Staggering exists because N simultaneous `claude` cold starts
   contend hard enough that a cold start can take tens of seconds (which used to blow the
   injection deadline; it now only delays the first turn).
-- **Seeding + link:** the child's first prompt (`pty.rs::spawn_prompt`, passed as argv) is just the task:
+- **Seeding + link:** the child's first prompt (`rules.rs::spawn_prompt` in `mulpex-core`, passed as argv) is just the task:
   start it, then `hub_send` a summary back to the spawner when done (listener arming is *not* in
   this prompt — it comes from the `UserPromptSubmit` hook like every instance). Still
   `[mulpex:hub]`-sentinel-prefixed (skips the sidebar task-capture) and a single line (task

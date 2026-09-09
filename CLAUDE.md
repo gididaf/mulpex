@@ -47,7 +47,12 @@ reused unchanged.
 crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim from the TUI)
                       + termlog (the terminal-transcript header, written by the app and
                         parsed by the helper — the one format both processes must agree on)
+                      + rules (HUB_RULES/PLANNING_RULES/spawn_prompt) and state_dir
+                        (the scratch-dir layout) — the two things a second host would
+                        otherwise copy, so they live here and must stay byte-identical
 crates/mulpex-helper/ bin: `hook <event>` / `mcp` dispatch → mulpex-core
+crates/mulpex-cli/    bin `mpx`: the SECOND host — Mulpex over tmux, for working via ssh
+                      (see "Two hosts, one core" below)
 src-tauri/            the Tauri app (Rust backend)
   src/pty.rs          Session = one claude OR one shell on a PTY (SessionKind), streaming
                       to a frontend Channel
@@ -81,6 +86,43 @@ docs/                 the deferred half of these notes — see the table above
 
 `src/`, `src-tauri/` and `crates/mulpex-core/` each hold a short `CLAUDE.md` router listing the
 `docs/` pages and the directory-local traps that apply when you're editing there.
+`crates/mulpex-cli/` has none — its module doc-comments carry that weight instead, starting with
+`main.rs`.
+
+## Two hosts, one core
+
+There are now **two** frontends over the same coordination hub, and a change to shared behavior has
+to be considered in both:
+
+- **The desktop app** (`src-tauri/` + `src/`) — this document's main subject.
+- **`mpx`** (`crates/mulpex-cli/`) — Mulpex in a terminal, for working over ssh. **tmux owns every
+  PTY**, so the binary has no VT emulation, key encoding, scrollback or mouse handling; it arranges
+  panes (`[ sidebar | instance ]` per window, project tabs on top) rather than painting them, and
+  `sidebar.rs` is the only part that draws. Its own `~/.mulpex-cli` home, its own state dirs.
+
+What they share is `mulpex-core`, and the sharing is the point: the hub, the hook, `persist`, and —
+since the rules/state_dir move — the append-system-prompt text and the scratch-dir layout too.
+**`HUB_RULES` must be byte-identical across hosts, not merely equivalent**: it contains the exact
+Monitor command an instance arms, and `hook.rs`'s arm nudge gates on the `touch` that command
+performs, so a copy that drifted by one character would re-nudge every instance forever.
+
+Two traps that only exist because there are two hosts:
+
+- **They must never share a session store.** `SessionStore::new` resolves its home through the
+  process-wide `MULPEX_HOME`, which `mpx` deliberately does not set — so a store opened with `new`
+  from `mpx` lands in the *app's* `~/.mulpex/sessions/` and hands the same `--resume` uuid to two
+  claudes. Use `SessionStore::in_home` with an explicit home; that is what makes it impossible
+  rather than merely documented.
+- **RTL is solved twice, differently, and neither fix reaches the other.** The app leans on the
+  browser's BiDi engine (`docs/rendering.md`); `mpx` reorders logical→visual *itself*
+  (`mulpex-cli/src/bidi.rs`) because iTerm2 does not implement the UBA — and it can only convert
+  text `mpx` prints, never `claude`'s own output or what the user types, since those bytes pass
+  through tmux without `mpx` seeing them. `MPX_BIDI=off/on` overrides the auto-detect, and on a
+  terminal that *does* implement the UBA the fix would be the bug.
+
+`mpx`'s measured behavior — the tmux key scheme, restore across `mpx down`, the picker, the
+messages feed — is recorded in [docs/verification-log.md](docs/verification-log.md), not in a
+`docs/` page of its own.
 
 ## The helper (why it's a separate binary)
 
@@ -92,8 +134,8 @@ must be tiny and fast to exec. It links only `mulpex-core` (~1.8 MB vs the ~29 M
 **Path resolution** (`lib.rs::resolve_helper_path`): `current_exe().parent().join("mulpex-helper")`
 — works in `tauri dev` (`target/<profile>/`) and in the bundled `.app` (`Contents/MacOS/`). The
 absolute path is substituted for `__MULPEX_BIN__` in the config templates **before every spawn**,
-not just when a project opens (`state.rs::write_state_dir`) — the scratch dir lives in `$TMPDIR`
-and macOS purges it out from under a long-running Mulpex. See
+not just when a project opens (`mulpex-core`'s `state_dir.rs::write_state_dir`) — the scratch dir
+lives in `$TMPDIR` and macOS purges it out from under a long-running Mulpex. See
 [docs/sessions.md](docs/sessions.md#the-scratch-dir-is-rebuilt-before-every-spawn).
 
 Bundling it as a **signed sidecar** is what keeps hooks working in the shipped `.app` — an unsigned
@@ -349,4 +391,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`c7219c184575fc2b11c82d01cf1446c18effa58e` — 2026-09-03
+`30b0c9e0a937a2a5c1acdedf7f431124cd774501` — 2026-09-09

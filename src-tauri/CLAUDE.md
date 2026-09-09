@@ -45,5 +45,6 @@ Traps that live in this directory specifically:
   `$TMPDIR`, which macOS purges of untouched files every night, and `settings.json` / `mcp.json`
   being the only write-once files in the tree is exactly how a Mulpex left open over a long weekend
   lost the two files `claude --settings` needs — while every running instance carried on, so
-  nothing looked wrong until the next ⌘T. New scratch state goes in `state.rs::write_state_dir`,
+  nothing looked wrong until the next ⌘T. New scratch state goes in `mulpex-core`'s
+  `state_dir.rs::write_state_dir` (moved out of `state.rs` when `mpx` needed the same layout),
   which every spawn re-runs. → [../docs/sessions.md](../docs/sessions.md)
