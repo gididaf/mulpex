@@ -1,15 +1,19 @@
-//! The Explainer: after each claude turn ends, a cheap Sonnet call produces a
-//! very short, very simple **Hebrew** explanation of what that claude said, for
-//! the right-hand Explainer panel.
+//! The Explainer: **on demand** — when the user presses ⌘⇧E — a cheap Sonnet
+//! call produces a very short, very simple **Hebrew** explanation of what the
+//! focused claude is saying right now, for the right-hand Explainer panel.
 //!
-//! The turn-end signal is the `Stop` hook writing `explainreq/<id>` (the turn's
-//! transcript path — see `hook::write_explain_request`); the poll loop consumes
-//! it (`Core::take_explain_requests`) and hands the job here. Everything after
-//! that happens on this module's own worker threads: read the transcript,
-//! extract the finished turn's assistant text, run `claude -p --model sonnet`
-//! headless, append the result to the in-memory feed and emit `explain-update`.
-//! Nothing here may ever run inside a hook (a Stop hook blocks the claude's
-//! turn end) or block the 200 ms poll loop.
+//! Nothing here runs by itself. There is no hook, no request file and no poll
+//! handshake: ⌘⇧E calls `explain_now`, which finds that instance's transcript
+//! on disk (`transcript_path` — Claude Code keeps appending to
+//! `~/.claude/projects/<slug>/<session-uuid>.jsonl`, across `--resume`, and
+//! Mulpex already knows the uuid it handed out) and queues one job. Everything
+//! after that happens on this module's own worker threads: read the transcript,
+//! extract the current turn, run `claude -p --model sonnet` headless, store the
+//! result and emit `explain-update`.
+//!
+//! **One entry per instance, no history.** The panel answers "what is he
+//! saying?" about the turn on screen; it is cleared when the panel closes and
+//! when the user sends the next prompt, so `MAX_ENTRIES` is 1.
 //!
 //! The summarizer child is a plain process, not a PTY session, and must stay a
 //! nobody: `env_clear()` + `claude_bin::forwarded_env()` (whose deny-list
@@ -30,7 +34,9 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
 use crate::claude_bin;
-use crate::snapshot::{ExplainEntry, ExplainKind, ExplainPending, ExplainUpdate, ProjectHandle};
+use crate::snapshot::{
+    ExplainEntry, ExplainKind, ExplainPending, ExplainSections, ExplainUpdate, ProjectHandle,
+};
 
 /// The system prompt of the summarizer. Hebrew because the panel is for reading
 /// at a glance; English identifiers stay as-is because translating them is how
@@ -42,56 +48,119 @@ use crate::snapshot::{ExplainEntry, ExplainKind, ExplainPending, ExplainUpdate, 
 /// A third-person summarizer also drifts into calling the *user* the one who
 /// did the work ("אתה ממתין לשני agents"), which is exactly backwards; pinning
 /// אני to the claude and אתה to the human kills both problems at once.
-const HEBREW_PROMPT: &str = "אתה \"המסביר\" של Mulpex. תקבל את הטקסט שכתב Claude Code בסיום תור עבודה.\n\
-כתוב הסבר קצר בעברית פשוטה מאוד — משפט אחד עד שלושה, כמו הסבר בעל־פה לחבר, בגוף ראשון יחיד — כאילו Claude עצמו אומר אותו למשתמש.\n\
+/// Three questions, three lines, in this order — see [`SECTION_KEYS`]. The
+/// **keys are ASCII** and the answers are Hebrew: a Hebrew key would have to
+/// survive the model's own RTL handling before the parser ever saw it, and
+/// there is nothing to gain from betting on that. The panel draws the Hebrew
+/// headings itself, so nothing in this output is ever shown as a label.
+const HEBREW_PROMPT: &str = "אתה \"המסביר\" של Mulpex. תקבל את ההודעות האחרונות של המשתמש, ואחריהן את הטקסט ש-Claude Code כתב בתור העבודה הנוכחי.\n\
+ענה בעברית פשוטה מאוד, בגוף ראשון יחיד — כאילו Claude עצמו מדבר אל המשתמש — בדיוק שלוש שורות, בפורמט הזה ובסדר הזה:\n\
+WORK: <על מה אנחנו עובדים>\n\
+DID: <מה עשיתי בסבב הזה>\n\
+NEED: <מה אני צריך מהמשתמש עכשיו>\n\
 כללים:\n\
-- גוף ראשון תמיד: בדקתי, תיקנתי, עכשיו אני מריץ, אני צריך ממך. אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
+- בדיוק שלוש שורות. כל שורה מתחילה במילת המפתח באנגלית ואז נקודתיים. אין שום טקסט לפני השורה הראשונה או אחרי השלישית.\n\
+- כל שורה היא משפט אחד קצר של עד 15 מילים, כמו שמסבירים לחבר שלא מבין בתכנות. קצר ופשוט לפני הכול.\n\
+- אם עשיתי או מצאתי כמה דברים — תגיד רק את הדבר החשוב ביותר, וּותר על כל השאר. עדיף שורה חסרה מדי מאשר שורה עמוסה.\n\
+- בלי נקודה-פסיק, בלי סוגריים, ובלי לחבר כמה דברים ב\"וגם\" או בפסיקים. משפט אחד, רעיון אחד.\n\
+- WORK: המטרה הגדולה שאנחנו עובדים עליה עכשיו, לפי ההודעות של המשתמש — לא מה שעשיתי הרגע.\n\
+- DID: מה שינסתי, בדקתי או תיקנתי בסבב הזה. רק העיקר, בלי רשימה ובלי לפרט שלבים.\n\
+- NEED: אם אני מחכה להחלטה, לתשובה או לבדיקה — תגיד בדיוק מה. אם אני לא צריך כלום — כתוב בדיוק: כלום, אפשר להמשיך.\n\
+- גוף ראשון תמיד: בדקתי, תיקנתי, אני צריך ממך. אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
 - אתה, אותך, ממך, שלך — מתייחסים אך ורק למשתמש האנושי. לעולם לא לעבודה שאני עצמי עשיתי.\n\
-- זה סיכום, לא שכתוב: משפט אחד עד שלושה, רק העיקר. פסקה אחת, בלי לעבור על כל הפרטים.\n\
-- מונחים טכניים, שמות קבצים, פקודות ושמות functions/branches נשארים באנגלית כמו שהם.\n\
-- בלי הקדמה, בלי \"לסיכום\", בלי כותרות ובלי bullet points. רק ההסבר עצמו.\n\
-- טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`.\n\
-- אם אני שואל שאלה או מחכה להחלטה — פתח בזה: מה אני צריך ממך עכשיו.\n\
-- אם נכשלתי או נתקעתי — אמור את זה ישירות.\n\
-- אל תוסיף שום דבר שלא מופיע בטקסט.";
+- שמות קבצים, פקודות, מונחים ושמות של functions/branches נשארים באנגלית בדיוק כמו שהם — בלי לתרגם ובלי לתעתק. סביב זה, מילים פשוטות.\n\
+- בלי להיכנס לפרטים טכניים ובלי להסביר איך משהו עובד מבפנים. מה, לא איך.\n\
+- טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`, בלי מקפים בתחילת שורה.\n\
+- אם נכשלתי או נתקעתי — אמור את זה ישירות ב-DID.\n\
+- אל תוסיף שום דבר שלא מופיע בטקסט שקיבלת.";
 
-/// The question-mode prompt: Claude stopped mid-turn on `AskUserQuestion` and
-/// the panel should say what is being asked and what each option means, while
-/// the question sits on screen waiting. First person, same as the turn prompt.
-const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude עצר באמצע העבודה ושואל את המשתמש שאלה לפני שימשיך, ואתה מנסח את השאלה בגוף ראשון — כאילו Claude עצמו פונה למשתמש.\n\
-תקבל את השאלות והאפשרויות. הסבר בעברית פשוטה מאוד: מה אני שואל, ומה המשמעות של כל אפשרות — משפט קצר לכל אחת.\n\
+/// The three line keys, in order. `parse_sections` requires **all three** — a
+/// partial parse renders as raw text rather than as a heading with nothing
+/// under it, because an empty part the user cannot tell from a missing one is
+/// exactly the "default that reads as an assertion" this codebase keeps paying
+/// for.
+const SECTION_KEYS: [&str; 3] = ["WORK", "DID", "NEED"];
+
+/// The question-mode prompt: Claude stopped mid-turn on `AskUserQuestion`.
+///
+/// Same three parts as a turn — the question is simply what goes in `NEED`, so
+/// the panel never changes shape — with the options as their own lines under
+/// it. `DID` is the part this exists to protect: the panel used to explain the
+/// question and **throw the turn away**, so it read as a claude who had done no
+/// work and immediately started asking. The rule is stated twice here (do it,
+/// and what to write if there genuinely is nothing) because that is the failure
+/// the user reported.
+const QUESTION_PROMPT: &str = "אתה \"המסביר\" של Mulpex. תקבל את ההודעות האחרונות של המשתמש, את מה ש-Claude Code כתב בתור הנוכחי, ואחריהם את השאלה שהוא עצר לשאול לפני שהוא ממשיך.\n\
+ענה בעברית פשוטה מאוד, בגוף ראשון יחיד — כאילו Claude עצמו מדבר אל המשתמש — בפורמט הזה ובסדר הזה:\n\
+WORK: <על מה אנחנו עובדים>\n\
+DID: <מה עשיתי בסבב הזה, לפני שעצרתי לשאול>\n\
+NEED: <מה אני צריך שתחליט, ואחריו כל אפשרות בשורה משלה>\n\
 כללים:\n\
-- גוף ראשון יחיד תמיד: אני צריך ממך להחליט, אני שואל (לא \"נעשה\" ולא \"נציג\"). אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
-- אתה, ממך, שלך — המשתמש האנושי בלבד. לעולם לא אני.\n\
-- מונחים טכניים, שמות קבצים, פקודות ושמות functions/branches נשארים באנגלית כמו שהם.\n\
-- בלי הקדמה ובלי סיכום. שורה לשאלה, ואז שורה קצרה לכל אפשרות שמתחילה ב\"- \".\n\
-- טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`.\n\
-- סמן אפשרות כמומלצת רק אם כתוב בה (Recommended) במפורש. אם לא כתוב — אל תסמן שום אפשרות, ואל תרמוז מה עדיף.\n\
-- אל תוסיף שום דבר שלא מופיע בשאלות.";
+- שלוש מילות המפתח, בסדר הזה. אין שום טקסט לפני WORK ואין כלום אחרי האפשרות האחרונה.\n\
+- WORK ו-DID: משפט אחד קצר כל אחד, עד 15 מילים. בלי נקודה-פסיק ובלי לחבר כמה דברים ב\"וגם\".\n\
+- DID הוא הדבר החשוב: מה בדקתי, מצאתי או עשיתי בסבב הזה לפני שעצרתי לשאול. אל תדלג עליו ואל תכתוב בו את השאלה.\n\
+- אם באמת לא עשיתי כלום בסבב הזה חוץ מלשאול — כתוב ב-DID בדיוק: עוד לא עשיתי כלום בסבב הזה.\n\
+- NEED: שורה ראשונה קצרה — מה אני צריך שתחליט. אחריה שורה לכל אפשרות שמתחילה ב\"- \", עד 12 מילים: שם האפשרות, מקף, ובמילים פשוטות מה היא אומרת.\n\
+- אם יש כמה שאלות — כל שאלה בשורה משלה בתוך NEED, והאפשרויות שלה בשורות שמתחתיה. תשמור על כולן קצרות מאוד.\n\
+- אם כתוב באפשרות (Recommended) — סמן אותה בסוף השורה שלה במילה (מומלץ), בעברית. אל תשאיר (Recommended) באנגלית.\n\
+- אם לא כתוב (Recommended) באף אפשרות — אל תסמן שום אפשרות, ואל תרמוז מה עדיף.\n\
+- גוף ראשון תמיד: בדקתי, מצאתי, אני צריך ממך. אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
+- אתה, אותך, ממך, שלך — מתייחסים אך ורק למשתמש האנושי. לעולם לא לעבודה שאני עצמי עשיתי.\n\
+- שמות קבצים, פקודות, מונחים ושמות של functions/branches נשארים באנגלית בדיוק כמו שהם — בלי לתרגם ובלי לתעתק.\n\
+- בלי להיכנס לפרטים טכניים. מה, לא איך.\n\
+- טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`. המקפים מותרים רק בתחילת שורת אפשרות.\n\
+- אל תוסיף שום דבר שלא מופיע בטקסט שקיבלת.";
 
 /// The plan-mode prompt: Claude finished planning and the "ready to code?"
-/// dialog is on screen. A plan is long, structured and technical by
-/// construction — headings, file paths, code fences — and the panel's job here
-/// is the opposite of reproducing it: ONE sentence saying what he intends to
-/// do, in his own voice. The detail is two inches away in the terminal if the
-/// user wants it.
-const PLAN_PROMPT: &str = "אתה \"המסביר\" של Mulpex. Claude סיים לתכנן ומחכה לאישור של המשתמש לפני שיתחיל לעבוד, ואתה מנסח את התוכנית בגוף ראשון — כאילו Claude עצמו אומר אותה.\n\
-תקבל את התוכנית המלאה. כתוב משפט אחד בעברית פשוטה מאוד: מה אני מתכוון לעשות, בגדול.\n\
+/// dialog is on screen.
+///
+/// Same three parts as a turn and a question. `NEED` is the approval plus the
+/// plan's main steps, one row each — the layout a question's options already
+/// use, so the panel reads the same way whatever it is showing. It is still
+/// **not** a copy of the plan: a plan is long, structured and technical by
+/// construction (headings, absolute paths, code fences) and reproducing any of
+/// that here would defeat the panel. At most four rows, the big moves only.
+const PLAN_PROMPT: &str = "אתה \"המסביר\" של Mulpex. תקבל את ההודעות האחרונות של המשתמש, את מה ש-Claude Code כתב בתור הנוכחי, ואחריהם את התוכנית שהוא סיים לכתוב ומחכה לאישור שלך עליה.\n\
+ענה בעברית פשוטה מאוד, בגוף ראשון יחיד — כאילו Claude עצמו מדבר אל המשתמש — בפורמט הזה ובסדר הזה:\n\
+WORK: <על מה אנחנו עובדים>\n\
+DID: <מה בדקתי ומצאתי בסבב הזה, לפני שכתבתי את התוכנית>\n\
+NEED: <שאני צריך אישור להתחיל, ואחריו השלבים העיקריים כל אחד בשורה משלו>\n\
 כללים:\n\
-- גוף ראשון יחיד: אני מתכוון ל… אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי. אתה/ממך — המשתמש בלבד.\n\
-- משפט אחד. שניים רק אם באמת אי אפשר אחרת. כמה שיותר קצר.\n\
-- בלי שלבים, בלי רשימות, בלי שמות קבצים ובלי פרטים טכניים — רק המטרה.\n\
-- מונחים ושמות באנגלית שאי אפשר בלעדיהם נשארים באנגלית כמו שהם.\n\
-- בלי הקדמה ובלי סיכום. טקסט פשוט בלבד — בלי **, בלי #, בלי `backticks`.\n\
+- שלוש מילות המפתח, בסדר הזה. אין שום טקסט לפני WORK ואין כלום אחרי השורה האחרונה.\n\
+- WORK ו-DID: משפט אחד קצר כל אחד, עד 15 מילים. בלי נקודה-פסיק ובלי לחבר כמה דברים ב\"וגם\".\n\
+- DID: מה קראתי, בדקתי או מצאתי בסבב הזה לפני שתכננתי. אל תכתוב בו את התוכנית עצמה.\n\
+- אם באמת רק תכננתי ולא נגעתי בכלום — כתוב ב-DID בדיוק: רק תיכננתי, עוד לא נגעתי בכלום.\n\
+- NEED: שורה ראשונה קצרה שאומרת שאני מחכה לאישור שלך כדי להתחיל. אחריה עד ארבע שורות שמתחילות ב\"- \", כל אחת עד 12 מילים: מה אני מתכוון לעשות, בגדול.\n\
+- אם בתוכנית יש יותר מארבעה שלבים — אחד את הקטנים ותן רק את המהלכים הגדולים. אל תעתיק את התוכנית ואל תפרט שלבים קטנים.\n\
+- בשורות האלה: בלי שמות קבצים, בלי פקודות ובלי פרטים טכניים — רק מה משתנה, במילים פשוטות. מונח באנגלית רק אם באמת אי אפשר בלעדיו.\n\
+- גוף ראשון תמיד: בדקתי, מצאתי, אני מתכוון. אף פעם לא \"הוא\", ואף פעם לא Claude בגוף שלישי.\n\
+- אתה, אותך, ממך, שלך — מתייחסים אך ורק למשתמש האנושי. לעולם לא לעבודה שאני עצמי עשיתי.\n\
+- טקסט פשוט בלבד — בלי סימוני markdown: בלי **, בלי #, בלי `backticks`. המקפים מותרים רק בתחילת שורת שלב.\n\
 - אל תוסיף שום דבר שלא כתוב בתוכנית, ואל תחווה דעה אם היא טובה.";
 
-/// Feed cap per instance. The panel is a "what just happened" glance, not an
-/// archive; the transcript itself is the archive.
-const MAX_ENTRIES: usize = 50;
+/// Entries kept per instance. **One.** The Explainer explains the turn that is
+/// on screen right now and nothing else — the panel is opened by ⌘⇧E, cleared
+/// when it closes and cleared again when the user sends the next prompt, so a
+/// feed would only ever hold stale rows nobody asked to see. (The store is
+/// still a `Vec` because a retry addresses its row by `seq`.)
+const MAX_ENTRIES: usize = 1;
 
 /// Cap on the turn text handed to Sonnet, keeping the **tail** — the end of a
 /// turn is where conclusions live. Byte-based, trimmed to a char boundary.
 const MAX_TURN_BYTES: usize = 24_000;
+
+/// How much of the user's own recent prompts rides along with the turn, and how
+/// many of them. This is what makes the `WORK:` line an answer rather than a
+/// guess: the goal lives in what the user asked for, and a claude mid-task
+/// rarely restates it.
+///
+/// Deliberately a *window*, not the session. Measured 2026-09-16 over the real
+/// transcripts on this machine: every prompt of a long session runs to ~50k
+/// tokens and the whole conversation to ~137k — for a first line that gets no
+/// better, on a keypress the user is waiting on, and dragging in prompts from
+/// before a `/clear` that are about something else entirely.
+const MAX_PROMPTS_BYTES: usize = 4_000;
+const RECENT_PROMPTS: usize = 6;
 
 /// Cap on the plan handed to Sonnet, keeping the **head** — the opposite end
 /// from a turn. A plan opens with its goal and descends into steps and file
@@ -114,33 +183,37 @@ const WORKERS: usize = 2;
 /// on. Cheap: it costs an extra call only on a call that already failed.
 const AUTO_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// The Stop hook races Claude Code's own transcript flush: measured 2026-08-30,
-/// the turn's final assistant entry hit the JSONL at 11:55:15.346 while the
-/// Stop hook fired inside the same second — the first read then sees the turn's
-/// boundary but no text yet. So: wait once before reading, and while the turn
-/// reads as empty keep retrying a little; a turn still empty after ~2.5s is a
-/// genuinely textless turn (an interrupt, tool-calls-only) and is skipped.
-const EXTRACT_DELAY: Duration = Duration::from_millis(400);
-const EXTRACT_RETRIES: usize = 6;
+/// Claude Code flushes a turn's final assistant entry to the JSONL a beat after
+/// the turn visibly ends (measured 2026-08-30: the entry landed at 11:55:15.346,
+/// within the same second as the turn's end), so a ⌘⇧E pressed the instant the
+/// claude stops can read a transcript whose last word hasn't arrived. The read
+/// is therefore tried **immediately** — the user is waiting on a keypress — and
+/// only retried while it comes back empty. Still empty after ~1s is a turn with
+/// genuinely nothing said yet, and says so.
+const EXTRACT_DELAY: Duration = Duration::from_millis(250);
+const EXTRACT_RETRIES: usize = 4;
 
-/// What a job explains. Turn and Question jobs for the same instance are
-/// distinct — a pending question must not be coalesced away by the turn that
-/// eventually follows it, nor vice versa.
+/// What the panel says when the focused claude has not said anything in this
+/// turn yet (he is mid-turn, still on tool calls). Not a failure and not a
+/// summary: no Sonnet call is made, because a call on nothing invents
+/// something. Press ⌘⇧E again in a few seconds.
+const NOTHING_YET: &str = "עדיין אין מה להסביר";
+
+/// What a job explains.
 enum Input {
-    /// A finished turn: read this transcript and summarize it.
-    Turn { transcript: PathBuf },
-    /// A pending `AskUserQuestion`: the tool's `tool_input` JSON.
-    Question { json: String },
-    /// A pending `ExitPlanMode`: the tool's `tool_input` JSON (its `plan` field
-    /// is the plan as markdown).
-    Plan { json: String },
+    /// One ⌘⇧E: read this instance's transcript and explain the current turn.
+    /// Whether that turn is prose, a pending `AskUserQuestion` or a pending
+    /// `ExitPlanMode` plan is decided **from the transcript** (`read_turn`) —
+    /// all three live in the same file, so the keypress has one input, not
+    /// three.
+    Now { transcript: PathBuf },
     /// A manual retry of the failed entry `seq` (the panel's "נסה שוב").
     ///
     /// It carries the *already-extracted* summarizer input, stashed when the
     /// entry failed — it does not go back to the transcript. By the time the
     /// user clicks, that claude may have finished two more turns, and
-    /// `extract_turn_text` reads the LAST one: re-extracting would silently
-    /// explain a different turn under the failed row's timestamp.
+    /// `read_turn` reads the LAST one: re-extracting would silently explain a
+    /// different turn under the failed row.
     Retry { seq: u64, kind: ExplainKind, prompt: &'static str, text: String },
 }
 
@@ -168,6 +241,45 @@ struct Inner {
     /// the instance or project is forgotten — so it can only ever hold inputs
     /// for failure rows currently on screen.
     retries: Mutex<HashMap<u64, Retryable>>,
+    /// `(handle, id)` → the transcript the entry on screen was made from.
+    /// Re-opening the panel on an unchanged transcript reuses that entry instead
+    /// of paying for the same three lines twice — see [`TranscriptKey`].
+    keys: Mutex<HashMap<(ProjectHandle, usize), TranscriptKey>>,
+}
+
+/// Identity of a transcript at a moment: which file, how long, last written
+/// when. Two equal keys mean the file has not been touched, and therefore that
+/// the summarizer's input — the turn and the prompts before it — cannot have
+/// changed either.
+///
+/// A `stat`, deliberately, not a hash of the parsed input: the check runs on
+/// the keypress with the user waiting, and transcripts here reach 60 MB. It is
+/// also the *conservative* direction — any byte appended, meaningful or not,
+/// counts as a change and re-runs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TranscriptKey {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
+/// What one ⌘⇧E did, for the panel: reuse what is on screen, produce a new
+/// explanation, or neither.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Nothing has changed since this instance's entry was made; it stands.
+    Cached,
+    /// A job is queued; the panel should drop what it has and wait.
+    Running,
+    /// There is nothing to explain and nothing coming (no transcript yet).
+    Unavailable,
+}
+
+/// The transcript's identity right now, or `None` if it isn't there.
+pub fn transcript_key(path: &Path) -> Option<TranscriptKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(TranscriptKey { path: path.to_path_buf(), len: meta.len(), mtime: meta.modified().ok() })
 }
 
 /// The stashed input of one failed entry: exactly the arguments
@@ -192,6 +304,7 @@ fn inner() -> &'static Arc<Inner> {
             store: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             retries: Mutex::new(HashMap::new()),
+            keys: Mutex::new(HashMap::new()),
         })
     })
 }
@@ -223,26 +336,36 @@ pub fn init(app: AppHandle) {
     }
 }
 
-/// Queue one finished turn. Latest-wins per instance for jobs not yet running:
-/// if a queued job for the same `(handle, id)` exists it is replaced — its
-/// transcript is the same file, and the newer request supersedes it exactly the
-/// way `explainreq/<id>` overwrites between polls. A job already *running* is
-/// not touched; the new one queues behind it.
-pub fn submit(handle: ProjectHandle, id: usize, transcript: String, cwd: PathBuf) {
-    enqueue(handle, id, Input::Turn { transcript: PathBuf::from(transcript) }, cwd);
-}
-
-/// Queue one pending `AskUserQuestion` (the `tool_input` JSON). Same latest-wins
-/// contract, within its own kind.
-pub fn submit_question(handle: ProjectHandle, id: usize, json: String, cwd: PathBuf) {
-    enqueue(handle, id, Input::Question { json }, cwd);
-}
-
-/// Queue one pending `ExitPlanMode` (the `tool_input` JSON). Same latest-wins
-/// contract, within its own kind — a plan job is never coalesced away by the
-/// turn or question that follows it.
-pub fn submit_plan(handle: ProjectHandle, id: usize, json: String, cwd: PathBuf) {
-    enqueue(handle, id, Input::Plan { json }, cwd);
+/// One ⌘⇧E: reuse this instance's explanation if the transcript has not moved
+/// since it was made, and otherwise produce a new one.
+///
+/// **The cache is the whole reason the panel can be opened freely.** Closing it
+/// no longer throws the answer away, so open/close/open costs one summarizer
+/// call rather than three — and if nothing changed, a second call could only
+/// have produced the same three lines.
+///
+/// On a miss the old entry is dropped *before* the job is queued: a keypress
+/// asking "what is he saying now" must not leave the previous turn's answer on
+/// screen for the seconds the new one takes. The **queue** is deliberately left
+/// alone — `enqueue`'s latest-wins replaces a not-yet-running job in place,
+/// which is what keeps the busy count honest when someone leans on the key.
+pub fn explain_now(handle: ProjectHandle, id: usize, transcript: PathBuf, cwd: PathBuf) -> Verdict {
+    let inner = inner();
+    let Some(key) = transcript_key(&transcript) else {
+        return Verdict::Unavailable;
+    };
+    {
+        let keys = inner.keys.lock().unwrap();
+        let has_entry = inner.store.lock().unwrap().get(&(handle, id)).is_some_and(|f| !f.is_empty());
+        if has_entry && keys.get(&(handle, id)) == Some(&key) {
+            return Verdict::Cached;
+        }
+    }
+    inner.store.lock().unwrap().remove(&(handle, id));
+    inner.keys.lock().unwrap().remove(&(handle, id));
+    inner.retries.lock().unwrap().retain(|_, r| !(r.handle == handle && r.id == id));
+    enqueue(handle, id, Input::Now { transcript }, cwd);
+    Verdict::Running
 }
 
 fn enqueue(handle: ProjectHandle, id: usize, input: Input, cwd: PathBuf) {
@@ -304,6 +427,13 @@ fn emit_pending(handle: ProjectHandle, id: usize, active: bool) {
     }
 }
 
+/// Drop this instance's entry and cancel its queued job, without the row going
+/// anywhere: the panel was closed (⌘⇧E again, ✕, a row switch) or the user sent
+/// the next prompt, and the explanation was about the turn before it.
+pub fn clear(handle: ProjectHandle, id: usize) {
+    forget(handle, id);
+}
+
 /// Drop one instance's feed (its row is gone from the sidebar, so the feed is
 /// unreachable) and any queued job for it. A job already mid-run may still
 /// finish and deposit one zombie entry; it is invisible (the frontend keys the
@@ -312,6 +442,7 @@ pub fn forget(handle: ProjectHandle, id: usize) {
     let inner = inner();
     inner.queue.lock().unwrap().retain(|j| !(j.handle == handle && j.id == id));
     inner.store.lock().unwrap().remove(&(handle, id));
+    inner.keys.lock().unwrap().remove(&(handle, id));
     inner.retries.lock().unwrap().retain(|_, r| !(r.handle == handle && r.id == id));
     // The row is gone; so is its busy dot. A still-running job's own
     // finish_pending later finds no entry and stays silent.
@@ -325,14 +456,17 @@ pub fn forget_project(handle: ProjectHandle) {
     let inner = inner();
     inner.queue.lock().unwrap().retain(|j| j.handle != handle);
     inner.store.lock().unwrap().retain(|(h, _), _| *h != handle);
+    inner.keys.lock().unwrap().retain(|(h, _), _| *h != handle);
     inner.pending.lock().unwrap().retain(|(h, _), _| *h != handle);
     inner.retries.lock().unwrap().retain(|_, r| r.handle != handle);
 }
 
-/// The whole feed of one project, for the frontend's initial paint (bootstrap /
-/// dev hot-reload). Per instance newest-first; instances in arbitrary order —
-/// the frontend groups by `entry.id` anyway.
-pub fn feed(handle: ProjectHandle) -> Vec<ExplainEntry> {
+/// Everything one project currently holds. There is no initial-paint command
+/// any more — an explanation only exists between a ⌘⇧E and the next prompt, so
+/// there is never anything for a fresh frontend to fetch — this is the tests'
+/// window onto the store.
+#[cfg(test)]
+fn feed(handle: ProjectHandle) -> Vec<ExplainEntry> {
     let store = inner().store.lock().unwrap();
     let mut out = Vec::new();
     for ((h, _), entries) in store.iter() {
@@ -359,44 +493,52 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// One job, end to end. An empty input — a turn with no assistant text (an
-/// interrupt, a tool-calls-only turn) or an unparseable question payload — is
-/// skipped: there is nothing to explain, and a Sonnet call on nothing would
-/// invent something. The skip is logged: a silent branch here already cost a
-/// debugging round (the flush race above looked like the whole feature not
-/// working).
+/// One job, end to end. A turn with nothing said in it yet gets the
+/// [`NOTHING_YET`] entry rather than a Sonnet call on nothing — and rather than
+/// a silent skip, which is what this feature's most expensive bug looked like
+/// from the outside (the panel simply never filled in).
 fn process(inner: &Inner, job: Job) {
     // `replace` is the seq of the failed row this job is redoing, if any: a
     // retry lands *in place of* its failure rather than as a second row.
+    // The key is captured from the file the worker actually read, not from the
+    // one the keypress saw: `read_turn_settled` can spend a second waiting out
+    // the flush race, and the entry must be stamped with the transcript it
+    // describes or the next press reuses an answer for content it never saw.
     let (kind, prompt, text, replace) = match &job.input {
-        Input::Turn { transcript } => match extract_turn_text_settled(transcript) {
-            Some(t) => (ExplainKind::Turn, HEBREW_PROMPT, t, None),
+        Input::Now { transcript } => match read_turn_settled(transcript) {
+            Some(turn) => {
+                if let Some(key) = transcript_key(transcript) {
+                    inner.keys.lock().unwrap().insert((job.handle, job.id), key);
+                }
+                (turn.kind, turn.prompt, turn.text, None)
+            }
             None => {
                 eprintln!(
-                    "[explainer] project {} claude#{}: turn skipped (no assistant text in {})",
+                    "[explainer] project {} claude#{}: nothing said yet in {}",
                     job.handle,
                     job.id,
                     transcript.display()
                 );
-                return;
-            }
-        },
-        Input::Question { json } => match question_text(json) {
-            Some(t) => (ExplainKind::Question, QUESTION_PROMPT, t, None),
-            None => {
-                eprintln!(
-                    "[explainer] project {} claude#{}: question skipped (unparseable payload)",
-                    job.handle, job.id
-                );
-                return;
-            }
-        },
-        Input::Plan { json } => match plan_text(json) {
-            Some(t) => (ExplainKind::Plan, PLAN_PROMPT, t, None),
-            None => {
-                eprintln!(
-                    "[explainer] project {} claude#{}: plan skipped (no plan in payload)",
-                    job.handle, job.id
+                // Stamped like any other answer: "nothing yet" is still the
+                // truth about this transcript, and re-reading it on every press
+                // while he works would be the same answer every time.
+                if let Some(key) = transcript_key(transcript) {
+                    inner.keys.lock().unwrap().insert((job.handle, job.id), key);
+                }
+                push_and_emit(
+                    inner,
+                    job.handle,
+                    job.id,
+                    ExplainEntry {
+                        id: job.id,
+                        ts: now_ms(),
+                        text: NOTHING_YET.to_string(),
+                        sections: None,
+                        ok: true,
+                        kind: ExplainKind::Turn,
+                        seq: next_seq(),
+                    },
+                    false,
                 );
                 return;
             }
@@ -408,7 +550,17 @@ fn process(inner: &Inner, job: Job) {
         Ok(summary) => {
             // It worked: the stashed input has no reader left.
             inner.retries.lock().unwrap().remove(&seq);
-            ExplainEntry { id: job.id, ts: now_ms(), text: summary, ok: true, kind, seq }
+            // All three kinds share the shape now: a question is a turn whose
+            // `NEED` carries the options, a plan one whose `NEED` carries the
+            // steps. The panel therefore reads the same way whatever it shows.
+            let sections = parse_sections(&summary);
+            if sections.is_none() {
+                eprintln!(
+                    "[explainer] project {} claude#{}: three-part parse failed; showing raw output",
+                    job.handle, job.id
+                );
+            }
+            ExplainEntry { id: job.id, ts: now_ms(), text: summary, sections, ok: true, kind, seq }
         }
         Err(why) => {
             // Stash (or refresh) what the panel's retry button will re-run.
@@ -425,6 +577,7 @@ fn process(inner: &Inner, job: Job) {
                 id: job.id,
                 ts: now_ms(),
                 text: format!("ההסבר נכשל ({why})"),
+                sections: None,
                 ok: false,
                 kind,
                 seq,
@@ -435,13 +588,26 @@ fn process(inner: &Inner, job: Job) {
     // be seen before the panel exists, and after it exists the place to check
     // when the panel shows nothing.
     eprintln!("[explainer] project {} claude#{}: {}", job.handle, job.id, entry.text);
-    if replace.is_some() {
-        replace_entry(inner, job.handle, job.id, entry.clone());
+    push_and_emit(inner, job.handle, job.id, entry, replace.is_some());
+}
+
+/// Store one finished entry and push it to the panel. `replace` puts a retry's
+/// result back in its failed row's slot; otherwise the entry becomes this
+/// instance's one entry.
+fn push_and_emit(
+    inner: &Inner,
+    handle: ProjectHandle,
+    id: usize,
+    entry: ExplainEntry,
+    replace: bool,
+) {
+    if replace {
+        replace_entry(inner, handle, id, entry.clone());
     } else {
-        push_entry(inner, job.handle, job.id, entry.clone());
+        push_entry(inner, handle, id, entry.clone());
     }
     if let Some(app) = APP.get() {
-        let _ = app.emit("explain-update", ExplainUpdate { handle: job.handle, id: job.id, entry });
+        let _ = app.emit("explain-update", ExplainUpdate { handle, id, entry });
     }
 }
 
@@ -705,31 +871,309 @@ fn plan_text(json: &str) -> Option<String> {
     Some(format!("{}\n[…truncated…]", &plan[..cut]))
 }
 
-/// `extract_turn_text` with the flush race absorbed: an initial pause (the
-/// final assistant entry lands within ~a second of the Stop hook), then retries
-/// while the turn reads as empty. Runs on a worker thread — the waiting costs
-/// nobody anything.
-fn extract_turn_text_settled(path: &Path) -> Option<String> {
-    std::thread::sleep(EXTRACT_DELAY);
-    for _ in 0..EXTRACT_RETRIES {
-        if let Some(turn) = extract_turn_text(path) {
+/// What one ⌘⇧E found in the transcript, and which persona explains it.
+struct Turn {
+    kind: ExplainKind,
+    prompt: &'static str,
+    text: String,
+}
+
+/// This instance's transcript on disk, or `None` if it has none yet (a claude
+/// that has not written a line since it started).
+///
+/// There is no hook and no bookmark behind this: Claude Code stores every
+/// session as `<claude home>/projects/<slug of cwd>/<session uuid>.jsonl` and
+/// keeps appending to that same file across `--resume` (measured 2026-09-16 on
+/// a live 6787-entry transcript spanning two days, whose uuid is the one in
+/// Mulpex's own session store). Mulpex generated that uuid, so it can simply
+/// open the file.
+///
+/// The slug is Claude Code's rule, not ours — every non-alphanumeric byte
+/// becomes `-` — so it is used as a **fast path only**: if that exact file is
+/// not there, the uuid (unique by construction) is looked up across the project
+/// dirs. A rule change on their side then costs one directory scan, on a
+/// keypress, instead of the feature.
+pub fn transcript_path(project_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let projects = claude_home()?.join("projects");
+    let file = format!("{session_id}.jsonl");
+    let direct = projects.join(project_slug(project_dir)).join(&file);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    std::fs::read_dir(&projects)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
+}
+
+/// `~/.claude`, or wherever `CLAUDE_CONFIG_DIR` moved it.
+fn claude_home() -> Option<PathBuf> {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(d) if !d.trim().is_empty() => Some(PathBuf::from(d)),
+        _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")),
+    }
+}
+
+/// Claude Code's project-dir name: every byte that is not a letter or digit
+/// becomes `-` (measured over 112 real project dirs — `/private/tmp/…` →
+/// `-private-tmp-…`, a dot or an underscore in the path becomes `-` too).
+fn project_slug(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// [`read_turn`] with the transcript-flush race absorbed. Tried **immediately**
+/// — a keypress is waiting on it — and retried only while the turn reads as
+/// empty, because that is the one state the race produces. Runs on a worker
+/// thread; the waiting costs nobody anything.
+fn read_turn_settled(path: &Path) -> Option<Turn> {
+    for attempt in 0..=EXTRACT_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(EXTRACT_DELAY);
+        }
+        if let Some(turn) = read_turn(path) {
             return Some(turn);
         }
-        std::thread::sleep(EXTRACT_DELAY);
     }
     None
 }
 
-/// The finished turn's assistant text: every `text` block of every
+/// The current turn out of a transcript, and what kind of turn it is.
+///
+/// A claude waiting on the user is the case the panel exists for, so it is
+/// checked first: an `AskUserQuestion` or `ExitPlanMode` `tool_use` that has no
+/// `tool_result` yet *is* the current turn, whatever prose came before it, and
+/// it is explained with its own persona. Both payloads are already in the
+/// transcript when the dialog is on screen (measured 2026-09-16: the assistant
+/// entry carrying the `questions` array is written before the tool runs), which
+/// is what lets one keypress cover all three cases from one file.
+fn read_turn(path: &Path) -> Option<Turn> {
+    let entries = read_entries(path)?;
+    if let Some((name, input)) = pending_ask(&entries) {
+        let json = input.to_string();
+        if name == "AskUserQuestion" {
+            if let Some(question) = question_text(&json) {
+                // **The turn's own prose rides along with the question.** It
+                // used to be dropped, and the panel then showed a claude who
+                // asks without ever having done anything — which is exactly how
+                // it read on screen. What he found before stopping is usually
+                // the reason the question is being asked at all.
+                let said = turn_text(&entries).unwrap_or_default();
+                let body = format!(
+                    "{said}\n\n=== THE QUESTION I STOPPED TO ASK ===\n{question}"
+                );
+                return Some(Turn {
+                    kind: ExplainKind::Question,
+                    prompt: QUESTION_PROMPT,
+                    text: with_recent_prompts(&entries, &body),
+                });
+            }
+        } else if let Some(plan) = plan_text(&json) {
+            // The prose before the plan is the research that justifies it, and
+            // it is what `DID` is made of — same reason the question case
+            // carries it. Without it a plan turn reads as pure intent.
+            let said = turn_text(&entries).unwrap_or_default();
+            let body = format!("{said}\n\n=== THE PLAN I AM WAITING FOR APPROVAL ON ===\n{plan}");
+            return Some(Turn {
+                kind: ExplainKind::Plan,
+                prompt: PLAN_PROMPT,
+                text: with_recent_prompts(&entries, &body),
+            });
+        }
+    }
+    let text = turn_text(&entries)?;
+    Some(Turn {
+        kind: ExplainKind::Turn,
+        prompt: HEBREW_PROMPT,
+        text: with_recent_prompts(&entries, &text),
+    })
+}
+
+/// The summarizer's input for a turn: the user's recent prompts, then this
+/// turn's text. Labelled in ASCII — these are structural markers in a payload
+/// that is otherwise Hebrew and English mixed, and they have to stay
+/// unmistakable in a bidirectional blob.
+fn with_recent_prompts(entries: &[Value], turn: &str) -> String {
+    let prompts = recent_prompts(entries);
+    if prompts.is_empty() {
+        return turn.to_string();
+    }
+    format!("=== RECENT USER MESSAGES (oldest first) ===\n{prompts}\n\n=== MY CURRENT TURN ===\n{turn}")
+}
+
+/// The last few things the **user** actually said, oldest first.
+///
+/// `<task-notification>` turns are dropped: they are the runtime waking the
+/// instance, not the user stating a goal, and a `WORK:` line built from one
+/// would describe a background job instead of the work. A `<command-name>`
+/// entry stays — a slash command is an instruction the user gave.
+fn recent_prompts(entries: &[Value]) -> String {
+    let mut picked: Vec<String> = Vec::new();
+    for e in entries.iter().rev() {
+        if picked.len() == RECENT_PROMPTS {
+            break;
+        }
+        if !is_real_user_prompt(e) {
+            continue;
+        }
+        let text = prompt_text(e);
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.starts_with("<task-notification") {
+            continue;
+        }
+        picked.push(trimmed.to_string());
+    }
+    picked.reverse();
+    let joined = picked.join("\n---\n");
+    // Tail-capped: of a window of prompts, the recent end is the current goal.
+    tail_cap(joined, MAX_PROMPTS_BYTES)
+}
+
+/// One user entry's text, whether its content is a bare string or a block list.
+fn prompt_text(e: &Value) -> String {
+    match e.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Keep the last `max` bytes, cut on a char boundary, marked when cut. The text
+/// here is Hebrew, so every char is multibyte and a naive slice panics.
+fn tail_cap(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = s.len() - max;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[…truncated…]\n{}", &s[cut..])
+}
+
+/// Split the summarizer's three lines into the parts the panel draws headings
+/// for. `None` unless **all three** keys are present with something after them
+/// — see [`SECTION_KEYS`].
+///
+/// A value may wrap onto following lines (the model is asked for one line each
+/// and mostly obliges, but a long `DID:` occasionally doesn't), so anything
+/// before the next key belongs to the key above it.
+fn parse_sections(out: &str) -> Option<ExplainSections> {
+    let mut found: [Option<String>; 3] = [None, None, None];
+    let mut current: Option<usize> = None;
+    // Enough context to tell a *wrapped sentence* from a *new line of content*:
+    // only a plain line directly under another plain line is a wrap. A list
+    // item, the line after a list item (the next question's header), and
+    // anything after a blank line all start a row of their own. Measured on real
+    // multi-question output — without the "after a list item" case, question 2's
+    // header was glued onto the tail of question 1's last option.
+    let mut prev_listy = false;
+    let mut blank_since = false;
+    for line in out.lines() {
+        let line = line.trim();
+        let key = SECTION_KEYS.iter().position(|k| {
+            line.strip_prefix(*k).and_then(|r| r.trim_start().strip_prefix(':')).is_some()
+        });
+        match key {
+            Some(i) => {
+                let value = line[SECTION_KEYS[i].len()..].trim_start();
+                let value = value.strip_prefix(':').unwrap_or(value).trim();
+                found[i] = Some(value.to_string());
+                current = Some(i);
+                prev_listy = false;
+                blank_since = false;
+            }
+            None if line.is_empty() => blank_since = true,
+            None => {
+                let listy = line.starts_with('-');
+                if let Some(i) = current {
+                    let slot = found[i].get_or_insert_with(String::new);
+                    if !slot.is_empty() {
+                        // `.text` is `white-space: pre-wrap`, so a newline here
+                        // is what puts a question's options one per row.
+                        let wrap = !listy && !prev_listy && !blank_since;
+                        slot.push(if wrap { ' ' } else { '\n' });
+                    }
+                    slot.push_str(line);
+                }
+                prev_listy = listy;
+                blank_since = false;
+            }
+        }
+    }
+    let [work, did, need] = found;
+    let (work, did, need) = (work?, did?, need?);
+    if work.is_empty() || did.is_empty() || need.is_empty() {
+        return None;
+    }
+    Some(ExplainSections { work, did, need })
+}
+
+/// The transcript as parsed JSONL entries; unparseable lines (a half-flushed
+/// last line, most often) are dropped rather than failing the read.
+fn read_entries(path: &Path) -> Option<Vec<Value>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    Some(
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+    )
+}
+
+/// An `AskUserQuestion` / `ExitPlanMode` call still waiting for its answer:
+/// the last such `tool_use` in the transcript, if no `tool_result` for its id
+/// has come back. The answered ones are ordinary history — the question the
+/// user already dismissed is not what ⌘⇧E is asking about.
+fn pending_ask(entries: &[Value]) -> Option<(&str, &Value)> {
+    let mut found: Option<(&str, &Value, &str)> = None;
+    let mut answered: Vec<&str> = Vec::new();
+    for e in entries {
+        let Some(Value::Array(blocks)) = e.get("message").and_then(|m| m.get("content")) else {
+            continue;
+        };
+        if e.get("isSidechain").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        for b in blocks {
+            match b.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                    if name == "AskUserQuestion" || name == "ExitPlanMode" {
+                        let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+                        if let Some(input) = b.get("input") {
+                            found = Some((name, input, id));
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                        answered.push(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let (name, input, id) = found?;
+    (!answered.contains(&id)).then_some((name, input))
+}
+
+/// The current turn's assistant text: every `text` block of every
 /// non-sidechain assistant entry after the last real user prompt, joined. Tail-
 /// capped at `MAX_TURN_BYTES`. `None` when there is nothing to explain.
-fn extract_turn_text(path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let entries: Vec<Value> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+fn turn_text(entries: &[Value]) -> Option<String> {
     let boundary = entries.iter().rposition(is_real_user_prompt)?;
     let mut texts: Vec<&str> = Vec::new();
     for e in &entries[boundary + 1..] {
@@ -751,18 +1195,11 @@ fn extract_turn_text(path: &Path) -> Option<String> {
             }
         }
     }
-    let mut joined = texts.join("\n\n");
+    let joined = texts.join("\n\n");
     if joined.trim().is_empty() {
         return None;
     }
-    if joined.len() > MAX_TURN_BYTES {
-        let mut cut = joined.len() - MAX_TURN_BYTES;
-        while !joined.is_char_boundary(cut) {
-            cut += 1;
-        }
-        joined = format!("[…truncated…]\n{}", &joined[cut..]);
-    }
-    Some(joined)
+    Some(tail_cap(joined, MAX_TURN_BYTES))
 }
 
 #[cfg(test)]
@@ -773,6 +1210,27 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mulpex-explain-{tag}.jsonl"));
         std::fs::write(&path, lines.join("\n")).unwrap();
         path
+    }
+
+    /// Drop just this handle's queued jobs. Tests share one global queue.
+    fn drain_queue(h: ProjectHandle) {
+        inner().queue.lock().unwrap().retain(|j| j.handle != h);
+    }
+
+    /// A real file for `explain_now` to `stat`. It resolves the transcript's
+    /// identity before doing anything, so a path that isn't there is
+    /// `Unavailable` and queues nothing — which is correct, and which silently
+    /// emptied the queue in every test that used a made-up path.
+    fn touch(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("mulpex-explain-t-{tag}.jsonl"));
+        std::fs::write(&path, "{}").unwrap();
+        path
+    }
+
+    /// The prose half of a transcript read, the way the tests used to call it
+    /// before `read_turn` grew the pending-question branch in front of it.
+    fn extract_turn_text(path: &Path) -> Option<String> {
+        turn_text(&read_entries(path)?)
     }
 
     /// The measured `ExitPlanMode` tool_input shape (a real `claude` v2.1.252 on
@@ -832,10 +1290,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The flush race, reproduced: at Stop time the transcript holds the turn's
-    /// boundary and tool traffic but not yet its final text — Claude Code
-    /// appends that entry a beat later (measured: same second, after the hook).
-    /// The settled reader must pick it up instead of skipping the turn.
+    /// The flush race, reproduced: ⌘⇧E lands while the transcript holds the
+    /// turn's boundary and tool traffic but not yet its final text — Claude Code
+    /// appends that entry a beat later (measured: same second as the turn's
+    /// end). The settled reader must pick it up instead of reporting an empty
+    /// turn at the user.
     #[test]
     fn extraction_waits_out_the_transcript_flush_race() {
         let path = write_transcript("race", &[
@@ -851,7 +1310,9 @@ mod tests {
             )
             .unwrap();
         });
-        assert_eq!(extract_turn_text_settled(&path).as_deref(), Some("late answer"));
+        let turn = read_turn_settled(&path).unwrap();
+        assert!(turn.text.ends_with("late answer"), "got: {}", turn.text);
+        assert!(matches!(turn.kind, ExplainKind::Turn));
         writer.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -874,9 +1335,10 @@ mod tests {
     }
 
     /// Measured on a real session: an interrupt lands as a plain string user
-    /// entry with nothing after it. Nothing to explain → no Sonnet call at all.
+    /// entry with nothing after it. Nothing to explain → no Sonnet call at all;
+    /// `process` turns this `None` into the `NOTHING_YET` entry.
     #[test]
-    fn a_turn_with_no_assistant_text_is_skipped() {
+    fn a_turn_with_no_assistant_text_reads_as_empty() {
         let path = write_transcript("empty", &[
             r#"{"type":"user","message":{"content":"do things"}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
@@ -903,19 +1365,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The store is bounded and forgettable: newest first, capped per instance,
-    /// dropped per instance on reap and wholesale on project close. Exercises
-    /// the real public surface against the module singleton — handles in the
-    /// 990xx range so parallel tests can't collide (`init` is never called in
-    /// tests, so no worker drains the queue behind our back).
+    /// The store holds **one** entry per instance — the current turn, nothing
+    /// before it — and is dropped per instance on clear/reap and wholesale on
+    /// project close. Exercises the real public surface against the module
+    /// singleton — handles in the 990xx range so parallel tests can't collide
+    /// (`init` is never called in tests, so no worker drains the queue behind
+    /// our back).
     #[test]
-    fn the_feed_is_newest_first_capped_and_forgettable() {
+    fn the_store_keeps_only_the_newest_entry_and_is_forgettable() {
         const H: ProjectHandle = 99001;
         const H2: ProjectHandle = 99002;
         let entry = |id: usize, n: u64| ExplainEntry {
             id,
             ts: n,
             text: format!("e{n}"),
+            sections: None,
             ok: true,
             kind: ExplainKind::Turn,
             seq: next_seq(),
@@ -927,11 +1391,11 @@ mod tests {
         push_entry(inner(), H2, 1, entry(1, 0));
 
         let mine: Vec<_> = feed(H);
-        assert_eq!(mine.iter().filter(|e| e.id == 1).count(), MAX_ENTRIES, "capped");
-        let newest = mine.iter().filter(|e| e.id == 1).next().unwrap();
-        assert_eq!(newest.ts, MAX_ENTRIES as u64 + 4, "newest first");
+        assert_eq!(mine.iter().filter(|e| e.id == 1).count(), MAX_ENTRIES, "capped at one");
+        let newest = mine.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(newest.ts, MAX_ENTRIES as u64 + 4, "and it is the newest");
 
-        forget(H, 1);
+        clear(H, 1);
         assert!(feed(H).iter().all(|e| e.id != 1));
         assert!(feed(H).iter().any(|e| e.id == 2), "other instance survives");
         forget_project(H);
@@ -940,11 +1404,12 @@ mod tests {
         forget_project(H2);
     }
 
-    /// A retry replaces its failed row where it sits and takes its stash with
-    /// it when the row leaves the feed. Drives the real singleton the way the
-    /// panel does — stash, retry, replace — without spawning a summarizer.
+    /// A retry rewrites the failed row in place and takes its stash with it the
+    /// moment the row is gone — replaced by a newer entry, or cleared. Drives
+    /// the real singleton the way the panel does — stash, retry, replace —
+    /// without spawning a summarizer.
     #[test]
-    fn a_retry_replaces_its_row_in_place_and_its_stash_is_bounded_by_the_feed() {
+    fn a_retry_rewrites_its_row_in_place_and_its_stash_dies_with_the_row() {
         const H: ProjectHandle = 99005;
         let stash = |id: usize, seq: u64| {
             let r = Retryable {
@@ -961,52 +1426,297 @@ mod tests {
             id,
             ts: 1,
             text: "ההסבר נכשל (exit 1)".into(),
+            sections: None,
             ok: false,
             kind: ExplainKind::Turn,
             seq,
         };
 
-        // Two failed rows, oldest first.
+        // One failed row on screen, and a failed row on a second instance —
+        // two retries in flight must both run.
         let (a, b) = (next_seq(), next_seq());
         stash(1, a);
-        stash(1, b);
+        stash(2, b);
         push_entry(inner(), H, 1, failed(1, a));
-        push_entry(inner(), H, 1, failed(1, b));
+        push_entry(inner(), H, 2, failed(2, b));
 
         assert!(!retry(H, 1, next_seq()), "an unknown seq queues nothing");
         assert!(!retry(H, 2, a), "another instance cannot retry this row");
         assert!(retry(H, 1, a));
-        assert!(retry(H, 1, b), "a second retry is not coalesced away by the first");
+        assert!(retry(H, 2, b), "a second retry is not coalesced away by the first");
         {
             let q = inner().queue.lock().unwrap();
             assert_eq!(q.iter().filter(|j| j.handle == H).count(), 2);
         }
         assert!(retry(H, 1, a), "the stash survives, so the row stays retryable");
 
-        // The result lands where the failed row was — its position, not the top.
+        // The result rewrites the failed row rather than arriving beside it.
         let ok = ExplainEntry {
             id: 1,
             ts: 9,
             text: "הסבר".into(),
+            sections: None,
             ok: true,
             kind: ExplainKind::Turn,
             seq: a,
         };
         replace_entry(inner(), H, 1, ok);
-        let f = feed(H);
-        assert_eq!(f.len(), 2, "replaced, not prepended");
-        assert_eq!(f[0].seq, b, "order untouched: b is still the newer row");
-        assert!(f[1].ok && f[1].seq == a);
+        let f: Vec<_> = feed(H).into_iter().filter(|e| e.id == 1).collect();
+        assert_eq!(f.len(), 1, "rewritten, not prepended");
+        assert!(f[0].ok && f[0].seq == a);
 
-        // Pushed off the end, the stash goes with it — nothing can address it.
-        for _ in 0..MAX_ENTRIES {
-            push_entry(inner(), H, 1, failed(1, next_seq()));
-        }
-        assert!(!retry(H, 1, b), "an aged-out row is no longer retryable");
+        // A newer entry evicts the failed row, and the stash goes with it —
+        // nothing can address it any more.
+        push_entry(inner(), H, 2, failed(2, next_seq()));
+        assert!(!retry(H, 2, b), "an evicted row is no longer retryable");
         assert!(inner().retries.lock().unwrap().get(&b).is_none());
 
         forget_project(H);
         assert!(inner().retries.lock().unwrap().values().all(|r| r.handle != H));
+    }
+
+    /// One keypress, three kinds, one file. A question or a plan still waiting
+    /// for the user IS the current turn and wins over the prose before it —
+    /// that is the whole reason the panel is worth opening mid-dialog. The
+    /// shape is the measured one (2026-09-16): the assistant entry carrying the
+    /// `questions` array is in the transcript while the dialog is on screen.
+    #[test]
+    fn a_waiting_dialog_outranks_the_prose_before_it() {
+        // (And carries that prose with it — see the two `find` assertions.)
+        // One line: a transcript is JSONL, and `write_transcript` joins with \n.
+        const ASKED: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"בדקתי את הקוד"},{"type":"tool_use","id":"toolu_1","name":"AskUserQuestion","input":{"questions":[{"question":"Which way?","options":[{"label":"A","description":"first"}]}]}}]}}"#;
+        let path = write_transcript("pending-q", &[
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            ASKED,
+        ]);
+        let turn = read_turn(&path).unwrap();
+        assert!(matches!(turn.kind, ExplainKind::Question), "the question is the turn");
+        assert!(turn.text.contains("Question 1: Which way?"));
+        // The regression the user reported: the work before the question was
+        // dropped, so the panel showed a claude who asks having done nothing.
+        assert!(turn.text.contains("בדקתי את הקוד"), "the turn's own work rides along");
+        assert!(
+            turn.text.find("בדקתי את הקוד") < turn.text.find("Question 1"),
+            "what I did comes before what I'm asking"
+        );
+
+        // Answered, it is history again: the turn's own text is what's left.
+        let path = write_transcript("answered-q", &[
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            ASKED,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"A"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ממשיך עם A"}]}}"#,
+        ]);
+        let turn = read_turn(&path).unwrap();
+        assert!(matches!(turn.kind, ExplainKind::Turn), "an answered question is history");
+        assert!(turn.text.contains("ממשיך עם A"));
+
+        let path = write_transcript("pending-plan", &[
+            r#"{"type":"user","message":{"content":"plan it"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"קראתי את הקוד"}]}}"#,
+            // `r##`: the plan is markdown, so the JSON contains `"#`.
+            r##"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"ExitPlanMode","input":{"plan":"# Do the thing"}}]}}"##,
+        ]);
+        let turn = read_turn(&path).unwrap();
+        assert!(matches!(turn.kind, ExplainKind::Plan));
+        assert!(turn.text.contains("# Do the thing"));
+        // Same rule as a question: the research that justifies the plan is what
+        // `DID` is made of, so it must reach the summarizer with the plan.
+        assert!(turn.text.contains("קראתי את הקוד"), "the work behind the plan rides along");
+        assert!(
+            turn.text.find("קראתי את הקוד") < turn.text.find("# Do the thing"),
+            "what I did comes before what I'm proposing"
+        );
+    }
+
+    /// The cache, which is what makes the panel free to open: an unchanged
+    /// transcript reuses the answer on screen and runs nothing. Only a file that
+    /// actually moved — or a cleared entry — costs a summarizer call.
+    #[test]
+    fn an_unchanged_transcript_reuses_its_answer_instead_of_paying_again() {
+        const H: ProjectHandle = 99006;
+        let path = touch("cache");
+        let cwd = PathBuf::from("/tmp");
+        let queued = || inner().queue.lock().unwrap().iter().filter(|j| j.handle == H).count();
+
+        // Nothing explained yet: the first press always runs.
+        assert!(matches!(explain_now(H, 1, path.clone(), cwd.clone()), Verdict::Running));
+        assert_eq!(queued(), 1);
+
+        // Stand in for the worker: an answer, stamped with what it was made from.
+        // `retain`, never `clear`: the queue is a process-wide singleton and the
+        // tests run in parallel — clearing it wholesale stole another test's
+        // queued job and failed it, one module over.
+        drain_queue(H);
+        push_entry(inner(), H, 1, ExplainEntry {
+            id: 1,
+            ts: 1,
+            text: "הסבר".into(),
+            sections: None,
+            ok: true,
+            kind: ExplainKind::Turn,
+            seq: next_seq(),
+        });
+        inner().keys.lock().unwrap().insert((H, 1), transcript_key(&path).unwrap());
+
+        assert!(matches!(explain_now(H, 1, path.clone(), cwd.clone()), Verdict::Cached));
+        assert_eq!(queued(), 0, "a cache hit must not queue a Sonnet call");
+        assert_eq!(feed(H).len(), 1, "and must not drop the answer it is reusing");
+
+        // The turn moved on: the answer is stale, so it goes and a job runs.
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&path, "{}\n{}").unwrap();
+        assert!(matches!(explain_now(H, 1, path.clone(), cwd.clone()), Verdict::Running));
+        assert!(feed(H).is_empty(), "no stale answer left on screen while the new one runs");
+        assert_eq!(queued(), 1);
+
+        // A cleared entry (the user sent the next prompt) can never be a hit,
+        // even though the transcript has not moved since.
+        drain_queue(H);
+        inner().keys.lock().unwrap().insert((H, 1), transcript_key(&path).unwrap());
+        clear(H, 1);
+        assert!(matches!(explain_now(H, 1, path.clone(), cwd.clone()), Verdict::Running));
+
+        // No file, no answer and nothing coming — the panel must be told.
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(explain_now(H, 2, path, cwd), Verdict::Unavailable));
+
+        forget_project(H);
+    }
+
+    /// The three-part contract, from both ends. All three keys or nothing — a
+    /// heading with nothing under it is a default reading as an assertion, and
+    /// the panel would rather show the raw sentence than invent a structure.
+    #[test]
+    fn three_lines_parse_and_anything_less_does_not() {
+        let s = parse_sections(
+            "WORK: משנים את ההתנהגות של ההסבר\nDID: ביטלתי את ההפעלה האוטומטית\nNEED: כלום, אפשר להמשיך",
+        )
+        .unwrap();
+        assert_eq!(s.work, "משנים את ההתנהגות של ההסבר");
+        assert_eq!(s.did, "ביטלתי את ההפעלה האוטומטית");
+        assert_eq!(s.need, "כלום, אפשר להמשיך");
+
+        // A wrapped value belongs to the key above it; blank lines are noise.
+        let s = parse_sections("WORK: א\n\nDID: התחלה\nהמשך של אותה שורה\nNEED: ג\n").unwrap();
+        assert_eq!(s.did, "התחלה המשך של אותה שורה");
+
+        // Tolerated sloppiness: whitespace before the colon, and stray indent.
+        assert!(parse_sections("  WORK : א\n  DID: ב\n  NEED: ג").is_some());
+
+        // A question's NEED is the ask, then one line per option: option lines
+        // keep their own row (the panel is `pre-wrap`), a wrapped sentence does
+        // not. This is what lets a question use the same three parts as a turn.
+        let s = parse_sections(
+            "WORK: א\nDID: ב\nNEED: להחליט איפה\n- בתוך NEED — אותו מבנה (מומלץ)\n- בחלק נפרד — הפרדה ברורה",
+        )
+        .unwrap();
+        assert_eq!(s.need.lines().count(), 3, "the ask plus one row per option");
+        assert!(s.need.lines().nth(1).unwrap().starts_with("- בתוך NEED"));
+
+        // The real thing: three questions in one NEED, as the live summarizer
+        // actually emitted them (2026-09-16). Every header and every option has
+        // to keep its own row — the first version of this parser glued
+        // question 2's header onto question 1's last option.
+        let s = parse_sections(
+            "WORK: א\nDID: ב\n\nNEED: איך לשלב שאלה ממתינה\n             - בתוך החלק השלישי (מומלץ) - אותו מבנה תמיד\n             - חלק רביעי נפרד - הפרדה ברורה\n\n             כמה פירוט להראות על כל אפשרות\n             - תווית ועוד כמה מילים (מומלץ) - שורה קצרה\n             - תווית בלבד - הכי קצר",
+        )
+        .unwrap();
+        let rows: Vec<&str> = s.need.lines().collect();
+        assert_eq!(rows.len(), 6, "two headers and four options, one row each: {rows:?}");
+        assert_eq!(rows[3], "כמה פירוט להראות על כל אפשרות", "a new header is not a wrap");
+        assert!(rows[1].starts_with('-') && rows[5].starts_with('-'));
+
+        assert!(parse_sections("WORK: א\nDID: ב").is_none(), "a missing key is not a section");
+        assert!(parse_sections("WORK: א\nDID:\nNEED: ג").is_none(), "an empty value likewise");
+        assert!(parse_sections("סתם משפט בעברית").is_none(), "prose is prose");
+    }
+
+    /// The `WORK:` line's raw material: the user's own recent prompts, oldest
+    /// first, with the runtime's `<task-notification>` wakes left out — those
+    /// are a background job reporting in, not the user stating a goal, and a
+    /// goal built from one describes the wrong thing entirely.
+    #[test]
+    fn the_input_carries_the_users_recent_prompts_not_the_runtimes() {
+        let path = write_transcript("prompts", &[
+            r#"{"type":"user","message":{"content":"build the thing"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"old"}]}}"#,
+            r#"{"type":"user","message":{"content":"<task-notification><status>completed</status></task-notification>"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"noted"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"now make it faster"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"THE TURN"}]}}"#,
+        ]);
+        let text = read_turn(&path).unwrap().text;
+        assert!(text.contains("build the thing") && text.contains("now make it faster"));
+        assert!(!text.contains("task-notification"), "the runtime is not the user");
+        assert!(
+            text.find("build the thing") < text.find("now make it faster"),
+            "oldest first, so the newest goal reads last"
+        );
+        assert!(text.contains("=== MY CURRENT TURN ===\nTHE TURN"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both caps keep the **tail** and cut on a char boundary — the text is
+    /// Hebrew, so every char is multibyte and a naive slice panics.
+    #[test]
+    fn the_prompt_window_is_tail_capped_on_a_char_boundary() {
+        let long = "שאלה ישנה מאוד. ".repeat(500);
+        assert!(long.len() > MAX_PROMPTS_BYTES);
+        let line = format!(
+            r#"{{"type":"user","message":{{"content":"{long}"}}}}
+{{"type":"user","message":{{"content":"THE LATEST ASK"}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"t"}}]}}}}"#
+        );
+        let path = write_transcript("promptcap", &[&line]);
+        let text = read_turn(&path).unwrap().text;
+        assert!(text.contains("THE LATEST ASK"), "the newest prompt survives");
+        assert!(text.contains("[…truncated…]"), "and the cut says so");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The transcript is found with no hook and no bookmark: Claude Code's own
+    /// slug (every non-alphanumeric byte → `-`, measured over 112 real project
+    /// dirs) is the fast path, and a uuid that is not where the slug says is
+    /// looked up across the project dirs — so a rule change on their side costs
+    /// a directory scan, not the feature.
+    #[test]
+    fn the_transcript_is_found_by_slug_or_by_scan() {
+        assert_eq!(
+            project_slug(Path::new("/Users/g/Documents/Code/my_proj.v2")),
+            "-Users-g-Documents-Code-my-proj-v2"
+        );
+
+        let home = std::env::temp_dir().join(format!("mulpex-claudehome-{}", next_seq()));
+        let projects = home.join("projects");
+        let cwd = home.join("theproject");
+        std::fs::create_dir_all(projects.join(project_slug(&cwd))).unwrap();
+        std::fs::create_dir_all(projects.join("some-other-slug")).unwrap();
+        // Scoped to this test's process-wide env var — set, used, restored.
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &home);
+
+        assert!(transcript_path(&cwd, "uuid-1").is_none(), "no file yet → nothing to explain");
+        assert!(transcript_path(&cwd, "").is_none(), "an instance with no session id");
+
+        let direct = projects.join(project_slug(&cwd)).join("uuid-1.jsonl");
+        std::fs::write(&direct, "").unwrap();
+        assert_eq!(transcript_path(&cwd, "uuid-1").as_ref(), Some(&direct));
+
+        let elsewhere = projects.join("some-other-slug").join("uuid-2.jsonl");
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(
+            transcript_path(&cwd, "uuid-2").as_ref(),
+            Some(&elsewhere),
+            "the uuid is unique, so a slug we guessed wrong is recoverable"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The failure text is only useful if it says why: `claude -p` reports its
@@ -1048,10 +1758,10 @@ mod tests {
         const H: ProjectHandle = 99004;
         let count = |id: usize| inner().pending.lock().unwrap().get(&(H, id)).copied();
 
-        submit(H, 1, "/tmp/a.jsonl".into(), PathBuf::from("/tmp"));
-        submit(H, 1, "/tmp/b.jsonl".into(), PathBuf::from("/tmp"));
-        assert_eq!(count(1), Some(1), "a coalesced re-submit is one job, not two");
-        submit(H, 2, "/tmp/c.jsonl".into(), PathBuf::from("/tmp"));
+        explain_now(H, 1, touch("pa"), PathBuf::from("/tmp"));
+        explain_now(H, 1, touch("pb"), PathBuf::from("/tmp"));
+        assert_eq!(count(1), Some(1), "leaning on ⌘⇧E is one job, not two");
+        explain_now(H, 2, touch("pc"), PathBuf::from("/tmp"));
         assert_eq!(count(2), Some(1));
 
         finish_pending(inner(), H, 1);
@@ -1064,46 +1774,27 @@ mod tests {
         forget_project(H); // drain this test's queue entries
     }
 
-    /// Latest-wins coalescing: a queued-not-yet-running job for the same
-    /// instance is replaced *within its kind* — a pending question is never
-    /// coalesced away by the turn that follows it. A different instance queues
-    /// alongside.
+    /// Latest-wins coalescing: leaning on ⌘⇧E replaces the queued-not-yet-
+    /// running job in place rather than stacking Sonnet calls, and a second
+    /// instance queues alongside rather than being collapsed into the first.
     #[test]
-    fn queued_jobs_coalesce_per_instance_and_kind() {
+    fn repeated_presses_coalesce_per_instance() {
         const H: ProjectHandle = 99003;
-        submit(H, 1, "/tmp/a.jsonl".into(), PathBuf::from("/tmp"));
-        submit(H, 2, "/tmp/b.jsonl".into(), PathBuf::from("/tmp"));
-        submit(H, 1, "/tmp/c.jsonl".into(), PathBuf::from("/tmp"));
-        submit_question(H, 1, r#"{"questions":[]}"#.into(), PathBuf::from("/tmp"));
-        submit_plan(H, 1, r#"{"plan":"do the thing"}"#.into(), PathBuf::from("/tmp"));
+        explain_now(H, 1, touch("ca"), PathBuf::from("/tmp"));
+        explain_now(H, 2, touch("cb"), PathBuf::from("/tmp"));
+        let newest = touch("cc");
+        explain_now(H, 1, newest.clone(), PathBuf::from("/tmp"));
         {
             let q = inner().queue.lock().unwrap();
             let mine: Vec<_> = q.iter().filter(|j| j.handle == H).collect();
-            assert_eq!(
-                mine.len(),
-                4,
-                "turn replaced within kind; question and plan queued alongside"
-            );
-            let turn1 = mine
-                .iter()
-                .find(|j| j.id == 1 && matches!(j.input, Input::Turn { .. }))
-                .unwrap();
+            assert_eq!(mine.len(), 2, "one job per instance, not one per press");
+            let turn1 = mine.iter().find(|j| j.id == 1).unwrap();
             match &turn1.input {
-                Input::Turn { transcript } => {
-                    assert_eq!(transcript, &PathBuf::from("/tmp/c.jsonl"), "the newer request won")
+                Input::Now { transcript } => {
+                    assert_eq!(transcript, &newest, "the newer press won")
                 }
-                Input::Question { .. } | Input::Plan { .. } | Input::Retry { .. } => {
-                    unreachable!()
-                }
+                Input::Retry { .. } => unreachable!(),
             }
-            assert!(
-                mine.iter().any(|j| j.id == 1 && matches!(j.input, Input::Question { .. })),
-                "the question job survived the turn submits"
-            );
-            assert!(
-                mine.iter().any(|j| j.id == 1 && matches!(j.input, Input::Plan { .. })),
-                "the plan job survived the turn and question submits"
-            );
         }
         forget_project(H); // also drains this test's queue entries
         assert!(inner().queue.lock().unwrap().iter().all(|j| j.handle != H));

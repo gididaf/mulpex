@@ -295,12 +295,54 @@ pub fn get_hub_snapshot(
         .map(Core::hub_snapshot)
 }
 
-/// A project's whole Explainer feed for the initial paint (bootstrap / dev
-/// hot-reload; thereafter pushed per entry via the `explain-update` event).
-/// Per instance newest-first; the frontend groups entries by their `id`.
+/// ⌘⇧E: explain what this instance is saying right now.
+///
+/// Finds that claude's transcript on disk from the session uuid Mulpex itself
+/// handed out — no hook, no request file, nothing running until the user asks —
+/// and queues one summarizer job; the result arrives as an `explain-update`.
+///
+/// Returns what the press did. `cached` means this instance's transcript has
+/// not moved since its explanation was made, so that explanation stands and no
+/// summarizer runs — opening and closing the panel is free. `running` means a
+/// job is queued and the panel should drop what it has. `unavailable` means
+/// there is nothing to explain and nothing coming: a terminal (shells run no
+/// turns), a gone instance, or a claude that has not written a transcript yet —
+/// the panel says so instead of waiting for an update that isn't coming.
 #[tauri::command]
-pub fn get_explains(project_handle: ProjectHandle) -> Vec<crate::snapshot::ExplainEntry> {
-    crate::explainer::feed(project_handle)
+pub fn explain_now(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+) -> crate::explainer::Verdict {
+    let found = {
+        let ws = state.ws.lock().unwrap();
+        ws.project(project_handle).and_then(|core| {
+            let s = core.sessions.iter().find(|s| s.id == id)?;
+            matches!(s.kind, crate::pty::SessionKind::Claude).then(|| {
+                (core.project_dir.clone(), s.session_id.clone(), core.state_dir.clone())
+            })
+        })
+    };
+    // The lookup reads the disk, so it happens with the workspace lock released
+    // — the 200 ms hub poll wants that lock back every tick.
+    let Some((project_dir, session_id, cwd)) = found else {
+        return crate::explainer::Verdict::Unavailable;
+    };
+    match crate::explainer::transcript_path(&project_dir, &session_id) {
+        Some(transcript) => crate::explainer::explain_now(project_handle, id, transcript, cwd),
+        None => crate::explainer::Verdict::Unavailable,
+    }
+}
+
+/// The user sent the next prompt (or answered the question that was on screen):
+/// drop this instance's explanation and cancel any job still producing one. It
+/// described the turn before this one.
+///
+/// **Closing the panel does not call this.** A closed panel keeps its answer so
+/// re-opening it is free; only a turn that actually moved on invalidates one.
+#[tauri::command]
+pub fn clear_explain(project_handle: ProjectHandle, id: usize) {
+    crate::explainer::clear(project_handle, id);
 }
 
 /// Re-run the summarizer for one **failed** Explainer entry (the panel's

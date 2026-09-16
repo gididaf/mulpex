@@ -92,7 +92,22 @@ export interface ClaudeStatus {
   searched_path: string;
 }
 
-/** One Explainer feed item: the short Hebrew explanation of one finished turn.
+/** A turn explanation's three fixed parts. The summarizer answers exactly these
+ *  three questions; the PANEL draws the Hebrew headings, so their wording and
+ *  typography are ours and never Sonnet's. Absent when the output didn't parse
+ *  into three parts, or on a question/plan entry — the panel then shows `text`
+ *  as-is rather than faking a structure. Mirrors `snapshot.rs::ExplainSections`. */
+export interface ExplainSections {
+  /** "על מה אנחנו עובדים" — the goal, from the user's own recent prompts. */
+  work: string;
+  /** "מה עשיתי בסבב זה" — what this turn did. */
+  did: string;
+  /** "מה אני צריך ממך" — always answered, explicitly "nothing" when nothing. */
+  need: string;
+}
+
+/** The Explainer's answer for one instance: the short Hebrew explanation of the
+ *  turn on screen. There is at most one of these per instance at a time.
  *  `ok: false` marks a summarizer failure (the text says so — rendered dim).
  *  Mirrors `snapshot.rs::ExplainEntry` (no codegen; keep in sync). */
 export interface ExplainEntry {
@@ -100,7 +115,10 @@ export interface ExplainEntry {
   /** Unix epoch milliseconds. A retry that replaced a failed entry carries the
    *  retry's time, which is also how the panel notices its row came back. */
   ts: number;
+  /** The summarizer's raw output: what the panel shows when `sections` is
+   *  null, and where a failure's reason lives. */
   text: string;
+  sections: ExplainSections | null;
   ok: boolean;
   /** "turn" explains a finished turn; "question" explains a pending
    *  AskUserQuestion (what's being asked + what each option means); "plan"
@@ -230,16 +248,28 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
-/** A project's whole Explainer feed, for the initial paint (thereafter pushed
- *  per entry via the `explain-update` event). Entries carry their instance id;
- *  the store groups them. */
-export const getExplains = (projectHandle: ProjectHandle) =>
-  invoke<ExplainEntry[]>("get_explains", { projectHandle });
+/** What one ⌘⇧E did. `cached`: the transcript hasn't moved since this
+ *  instance's explanation was made, so it stands and nothing was run — opening
+ *  and closing the panel is free. `running`: a job is queued, drop what you have
+ *  and wait for the `explain-update`. `unavailable`: nothing to explain and
+ *  nothing coming (a terminal, a gone instance, no transcript yet). */
+export type ExplainVerdict = "cached" | "running" | "unavailable";
+
+/** ⌘⇧E: explain what this instance is saying right now, reusing the answer on
+ *  screen when nothing has changed. See `ExplainVerdict`. */
+export const explainNow = (projectHandle: ProjectHandle, id: number) =>
+  invoke<ExplainVerdict>("explain_now", { projectHandle, id });
+
+/** Drop this instance's explanation and cancel any job still producing one —
+ *  the user sent the next prompt. NOT called when the panel merely closes: a
+ *  closed panel keeps its answer so re-opening it costs nothing. */
+export const clearExplain = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("clear_explain", { projectHandle, id });
 
 /** Re-run the summarizer for one failed entry; its result replaces that row in
  *  place (an ordinary `explain-update` carrying the same `seq`). False means the
- *  backend has nothing stashed under that seq any more — the row aged out of the
- *  50-entry feed, or its instance is gone — and the button should come back. */
+ *  backend has nothing stashed under that seq any more — the entry was cleared,
+ *  or its instance is gone — and the button should come back. */
 export const retryExplain = (
   projectHandle: ProjectHandle,
   id: number,

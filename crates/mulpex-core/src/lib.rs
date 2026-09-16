@@ -61,35 +61,6 @@ pub fn named_flag_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(NAMED_DIR).join(id.to_string())
 }
 
-/// Where the `Stop` hook hands a finished turn to the Explainer: one file per
-/// instance under `<state_dir>/explainreq/`, holding the session's transcript
-/// path (from the Stop payload's `transcript_path` — measured present,
-/// 2026-08-30). Written by the helper, consumed-and-deleted by the app's poll
-/// loop (`Core::take_explain_requests`); overwriting between polls is the
-/// latest-wins coalescing.
-pub fn explain_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
-    state_dir.join(EXPLAINREQ_DIR).join(id.to_string())
-}
-
-/// Where the `AskUserQuestion` PreToolUse hook hands the pending questions to
-/// the Explainer: one file per instance under `<state_dir>/explainq/`, holding
-/// the tool's `tool_input` JSON (`questions` array). Written by the helper
-/// (`hook askq`), consumed-and-deleted by the app's poll loop.
-pub fn question_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
-    state_dir.join(EXPLAINQ_DIR).join(id.to_string())
-}
-
-/// Where the `ExitPlanMode` PreToolUse hook hands the pending plan to the
-/// Explainer: one file per instance under `<state_dir>/explainplan/`, holding
-/// the tool's `tool_input` JSON (its `plan` field is the plan as markdown).
-/// Written by the helper (`hook plan`), consumed-and-deleted by the app's poll
-/// loop. Measured 2026-09-01: `PreToolUse[ExitPlanMode]` fires ~6 s *before*
-/// the approval dialog paints, so the explanation is already in flight while
-/// the user is still reading the plan.
-pub fn plan_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
-    state_dir.join(EXPLAINPLAN_DIR).join(id.to_string())
-}
-
 /// A spawned child's task-delivery verdict: `<state_dir>/spawning/<id>`, holding
 /// `pending` (created, not started yet), `failed` (never began a turn) or
 /// `partial` (began a turn, but on text that is not what Mulpex sent). Absent

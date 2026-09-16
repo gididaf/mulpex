@@ -187,10 +187,11 @@ pub struct ClaudeStatus {
     pub searched_path: String,
 }
 
-/// What an Explainer entry explains: a finished turn, a pending
+/// What an Explainer entry explains: the turn's text, a pending
 /// `AskUserQuestion` (what the claude is asking right now and what each option
 /// means), or a pending `ExitPlanMode` plan (what it is proposing to do, before
-/// you approve it). The panel styles each kind distinctly.
+/// you approve it). All three are read out of the same transcript by
+/// `explainer::read_turn`; the panel styles each kind distinctly.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExplainKind {
@@ -199,23 +200,47 @@ pub enum ExplainKind {
     Plan,
 }
 
-/// One Explainer feed item: the short Hebrew explanation of one finished turn
-/// of one instance. `ok: false` marks a summarizer failure — the text then says
-/// so instead of pretending (never round ignorance up to an explanation), and
-/// the panel offers a retry on it.
+/// A turn explanation's three fixed parts. The summarizer is required to answer
+/// exactly these three questions and nothing else, and **the panel draws the
+/// headings itself** — so the wording and the typography are the app's, not
+/// whatever Sonnet felt like writing that time, and a part it left empty is
+/// visibly empty rather than silently missing.
+///
+/// `None` on an entry means the output did not parse into three parts (or the
+/// entry is a question/plan, which have their own shapes); the panel then shows
+/// `text` as-is rather than faking a structure that isn't there.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ExplainSections {
+    /// "על מה אנחנו עובדים" — the goal, from the user's own recent prompts.
+    pub work: String,
+    /// "מה עשיתי בסבב זה" — what this turn actually did.
+    pub did: String,
+    /// "מה אני צריך ממך" — always answered, explicitly "nothing" when nothing.
+    pub need: String,
+}
+
+/// The Explainer's answer for one instance: the short Hebrew explanation of the
+/// turn on screen. There is at most one of these per instance at a time — ⌘⇧E
+/// produces it and the next prompt clears it. `ok: false` marks a summarizer
+/// failure — the text then says so instead of pretending (never round ignorance
+/// up to an explanation), and the panel offers a retry on it.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ExplainEntry {
     pub id: usize,
     /// Unix epoch milliseconds of when the explanation was produced. A retry
     /// that replaces a failed entry carries the retry's time, not the failure's.
     pub ts: u64,
+    /// The summarizer's raw output. Always present; it is what the panel shows
+    /// when `sections` is `None`, and what a failure's reason lives in.
     pub text: String,
+    /// The three parts, when this is a turn explanation that parsed.
+    pub sections: Option<ExplainSections>,
     pub ok: bool,
     pub kind: ExplainKind,
-    /// Process-wide unique id of this feed item. It is the retry address (a
-    /// failed entry's summarizer input is stashed under it) and it is what a
-    /// retry's `explain-update` matches to *replace* the failed row in place
-    /// rather than prepend a second one. Stable across a retry.
+    /// Process-wide unique id of this entry. It is the retry address (a failed
+    /// entry's summarizer input is stashed under it) and it is what a retry's
+    /// `explain-update` matches to *rewrite* the failed entry rather than
+    /// arrive as a new one. Stable across a retry.
     pub seq: u64,
 }
 

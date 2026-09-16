@@ -1,18 +1,28 @@
-<!-- The Explainer: a persistent right-hand column showing the focused
-     instance's per-turn Hebrew explanations, oldest first — the newest entry is
-     at the BOTTOM, so the feed grows downward the way the claude transcript
-     beside it does. The backend store stays newest-first (its 50-entry cap is
-     a prepend-and-truncate); the reversal is render-time only.
-     A real grid column, not an overlay — toggling it (⌘⇧E) resizes the
-     terminal pane, which the TerminalPane ResizeObserver propagates
-     workspace-wide like any window resize. RTL is per-entry via dir="auto":
-     Hebrew paragraphs read right-to-left while inline English identifiers sit
-     correctly inside them. Nothing here touches the xterm CSS. -->
+<!-- The Explainer: a right-hand column showing ONE Hebrew explanation — what the
+     focused claude is saying in the turn on screen right now, as three fixed
+     parts: what we are working on, what he did this turn, what he needs from
+     you. THE HEADINGS ARE DRAWN HERE, not by the summarizer — it emits three
+     marked lines (WORK/DID/NEED) and the app owns the wording and the type, so
+     they cannot drift from one turn to the next. An entry whose output did not
+     parse into three parts (and a question or a plan, which have their own
+     shapes) falls back to its raw text rather than faking the structure.
+
+     It is on demand and nothing else. ⌘⇧E opens this panel and asks in the same
+     keystroke; closing it, switching rows, or sending the next prompt clears the
+     answer and puts the column away (App.svelte owns all three). So there is no
+     feed, no timestamps and no scrollback here: the transcript beside it is the
+     history, and this is a glance at the present.
+
+     A real grid column, not an overlay — showing it resizes the terminal pane,
+     which the TerminalPane ResizeObserver propagates workspace-wide like any
+     window resize. The entry text is hard dir="rtl" (see the markup comment).
+     Nothing here touches the xterm CSS. -->
 <script lang="ts">
   import { untrack } from "svelte";
   import {
     activeExplains,
     activeExplainBusy,
+    explainDeciding,
     activeProjectHandle,
     sessions,
     activeId,
@@ -25,72 +35,40 @@
   const label = $derived(
     cur && !isShell ? (cur.name ?? `claude #${cur.id}`) : null,
   );
-  // Newest last. `$activeExplains` is a fresh array per update (applyExplainFor
-  // rebuilds it), but reverse() mutates — copy first.
-  const ordered = $derived([...$activeExplains].reverse());
+  // At most one, by construction (the backend keeps a single entry per instance).
+  const entry = $derived($activeExplains[0] ?? null);
 
-  let bodyEl = $state<HTMLDivElement | null>(null);
-  // Chat-style stickiness: follow the newest entry only while the user is
-  // already parked at the bottom. Deliberately NOT $state — the scroll effect
-  // must not re-run just because this flipped.
-  let stuck = true;
+  // The Hebrew headings. Order is fixed and matches the summarizer's contract:
+  // the goal, then the turn, then the ask — widest scope first, and the thing
+  // that might need you from last, where the eye lands.
+  const PARTS = [
+    { key: "work", title: "על מה אנחנו עובדים" },
+    { key: "did", title: "מה עשיתי בסבב זה" },
+    { key: "need", title: "מה אני צריך ממך" },
+  ] as const;
 
-  function onScroll() {
-    if (!bodyEl) return;
-    // Slack for sub-pixel scroll positions and the in-flight "מסביר…" line.
-    stuck = bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight < 24;
-  }
-
-  // Switching rows shows a different feed from scratch — always start at its
-  // newest end, whatever the scroll position on the previous row was.
-  $effect(() => {
-    void cur?.id;
-    stuck = true;
-  });
-
-  // Runs after the DOM has the new entry, so scrollHeight is already grown.
-  $effect(() => {
-    void ordered.length;
-    void $activeExplainBusy;
-    const el = bodyEl;
-    if (!el || !stuck) return;
-    el.scrollTop = el.scrollHeight;
-  });
-
-  // Rows with a retry in flight: entry `seq` → the `ts` it had when the button
-  // was pressed. The backend replaces a retried row in place and stamps it with
+  // The row's retry is in flight: the `ts` the entry had when the button was
+  // pressed. The backend rewrites a retried entry in place and stamps it with
   // the retry's time, so a changed `ts` under the same `seq` is exactly "your
   // retry came back" — success or a fresh failure alike.
-  let retrying = $state<Record<number, number>>({});
-  // Only retries of rows in the feed on screen suppress the bottom in-flight
-  // line — a retry left running on another instance says nothing about this one.
-  const anyRetrying = $derived($activeExplains.some((e) => retrying[e.seq]));
+  let retrying = $state<{ seq: number; ts: number } | null>(null);
 
   $effect(() => {
-    const live = $activeExplains;
+    const e = $activeExplains[0] ?? null;
     untrack(() => {
-      const next = { ...retrying };
-      let changed = false;
-      for (const key of Object.keys(next)) {
-        const seq = Number(key);
-        const e = live.find((x) => x.seq === seq);
-        // Only a *returned* row clears the marker. A seq that is simply absent
-        // belongs to another instance's feed (the user switched rows mid-retry)
-        // and must survive, or coming back would show the failure again with
-        // its button while the retry is still running.
-        if (e && e.ts !== next[seq]) {
-          delete next[seq];
-          changed = true;
-        }
-      }
-      if (changed) retrying = next;
+      if (!retrying) return;
+      // Only a *returned* entry clears the marker. An absent one means this row
+      // is simply not on screen (the panel cleared, or another instance is
+      // focused), and clearing on that would put the button back under a retry
+      // that is still running.
+      if (e && e.seq === retrying.seq && e.ts !== retrying.ts) retrying = null;
     });
   });
 
   async function retry(seq: number, ts: number, id: number) {
     const handle = $activeProjectHandle;
     if (handle === null) return;
-    retrying = { ...retrying, [seq]: ts };
+    retrying = { seq, ts };
     let queued = false;
     try {
       queued = await retryExplain(handle, id, seq);
@@ -99,18 +77,7 @@
     }
     // Nothing stashed under that seq any more (or the call failed): no update is
     // coming, so give the button back instead of spinning forever.
-    if (!queued) {
-      const next = { ...retrying };
-      delete next[seq];
-      retrying = next;
-    }
-  }
-
-  function when(ts: number): string {
-    return new Date(ts).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    if (!queued && retrying?.seq === seq) retrying = null;
   }
 </script>
 
@@ -125,68 +92,68 @@
       aria-label="Hide Explainer (⌘⇧E)">✕</button
     >
   </header>
-  <!-- `explaining` is what dims the previous entry the MOMENT a new summary
-       starts, instead of at the moment its replacement lands. -->
-  <div
-    class="body"
-    class:explaining={cur && !isShell && $activeExplainBusy && !anyRetrying}
-    bind:this={bodyEl}
-    onscroll={onScroll}
-  >
-    {#if !cur}
-      <div class="empty">no session focused</div>
-    {:else if isShell}
-      <div class="empty">terminals aren't explained</div>
-    {:else if ordered.length === 0 && !$activeExplainBusy}
-      <div class="empty">nothing yet — explanations appear after each turn</div>
-    {:else}
-      <!-- Keyed by seq: a retry rewrites its row in place (same seq, new ts), and
-           keying on ts would tear the article down and rebuild it instead. -->
-      {#each ordered as e (e.seq)}
+  <!-- The content sits at the BOTTOM of the column, not the top: the claude's
+       own latest words are at the bottom of the terminal beside it, and an
+       explanation pinned to the top would mean looking up for one and down for
+       the other. See the `.content` rule for why this is an auto margin and not
+       `justify-content: flex-end`. -->
+  <div class="body">
+    <div class="content">
+      {#if !cur}
+        <div class="empty">no session focused</div>
+      {:else if isShell}
+        <div class="empty">terminals aren't explained</div>
+      {:else if $explainDeciding || retrying || (!entry && $activeExplainBusy)}
+        <div class="working" dir="rtl">מסביר…</div>
+      {:else if !entry}
+        <!-- Reachable when explain_now refused: no transcript yet, or the instance
+             went away between the keypress and the answer. -->
+        <div class="empty">nothing to explain yet</div>
+      {:else}
         <article
-          class:failed={!e.ok}
-          class:question={e.kind === "question"}
-          class:plan={e.kind === "plan"}
+          class:failed={!entry.ok}
+          class:question={entry.kind === "question"}
+          class:plan={entry.kind === "plan"}
         >
-          <div class="ts">
-            {when(e.ts)}{#if e.kind === "question"}<span class="tag" dir="rtl"
-                >שאלה</span
-              >{:else if e.kind === "plan"}<span class="tag" dir="rtl">תוכנית</span
-              >{/if}
-          </div>
+          {#if entry.kind === "question"}
+            <div class="tag" dir="rtl">שאלה</div>
+          {:else if entry.kind === "plan"}
+            <div class="tag" dir="rtl">תוכנית</div>
+          {/if}
           <!-- Hard rtl, NOT dir="auto": auto resolves from the first strong
                character, and our prompt keeps English identifiers verbatim, so
-               entries often *begin* with one — auto then lays the whole Hebrew
-               paragraph out LTR (measured: scrambled line order, trailing period
+               a part often *begins* with one — auto then lays the whole Hebrew
+               sentence out LTR (measured: scrambled line order, trailing period
                on the wrong side). The panel's language is Hebrew by contract;
                inline English sits correctly inside an RTL paragraph. -->
-          {#if retrying[e.seq]}
-            <div class="text working" dir="rtl">מסביר…</div>
+          {#if entry.sections}
+            {#each PARTS as part (part.key)}
+              <section>
+                <h2 dir="rtl">{part.title}</h2>
+                <div class="text" dir="rtl">{entry.sections[part.key]}</div>
+              </section>
+            {/each}
           {:else}
-            <div class="text" dir="rtl">{e.text}</div>
-            {#if !e.ok}
-              <!-- A failed row is the one place the panel is actionable: the
-                   summarizer child died (most often on a transient the automatic
-                   second attempt didn't outlive), and the turn's text is still
-                   stashed backend-side, so one click re-runs exactly it. -->
-              <div class="actions">
-                <button
-                  class="retry"
-                  dir="rtl"
-                  title="להריץ שוב את ההסבר לתור הזה"
-                  onclick={() => retry(e.seq, e.ts, e.id)}>נסה שוב</button
-                >
-              </div>
-            {/if}
+            <div class="text" dir="rtl">{entry.text}</div>
+          {/if}
+          {#if !entry.ok}
+            <!-- A failed entry is the one place the panel is actionable: the
+                 summarizer child died (most often on a transient the automatic
+                 second attempt didn't outlive), and its input is still stashed
+                 backend-side, so one click re-runs exactly it. -->
+            <div class="actions">
+              <button
+                class="retry"
+                dir="rtl"
+                title="להריץ שוב את ההסבר"
+                onclick={() => retry(entry.seq, entry.ts, entry.id)}
+                >נסה שוב</button
+              >
+            </div>
           {/if}
         </article>
-      {/each}
-    {/if}
-    <!-- The in-flight line lives at the bottom, where the entry it is producing
-         will land. -->
-    {#if cur && !isShell && $activeExplainBusy && !anyRetrying}
-      <div class="working" dir="rtl">מסביר…</div>
-    {/if}
+        {/if}
+    </div>
   </div>
 </aside>
 
@@ -254,43 +221,27 @@
     }
   }
   .body {
+    /* `flex: 1` is load-bearing, not tidiness: without it the body is only as
+       tall as its content (a flex item defaults to `flex: 0 1 auto`), so there
+       is no free space for the auto margin below to consume and the content
+       stays glued to the top. Measured — the first version of this bottom-pin
+       changed nothing at all for exactly that reason. */
+    flex: 1;
     overflow-y: auto;
     min-height: 0;
     padding: 0.5rem 0.8rem;
+    display: flex;
+    flex-direction: column;
   }
-  article {
-    padding: 0.5rem 0;
-    border-bottom: 1px solid var(--border);
-    /* History recedes: only the newest entry (the last one, see below) reads at
-       full strength until the pointer enters the panel. */
-    opacity: 0.18;
-    transition: opacity 0.15s ease;
-  }
-  /* :last-of-type, not :last-child — the "מסביר…" line is the last child while
-     a summary is in flight. */
-  article:last-of-type {
-    opacity: 1;
-  }
-  /* While a new turn is being explained the entry above it is already history,
-     so it recedes right away — the panel shouldn't keep pointing at the old
-     summary for the seconds it takes the new one to arrive. Same specificity
-     game as below: (0,3,1) here, (0,3,1) later for hover, so hover wins on
-     source order. */
-  .body.explaining article:last-of-type {
-    opacity: 0.18;
-  }
-  /* Pointer in the panel reads the whole history at full strength, in flight
-     or not. */
-  .explainer:hover .body article {
-    opacity: 1;
-  }
-  article:last-child {
-    border-bottom: none;
-  }
-  .ts {
-    color: var(--text-faint);
-    font-size: 0.7rem;
-    margin-bottom: 0.3rem;
+  /* Bottom-pinned, the way a chat log is. `margin-top: auto` and NOT
+     `justify-content: flex-end`: in a scroll container, flex-end pushes
+     overflow past the START edge, where it cannot be scrolled back to — a long
+     explanation would lose its first lines with no way to reach them. An auto
+     margin resolves to 0 the moment the content is taller than the box, so
+     short content sits at the bottom and tall content scrolls normally from the
+     top. Measured both ways (see docs/explainer.md). */
+  .content {
+    margin-top: auto;
   }
   .text {
     /* dir="rtl" on the element (see the markup comment); text-align:start
@@ -304,11 +255,24 @@
     line-height: 1.55;
     color: var(--text);
   }
+  section + section {
+    margin-top: 0.85rem;
+  }
+  /* The heading is a label, not a voice: small, dim, uppercase-ish spacing is
+     wrong for Hebrew, so it leans on size and colour instead. text-align:start
+     under dir="rtl" puts it on the reading edge, above its own sentence. */
+  h2 {
+    margin: 0 0 0.2rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--label);
+    text-align: start;
+  }
   .failed .text {
     color: var(--text-faint);
     font-style: italic;
   }
-  /* The retry lives under its failed row, hugging the RTL reading edge. */
+  /* The retry lives under its failed entry, hugging the RTL reading edge. */
   .actions {
     display: flex;
     justify-content: flex-end;
@@ -328,17 +292,11 @@
     color: var(--text);
     border-color: var(--text-dim);
   }
-  /* The in-place "מסביר…" reuses the bottom line's look, minus its padding —
-     it stands in for the entry text, inside a row that already has its own. */
-  .text.working {
-    padding: 0;
-  }
-  /* A question or a plan entry: the claude is waiting on the user right now —
-     accent edge on the reading (right) side, matching the panel's RTL. The
-     colour is what separates them at a glance: cyan is a question to answer,
-     green a finished plan waiting for "yes, execute" (the same green the
-     sidebar uses for ready, and deliberately NOT the amber the in-flight dot
-     owns). */
+  /* A question or a plan: the claude is waiting on the user right now — accent
+     edge on the reading (right) side, matching the panel's RTL. The colour is
+     what separates them at a glance: cyan is a question to answer, green a
+     finished plan waiting for "yes, execute" (the same green the sidebar uses
+     for ready, and deliberately NOT the amber the in-flight dot owns). */
   .question,
   .plan {
     border-right: 2px solid var(--accent);
@@ -349,8 +307,9 @@
   }
   .tag {
     color: var(--accent);
-    margin-left: 0.5rem;
-    float: right;
+    font-size: 0.7rem;
+    text-align: start;
+    margin-bottom: 0.3rem;
   }
   .plan .tag {
     color: var(--dot-ready);

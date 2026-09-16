@@ -496,8 +496,7 @@ conversation to go and find.
 `Core::restart_instance` (`commands::restart_session`, menu id `restart`) kills the child and spawns
 a new one **on the same row** with the same `session_id` and `resume: true`. Everything that
 identifies the instance survives because none of it lives in the process: the id and therefore its
-hub address, its name and mute, its position in the sidebar, its `inbox/<id>` mail, its Explainer
-feed. It is the restore path from `Core::open`, aimed at one row while the app runs.
+hub address, its name and mute, its position in the sidebar, its `inbox/<id>` mail. It is the restore path from `Core::open`, aimed at one row while the app runs.
 
 Five things it does that are not obvious:
 

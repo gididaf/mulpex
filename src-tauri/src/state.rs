@@ -1110,57 +1110,6 @@ impl Core {
         changed
     }
 
-    /// Collect the turns the `Stop` hook handed to the Explainer: one
-    /// `explainreq/<id>` file per instance, holding that turn's transcript path.
-    /// Consume-and-delete like `process_name_requests` — the file is gone even
-    /// when the id is refused, so a stale request can't sit on disk retrying
-    /// every tick. Ids that aren't a live claude are dropped: a shell never
-    /// writes one (shells run no hooks), so one here is leftover from a closed
-    /// instance whose id a terminal now holds, and explaining it would be a lie.
-    pub fn take_explain_requests(&mut self) -> Vec<(usize, String)> {
-        self.drain_request_dir(mulpex_core::EXPLAINREQ_DIR)
-    }
-
-    /// Same handshake for `explainq/<id>` — the pending `AskUserQuestion`
-    /// payload the `askq` hook wrote, to be explained while the question is on
-    /// screen.
-    pub fn take_question_requests(&mut self) -> Vec<(usize, String)> {
-        self.drain_request_dir(mulpex_core::EXPLAINQ_DIR)
-    }
-
-    /// Same handshake for `explainplan/<id>` — the pending `ExitPlanMode`
-    /// payload the `plan` hook wrote, to be explained while the "ready to code?"
-    /// approval dialog is on screen.
-    pub fn take_plan_requests(&mut self) -> Vec<(usize, String)> {
-        self.drain_request_dir(mulpex_core::EXPLAINPLAN_DIR)
-    }
-
-    /// Consume-and-delete every `<subdir>/<id>` file, keeping only live claudes'
-    /// non-empty payloads (see `take_explain_requests` for why the rest is
-    /// dropped silently).
-    fn drain_request_dir(&mut self, subdir: &str) -> Vec<(usize, String)> {
-        let dir = self.state_dir.join(subdir);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let id = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<usize>().ok());
-            let payload = std::fs::read_to_string(&path).unwrap_or_default();
-            let _ = std::fs::remove_file(&path);
-            let Some(id) = id else { continue };
-            let live_claude = self.sessions.iter().any(|s| s.id == id && !s.is_shell());
-            if live_claude && !payload.trim().is_empty() {
-                out.push((id, payload.trim().to_string()));
-            }
-        }
-        out
-    }
-
     /// The label the sidebar shows for a row: the real name if there is one,
     /// otherwise the provisional one. See `fallback_names` for why the two are
     /// separate maps rather than one.

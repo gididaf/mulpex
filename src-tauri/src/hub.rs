@@ -26,8 +26,9 @@ const POLL: Duration = Duration::from_millis(200);
 
 /// Spawn the poll loop. Runs for the life of the app on its own thread.
 pub fn start(app: AppHandle) {
-    // The Explainer's Sonnet workers: fed below from `take_explain_requests`,
-    // emitting `explain-update` on their own once a summary lands.
+    // The Explainer's Sonnet workers. Nothing in this loop feeds them — they are
+    // fed by ⌘⇧E (`commands::explain_now`) and emit `explain-update` themselves
+    // once a summary lands.
     explainer::init(app.clone());
     std::thread::spawn(move || {
         // Last-emitted snapshot per project, so we only push on change.
@@ -65,25 +66,18 @@ pub fn start(app: AppHandle) {
                 // (an empty dir read) and it changes `session_infos`, so the diff
                 // below is what actually repaints the row.
                 core.process_name_requests();
+                // ⌘M is undone by the user simply talking to the row again. Same
+                // shape as the name requests above: an empty dir read per tick,
+                // and the session diff below is what redraws the sidebar.
+                core.process_user_prompts();
                 // Remote claudes calling their driver back. Cheap when there are
                 // none (one empty dir read) and it must run every tick: this is
                 // the only path by which a machine on the other end of an ssh
                 // link can reach a local instance at all.
                 core.process_remote_signals();
-                // Turns the Stop hook handed to the Explainer (transcript path
-                // per finished turn) → the Sonnet worker queue. Cheap here (one
-                // dir read + a queue push); the summarizing happens off-thread.
-                for (id, transcript) in core.take_explain_requests() {
-                    explainer::submit(core.handle, id, transcript, core.state_dir.clone());
-                }
-                // A pending AskUserQuestion — explained while it sits on screen.
-                for (id, json) in core.take_question_requests() {
-                    explainer::submit_question(core.handle, id, json, core.state_dir.clone());
-                }
-                // A finished plan waiting for "yes, execute" — same deal.
-                for (id, json) in core.take_plan_requests() {
-                    explainer::submit_plan(core.handle, id, json, core.state_dir.clone());
-                }
+                // The Explainer is NOT driven from here. It runs only on ⌘⇧E
+                // (`commands::explain_now`), so this loop has no Explainer work
+                // per tick — only the `forget` below, when a row goes away.
                 core.refresh_worked();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on

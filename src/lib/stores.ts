@@ -27,7 +27,8 @@ export interface ProjectState {
   sessions: SessionInfo[];
   statuses: Map<number, Status>;
   tasks: Map<number, string>;
-  /** id → that instance's Explainer feed, newest first (see ExplainerPanel). */
+  /** id → that instance's Explainer answer: 0 or 1 entries, never a history
+   *  (see ExplainerPanel). An array because a retry addresses it by `seq`. */
   explains: Map<number, ExplainEntry[]>;
   /** Instances the Explainer is currently working on (the panel's busy dot). */
   explainPending: Set<number>;
@@ -195,7 +196,8 @@ export const tasks = derived(
 );
 /** The active project's hub snapshot (locks / waiting / messages / pending). */
 export const hub = derived(activeProject, (p) => p?.hub ?? null);
-/** The Explainer feed of the active project's *focused* instance, newest first. */
+/** The active project's *focused* instance's Explainer answer — an array of at
+ *  most one, since the Explainer only ever speaks about the turn on screen. */
 export const activeExplains = derived(activeProject, (p) =>
   p && p.activeSessionId != null
     ? (p.explains.get(p.activeSessionId) ?? [])
@@ -369,19 +371,6 @@ export function applyExplainFor(
   patchProject(handle, { explains });
 }
 
-/** Replace a project's whole Explainer feed from `get_explains` (initial paint /
- *  hot-reload). Entries arrive flat, each carrying its instance id. */
-export function setExplainsFor(
-  handle: ProjectHandle,
-  entries: ExplainEntry[],
-): void {
-  const explains = new Map<number, ExplainEntry[]>();
-  for (const e of entries) {
-    explains.set(e.id, [...(explains.get(e.id) ?? []), e]);
-  }
-  patchProject(handle, { explains });
-}
-
 /** Mirror an `explain-pending` transition (the panel's busy dot). */
 export function setExplainPendingFor(
   handle: ProjectHandle,
@@ -396,7 +385,9 @@ export function setExplainPendingFor(
   patchProject(handle, { explainPending });
 }
 
-/** Drop an exited instance's feed — its row is gone, so it's unreachable. */
+/** Drop one instance's explanation and its busy dot. Used both when its row
+ *  exits and when the explanation goes stale — the panel closed, or the user
+ *  sent the next prompt. */
 export function removeExplainsFor(handle: ProjectHandle, id: number): void {
   const p = get(projects).get(handle);
   if (!p || (!p.explains.has(id) && !p.explainPending.has(id))) return;
@@ -419,9 +410,18 @@ export function findByDir(dir: string): ProjectState | undefined {
 /** Whether the ⌘⇧M message reader panel is open. */
 export const showMessages = writable(false);
 
-/** Whether the ⌘⇧E Explainer column is visible. On by default — the panel's
- *  whole point is being there after every turn; hide it for the current run. */
-export const showExplainer = writable(true);
+/** Whether the ⌘⇧E Explainer column is visible. **Off by default, and off most
+ *  of the time**: the Explainer runs only when asked, so a visible-but-empty
+ *  column would be a third of the window spent on nothing. ⌘⇧E opens it and
+ *  asks in one keystroke; closing it, switching rows, or sending the next
+ *  prompt puts it away again. */
+export const showExplainer = writable(false);
+
+/** True between a ⌘⇧E and the backend saying whether it will reuse the answer
+ *  on screen or produce a new one. The panel waits on this rather than render
+ *  an entry it may be about to discard — the verdict is a `stat`, so this is a
+ *  frame at most, but without it a changed turn flashes its predecessor. */
+export const explainDeciding = writable(false);
 
 /** Whether the ⌘P project quick-switcher overlay is open. */
 export const showPalette = writable(false);

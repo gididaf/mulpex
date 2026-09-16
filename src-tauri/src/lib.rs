@@ -100,7 +100,8 @@ pub fn run() {
             commands::resize_terminals,
             commands::focus_session,
             commands::get_hub_snapshot,
-            commands::get_explains,
+            commands::explain_now,
+            commands::clear_explain,
             commands::retry_explain,
             commands::restart_app,
         ])
