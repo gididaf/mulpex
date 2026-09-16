@@ -106,16 +106,6 @@ pub(crate) struct Ctx {
     /// compaction can run for minutes with no hook in between, so without it the
     /// 60 s idle notification lands mid-compaction and reports "needs you".
     pub(crate) compacting_dir: PathBuf,
-    /// `monitors/<id>` lists the task ids of the **persistent** Monitors this
-    /// instance has running, one per line. A persistent Monitor is a watcher, not
-    /// work in flight — and Mulpex tells every instance to arm one (the hub
-    /// listener, see `HUB_RULES` "INCOMING MESSAGES"), so without this every
-    /// instance in every project ended every turn `working`, forever. The `Stop`
-    /// payload cannot tell the two apart on its own — measured, a persistent
-    /// Monitor arrives there as `{"type":"shell","status":"running"}`, identical
-    /// in shape to a `run_in_background` shell, with no `persistent` field — so
-    /// the id is captured from `PostToolUse`, which does carry it.
-    pub(crate) monitors_dir: PathBuf,
 }
 
 impl Ctx {
@@ -132,7 +122,6 @@ impl Ctx {
         let waiting_dir = state_dir.join("waiting");
         let bg_dir = state_dir.join("bg");
         let compacting_dir = state_dir.join("compacting");
-        let monitors_dir = state_dir.join("monitors");
         let _ = std::fs::create_dir_all(&locks_dir);
         let _ = std::fs::create_dir_all(&history_dir);
         let _ = std::fs::create_dir_all(&tasks_dir);
@@ -140,7 +129,6 @@ impl Ctx {
         let _ = std::fs::create_dir_all(&waiting_dir);
         let _ = std::fs::create_dir_all(&bg_dir);
         let _ = std::fs::create_dir_all(&compacting_dir);
-        let _ = std::fs::create_dir_all(&monitors_dir);
         Some(Ctx {
             instance,
             state_dir,
@@ -152,7 +140,6 @@ impl Ctx {
             waiting_dir,
             bg_dir,
             compacting_dir,
-            monitors_dir,
         })
     }
 
@@ -613,85 +600,64 @@ fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>) {
 /// work in flight — between firings the instance genuinely is idle and a prompt
 /// really is what it is waiting for.
 ///
-/// Neither is a **persistent Monitor**, for the same reason and with much worse
-/// consequences: Mulpex itself tells every instance to arm one on its inbox
-/// (`HUB_RULES` "INCOMING MESSAGES"), and it never ends. It arrives here as
-/// `{"id":…,"type":"shell","status":"running","description":"Mulpex hub inbox",…}`
-/// — measured, and indistinguishable from a real background shell — so the ids
-/// recorded by `note_persistent_monitor` from `PostToolUse` (the one event that
-/// sees `persistent`) are subtracted. Without that every instance was `working`
-/// forever, which also suppressed `needs` forever: no red dot, no tab badge, no
-/// dock badge, no banner, for anyone.
-fn background_work_running(ctx: &Ctx, payload: Option<&serde_json::Value>) -> bool {
-    let watchers = persistent_monitors(ctx);
+/// Neither is **Mulpex's own hub listener**, for the same reason and with much
+/// worse consequences: Mulpex itself tells every instance to arm one on its
+/// inbox (`HUB_RULES` "INCOMING MESSAGES"), and it runs for as long as the tool
+/// lets it. It arrives here as
+/// `{"id":…,"type":"shell","status":"running","description":"Mulpex hub inbox","command":…}`
+/// — in shape, indistinguishable from a real `run_in_background` shell. Left
+/// counted, every instance in every project is `working` forever, which used to
+/// suppress `needs` forever too: no red dot, no tab badge, no dock badge, no
+/// banner, for anyone.
+///
+/// **It is recognised by its `command`, which is Mulpex's own text.** `HUB_RULES`
+/// dictates that command byte-for-byte and `hook.rs` already gates the arm nudge
+/// on the `touch` inside it, so matching it here is the same contract read from
+/// the other end — and measured (real `claude`, `scratchpad/monprobe`,
+/// 2026-09-16) the whole command reaches `Stop` verbatim, however long it is.
+///
+/// This replaced a two-hook handshake that recorded each **persistent** Monitor's
+/// task id from `PostToolUse` and subtracted it here. That broke completely when
+/// Claude Code removed persistent Monitors: `persistent` moved from `tool_input`
+/// to `tool_response` **and became permanently `false`**, so nothing was ever
+/// recorded and every instance stuck on yellow. Three properties make the
+/// command match the better contract, not merely the working one:
+///
+/// - **One hook.** No `monitors/<id>` file, no ordering between `PostToolUse` and
+///   `Stop`, nothing to clear at `SessionStart`, and `posttooluse` no longer
+///   parses a payload on every tool call.
+/// - **It is retroactive.** An instance that armed its listener before this
+///   shipped goes green at its very next turn end. The id-recording version could
+///   not see a Monitor armed before it, so every instance had to re-arm first.
+/// - **It depends only on a string Mulpex authors.** The previous version
+///   depended on an optional parameter of someone else's tool, which vanished.
+fn background_work_running(_ctx: &Ctx, payload: Option<&serde_json::Value>) -> bool {
     payload
         .and_then(|j| j.get("background_tasks"))
         .and_then(|v| v.as_array())
         .is_some_and(|tasks| {
             tasks.iter().any(|t| {
-                let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let running = t
                     .get("status")
                     .and_then(|s| s.as_str())
                     .map(|s| s == "running")
                     .unwrap_or(true);
-                running && !watchers.iter().any(|w| w == id)
+                running && !is_hub_listener(t)
             })
         })
 }
 
-/// `PostToolUse` for a `Monitor` call. Measured payload (real `claude` v2.1.241,
-/// `scratchpad/monprobe`):
-///   `tool_input`    `{"description":"Mulpex hub inbox","persistent":true,"command":…}`
-///   `tool_response` `{"taskId":"bo013hsts","timeoutMs":0,"persistent":true}`
-/// A **persistent** Monitor runs until the session ends, so it must never make
-/// the instance look busy. A one-shot Monitor is not recorded and still counts.
-fn note_persistent_monitor(ctx: &Ctx, payload: Option<&serde_json::Value>) {
-    let Some(json) = payload else { return };
-    if json.get("tool_name").and_then(|v| v.as_str()) != Some("Monitor") {
-        return;
-    }
-    let persistent = json
-        .get("tool_input")
-        .and_then(|t| t.get("persistent"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !persistent {
-        return;
-    }
-    let Some(task_id) = json
-        .get("tool_response")
-        .and_then(|r| r.get("taskId"))
+/// The marker that identifies the hub listener inside its own command line. It
+/// is the inbox path every listener watches, spelled exactly as `HUB_RULES`
+/// spells it — short enough that a hand-rolled variant still carries it, and
+/// specific enough that nothing else plausibly does.
+const LISTENER_MARKER: &str = "$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID";
+
+/// Is this `background_tasks` entry the instance's own hub listener?
+fn is_hub_listener(task: &serde_json::Value) -> bool {
+    task.get("command")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    else {
-        return;
-    };
-    let mut ids = persistent_monitors(ctx);
-    if ids.iter().any(|i| i == task_id) {
-        return;
-    }
-    ids.push(task_id.to_string());
-    let _ = std::fs::write(monitors_file(ctx), ids.join("\n"));
-}
-
-fn monitors_file(ctx: &Ctx) -> PathBuf {
-    ctx.monitors_dir.join(ctx.id_str())
-}
-
-/// The task ids of this instance's persistent Monitors, as recorded by
-/// `note_persistent_monitor`.
-fn persistent_monitors(ctx: &Ctx) -> Vec<String> {
-    std::fs::read_to_string(monitors_file(ctx))
-        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect())
-        .unwrap_or_default()
-}
-
-/// A session start that is not a compaction means the previous session's
-/// Monitors are gone with it, so their ids must not keep excusing tasks that a
-/// *new* session started.
-fn clear_persistent_monitors(ctx: &Ctx) {
-    let _ = std::fs::remove_file(monitors_file(ctx));
+        .is_some_and(|c| c.contains(LISTENER_MARKER))
 }
 
 fn background_flag(ctx: &Ctx) -> PathBuf {
@@ -708,48 +674,53 @@ fn set_background_flag(ctx: &Ctx, busy: bool) {
 
 /// Handle a `Notification` event (matcher `permission_prompt|idle_prompt`).
 ///
-/// This used to be a bare `printf needs > $MULPEX_STATE_DIR/$MULPEX_INSTANCE_ID`
-/// in the settings template, which is wrong for one case and one case only:
-/// **`idle_prompt` while the instance has background work outstanding.** Claude
-/// Code fires that notification 60 s after a turn ends (measured: `Stop` at
-/// 11:58:56, `Notification` at 11:59:56, to the second), regardless of whether a
-/// background agent it launched is still running — so an instance quietly waiting
-/// on its own agent lit the red dot, the tab's red badge, the dock badge and a
-/// desktop banner, all saying "this one needs YOU". It didn't.
+/// **This hook can no longer produce `needs`.** Red means one thing now — the
+/// instance is holding an `AskUserQuestion` or an `ExitPlanMode` plan up for an
+/// answer — and those are written by `askq` and `plan` from their own
+/// `PreToolUse` matchers. Everything else a notification reports is either
+/// idleness (`waiting`) or work in flight (`working`), and calling either of
+/// those "needs YOU" is what made the dot, the tab badge, the dock badge and the
+/// desktop banner unreadable: `idle_prompt` fires 60 s after *every* turn end
+/// (measured: `Stop` at 11:58:56, `Notification` at 11:59:56, to the second), so
+/// the common state of a healthy instance was red.
 ///
-/// The notification's own payload cannot answer the question — it carries only
-/// `notification_type` and `message` (measured) — so the answer comes from the
-/// flag the `Stop` hook left behind, which is written from the one payload that
-/// does know.
+/// What it still does, and why it is not deleted:
 ///
-/// `permission_prompt` is never suppressed: a permission request is a question
-/// for the user whatever else is running. Neither is `AskUserQuestion`, which
-/// writes `needs` from its own `PreToolUse` matcher and never comes through here.
+/// - **It never clears `needs` either.** The plan dialog fires its own
+///   `permission_prompt` ~6 s after `PreToolUse[ExitPlanMode]` (measured
+///   2026-09-01), so a notification that wrote `waiting` unconditionally would
+///   flip the plan's red back to green while the dialog is still on screen. A
+///   status already reading `needs` is left exactly as it is.
+/// - **It downgrades a stale `working`.** A turn that ended without a `Stop`
+///   (an interrupt) leaves `working` behind; the idle notification is the only
+///   event that then says otherwise.
+/// - **`busy` still wins over idleness.** The notification's own payload cannot
+///   see background work — it carries only `notification_type` and `message`
+///   (measured) — so the answer comes from the flag the `Stop` hook left behind,
+///   which is written from the one payload that does know. Same for the
+///   `PreCompact` flag: compaction fires nothing between its endpoints.
+///
+/// `notification_type` is therefore no longer read: both kinds get the same
+/// answer, and the matcher is what limits which ones arrive.
 fn notification(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let kind = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
-        .and_then(|j| {
-            j.get("notification_type")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
-
-    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), notify_status(ctx, &kind));
+    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), notify_status(ctx));
     Ok(())
 }
 
 /// The whole decision `notification` makes, split out so a test can drive the
 /// real thing rather than a copy of it (the hook itself reads stdin, which a test
 /// cannot hand it).
-fn notify_status(ctx: &Ctx, kind: &str) -> &'static str {
+fn notify_status(ctx: &Ctx) -> &'static str {
+    if read_field_or_line(&ctx.state_dir.join(ctx.id_str())).as_deref() == Some("needs") {
+        return "needs";
+    }
     let busy = background_flag(ctx).exists() || compacting_flag(ctx).exists();
-    if kind == "idle_prompt" && busy {
+    if busy {
         "working"
     } else {
-        "needs"
+        "waiting"
     }
 }
 
@@ -798,7 +769,6 @@ fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
     if !is_compaction_end(&source) {
         // startup / resume / clear: whatever Monitors the last session had died
         // with it. Their ids must not keep excusing this session's tasks.
-        clear_persistent_monitors(ctx);
         return Ok(());
     }
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), compaction_end_status(ctx));
@@ -856,17 +826,16 @@ fn release_my_locks(ctx: &Ctx) {
 fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
 
-    // This is the ONE event that can see whether a Monitor is persistent, so the
-    // ids of the persistent ones are recorded here for `Stop` to subtract; see
-    // `Ctx::monitors_dir`. A `PostToolUse` payload carries the whole
-    // `tool_response` (a Read of a big file, a long Bash output) and this hook
-    // forks on EVERY tool call, so the JSON is only parsed when the cheap scan
-    // says a Monitor could be in it.
+    // Drained but never parsed. This hook forks on EVERY tool call and the
+    // payload carries the whole `tool_response` (a Read of a big file, a long
+    // Bash output), so the cheapest thing it can do with it is nothing. It used
+    // to scan for `Monitor` and record persistent Monitors' task ids here; `Stop`
+    // now recognises the hub listener from its own command line instead, which is
+    // why there is nothing left to learn from this payload — see
+    // `background_work_running`.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    if input.contains("Monitor") {
-        note_persistent_monitor(ctx, serde_json::from_str(&input).ok().as_ref());
-    }
+    drop(input);
 
     let mut notes: Vec<String> = Vec::new();
 
@@ -1104,17 +1073,22 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hidden reminder injected on each turn until this instance's hub listener is
-/// armed (see `HUB_RULES` "INCOMING MESSAGES" for the exact Monitor command). Once
-/// the Monitor starts it `touch`es `armed/<id>`, `listener_armed` sees it, and the
-/// reminder stops. Kept low-key so arming happens in the background of the user's
-/// actual first request, not as a separate visible turn.
-const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not armed yet this \
-session. As part of THIS turn — quietly, in the background — arm it now: the persistent Monitor \
-on your inbox, exactly as described under \"INCOMING MESSAGES\" in your instructions. Do not make \
-arming it your whole response and do not narrate it beyond a brief mention; just arm it and then \
-continue with what I actually asked. (You'll see this reminder each turn only until the listener \
-is armed.)";
+/// Hidden reminder injected on each turn while this instance's hub listener is
+/// not running (see `HUB_RULES` "INCOMING MESSAGES" for the exact Monitor
+/// command). The Monitor `touch`es `armed/<id>` when it starts and again every
+/// second it lives, `listener_armed` reads that heartbeat, and the reminder
+/// stops. Kept low-key so arming happens in the background of the user's actual
+/// first request, not as a separate visible turn.
+///
+/// It says "not running" rather than "not armed yet" because since monitors
+/// started expiring this fires for a listener that *was* armed and has since
+/// died, which is the case the heartbeat exists to catch.
+const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not running right \
+now (never armed, or it expired). As part of THIS turn — quietly, in the background — arm it: the \
+Monitor on your inbox, exactly as described under \"INCOMING MESSAGES\" in your instructions, with \
+timeout_ms at the maximum the tool allows. Do not make arming it your whole response and do not \
+narrate it beyond a brief mention; just arm it and then continue with what I actually asked. \
+(You'll see this reminder only while the listener is down.)";
 
 /// Whether this turn may carry the arm/name nudges.
 ///
@@ -1167,12 +1141,40 @@ fn take_resumed_in_place(ctx: &Ctx) -> bool {
     path.exists() && std::fs::remove_file(&path).is_ok()
 }
 
-/// Whether this instance's hub listener is armed: the persistent Monitor `touch`es
-/// `armed/<id>` when it starts, so the file's presence tracks the real listener. A
-/// fresh `state_dir` per Mulpex launch (and thus per `--resume`, which kills the
-/// old Monitor) means the flag is absent at startup, so restored instances re-arm.
+/// How long `armed/<id>` may go untouched before the listener counts as dead.
+/// The loop touches it once a second, so anything past a few seconds is a
+/// stopped listener; the margin is for a machine that slept or a very loaded box.
+const LISTENER_HEARTBEAT_GRACE: Duration = Duration::from_secs(30);
+
+/// Whether this instance's hub listener is **alive**, not merely whether it was
+/// ever armed.
+///
+/// `armed/<id>` is a heartbeat: the listener `touch`es it when it starts and then
+/// again on every pass of its one-second loop (`HUB_RULES` "INCOMING MESSAGES"),
+/// so the file's *mtime* is the liveness signal and its mere existence is not.
+///
+/// The distinction became load-bearing when Claude Code removed persistent
+/// Monitors. Every monitor now expires (30 min at most), so a listener stops on
+/// its own while the flag it wrote sits there forever — and the arm nudge, which
+/// is the only thing that ever gets one re-armed, is gated on exactly this
+/// function. Testing existence meant a listener died silently at the 30-minute
+/// mark and the instance was never woken by peer mail again, with nothing
+/// anywhere saying so. Testing freshness makes the nudge come back by itself.
+///
+/// A fresh `state_dir` per Mulpex launch (and thus per `--resume`, which kills
+/// the old Monitor) still means the flag is absent at startup, so restored
+/// instances re-arm as before.
 fn listener_armed(ctx: &Ctx) -> bool {
-    ctx.state_dir.join("armed").join(ctx.id_str()).exists()
+    let path = ctx.state_dir.join("armed").join(ctx.id_str());
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    // A clock that moved backwards leaves `elapsed()` erroring; treat that as
+    // alive rather than nudging an instance whose listener is probably fine.
+    modified
+        .elapsed()
+        .map(|age| age < LISTENER_HEARTBEAT_GRACE)
+        .unwrap_or(true)
 }
 
 /// Hidden reminder injected each turn until this instance has named its own
@@ -1444,7 +1446,6 @@ mod tests {
             waiting_dir: state_dir.join("waiting"),
             bg_dir: state_dir.join("bg"),
             compacting_dir: state_dir.join("compacting"),
-            monitors_dir: state_dir.join("monitors"),
             state_dir,
         }
     }
@@ -1586,115 +1587,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The exact payloads for the hub listener, captured from a real `claude`
-    /// v2.1.241 driven on a PTY (`scratchpad/monprobe`). A **persistent** Monitor
-    /// reaches `Stop` as `type: "shell"` with no `persistent` field — the same
-    /// shape a `run_in_background` shell has — so only `PostToolUse` can tell
-    /// them apart.
-    const POSTTOOL_LISTENER: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"Monitor",
-        "tool_input":{"description":"Mulpex hub inbox","timeout_ms":300000,"persistent":true,
-        "command":"while true; do sleep 1; done"},
-        "tool_response":{"taskId":"bo013hsts","timeoutMs":0,"persistent":true}}"#;
-    const STOP_WITH_LISTENER: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
-        "background_tasks":[{"id":"bo013hsts","type":"shell","status":"running",
-        "description":"Mulpex hub inbox","command":"while true; do sleep 1; done"}],
-        "session_crons":[]}"#;
-    /// The same turn, with a real background shell running alongside the listener.
-    const STOP_LISTENER_AND_SHELL: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
-        "background_tasks":[
-        {"id":"bo013hsts","type":"shell","status":"running","description":"Mulpex hub inbox"},
-        {"id":"bwg6gwcry","type":"shell","status":"running","description":"Sleep 150 seconds"}],
-        "session_crons":[]}"#;
-    /// A one-shot Monitor: `persistent` is false, so it is NOT excused.
-    const POSTTOOL_ONESHOT: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"Monitor",
-        "tool_input":{"description":"Wait for the build","persistent":false},
-        "tool_response":{"taskId":"bq7one1x","persistent":false}}"#;
+    /// The real hub-listener command, exactly as `HUB_RULES` dictates it and
+    /// exactly as it reaches the `Stop` hook — captured from a real `claude`
+    /// (`scratchpad/monprobe`, 2026-09-16). The whole command survives verbatim
+    /// however long it is, which is what makes it usable as the identifying mark.
+    const LISTENER_CMD: &str = r#"INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=\"$MULPEX_STATE_DIR/armed\"; mkdir -p \"$INBOX\" \"$ARMED\"; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; prev=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); while true; do cur=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); if [ \"$cur\" -gt \"$prev\" ]; then echo \"mulpex: $((cur - prev)) new hub message(s)\"; fi; prev=$cur; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; sleep 1; done"#;
 
-    /// Mulpex tells **every** instance to arm a persistent Monitor on its inbox
-    /// (`HUB_RULES` "INCOMING MESSAGES"), and that Monitor never ends. Counting it
-    /// as work in flight made every instance in every project report `working`
-    /// forever — which, because `working` also suppresses the idle notification,
-    /// silently killed the red dot, the tab badge, the dock badge and the banner
-    /// for everyone. Reported from the field with a pane sitting idle at its
-    /// prompt under `Baked for 4m 0s · 1 monitor still running`.
+    /// A turn that ended with nothing but the hub listener running.
+    fn stop_with_listener() -> String {
+        format!(
+            r#"{{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[
+            {{"id":"bnxvw92ez","type":"shell","status":"running",
+             "description":"Mulpex hub inbox","command":"{LISTENER_CMD}"}}],"session_crons":[]}}"#
+        )
+    }
+
+    /// The same turn, with a real background shell running alongside the listener.
+    fn stop_listener_and_shell() -> String {
+        format!(
+            r#"{{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[
+            {{"id":"bnxvw92ez","type":"shell","status":"running",
+             "description":"Mulpex hub inbox","command":"{LISTENER_CMD}"}},
+            {{"id":"bwg6gwcry","type":"shell","status":"running",
+             "description":"Sleep 150 seconds","command":"sleep 150"}}],"session_crons":[]}}"#
+        )
+    }
+
+    /// Mulpex tells **every** instance to arm a Monitor on its inbox (`HUB_RULES`
+    /// "INCOMING MESSAGES"). Counting it as work in flight made every instance in
+    /// every project report `working` forever — which, because `working` also
+    /// suppresses the idle notification, silently killed the red dot, the tab
+    /// badge, the dock badge and the banner for everyone. Reported from the field
+    /// with a pane sitting idle at its prompt under
+    /// `Baked for 4m 0s · 1 monitor still running`.
+    ///
+    /// It is recognised by its **command**, which `HUB_RULES` authors. The
+    /// previous version recorded each persistent Monitor's task id from
+    /// `PostToolUse` and subtracted it here; that died silently when Claude Code
+    /// removed persistent Monitors (`persistent` moved to `tool_response` and
+    /// became permanently `false`, measured 2026-09-16), and every instance stuck
+    /// on yellow with no way back short of an app restart.
     #[test]
     fn the_hub_listener_is_a_watcher_not_work_in_flight() {
         let dir = std::env::temp_dir().join(format!("mulpex-listener-{}", crate::persist::new_uuid()));
-        std::fs::create_dir_all(dir.join("monitors")).unwrap();
         std::fs::create_dir_all(dir.join("bg")).unwrap();
         let ctx = test_ctx(&dir, 3);
 
-        // Before `PostToolUse` has seen it, the listener is indistinguishable from
-        // a background shell — this is the shape of the bug.
-        assert!(background_work_running(&ctx, payload(STOP_WITH_LISTENER).as_ref()));
-
-        // `PostToolUse` records it, and from then on it is a watcher.
-        note_persistent_monitor(&ctx, payload(POSTTOOL_LISTENER).as_ref());
-        assert_eq!(persistent_monitors(&ctx), vec!["bo013hsts".to_string()]);
         assert!(
-            !background_work_running(&ctx, payload(STOP_WITH_LISTENER).as_ref()),
+            !background_work_running(&ctx, payload(&stop_with_listener()).as_ref()),
             "an instance idle at its prompt with only its hub listener running is NOT working"
         );
-        // Recording is idempotent — the id is not appended once per turn.
-        note_persistent_monitor(&ctx, payload(POSTTOOL_LISTENER).as_ref());
-        assert_eq!(persistent_monitors(&ctx).len(), 1);
 
-        // ...and the whole point: the 60 s idle notification can say "needs you"
-        // again.
-        set_background_flag(&ctx, background_work_running(&ctx, payload(STOP_WITH_LISTENER).as_ref()));
-        assert_eq!(notify_status(&ctx, "idle_prompt"), "needs");
+        // ...and the whole point: the turn ends green rather than pinning the row
+        // yellow forever.
+        set_background_flag(
+            &ctx,
+            background_work_running(&ctx, payload(&stop_with_listener()).as_ref()),
+        );
+        assert_eq!(notify_status(&ctx), "waiting");
 
         // Real work running alongside the listener still counts.
         assert!(
-            background_work_running(&ctx, payload(STOP_LISTENER_AND_SHELL).as_ref()),
+            background_work_running(&ctx, payload(&stop_listener_and_shell()).as_ref()),
             "excusing the listener must not excuse the background shell next to it"
         );
-        // A one-shot Monitor is work, and is never recorded.
-        note_persistent_monitor(&ctx, payload(POSTTOOL_ONESHOT).as_ref());
-        assert_eq!(persistent_monitors(&ctx).len(), 1);
+
+        // Any other Monitor is ordinary work — the exemption is the inbox command,
+        // not the tool.
         assert!(background_work_running(
             &ctx,
-            payload(r#"{"background_tasks":[{"id":"bq7one1x","status":"running"}]}"#).as_ref()
+            payload(
+                r#"{"background_tasks":[{"id":"bq7one1x","type":"shell","status":"running",
+                "description":"Wait for the build","command":"tail -f build.log"}]}"#
+            )
+            .as_ref()
         ));
 
-        // A new session kills the old Monitors, so their ids stop excusing anything.
-        clear_persistent_monitors(&ctx);
-        assert!(background_work_running(&ctx, payload(STOP_WITH_LISTENER).as_ref()));
+        // A subagent has no `command` at all, and must not be mistaken for one.
+        assert!(background_work_running(
+            &ctx,
+            payload(
+                r#"{"background_tasks":[{"id":"ba1","type":"subagent","status":"running",
+                "description":"Explore","agent_type":"Explore"}]}"#
+            )
+            .as_ref()
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bug the user hit: the row said "needs you" while the pane said
-    /// "Waiting for 1 background agent to finish".
+    /// `armed/<id>` is a heartbeat, not a one-off flag: the listener re-`touch`es
+    /// it every second, so a monitor that has expired — which every monitor now
+    /// does — goes stale and the arm nudge comes back on its own. Testing mere
+    /// existence meant a dead listener was indistinguishable from a live one and
+    /// the instance was never woken by peer mail again.
+    #[test]
+    fn a_dead_listener_goes_stale_so_the_nudge_comes_back() {
+        let dir = std::env::temp_dir().join(format!("mulpex-armed-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 4);
+        let armed = dir.join("armed");
+        std::fs::create_dir_all(&armed).unwrap();
+        let flag = armed.join("4");
+
+        assert!(!listener_armed(&ctx), "never armed");
+
+        std::fs::write(&flag, "").unwrap();
+        assert!(listener_armed(&ctx), "just touched — the listener is alive");
+
+        // Age the heartbeat past the grace: the monitor expired and stopped
+        // touching it, while the file it wrote sits there forever.
+        let stale = SystemTime::now() - LISTENER_HEARTBEAT_GRACE - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&flag)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        assert!(
+            !listener_armed(&ctx),
+            "an expired listener must read as unarmed, or nothing ever re-arms it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Red is reserved for a pending question or plan, and a `Notification` can
+    /// neither light it nor put it out.
     ///
     /// Claude Code fires `idle_prompt` 60 s after a turn ends whether or not the
     /// instance launched something that is still running (measured to the second:
     /// `Stop` 11:58:56 → `Notification` 11:59:56, with the agent still live). The
     /// notification's payload carries only `notification_type` and `message` — no
-    /// task list — so the only thing that can answer "is it actually waiting for
-    /// ME?" is what `Stop` recorded on its way out.
+    /// task list — so the only thing that can answer "is it actually busy?" is
+    /// what `Stop` recorded on its way out.
     #[test]
-    fn an_idle_prompt_is_only_needs_you_when_nothing_is_running() {
+    fn a_notification_never_lights_red_and_never_clears_it() {
         let dir = std::env::temp_dir().join(format!("mulpex-notify-{}", crate::persist::new_uuid()));
         std::fs::create_dir_all(dir.join("bg")).unwrap();
         let ctx = test_ctx(&dir, 3);
+        let status = ctx.state_dir.join("3");
         // Turn ended with an agent still running.
         set_background_flag(&ctx, background_work_running(&ctx, payload(STOP_WITH_AGENT).as_ref()));
         assert!(background_flag(&ctx).exists());
         assert_eq!(
-            notify_status(&ctx, "idle_prompt"),
+            notify_status(&ctx),
             "working",
             "an instance waiting on its own agent must not claim it needs the user"
         );
 
-        // A permission prompt is a real question whatever else is running.
-        assert_eq!(notify_status(&ctx, "permission_prompt"), "needs");
-
         // The agent finishes; the next turn boundary clears the flag and the
-        // ordinary idle behaviour comes straight back.
+        // instance is genuinely idle at its prompt — green, not red.
         set_background_flag(&ctx, background_work_running(&ctx, payload(STOP_IDLE).as_ref()));
         assert!(!background_flag(&ctx).exists());
-        assert_eq!(notify_status(&ctx, "idle_prompt"), "needs");
+        assert_eq!(
+            notify_status(&ctx),
+            "waiting",
+            "an idle prompt is idleness, not a question for the user"
+        );
+
+        // A pending plan/question wrote `needs` from its own PreToolUse matcher.
+        // The plan dialog's own `permission_prompt` lands ~6 s later (measured
+        // 2026-09-01) and must not flip the row green while it is on screen.
+        std::fs::write(&status, "needs").unwrap();
+        assert_eq!(notify_status(&ctx), "needs");
+        set_background_flag(&ctx, true);
+        assert_eq!(notify_status(&ctx), "needs", "not even background work outranks it");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1718,12 +1775,10 @@ mod tests {
         // The exact payload Claude Code hands PreCompact.
         std::fs::write(compacting_flag(&ctx), "manual").unwrap();
         assert_eq!(
-            notify_status(&ctx, "idle_prompt"),
+            notify_status(&ctx),
             "working",
-            "the 60 s idle notification landed mid-compaction and claimed the user was needed"
+            "the 60 s idle notification landed mid-compaction and called the instance idle"
         );
-        // A permission prompt is still a real question, compaction or not.
-        assert_eq!(notify_status(&ctx, "permission_prompt"), "needs");
 
         // A manual /compact leaves the instance idle at its prompt...
         assert_eq!(compaction_end_status(&ctx), "waiting");
@@ -1735,7 +1790,7 @@ mod tests {
         // Once it has ended, the ordinary idle behaviour comes straight back.
         clear_compacting(&ctx);
         assert!(!compacting_flag(&ctx).exists());
-        assert_eq!(notify_status(&ctx, "idle_prompt"), "needs");
+        assert_eq!(notify_status(&ctx), "waiting");
 
         // A missing/garbled flag must not strand the row as busy.
         assert_eq!(compaction_end_status(&ctx), "waiting");

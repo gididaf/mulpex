@@ -23,7 +23,7 @@ Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `compacting/`, `armed/`,
-  `named/`, `namenudge/`, `spawning/`, `monitors/`, `resumed/`, `explainreq/`, `explainq/`,
+  `named/`, `namenudge/`, `spawning/`, `resumed/`, `explainreq/`, `explainq/`,
   `explainplan/`, like `peers/` already does.
 - **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
   fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be
@@ -39,9 +39,13 @@ Traps that live in this crate specifically:
   is not the desktop app opens the store with `SessionStore::in_home` and passes its home
   explicitly.
 - **`rules.rs` must stay byte-identical across hosts, not merely equivalent.** `HUB_RULES` carries
-  the exact Monitor command an instance arms, and `hook.rs`'s arm nudge gates on the `touch` that
-  command performs; a character of drift re-nudges every instance forever. That is why it lives
-  here instead of in each host. → [../../docs/hub.md](../../docs/hub.md)
+  the exact Monitor command an instance arms, and **three** separate pieces of `hook.rs` read that
+  one string: the arm nudge gates on the `touch` it performs, `listener_armed` reads the *second*
+  `touch` (inside the loop) as a liveness heartbeat, and `background_work_running` identifies the
+  listener by the inbox path in the command. A character of drift re-nudges every instance forever,
+  or strands every instance on yellow. That is why it lives here instead of in each host, and why
+  `hub_rules_carry_the_exact_arming_touch` asserts all three.
+  → [../../docs/hub.md](../../docs/hub.md)
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
   ambiguity once made a 91 s spawn stall indistinguishable from a lost task.
   → [../../docs/hub.md](../../docs/hub.md)

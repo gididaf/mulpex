@@ -75,7 +75,51 @@ The sidebar dot, the dock badge, the red tab badge and the updater's busy guard 
 word per instance, written by the hooks in `mulpex-core`. Two things that look like idleness are
 not, and each needed its own fix.
 
-### `needs` must mean "needs YOU", not "its agent is still going"
+### `needs` means a pending question or plan, and nothing else
+
+Red is the strongest thing the sidebar can say, so it is reserved for the two states where the
+instance is genuinely holding something up and one keystroke from the user unblocks it:
+
+- **`PreToolUse[AskUserQuestion]`** (`hook askq`)
+- **`PreToolUse[ExitPlanMode]`** (`hook plan`) — a plan waiting for approval
+
+Those are the **only** writers of `needs`. In particular the `Notification` hook is not: it used to
+write `needs` for `permission_prompt` *and* for `idle_prompt`, and since `idle_prompt` fires 60 s
+after **every** turn end, red was the resting state of a perfectly healthy instance. A signal that
+is on most of the time is not a signal, which is what "the statuses work bad" meant. It now reports
+what it actually knows — `working` while background work or a compaction is outstanding, `waiting`
+otherwise — and the two rules that keep that honest are:
+
+- **It never sets `needs`.** `notification_type` is no longer even read; both kinds get the same
+  answer and the matcher is what limits which ones arrive.
+- **It never clears `needs` either.** The plan-approval dialog fires its own `permission_prompt`
+  ~6 s after `PreToolUse[ExitPlanMode]` (measured 2026-09-01), so a notification that wrote
+  `waiting` unconditionally would flip the plan's red back to green while the dialog is still on
+  screen. A status already reading `needs` is left exactly as it is — not even background work
+  outranks it.
+
+What still earns the hook its place is the downgrade: a turn that ended without a `Stop` (an
+interrupt) leaves `working` behind, and the idle notification is the only event that then says
+otherwise.
+
+Red is cleared by anything that proves the instance moved on — `PostToolUse` (answering the
+question or approving the plan) writes `working`, `UserPromptSubmit` the same, `Stop` writes
+`waiting`. The one residual case is escaping the dialog and then doing nothing at all: the row
+stays red until the next prompt. It is a true statement about a question that was never answered,
+so it is left alone.
+
+Everything keyed off `needs` narrows with it for free — the dock badge, the red tab badge and the
+desktop banner (`attention.ts`, `stores.ts::needsCount`) all read the same word.
+
+Pinned by `a_notification_never_lights_red_and_never_clears_it`, confirmed to fail with the
+`needs`-preserving guard removed (`left: "waiting" right: "needs"` — the plan dialog going green
+under itself).
+
+### A turn that ends with background work is not idle
+
+(Written when the idle notification still wrote `needs`, which is why it reads as a red-dot bug.
+The `needs` half is now impossible — see above — but the `waiting`-vs-`working` distinction it
+established is what the sidebar, the tab badges and the updater's busy guard still run on.)
 
 An instance that launches a **background agent** (or a `run_in_background` shell) ends its turn and
 is then woken later by a `<task-notification>`. Claude Code fires its `idle_prompt` notification
@@ -101,14 +145,13 @@ The fix is that `Stop` is the only hook that can see the truth, so it records it
   keyed off it is already right: no dock badge, no red tab badge, and `updater.ts`'s busy guard
   keeps counting the instance as busy, so an auto-update cannot restart the app out from under a
   running agent.
-- **`permission_prompt` is never suppressed** — a permission request is a question for the user
-  whatever else is running — and `AskUserQuestion` never comes through here at all, since it writes
-  `needs` from its own `PreToolUse` matcher. A genuinely blocked instance still shouts.
-- **A plan waiting for approval writes `needs` twice, from two places.** `PreToolUse[ExitPlanMode]`
-  (`hook plan`) writes it immediately, and the dialog's own `permission_prompt` notification writes
-  it again ~6 s later — measured 2026-09-01. The first is what makes the dot immediate; the second
-  is what would still be right if the hook ever stopped firing. Neither is load-bearing alone.
-  → [explainer.md](explainer.md)
+- **`permission_prompt` no longer gets its own answer.** It used to be the one kind never
+  suppressed, on the grounds that a permission request is a question whatever else is running —
+  but with `--dangerously-skip-permissions` on, essentially the only thing that still fires it is
+  the plan-approval dialog itself, ~6 s after `PreToolUse[ExitPlanMode]` (measured 2026-09-01).
+  That dialog's red is already written by `hook plan`, so all the notification has to do is not
+  undo it, which is the `needs`-preserving guard above. Both notification kinds now take the same
+  branch. → [explainer.md](explainer.md)
 - **`session_crons` is deliberately not counted.** A scheduled future run is not work in flight;
   between firings the instance really is idle and a prompt really is what it wants.
 - A task entry with **no** `status` counts as running. The failure that matters is calling a busy
@@ -117,8 +160,8 @@ The fix is that `Stop` is the only hook that can see the truth, so it records it
 ### ...and a watcher is not work either — Mulpex's own listener broke all of this
 
 The fix above then broke the thing it was protecting, everywhere. `HUB_RULES` tells **every**
-instance to arm a persistent Monitor on its inbox (["INCOMING MESSAGES"](hub.md), `pty.rs`), and
-that Monitor is a `while true … sleep 1` loop that never ends. It arrives in `Stop`'s
+instance to arm a Monitor on its inbox (["INCOMING MESSAGES"](hub.md), `pty.rs`), and
+that Monitor is a `while true … sleep 1` loop. It arrives in `Stop`'s
 `background_tasks` like any other task, so `background_work_running` was **permanently true**:
 every instance in every project ended every turn `working`, `bg/<id>` was never cleared, and
 because `working` is exactly what suppresses the idle notification, `needs` could never be
@@ -127,42 +170,98 @@ field as a pane sitting idle at its prompt under *"Baked for 4m 0s · 1 monitor 
 confirmed on the live scratch dir, where `bg/` held a flag for **all 14** instances of one project
 and `registry.json` reported every instance in every project as `working`.
 
-A persistent Monitor is a **watcher**, not work in flight — the same judgement `session_crons`
-already gets. But it cannot be recognised at `Stop`. Measured (real `claude` v2.1.241,
-`scratchpad/monprobe`), it reaches the `Stop` hook as
+The listener is a **watcher**, not work in flight — the same judgement `session_crons` already
+gets. **It is recognised by its own command line**, which is Mulpex's text: `HUB_RULES` dictates
+it byte-for-byte, so `background_work_running` subtracts any `background_tasks` entry whose
+`command` contains `hook::LISTENER_MARKER` (`$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID`). Measured
+2026-09-16 on a real `claude` (`scratchpad/monprobe`), the entry is
 
 ```json
-{"id":"bo013hsts","type":"shell","status":"running","description":"Mulpex hub inbox","command":"while true; do sleep 1; done"}
+{"id":"bnxvw92ez","type":"shell","status":"running","description":"Mulpex hub inbox",
+ "command":"INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; … prev=$cur; touch \"$ARMED/…\"; sleep 1; done"}
 ```
 
-— **`type: "shell"`, no `persistent` field**: byte-for-byte the shape of a `run_in_background`
-shell, which must keep counting. The one event that does know is `PostToolUse`, whose payload for
-that same call carries `tool_input.persistent: true` and `tool_response.taskId` — the id that
-later appears in `background_tasks`.
+— **the whole command, verbatim, however long it is.** (An older note here recorded the command as
+the bare `while true; do sleep 1; done`; that was the probe's own short command, not truncation.)
 
-So `posttooluse` records it: a persistent Monitor's task id is appended to `monitors/<id>` (one
-per line, deduped), and `background_work_running` subtracts those ids. Consequences worth keeping:
+Consequences worth keeping:
 
-- **A one-shot Monitor still counts.** `persistent: false` is never recorded, so an instance
-  genuinely waiting on a Monitor is still `working`.
-- **Real work alongside the listener still counts** — the exclusion is per task id, not a
-  whole-payload verdict.
-- **`SessionStart` for `startup`/`resume`/`clear` clears the list.** Those Monitors died with the
-  previous session; keeping their ids would let them excuse a *new* session's tasks.
-- **`posttooluse` only parses its stdin when the raw text contains `Monitor`.** That hook forks on
-  every tool call and a `PostToolUse` payload carries the whole `tool_response` (a big Read, a long
-  Bash output); the substring scan keeps the common path a memchr rather than a full serde parse.
-- **An instance that armed its listener before the fix shipped stays `working` until it re-arms** —
-  its task id was never recorded. It self-heals at the next app launch, since the scratch dir is
-  per-run and `armed/<id>` is therefore absent — but only once the user actually talks to it, since
-  the arm nudge now rides on genuine user turns and no longer on the restart wake ([hub.md](hub.md)).
+- **The exemption is the command, not the tool.** Any *other* Monitor is ordinary work and still
+  counts, exactly as a `run_in_background` shell does.
+- **Real work alongside the listener still counts** — the verdict is per task, not per payload.
+- **A `subagent` entry has no `command` at all**, so the match cannot mistake one for a listener.
+- **It is retroactive.** An instance that armed its listener before this shipped goes green at its
+  very next turn end, with no re-arm and no app restart.
+
+#### What this replaced, and why the replacement is the better contract
+
+Until 2026-09-16 the listener was recognised by **task id**, recorded in `monitors/<id>` by a
+`PostToolUse` hook that read `tool_input.persistent: true` — the one event that could see the flag.
+Then Claude Code **removed persistent Monitors**. Measured on a real `claude`, the flag moved from
+`tool_input` to `tool_response` *and became permanently `false`*:
+
+```json
+"tool_input":  {"description":"Mulpex hub inbox","timeout_ms":600000,"command":"INBOX=…"}
+"tool_response":{"taskId":"bp1jr29w8","timeoutMs":600000,"persistent":false}
+```
+
+So `note_persistent_monitor` returned early on every call, `monitors/` stayed empty (confirmed on
+the user's live scratch dir, alongside a populated `armed/` and `bg/`), and **every instance was
+stuck yellow with no way back short of an app restart** — the exact bug the id-recording was
+written to fix, re-created from the other end. Nothing in this repo had changed.
+
+Three things the command match does that the id handshake could not, and they are the reason it is
+not merely the current fix:
+
+- **One hook, no ordering.** No `monitors/<id>` file, no dependency on `PostToolUse` running before
+  `Stop`, nothing to clear at `SessionStart`, and `posttooluse` no longer parses a payload on every
+  single tool call.
+- **It is retroactive** (above). The id version could not see a Monitor armed before it shipped, so
+  every instance had to re-arm first — which, since the arm nudge rides on genuine user turns,
+  meant "until the user happens to talk to it".
+- **It depends only on a string Mulpex writes.** The id version depended on an optional parameter
+  of someone else's tool. *Someone else's UI is not an interface* — and neither is someone else's
+  optional field.
 
 Pinned by `the_hub_listener_is_a_watcher_not_work_in_flight` (confirmed to fail with the
 subtraction removed, on *"an instance idle at its prompt with only its hub listener running is NOT
-working"*), then driven through the real `mulpex-helper` binary: Stop before recording →
-`working`; PostToolUse[Monitor persistent] → `monitors/7`; the same Stop → `waiting` and the `bg`
-flag gone; idle_prompt → `needs`; a real background shell beside the listener → `working` and it
-stays `working` through the idle notification; SessionStart[resume] → the list is gone.
+working"*) and by `rules::hub_rules_carry_the_exact_arming_touch`, which asserts the marker and both
+`touch`es survive in `HUB_RULES` — confirmed to fail when the heartbeat is dropped. Then driven
+through the real `mulpex-helper` binary on the **verbatim captured payload**: Stop with only the
+listener → `waiting` and no `bg` flag; idle_prompt after it → `waiting`; Stop with the listener plus
+a real background shell → `working` and the flag set; idle_prompt after that → still `working`; Stop
+with nothing → `waiting`. `monitors/` is no longer created at all.
+
+### The listener expires, so `armed/<id>` is a heartbeat
+
+Removing persistent Monitors broke a second thing, quieter and worse: **every monitor now expires**
+(30 min at most). The hub listener is therefore not permanent, and when it stops, peer mail can no
+longer wake an idle instance — the whole point of arming it.
+
+The arm nudge is the only thing that ever gets one re-armed, and it was gated on `armed/<id>`
+*existing*. The dead listener's flag sits there forever, so the nudge never came back and the
+instance went deaf silently, with nothing anywhere saying so.
+
+So `armed/<id>` is now a **heartbeat, not a flag**: the `HUB_RULES` command `touch`es it when it
+starts *and again on every pass of its one-second loop*, and `hook::listener_armed` tests the
+file's **mtime** against `LISTENER_HEARTBEAT_GRACE` (30 s) rather than its existence. A listener
+that dies goes stale within seconds and the nudge returns by itself. `HUB_RULES` also tells the
+instance to re-arm immediately when it is told its monitor expired, which is the fast path; the
+heartbeat is the one that does not depend on the model noticing.
+
+- **The grace is 30 s for a one-second heartbeat** — wide enough for a slept machine or a loaded
+  box, still far inside the 30-minute expiry it exists to catch.
+- **A clock that moved backwards reads as alive.** `elapsed()` errors there, and nudging an
+  instance whose listener is probably fine is the worse failure.
+- **`HUB_RULES` must not ask for `persistent` any more.** The Monitor tool's schema is
+  `additionalProperties: false`, so passing it is now rejected outright — an instruction that would
+  have made a literal-minded instance fail to arm at all. Asserted absent by the same rules test.
+
+Pinned by `a_dead_listener_goes_stale_so_the_nudge_comes_back`, confirmed to fail with
+`listener_armed` reverted to `.exists()`. Driven end to end afterwards: the `HUB_RULES` command run
+as literal shell ticks the mtime every second (1789538468 → 1789538470 over two seconds), and
+through the real `mulpex-helper`, a fresh heartbeat emits no arm nudge while a 120-s-old one and a
+missing flag both do.
 
 ### Compaction is work too
 
@@ -193,7 +292,8 @@ Pinned by `compaction_is_working_and_never_needs_you` (confirmed to fail with *"
 notification landed mid-compaction and claimed the user was needed"*) and
 `only_a_compaction_session_start_touches_the_status`, then replayed through the real
 `mulpex-helper` as the captured live sequence: Stop → `waiting`, PreCompact → `working`, idle_prompt
-mid-compaction → stays `working`, SessionStart[compact] → `waiting`, idle_prompt after → `needs`.
+mid-compaction → stays `working`, SessionStart[compact] → `waiting`, idle_prompt after → `needs`
+(`waiting` since red narrowed to questions and plans).
 
 `bg` and `compacting` are subdirs for the same reason `peers/` is: a bare integer at the state-dir
 root is scanned as an instance status file (`mcp::live_ids`).

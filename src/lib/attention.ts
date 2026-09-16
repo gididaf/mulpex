@@ -2,10 +2,12 @@
 // something else: the dock badge (a live count) and a macOS notification (a
 // one-shot alert at the moment it happens).
 //
-// Both key off `needs` — the status the `AskUserQuestion` / idle-prompt hooks
-// write (see `config.rs`). Deliberately NOT `waiting`: `waiting` only means a
-// turn ended, which happens constantly and asks nothing of you, so counting or
-// announcing it would train you to ignore both signals.
+// Both key off `needs`, and `needs` now means exactly one thing: the instance is
+// holding an `AskUserQuestion` or a plan up for an answer (written by the
+// `askq` / `plan` PreToolUse hooks — see `config.rs`). Deliberately NOT
+// `waiting`, and no longer the 60 s idle prompt either: both only mean a turn
+// ended, which happens constantly and asks nothing of you, so counting or
+// announcing them would train you to ignore both signals.
 //
 // Muted sessions are excluded from both, matching the tab badges — mute means
 // "I'm deliberately not watching this one".

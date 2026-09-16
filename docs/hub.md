@@ -42,6 +42,24 @@ against the *local* hub:
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
 
+### The listener is not permanent, and `armed/<id>` is a heartbeat
+
+Claude Code removed persistent Monitors (measured 2026-09-16), so **every hub listener expires** —
+30 minutes at most. A listener that has stopped cannot wake an idle instance, which is the only
+reason it exists.
+
+The arm nudge is what gets one re-armed, and it reads `armed/<id>`. That file is now written by the
+listener *on every pass of its one-second loop*, not once at startup, and `hook::listener_armed`
+tests its **mtime** (grace: 30 s) instead of its existence — so a dead listener goes stale within
+seconds and the nudge comes back on its own. `HUB_RULES` separately tells the instance to re-arm the
+moment it is told its monitor expired; that is the fast path, the heartbeat is the one that does not
+depend on the model noticing.
+
+`HUB_RULES` must also no longer ask for `persistent: true`: the Monitor schema is
+`additionalProperties: false`, so passing it is rejected and a literal-minded instance would fail to
+arm at all. The full story, including what the same change did to the sidebar's yellow dot, is in
+[sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
+
 ### The nudge that fed itself: why instances opened by themselves after an update
 
 The arming nudge is self-healing by design, and for a while it healed a wound it was itself
@@ -51,15 +69,14 @@ wasn't looking at — wake up and take a turn nobody asked for.
 The loop, traced end-to-end in a live transcript (`bvpgm5lxl` → `bjwjmo0kw`, 2026-09-03) rather
 than reasoned about:
 
-1. Teardown `killpg`s each `claude`, so the listener's **persistent Monitor dies with no completion
-   record**.
+1. Teardown `killpg`s each `claude`, so the listener's **Monitor dies with no completion record**.
 2. On the next launch the resumed session is handed a synthetic
    `<task-notification><status>stopped</status>… No completion record was found …` prompt. **That
    is a real turn** — not a notice. It is what "the session opened by itself" actually was.
 3. `UserPromptSubmit` fires on it (measured: the injected turn carries `origin.kind:
    "task-notification"`, `promptSource: "system"`, and a `hook_additional_context` attachment), so
    `ARM_LISTENER_NUDGE` rides in.
-4. The instance dutifully arms a fresh persistent Monitor — **the orphan that repeats this at the
+4. The instance dutifully arms a fresh Monitor — **the orphan that repeats this at the
    next update.**
 
 The nudge manufactured the artifact that caused the next nudge, so it never settled. Note where the

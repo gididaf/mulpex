@@ -17,10 +17,12 @@
 /// `PreToolUse[ExitPlanMode]` → needs the same way (via `<helper> hook plan`),
 /// which also hands the pending plan to the Explainer; `Stop` → waiting (via the
 /// helper, which also releases locks); the `permission_prompt`/`idle_prompt`
-/// notifications →
-/// needs, via the helper rather than a bare `printf` because `idle_prompt` fires
-/// 60 s after every turn end *even when a background agent the instance launched
-/// is still running* — see `hook::notification`. `PreCompact` → working and
+/// notifications → waiting, or working while background work or a compaction is
+/// outstanding, and **never** needs — red is reserved for the two `PreToolUse`
+/// matchers above, the only states where the instance is genuinely holding
+/// something up for the user. A notification also never *clears* needs, because
+/// the plan dialog fires its own `permission_prompt` ~6 s after `ExitPlanMode`.
+/// See `hook::notification`. `PreCompact` → working and
 /// `SessionStart[source=compact]` → back to a real status, because compaction
 /// runs for minutes firing nothing else and `/compact` does not even fire
 /// `UserPromptSubmit`. The sidebar polls these one-word state files.

@@ -2825,7 +2825,6 @@ mod tests {
             waiting_dir: state_dir.join("waiting"),
             bg_dir: state_dir.join("bg"),
             compacting_dir: state_dir.join("compacting"),
-            monitors_dir: state_dir.join("monitors"),
             state_dir,
         }
     }
@@ -2880,7 +2879,6 @@ mod tests {
             waiting_dir: a_state.join("waiting"),
             bg_dir: a_state.join("bg"),
             compacting_dir: a_state.join("compacting"),
-            monitors_dir: a_state.join("monitors"),
             state_dir: a_state,
         };
         (root, ctx, b_state)

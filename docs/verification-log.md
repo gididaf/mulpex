@@ -1567,3 +1567,65 @@ measurement of this bug repeated the same mistake and produced a clean "no effec
   working inside it).
 - **Arabic**, and any row mixing RTL text with the *cursor* — the caret is still column-based, the
   residual limit already recorded in [rendering.md](rendering.md).
+
+## 2026-09-16 — the sidebar dots: red narrowed, and why yellow never went green
+
+Driven against a real `claude` and the real `mulpex-helper` binary, not reasoned about. The probe
+(`scratchpad/monprobe`) runs `claude -p` with a throwaway `--settings` whose `PostToolUse` and `Stop`
+hooks are a bare `cat >> …jsonl`, in an environment with `MULPEX_*` and `CLAUDE_CODE_CHILD_SESSION`
+scrubbed.
+
+### Measured: Claude Code removed persistent Monitors
+
+The payload `note_persistent_monitor` was built on no longer exists. `persistent` **moved from
+`tool_input` to `tool_response`, and is now permanently `false`** — the Monitor tool has no such
+input parameter any more (its schema is `additionalProperties: false`, so passing one is rejected),
+and every monitor expires (30 min cap):
+
+```json
+"tool_input":  {"description":"Mulpex hub inbox","timeout_ms":600000,"command":"INBOX=…"}
+"tool_response":{"taskId":"bp1jr29w8","timeoutMs":600000,"persistent":false}
+```
+
+So the `PostToolUse` recorder returned early on every call and `monitors/` was never written.
+Confirmed on the **user's live scratch dir** (`mulpex-1149/3`): `monitors/` empty, `armed/1` and
+`bg/1` both present, status `working`. That is the whole "yellow never turns green" report.
+
+### Measured: the listener's command reaches `Stop` verbatim
+
+The identifying fact the fix now rests on. With the real `HUB_RULES` command armed, the `Stop`
+payload carries it in full — not summarised, not truncated:
+
+```json
+{"id":"bnxvw92ez","type":"shell","status":"running","description":"Mulpex hub inbox",
+ "command":"INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=…; while true; do … done"}
+```
+
+This also corrects an earlier note in [sessions.md](sessions.md): the previously recorded
+`"command":"while true; do sleep 1; done"` was that probe's own short command, **not** evidence of
+truncation.
+
+### Driven through the real helper
+
+- **Red narrowed.** Stop → `waiting`; idle_prompt → `waiting`; permission_prompt → `waiting`;
+  `PreToolUse[AskUserQuestion]` → `needs`, and its own permission_prompt 6 s later → still `needs`;
+  PostToolUse (the user answered) → `working`; `PreToolUse[ExitPlanMode]` → `needs`, surviving both
+  its permission_prompt and a later idle_prompt; Stop with an agent running → `working`, and the
+  idle_prompt after it → still `working`.
+- **Yellow fixed, on the verbatim captured payload.** Stop with only the listener → `waiting`, `bg`
+  flag clear; idle_prompt after → `waiting`; Stop with the listener *plus* a real background shell →
+  `working`, flag set; idle_prompt after → still `working`; Stop with nothing → `waiting`.
+  `monitors/` is no longer created at all.
+- **The heartbeat.** The `HUB_RULES` command run as literal shell ticks `armed/<id>`'s mtime every
+  second (1789538468 → 1789538470 across two seconds). Through the helper's `userpromptsubmit`: a
+  fresh heartbeat emits **no** arm nudge, a 120-s-old one **does**, a missing flag **does**.
+
+### Not verified
+
+- **Live in the shipped `.app`.** Tests + the real helper binary only; Mulpex was not restarted (the
+  user is working inside it), so the running app still carries the old helper.
+- **That an instance actually re-arms on being told its monitor expired.** `HUB_RULES` now asks for
+  it, and the heartbeat is the backstop that does not depend on it, but the model's own response to
+  an expiry notice was not driven.
+- **Whether anything other than the plan dialog still fires `permission_prompt`** under
+  `--dangerously-skip-permissions`. Nothing in the fix depends on the answer.
