@@ -131,7 +131,20 @@ export function needsCount(p: ProjectState): number {
 }
 
 /**
- * Unread hub messages in `p`, muted recipients excluded (the tab's amber badge,
+ * Claudes of `p` sitting idle, muted ones excluded (the tab's green badge).
+ *
+ * `statuses` holds claudes only — a terminal is never a hub peer — so this never
+ * counts a shell. `working` is deliberately uncounted: the tab says what is
+ * *finished* and what is *blocked on you*, not what is busy.
+ */
+export function readyCount(p: ProjectState): number {
+  return p.sessions.filter((s) => !s.muted && p.statuses.get(s.id) === "waiting")
+    .length;
+}
+
+/**
+ * Unread hub messages in `p`, muted recipients excluded (shown in the hub panel
+ * and the bottom bar; the project tab no longer badges it),
  * and the same number the hub panel and status strip show).
  *
  * `pending_messages` is a project-wide total, so the muted share has to come off

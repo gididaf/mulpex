@@ -686,6 +686,28 @@
     applyProjectOrder(order);
   }
 
+  /**
+   * Slide the focused instance one row up/down in the sidebar (⌘⇧↑ / ⌘⇧↓) —
+   * the Y-axis twin of `moveProject`, committing through the same path a drag
+   * does, so the arrangement is persisted and ⌘[ / ⌘] cycle it in the new order.
+   *
+   * Clamped exactly like a drag: `dragOrder` runs `clampToGroup`, so a row can
+   * only move within its own block (unmuted claudes / muted claudes / terminals)
+   * and the ends are a no-op. Crossing a boundary could never stick anyway —
+   * `displayOrder` re-applies on top of whatever order is committed — so a
+   * clamped `to` that equals `from` is dropped here rather than round-tripping
+   * an order that changes nothing.
+   */
+  function moveInstance(delta: number) {
+    const list = get(sessions); // already in display order
+    const cur = get(activeId);
+    const from = list.findIndex((s) => s.id === cur);
+    if (from < 0) return;
+    const to = clampToGroup(list, from, from + delta);
+    if (to === from) return;
+    applySessionOrder(dragOrder(list, from, to));
+  }
+
   async function handleMenu(id: string) {
     const h = get(activeProjectHandle);
     switch (id) {
@@ -764,6 +786,12 @@
       case "prev":
         cycle(-1);
         break;
+      case "move_instance_up":
+        moveInstance(-1);
+        break;
+      case "move_instance_down":
+        moveInstance(1);
+        break;
       default:
         // ⌘1–⌘9 → the Nth open project, in tab-bar order (the projects Map's
         // insertion order, which is what ProjectTabBar renders).
@@ -836,13 +864,23 @@
       if ((left || e.code === "ArrowRight") && !inTextField(e.target)) {
         e.preventDefault();
         moveProject(left ? -1 : 1);
+        return;
+      }
+      // ⌘⇧↑ / ⌘⇧↓ — Move Instance Up/Down, the same story one axis over:
+      // declared in the menu, but with the terminal focused the keys are
+      // AppKit's `moveUp/DownAndModifySelection:` on xterm's hidden textarea
+      // and never fall through to the main menu.
+      const up = e.code === "ArrowUp";
+      if ((up || e.code === "ArrowDown") && !inTextField(e.target)) {
+        e.preventDefault();
+        moveInstance(up ? -1 : 1);
       }
     }
   }
 
   /**
-   * A field where ⌘⇧←/→ really is a selection gesture — the rename box, the
-   * palette's query — so the shortcut must be left alone there.
+   * A field where ⌘⇧ + an arrow really is a selection gesture — the rename box,
+   * the palette's query — so the shortcut must be left alone there.
    *
    * xterm's helper textarea is deliberately excluded: it is not a text field you
    * can see or edit, it's how the terminal receives keys, and its selection is

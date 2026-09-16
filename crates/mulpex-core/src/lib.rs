@@ -103,6 +103,20 @@ pub fn resumed_in_place_path(state_dir: &std::path::Path, id: usize) -> std::pat
     state_dir.join(RESUMED_DIR).join(id.to_string())
 }
 
+/// The mark that says "the USER just submitted a real prompt to this instance":
+/// `<state_dir>/userprompt/<id>`, written by the `UserPromptSubmit` hook and
+/// consumed-and-deleted by the host's poll loop, which unmutes the row.
+///
+/// The hook is the only place that can tell a user prompt from the runtime
+/// injecting a turn — a `<task-notification>` (a hub wake, a finished background
+/// job) fires `UserPromptSubmit` identically, and unmuting on one would undo the
+/// user's ⌘M the moment a peer messaged the instance, which is the opposite of
+/// what mute is for. So the mark is written only where `system_turn` is false;
+/// no reader has to re-derive that distinction.
+pub fn user_prompt_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(USERPROMPT_DIR).join(id.to_string())
+}
+
 /// Why closing `claude#id` right now would interrupt work in progress, or `None`
 /// if it is safely idle. The refusal `hub_close` reports when it was called
 /// without `force`.

@@ -156,6 +156,17 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let prev = MenuItemBuilder::with_id("prev", "Previous Session")
         .accelerator("Cmd+[")
         .build(app)?;
+    // ⌘⇧↑ / ⌘⇧↓ slide the focused row in the sidebar, the Y-axis twin of
+    // ⌘⇧← / ⌘⇧→ on the tab bar. Arrows for the same reason those are arrows —
+    // a function key has no shifted character for AppKit to match instead.
+    // Also claimed in the webview (`App.svelte::onGlobalKey`), because with the
+    // terminal focused these are AppKit text-selection commands.
+    let move_up = MenuItemBuilder::with_id("move_instance_up", "Move Instance Up")
+        .accelerator("Cmd+Shift+Up")
+        .build(app)?;
+    let move_down = MenuItemBuilder::with_id("move_instance_down", "Move Instance Down")
+        .accelerator("Cmd+Shift+Down")
+        .build(app)?;
     // Sessions are navigated with ⌘[ / ⌘] only — ⌘1–9 belong to projects.
     let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&rename)
@@ -166,6 +177,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&next)
         .item(&prev)
+        .item(&move_up)
+        .item(&move_down)
         .build()?;
 
     // Window: standard minimize/zoom. Minimize is a *custom* item rather than the

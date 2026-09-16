@@ -51,6 +51,8 @@ fn is_forwarded(id: &str) -> bool {
             | "minimize"
             | "next"
             | "prev"
+            | "move_instance_up"
+            | "move_instance_down"
             | "check_updates"
     ) || id.starts_with("project_")
 }

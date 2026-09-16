@@ -1043,6 +1043,17 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                     if !task.is_empty() {
                         let _ = std::fs::write(ctx.tasks_dir.join(ctx.id_str()), &task);
                     }
+                    // The user is talking to this instance, so a ⌘M on it has
+                    // been overtaken: the host's poll loop reads this mark and
+                    // unmutes the row. It is written in this branch and nowhere
+                    // else because this is the only place in the system that
+                    // knows the turn is the *user's* — a `<task-notification>`
+                    // (a hub wake, a finished background job) fires
+                    // `UserPromptSubmit` identically, and unmuting on one would
+                    // undo a ⌘M the moment a peer sent mail. Unconditional: the
+                    // reader is the only side that knows whether the row is
+                    // muted, and the mark is consumed either way.
+                    let _ = std::fs::write(crate::user_prompt_path(&ctx.state_dir, ctx.instance), "");
                 }
                 // The restart wake. Swallow it unless ⌘⇧R asked for it — see
                 // `orphaned_task_wake` for why this is the whole bug.

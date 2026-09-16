@@ -115,6 +115,31 @@ hub-panel/status-strip unread readouts — and takes it out of the ⌘[ / ⌘] r
   name column empty so the flag stays in field three. Covered by five `persist.rs` tests.
 - **Muting never moves focus**, and the muted terminal stays visible and typeable. Mute means "stop
   shouting at me", not "I'm done with this one".
+- **Sending the instance a prompt unmutes it.** Mute says "stop putting this in front of me";
+  talking to the row *is* the user putting it in front of themselves, so leaving it dimmed and sunk
+  would hide the one instance they are actively working with. There is no ⌘M to undo — it undoes
+  itself.
+
+  **Only a genuine user prompt counts, and the hook is the only side that can tell.** A
+  `<task-notification>` — a hub wake, a finished background job — fires `UserPromptSubmit` exactly
+  like a prompt (the general rule in the root file's invariants), so unmuting on one would undo a
+  ⌘M the moment a peer sent mail, which is precisely what mute exists to prevent. So the signal is
+  a mark rather than a keystroke: `hook.rs::userpromptsubmit` writes `userprompt/<id>` in the one
+  branch that already knows the turn is the user's (`!system_turn`, not `MULPEX_SENTINEL`), and the
+  200 ms poll consumes it in `Core::process_user_prompts`, unmutes and persists. Both hosts do it —
+  `mpx` clears the window's `@mpx_muted` from `core::process_user_prompts`. Cost is one empty dir
+  read per project per tick.
+
+  The frontend needed no change: the poll loop's session diff republishes the row, and
+  `App.svelte::syncMuteMenu` already re-runs on every hub update, so the Session ▸ Mute tick
+  follows. The mark is written for *every* instance, not only muted ones — the hook cannot see the
+  mute flag, which lives in `Core` — so the reader's job is mostly to delete a file and report no
+  change. It is consumed even for an unknown id, or a stale one would be re-read every tick.
+
+  Typing into the terminal is deliberately **not** the trigger, though it was the cheaper option:
+  a keystroke unmutes on an Esc or an arrow key, and an Enter is as often a y/n confirm or an
+  AskUserQuestion pick as it is a prompt. `userprompt/<id>` lands ~200 ms later and means the thing
+  it says.
 - **The 🔇 is not decoration.** A dimmed, dot-less, status-less row would otherwise read as *dead*
   rather than *silenced* — same failure the empty hub-panel sections had, an ambiguous readout that
   teaches the eye wrong. It's also the click target for muting a session **without focusing it**
@@ -208,6 +233,14 @@ list runs vertically). Terminals drag like instances: one list, one behavior.
   `Workspace::reorder_projects`.
 - Sidebar order is what ⌘[ / ⌘] cycle, so a drag remaps those too — the same "what you see is what
   you cycle" rule the kind split and the muted sort already follow.
+- **⌘⇧↑ / ⌘⇧↓ is the keyboard form of that drag** (`App.svelte::moveInstance`, Session menu): the
+  *focused* row moves one slot and commits through `applySessionOrder`, so there is no second
+  implementation of the reorder. It reuses `clampToGroup` + `dragOrder` for exactly the reason the
+  drag does, and a clamped `to` that equals `from` is dropped rather than round-tripping an order
+  that changes nothing — so the ends of a block are a silent no-op, matching ⌘⇧← / ⌘⇧→ on tabs.
+  Like those, the keys are declared in the menu *and* claimed in `onGlobalKey`, because with the
+  terminal focused ⌘⇧↑/↓ is AppKit's `moveUp/DownAndModifySelection:` on xterm's helper textarea
+  and never reaches the menu (see **Keyboard** in `../CLAUDE.md`).
 
 ## What a project tab shows
 

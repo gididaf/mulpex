@@ -3,7 +3,7 @@
     projects,
     activeProjectHandle,
     needsCount,
-    unreadCount,
+    readyCount,
     type ProjectHandle,
   } from "../stores";
 
@@ -95,10 +95,9 @@
   {#each list as p, i (p.handle)}
     <!-- Both badge counts exclude muted sessions (stores.ts) — muting is meant to
          quiet a project you're deliberately not watching, so a muted instance
-         must not keep the tab lit up. The plain session count still counts
-         everything: it says what's here, not what wants you. -->
+         must not keep the tab lit up. -->
+    {@const ready = readyCount(p)}
     {@const needs = needsCount(p)}
-    {@const unread = unreadCount(p)}
     <div
       class="tab"
       class:active={p.handle === $activeProjectHandle}
@@ -116,14 +115,18 @@
         onclick={() => selectUnlessDragged(p.handle)}
       >
         <span class="name">{p.name}</span>
-        <!-- Total sessions, always shown (0 included — "nothing running here" is
-             information too). The two badges are counts of things wanting you:
-             red = sessions asking a question, amber = unread hub messages. -->
-        <span
-          class="count"
-          title="{p.sessions.length} session{p.sessions.length === 1 ? '' : 's'}"
-          >{p.sessions.length}</span
-        >
+        <!-- Two badges, same colors as the sidebar dots, each hidden at zero:
+             green = claudes done and idle, red = claudes stopped on a question.
+             Working (amber) is deliberately unbadged, so a tab with everything
+             busy shows no pill at all. -->
+        {#if ready > 0}
+          <span
+            class="badge ready"
+            title="{ready} idle session{ready === 1 ? '' : 's'}"
+          >
+            {ready}
+          </span>
+        {/if}
         {#if needs > 0}
           <span
             class="badge needs"
@@ -132,14 +135,6 @@
               : ''} you"
           >
             {needs}
-          </span>
-        {/if}
-        {#if unread > 0}
-          <span
-            class="badge unread"
-            title="{unread} unread hub message{unread === 1 ? '' : 's'}"
-          >
-            {unread}
           </span>
         {/if}
       </button>
@@ -219,16 +214,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .count {
-    flex: none;
-    color: var(--text-faint);
-    font-size: 0.7rem;
-    font-variant-numeric: tabular-nums;
-  }
-  .tab.active .count {
-    color: var(--text-dim);
-    font-weight: 400;
-  }
   .badge {
     flex: none;
     min-width: 1.1rem;
@@ -238,15 +223,15 @@
     font-size: 0.66rem;
     font-weight: 700;
   }
-  /* Two different asks, two different colors — a red pill must never be ambiguous
-     between "a claude is blocked on you" and "you have mail". */
+  /* The sidebar's dot colors, so a tab reads the same way a row does. Dark text
+     on a saturated pill — white on either of these fails contrast. */
+  .badge.ready {
+    background: var(--dot-ready);
+    color: #0c2110;
+  }
   .badge.needs {
     background: var(--dot-needs);
     color: #2a0a0d;
-  }
-  .badge.unread {
-    background: var(--label);
-    color: #2a2005;
   }
   .x {
     flex: none;

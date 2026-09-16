@@ -164,6 +164,8 @@
       ["explainer", "Explainer", "⌘⇧E", true],
       ["next", "Next Session", "⌘]", $sessions.length > 1],
       ["prev", "Previous Session", "⌘[", $sessions.length > 1],
+      ["move_instance_up", "Move Instance Up", "⌘⇧↑", $sessions.length > 1],
+      ["move_instance_down", "Move Instance Down", "⌘⇧↓", $sessions.length > 1],
       ["open_project", "Open Project…", "⌘O", true],
       ["close_project", "Close Project", "⌘⇧W", true],
       ["next_project", "Next Project", "⌘⇧]", $projects.size > 1],

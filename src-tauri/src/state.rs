@@ -1209,6 +1209,47 @@ impl Core {
         self.persist_sessions();
     }
 
+    /// Unmute any instance the user has just spoken to: one `userprompt/<id>`
+    /// mark per real user prompt, written by the `UserPromptSubmit` hook.
+    /// Returns whether any row changed (the poll loop republishes on the diff).
+    ///
+    /// Mute means "stop putting this in front of me". Sending it a prompt is the
+    /// user putting it in front of themselves, so leaving the row dimmed and sunk
+    /// below the others would hide the one instance they are actively working
+    /// with. Consume-and-delete like `process_name_requests`, and unmuting an
+    /// already-unmuted row is a no-op — the common case, since the hook writes
+    /// the mark for every instance rather than only the muted ones (it cannot see
+    /// the mute state, which lives here).
+    ///
+    /// **Only a genuine user prompt gets here.** A `<task-notification>` — a hub
+    /// wake, a finished background job — fires `UserPromptSubmit` exactly like a
+    /// prompt, and unmuting on one would undo a ⌘M the moment a peer sent mail.
+    /// The hook is the only side that can tell them apart, so it writes the mark
+    /// only on the user's turns and this reader trusts it.
+    pub fn process_user_prompts(&mut self) -> bool {
+        let dir = self.state_dir.join(mulpex_core::USERPROMPT_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        let mut changed = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<usize>().ok());
+            let _ = std::fs::remove_file(&path);
+            let Some(id) = id else { continue };
+            if self.muted.remove(&id) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_sessions();
+        }
+        changed
+    }
+
     /// Rearrange sessions to match `ids` (the sidebar's new top-to-bottom order
     /// after a drag). Ids we don't know are ignored and sessions the caller
     /// omitted keep their relative order at the end, so a stale frontend list can
@@ -3235,34 +3276,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// End to end through the Explainer's request dir: a live claude's finished
-    /// turn is collected, everything else is consumed silently — a shell's id, a
-    /// reaped id, junk — so a stale file can never sit on disk retrying every
-    /// 200 ms tick.
+    /// A prompt from the user undoes ⌘M on the instance it was sent to — and the
+    /// mark is consumed whatever happens, so an unmuted row (the common case,
+    /// since the hook writes the mark for every instance) or a reaped id can't
+    /// leave a file the poll loop re-reads every tick.
     #[test]
-    fn explain_requests_are_consumed_and_only_live_claudes_count() {
-        let (_env, root, mut core) = scratch_core("explain-req-test");
-        let dir = core.state_dir.join(mulpex_core::EXPLAINREQ_DIR);
-        assert!(dir.is_dir(), "open() should create the request dir");
+    fn a_user_prompt_unmutes_the_instance_it_was_sent_to() {
+        let (_env, root, mut core) = scratch_core("unmute-test");
+        let dir = core.state_dir.join(mulpex_core::USERPROMPT_DIR);
+        assert!(dir.is_dir(), "open() should create the mark dir");
 
-        let id = core.spawn_instance().unwrap().id;
-        let term = core.spawn_terminal(None, None, true).unwrap().id;
-        std::fs::write(dir.join(id.to_string()), "/tmp/t.jsonl\n").unwrap();
-        std::fs::write(dir.join(term.to_string()), "/tmp/shell.jsonl").unwrap();
-        std::fs::write(dir.join("999"), "/tmp/ghost.jsonl").unwrap();
-        std::fs::write(dir.join("notanid"), "junk").unwrap();
+        let muted = core.spawn_instance().unwrap().id;
+        let loud = core.spawn_instance().unwrap().id;
+        core.set_muted(muted, true);
+        assert!(core.muted.contains(&muted));
 
-        assert_eq!(
-            core.take_explain_requests(),
-            vec![(id, "/tmp/t.jsonl".to_string())],
-            "only the live claude's turn is handed on, path trimmed"
-        );
+        // A quiet tick changes nothing and reports nothing.
+        assert!(!core.process_user_prompts(), "an empty dir must be a no-op");
+        assert!(core.muted.contains(&muted), "nothing was prompted");
+
+        // The user talks to the unmuted one: consumed, but no row changed, so the
+        // poll loop must not republish the session list.
+        std::fs::write(dir.join(loud.to_string()), "").unwrap();
+        assert!(!core.process_user_prompts(), "unmuting an unmuted row is not a change");
+
+        // …and to the muted one.
+        std::fs::write(dir.join(muted.to_string()), "").unwrap();
+        // An id nobody owns and a junk filename, neither of which may panic.
+        std::fs::write(dir.join("999"), "").unwrap();
+        std::fs::write(dir.join("notanid"), "").unwrap();
+        assert!(core.process_user_prompts(), "a real user prompt must unmute");
+        assert!(!core.muted.contains(&muted));
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
             0,
-            "requests must be consumed, or the poll loop retries them every tick"
+            "marks must be consumed, or the poll loop re-reads them every tick"
         );
-        assert!(core.take_explain_requests().is_empty(), "consumed means gone");
+        // Persisted, or the next launch brings the mute back.
+        assert!(
+            core.store.load().iter().all(|s| !s.muted),
+            "the unmute never reached the store"
+        );
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
