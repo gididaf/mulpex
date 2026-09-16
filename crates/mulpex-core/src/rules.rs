@@ -3,11 +3,18 @@
 //!
 //! **Why this lives in `mulpex-core` rather than beside the spawner.** `HUB_RULES`
 //! is a two-process contract, not documentation. It contains the exact `Monitor`
-//! command an instance must arm, whose `touch "$ARMED/$MULPEX_INSTANCE_ID"` is the
-//! only thing that writes the flag `hook.rs`'s `ARM_LISTENER_NUDGE` gates on — so
-//! the hook stops nagging only if the instance ran *that* command. It also fixes
-//! the `claude#1` / `term#5` / `<project>#<n>` address grammar that `registry.rs`
+//! command an instance must arm, and `hook.rs` both recognises that command
+//! (`is_hub_listener`, which is what keeps a listener from counting as work in
+//! flight) and repeats it verbatim in the arm nudge. It also fixes the
+//! `claude#1` / `term#5` / `<project>#<n>` address grammar that `registry.rs`
 //! parses and `mcp.rs` prints.
+//!
+//! **The command is one line naming a binary, and that is the point.** It used to
+//! be a ~400-character shell loop the model had to retype from this prose, and a
+//! model retypes whatever version is nearest in its context — usually its own last
+//! `Monitor` call. One instance re-armed a superseded copy 71 times across two days
+//! and an app update before `/compact` finally dropped it from context. Anything
+//! that must be got exactly right belongs in a program; see `listen.rs`.
 //!
 //! Two frontends now spawn claudes (the desktop app and `mpx`), and a second copy
 //! of this text would drift silently: the nudge would keep firing, or an address
@@ -151,24 +158,22 @@ the round-trip and silently picking up the peer's changes.\n\
 INCOMING MESSAGES (hub listener) — To be woken when another instance messages you, even while \
 you are idle between my prompts, you run a background listener on your inbox. TO ARM \
 IT: call the Monitor tool (if it is a deferred tool, load it first via ToolSearch with query \
-select:Monitor) with timeout_ms set to the MAXIMUM the tool allows and this EXACT command: \
-INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=\"$MULPEX_STATE_DIR/armed\"; \
-mkdir -p \"$INBOX\" \"$ARMED\"; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; \
-prev=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d ' '); while true; do \
-cur=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d ' '); \
-if [ \"$cur\" -gt \"$prev\" ]; then echo \"mulpex: $((cur - prev)) new hub message(s)\"; fi; \
-prev=$cur; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; sleep 1; done\n\
+select:Monitor) with timeout_ms set to the MAXIMUM the tool allows and this EXACT command, which \
+is one line and takes no arguments:\n\
+\"__MULPEX_BIN__\" listen\n\
 Do NOT pass a `persistent` parameter — the Monitor tool no longer has one and the call would be \
 rejected. Every monitor EXPIRES, so the listener is not permanent: when you are told yours \
 expired, RE-ARM IT IMMEDIATELY with the identical command, quietly, whatever else you were doing. \
-An expired listener means peer mail can no longer wake you.\n\
+An expired listener means peer mail can no longer wake you. NEVER re-arm by copying a Monitor \
+call from earlier in this conversation — an earlier turn may hold a superseded command, a \
+listener started from one cannot report that it is alive, and you will then be asked to arm \
+another on every single turn. Read the command off the line above, every time.\n\
 WHEN TO ARM: as soon as you start working. You are NOT prompted to arm it by a separate startup \
 turn; instead, on your first turn Mulpex injects a hidden reminder (and repeats it each turn ONLY \
 until the listener is armed). When you see that reminder, arm the Monitor QUIETLY as part of the \
 same turn — do not make arming your whole response and do not announce it beyond a brief mention — \
-then carry on with whatever I asked. The `touch` in the command above is what records that you \
-are armed, so the reminder stops — and because the loop repeats that `touch` every second, a \
-listener that has died goes stale and the reminder comes back on its own. \
+then carry on with whatever I asked. The listener reports itself alive to Mulpex for as long as \
+it runs, so the reminder stops once it is up and comes back on its own if it dies. \
 Once armed, a peer message shows up as a Monitor event whose line starts with \"mulpex:\" \
 (for example \"mulpex: 1 new hub message(s)\") — that is a peer message arriving, NOT something \
 I typed. When it happens, handle it immediately and autonomously: (1) call \
@@ -205,8 +210,22 @@ pub struct SpawnTask {
 /// discipline, joined by a single newline. ~14 KB — large enough that it cannot go
 /// on a tmux command line (see `mulpex-cli`'s `spec.rs`), and large enough that it
 /// is worth building once per spawn rather than per call site.
-pub fn append_system_prompt() -> String {
-    format!("{HUB_RULES}\n{PLANNING_RULES}")
+///
+/// `helper` is the absolute path of `mulpex-helper`, substituted for
+/// `__MULPEX_BIN__` exactly as `state_dir::write_state_dir` does it for
+/// `settings.json` and `mcp.json` — and for the same reason: the path differs per
+/// install and per build, and a child invokes the binary directly. Here it is the
+/// listener command `HUB_RULES` asks the instance to arm.
+pub fn append_system_prompt(helper: &std::path::Path) -> String {
+    let hub = HUB_RULES.replace("__MULPEX_BIN__", &helper.to_string_lossy());
+    format!("{hub}\n{PLANNING_RULES}")
+}
+
+/// The command `HUB_RULES` tells an instance to arm, spelled out for anything
+/// that has to name it outside the rules text — the arm nudge, which repeats it
+/// so a model has no reason to reach back into its own history for one.
+pub fn listener_command(helper: &std::path::Path) -> String {
+    format!("\"{}\" listen", helper.display())
 }
 
 /// The first prompt a `hub_spawn` child starts on: its assignment plus a
@@ -249,36 +268,46 @@ pub fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The arming command in HUB_RULES is a contract with `hook.rs`, and since
-    /// the listener started expiring it is *three* contracts in one string:
+    /// The arming command in `HUB_RULES` is a contract with `hook.rs`, and it is
+    /// now a contract about a *path* rather than about a shell loop:
     ///
-    /// - the `touch` is what writes `armed/<id>`, and the arm nudge stops only
-    ///   when that flag exists — diverge and every instance re-arms forever;
-    /// - the **second** `touch`, inside the loop, is the heartbeat
-    ///   `hook::listener_armed` reads as liveness — drop it and the flag goes
-    ///   stale once a second, so every instance re-arms forever *the other way*;
-    /// - the inbox path is `hook::LISTENER_MARKER`, how `background_work_running`
-    ///   tells the listener from a real background shell — diverge and every
-    ///   instance is stuck `working` (yellow) for good, which is exactly what a
-    ///   missing `persistent` flag did on 2026-09-16.
+    /// - the placeholder must be substituted, or the instance arms the literal
+    ///   string `__MULPEX_BIN__` and no listener ever starts;
+    /// - the substituted command must carry `hook::LISTENER_MARKERS`' helper
+    ///   mark, which is how `background_work_running` tells the listener from a
+    ///   real background shell — diverge and every instance is stuck `working`
+    ///   (yellow) for good, exactly as a missing `persistent` flag did on
+    ///   2026-09-16;
+    /// - `rules::listener_command` is what the arm nudge repeats, so it must be
+    ///   the same string the rules print. Two spellings of one command is how a
+    ///   model ends up choosing between them.
+    ///
+    /// It no longer asserts a `touch`: the heartbeat moved into the binary, which
+    /// is the point — a contract the model has to retype correctly was one an
+    /// instance broke 71 times in a row (see `listen.rs`).
     #[test]
-    fn hub_rules_carry_the_exact_arming_touch() {
-        assert_eq!(
-            HUB_RULES.matches(r#"touch "$ARMED/$MULPEX_INSTANCE_ID""#).count(),
-            2,
-            "the arming touch AND the in-loop heartbeat must both survive verbatim"
-        );
-        assert!(HUB_RULES.contains("$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID"));
-        // The heartbeat is only a heartbeat if it runs on every pass of the loop.
+    fn hub_rules_carry_the_exact_arming_command() {
+        let helper = std::path::Path::new("/Applications/Mulpex.app/Contents/MacOS/mulpex-helper");
+        let prompt = append_system_prompt(helper);
+
         assert!(
-            HUB_RULES.contains(r#"touch "$ARMED/$MULPEX_INSTANCE_ID"; sleep 1; done"#),
-            "the heartbeat touch must sit inside the loop, next to the sleep"
+            !prompt.contains("__MULPEX_BIN__"),
+            "an unsubstituted placeholder is a listener that can never start"
+        );
+        assert!(prompt.contains(&listener_command(helper)), "one spelling, not two");
+        assert!(
+            crate::hook::command_is_hub_listener(&listener_command(helper)),
+            "the mark `hook::is_hub_listener` matches must survive in the command"
         );
         // The tool no longer has this parameter, and passing it is rejected.
         assert!(
-            !HUB_RULES.contains("persistent set to true"),
+            !prompt.contains("persistent set to true"),
             "HUB_RULES must not ask for a Monitor parameter that no longer exists"
         );
+        // The event wording is the other half of the contract: `HUB_RULES` tells
+        // the instance a line starting `mulpex:` is peer mail, and `listen.rs`
+        // prints exactly that.
+        assert!(prompt.contains("mulpex: 1 new hub message(s)"));
     }
 
     /// The address grammar `registry::parse_address` reads.
@@ -313,8 +342,9 @@ mod tests {
 
     #[test]
     fn the_append_prompt_joins_both_halves() {
-        let s = append_system_prompt();
+        let s = append_system_prompt(std::path::Path::new("/tmp/mulpex-helper"));
         assert!(s.starts_with("You are one of several parallel"));
         assert!(s.contains("\nPLANNING —"));
     }
 }
+

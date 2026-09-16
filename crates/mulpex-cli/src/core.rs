@@ -378,6 +378,42 @@ pub fn process_name_requests(t: &Tmux, p: &Project) -> Result<bool> {
     Ok(changed)
 }
 
+/// Unmute any instance the user has just spoken to: one `userprompt/<id>` mark
+/// per real user prompt, written by the `UserPromptSubmit` hook. Returns whether
+/// any window changed.
+///
+/// Mute says "stop putting this in front of me"; sending it a prompt is the user
+/// putting it in front of themselves, so the row stops being dimmed and sunk.
+/// Only a *genuine* user prompt reaches here — a `<task-notification>` fires
+/// `UserPromptSubmit` identically, and the hook is the only side that can tell
+/// them apart, so it writes the mark on the user's turns alone.
+///
+/// The mark is consumed even for a row that is not muted (the hook can't see the
+/// mute flag, which lives on the tmux window), and even for an id `mpx` no longer
+/// has — otherwise it would sit on disk being re-read every tick.
+pub fn process_user_prompts(t: &Tmux, p: &Project) -> Result<bool> {
+    let dir = p.state_dir.join(mulpex_core::USERPROMPT_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for e in entries.flatten() {
+        let path = e.path();
+        let id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<usize>().ok());
+        let _ = std::fs::remove_file(&path);
+        let Some(inst) = id.and_then(|i| p.find(i)) else { continue };
+        if !inst.muted {
+            continue;
+        }
+        t.set_user_option(&inst.window, true, crate::claudewin::MUTED_OPT, "")?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 /// A window name is arbitrary text from `hub_set_name`. Control characters would
 /// corrupt the `list-panes` parse (SEP above) and the status line; a very long
 /// name would push every other window off the bar.

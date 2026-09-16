@@ -1629,3 +1629,87 @@ truncation.
   an expiry notice was not driven.
 - **Whether anything other than the plan dialog still fires `permission_prompt`** under
   `--dangerously-skip-permissions`. Nothing in the fix depends on the answer.
+
+## 2026-09-16 — the listener: a transcribed command, a nudge storm, and six orphans
+
+Started from a screenshot of `warweb#65` showing three `Monitor` tasks at once and a duplicate wake
+per hub message.
+
+### Measured: the listener command is retyped from context, and drifts
+
+Read off the instances' own transcript `.jsonl` files (`~/.claude/projects/<slug>/*.jsonl`), counting
+every `Monitor` tool call whose input contains `new hub message` and checking whether the in-loop
+`touch` (added that morning by `003ad33`) was present:
+
+| instance | arms | carrying the current command |
+| --- | --- | --- |
+| `warweb#65` (`c30f48b2`) | 72 | only #72, at 10:49 — **immediately after a `/compact`** |
+| `warweb#74` (`9154c9be`) | 34 | none |
+| `cloudraw#3` (`0a33866e`) | 4 | both of today's (it had compacted earlier) |
+
+The instance's `--append-system-prompt` argv was read straight off `ps -ww` and **did** contain both
+`touch`es, so the rules were correct and the transcription was not. Compaction is what accidentally
+healed it: dropping the old `Monitor` call from context left the system prompt as the nearest copy.
+
+Consequence, confirmed on disk: `armed/65` frozen at 10:23:57 while its loop was demonstrably alive
+(CPU accumulating, a live `sleep 1` child), so `listener_armed` was false on every turn, so the arm
+nudge fired on every turn, so Monitors stacked.
+
+### Measured: `background_tasks` is a `Stop`-only field
+
+Real interactive `claude` v2.1.273 on a PTY (Haiku 4.5), scratch dir, hooks dumping raw stdin:
+
+| hook | `background_tasks` |
+| --- | --- |
+| `userpromptsubmit` | **absent** — including a prompt taken 24 s after a Monitor was armed |
+| `posttooluse` | absent |
+| `stop` | present, with `id`, `status` and the full `command` |
+
+This killed the first plan (teach `listener_armed` to read the task list) and produced the
+`Stop` → `relisten/<id>` → nudge handshake instead.
+
+### Measured: a listener escapes every kill path
+
+`ps -o pid,ppid,pgid,sess,stat` on live listeners: `PGID == pid`, `SESS 0`, state `Ss` (no `+`) —
+own process group, no controlling terminal, so neither `killpg(child_pid)` nor `kill_tty_session`
+can reach one. Six were alive with `ppid 1` at the time of writing, started 09:25, 09:27, 09:39,
+09:40 and 10:41 the *previous* day plus one at 09:59, all belonging to Mulpex processes that had
+exited; their scratch roots were long gone and they were still forking a `sleep` once a second.
+
+Demonstrated live rather than inferred: closing the probe terminal killed its `claude`, and its
+Monitor shell was immediately `ppid 1` and still running.
+
+### A probe bug worth recording
+
+`KERN_PROCARGS2` asked for its size with a null `oldp` answers **32 bytes** — enough for `sleep 60`
+and nothing else. A buffer sized from that silently returns a *truncated* command line, and the
+first version of the orphan sweep matched nothing while looking like it worked. Use `KERN_ARGMAX`.
+
+Also: it returns **argv only** for our own children — a real orphan's blob came back 756 bytes with
+no `MULPEX_*` anywhere. So "which state dir does this listener serve?" is unanswerable from outside
+the process (argv spells it `$MULPEX_STATE_DIR`, unexpanded), and the reaper keys on `ppid == 1`
+instead.
+
+### Driven through the real binaries
+
+- **`mulpex-helper listen`:** heartbeat ticks `armed/<id>` once a second; two messages then one more
+  produce exactly `mulpex: 2 new hub message(s)` then `mulpex: 1 new hub message(s)`; a second
+  listener for the same instance prints `standing down` and exits 0; removing the state dir makes it
+  exit on its own; killing the pid in `pids/<id>` makes it exit on its own and clear its lock.
+- **The `Stop` → nudge handshake, through `mulpex-helper hook`:** a stale `armed/<id>` plus one
+  superseded-format listener writes `relisten/7 = bstale1`; the next `userpromptsubmit` emits the
+  repair nudge naming `bstale1` and the command to arm instead, and consumes the note. A healthy
+  single listener writes no note and produces no nudge. Two listeners write `b1 b2`.
+- **The rendered rules and nudge** were read as an instance sees them, not just asserted on: the
+  command sits on its own line in both.
+- 110 `mulpex-core` tests, 86 `src-tauri` tests.
+
+### Not verified
+
+- **Live in the shipped `.app`.** Tests and the real helper binary only; Mulpex was not restarted
+  (the user is working inside it), so the running app still carries the 0.18.2 helper.
+- **That a real instance obeys the repair nudge** — stops the named tasks and arms the new command.
+  The handshake that produces the nudge is driven end to end; the model's response to it is not.
+- **The six live orphans were left alone**, by the user's decision. The reaper's *selection* is
+  tested (`only_a_parentless_listener_is_reaped`) against purpose-built processes; it has not been
+  run against them.

@@ -2155,6 +2155,7 @@ name = "mulpex-core"
 version = "0.4.6"
 dependencies = [
  "anyhow",
+ "libc",
  "serde_json",
 ]
 

@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 serde_json = "1.0"
+# Only for `kill(pid, 0)`: the hub listener has to notice that the `claude` that
+# owns it is gone, and it is not in that process's group (see `listen.rs`).
+libc = "0.2"

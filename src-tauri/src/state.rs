@@ -232,6 +232,15 @@ impl Workspace {
             core.teardown();
         }
         self.projects.clear();
+        // The guarantee said "no orphaned claude" and stopped there, and hub
+        // listeners quietly fell through the gap: `killpg` cannot reach one (own
+        // process group) and neither can the tty sweep (no controlling terminal),
+        // so every quit left one per instance behind, spinning until reboot. A
+        // current listener exits by itself once this root disappears, but an
+        // instance that was already running when this shipped is still on the old
+        // shell loop, which never learned to. The claudes above are dead by now,
+        // so theirs have just been reparented to launchd and are reapable.
+        crate::pty::reap_orphaned_listeners();
         let _ = std::fs::remove_dir_all(&self.state_root);
     }
 }
@@ -433,6 +442,7 @@ impl Core {
                 SpawnSpec::Claude {
                     settings_path: &settings_path,
                     state_dir: &state_dir,
+                    helper_path,
                     session_id: &saved.session_id,
                     resume: true,
                     initial_task: None,
@@ -628,6 +638,7 @@ impl Core {
             SpawnSpec::Claude {
                 settings_path: &self.settings_path,
                 state_dir: &self.state_dir,
+                helper_path: &self.helper_path,
                 session_id: &session_id,
                 resume: false,
                 initial_task,
@@ -1327,6 +1338,7 @@ impl Core {
 
         let settings_path = self.settings_path.clone();
         let state_dir = self.state_dir.clone();
+        let helper_path = self.helper_path.clone();
         let session = Session::spawn(
             id,
             &self.project_dir,
@@ -1335,6 +1347,7 @@ impl Core {
             SpawnSpec::Claude {
                 settings_path: &settings_path,
                 state_dir: &state_dir,
+                helper_path: &helper_path,
                 session_id: &session_id,
                 resume: true,
                 initial_task: None,

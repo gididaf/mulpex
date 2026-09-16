@@ -253,7 +253,7 @@ fn build_argv(
         p.state_dir.join("mcp.json").to_string_lossy().to_string(),
         // ~14 KB, and the reason the argv cannot go on the tmux command line.
         "--append-system-prompt".into(),
-        mulpex_core::rules::append_system_prompt(),
+        mulpex_core::rules::append_system_prompt(&claude::helper_path()),
     ];
     // A spawned child's task is `claude`'s POSITIONAL prompt argument. It cannot
     // truncate, needs no readiness detection, and cannot race the TUI.

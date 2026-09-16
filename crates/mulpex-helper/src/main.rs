@@ -16,9 +16,13 @@ fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("hook") => mulpex_core::hook::run(&args[2..]),
         Some("mcp") => mulpex_core::mcp::run(&args[2..]),
+        // Long-lived, one per instance, started by the instance itself through
+        // the `Monitor` tool — see `listen.rs` for why the loop is here rather
+        // than in the prompt that asks for it.
+        Some("listen") => mulpex_core::listen::run(&args[2..]),
         other => {
             eprintln!(
-                "mulpex-helper: expected `hook <event>` or `mcp`, got {:?}",
+                "mulpex-helper: expected `hook <event>`, `mcp` or `listen`, got {:?}",
                 other
             );
             std::process::exit(2);

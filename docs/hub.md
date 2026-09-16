@@ -16,24 +16,28 @@ peer sits unread while the instance is idle between the user's prompts. To make 
 react on its own **without host-side stdin polling**, each instance runs the agentalk pattern
 against the *local* hub:
 
-- **Watcher:** the instance arms a **persistent `Monitor`** on a ~1 s poll of its own inbox dir
+- **Watcher:** the instance arms a `Monitor` running **`"<helper>" listen`** (`mulpex-core`'s
+  `listen.rs`, reached through `mulpex-helper`), a ~1 s poll of its own inbox dir
   (`$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID/`), emitting a `mulpex: N new hub message(s)`
   line only when new message files appear (seeded to the current count, so only post-arm
   arrivals fire). Each such line is a wake event the Claude Code runtime injects as a new turn —
-  even while the instance is idle waiting for the user.
+  even while the instance is idle waiting for the user. It was a shell one-liner until 2026-09-16;
+  see [the command is a binary now](#the-command-is-a-binary-now-and-the-old-one-is-why) for why
+  that had to stop.
 - **Arming (hook-driven, no injected prompt):** only the agent can arm its *own* Monitor, and a
   `--resume` restart kills the previous one — but instead of typing a visible bootstrap prompt
   into the PTY (which looked ugly/confusing on every spawn and resume), a normal instance now
   **starts completely clean** and arms its listener from the **`UserPromptSubmit` hook** on the
   user's first turn. The hook (`hook.rs::userpromptsubmit`) injects `ARM_LISTENER_NUDGE` as hidden
   `additionalContext` — a low-key "arm your listener quietly as part of this turn" reminder — but
-  only while `listener_armed(ctx)` is false, i.e. while `state_dir/armed/<id>` is absent. The
-  Monitor command in `HUB_RULES` **`touch`es that flag as its first action**, so the flag tracks
-  the *real* Monitor: once armed the reminder stops; if arming was missed it re-injects next turn
-  (self-healing). Because `state_dir` is fresh per Mulpex launch (hence per `--resume`), the flag
-  is absent at startup, so restored instances re-arm on their first prompt. The full arming
-  procedure + exact Monitor command still live in `HUB_RULES` (append-system-prompt, so the wake→act
-  contract survives compaction). *(`hub_spawn` children are the one case that still gets an injected
+  only while `listener_armed(ctx)` is false, i.e. while `state_dir/armed/<id>`'s mtime is stale.
+  The listener **rewrites that flag on every pass of its loop**, so it tracks a *live* Monitor:
+  once armed the reminder stops; if arming was missed, or the Monitor expired, it re-injects next
+  turn (self-healing). Because `state_dir` is fresh per Mulpex launch (hence per `--resume`), the
+  flag is absent at startup, so restored instances re-arm on their first prompt. The full arming
+  procedure + exact Monitor command live in `HUB_RULES` (append-system-prompt, so the wake→act
+  contract survives compaction), and the nudge **repeats that command verbatim** rather than
+  pointing at it. *(`hub_spawn` children are the one case that still gets an injected
   PTY prompt — their assigned task — via `mulpex-core`'s `rules.rs::spawn_prompt`; they arm the
   listener from the same hook on that first turn.)*
 - **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
@@ -60,6 +64,78 @@ depend on the model noticing.
 arm at all. The full story, including what the same change did to the sidebar's yellow dot, is in
 [sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
 
+### The command is a binary now, and the old one is why
+
+Adding that in-loop `touch` is what exposed the real problem: **the listener command was
+transcribed by the model, and a model copies whichever version is nearest in its context — which is
+its own previous `Monitor` call, not the system prompt.**
+
+Measured on live instances, 2026-09-16, from their own transcripts:
+
+- `warweb#65` armed the listener **72 times** across two days. Arms #1–#71 all carried the
+  pre-in-loop-`touch` command. It went straight through the app update that changed the text, and
+  only picked up the current version at arm #72 — immediately after a `/compact` dropped the old
+  call from its context. Its sibling `warweb#74` never recovered at all.
+- `cloudraw#3` is the control: it compacted earlier in the day and has armed the current command
+  ever since.
+
+The consequence is a feedback loop, not just a stale string. No in-loop `touch` ⇒ `armed/<id>` never
+refreshes ⇒ `listener_armed` is false every turn ⇒ the arm nudge fires every turn ⇒ **another
+Monitor stacks on each one**. `warweb#65` was seen running three at once; one hub message woke it
+three times, which is how the whole thing was noticed.
+
+So the command stopped being prose to retype and became **`"<helper>" listen`** — one line naming a
+binary:
+
+- The loop's behaviour ships with the app. Changing it never asks a model to retype anything, and a
+  session running last week's binary gets this week's logic at its next re-arm.
+- The helper lives inside the `.app`, so the **three-day `$TMPDIR` fuse** cannot reach it. A script
+  in the scratch dir would have been unrunnable for an instance open over a long weekend — at
+  exactly the moment it needed to re-arm.
+- `hook::command_is_hub_listener` is one matcher used by everything that has to recognise a
+  listener (the `Stop` hook's working/idle count, and the orphan reaper). Two spellings is how one
+  of them silently stops recognising the other.
+
+**Recognising the old form is permanent, not transitional.** A session that was already running
+keeps re-emitting the shell one-liner out of its history for as long as it lives, so
+`command_is_hub_listener` matches both forms. For those sessions there is a repair path: only the
+`Stop` payload carries `background_tasks` (see below), so `Stop` writes `relisten/<id>` when it sees
+a listener that is running yet not refreshing the heartbeat — or more than one — and the next arm
+nudge names those task ids and tells the instance to `TaskStop` them and arm one current listener.
+
+**`background_tasks` is a `Stop`-only field.** Measured against a real `claude` v2.1.273 with
+dumping hooks: it is present on `Stop`, and absent from `UserPromptSubmit` (even on a prompt taken
+24 s after a Monitor was armed), from `PostToolUse`, and from the idle notification. That is the
+whole reason the repair is a two-hook file handshake instead of a check inside `listener_armed`.
+
+### A listener outlives everything that is supposed to kill it
+
+`Session::kill` `killpg`s the child's process group (`pty.rs`) and sweeps its controlling terminal
+(`kill_tty_session`). **A hub listener escapes both.** Claude Code runs each background command in
+its own process group with no controlling terminal — measured on live listeners: `PGID == pid`,
+`SESS 0`, state `Ss` (no `+`). So it survives ⌘W, a crash and app teardown alike, and launchd
+adopts it still spinning `sleep 1`. Six were found alive on one machine at once, the oldest from
+the previous morning, belonging to a Mulpex that had already exited. `mulpex-cli/src/sweep.rs`
+named this hole; nothing acted on it.
+
+Two halves close it, and both are needed:
+
+- **`listen.rs` exits by itself** when `$MULPEX_STATE_DIR` disappears (app quit removes the whole
+  scratch root; project close removes the project's) or when the `claude` in `pids/<id>` — written
+  by `pty.rs` right after spawn — is gone. It also takes a `listeners/<id>` pid lock, so a second
+  listener for the same instance stands down instead of doubling every wake-up.
+- **`pty::reap_orphaned_listeners`** SIGKILLs the ones that predate that, at launch (next to
+  `sweep_stale_state_roots`) and at teardown. It keys on **`ppid == 1` plus the listener mark**,
+  *not* on a dead scratch root: a legacy listener's argv spells its state dir as the literal
+  `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return the environment that would expand it
+  (measured — a real orphan's blob came back 756 bytes, argv only, no `MULPEX_*` anywhere). A
+  listener serving a live instance is a child of that `claude` and is therefore never matched.
+
+One more trap found while writing that: asking `KERN_PROCARGS2` for its buffer size with a null
+`oldp` answers **32 bytes** — enough for `sleep 60` and nothing else. The buffer has to be
+`KERN_ARGMAX`, or every command line comes back truncated and the sweep matches nothing while
+looking like it works.
+
 ### The nudge that fed itself: why instances opened by themselves after an update
 
 The arming nudge is self-healing by design, and for a while it healed a wound it was itself
@@ -70,6 +146,9 @@ The loop, traced end-to-end in a live transcript (`bvpgm5lxl` → `bjwjmo0kw`, 2
 than reasoned about:
 
 1. Teardown `killpg`s each `claude`, so the listener's **Monitor dies with no completion record**.
+   (The `claude` dies; the listener *process* does not — see
+   [A listener outlives everything that is supposed to kill it](#a-listener-outlives-everything-that-is-supposed-to-kill-it).
+   From Claude Code's point of view the task is gone either way, which is what produces the wake.)
 2. On the next launch the resumed session is handed a synthetic
    `<task-notification><status>stopped</status>… No completion record was found …` prompt. **That
    is a real turn** — not a notice. It is what "the session opened by itself" actually was.

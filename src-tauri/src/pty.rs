@@ -48,6 +48,10 @@ pub enum SpawnSpec<'a> {
     Claude {
         settings_path: &'a Path,
         state_dir: &'a Path,
+        /// Absolute path of `mulpex-helper`. The hooks and MCP server reach it
+        /// through the config files; the **listener** reaches it through
+        /// `--append-system-prompt`, which is why it has to be here too.
+        helper_path: &'a Path,
         session_id: &'a str,
         /// Reopen an existing session id rather than creating it.
         resume: bool,
@@ -266,6 +270,7 @@ impl Session {
             SpawnSpec::Claude {
                 settings_path,
                 state_dir,
+                helper_path,
                 session_id,
                 resume,
                 initial_task,
@@ -283,7 +288,7 @@ impl Session {
                 cmd.arg("--mcp-config");
                 cmd.arg(state_dir.join("mcp.json"));
                 cmd.arg("--append-system-prompt");
-                cmd.arg(append_system_prompt());
+                cmd.arg(append_system_prompt(helper_path));
                 // A spawned child's task is handed over as `claude`'s POSITIONAL
                 // prompt argument. It used to be TYPED into the child's TUI once
                 // that TUI looked ready, and that silently truncated every task
@@ -347,6 +352,22 @@ impl Session {
 
         let child = pair.slave.spawn_command(cmd)?;
         let child_pid = child.process_id().map(|p| p as libc::pid_t);
+        // Publish the child's pid so its hub listener can tell when it dies.
+        //
+        // Nothing else can tell it. `Session::kill` `killpg`s this pid's process
+        // group and sweeps its controlling terminal, and the listener is in
+        // neither: Claude Code runs each background command in its own process
+        // group with no controlling tty, so it survives ⌘W, a crash and app
+        // teardown alike and is reparented to launchd still spinning (measured —
+        // six such orphans found alive at once, the oldest over a day old). The
+        // listener therefore has to notice on its own, and a pid it can probe is
+        // the smallest thing that lets it. Claude sessions only: a shell terminal
+        // is never a hub peer and has no listener.
+        if let (SessionKind::Claude, Some(pid)) = (kind, child_pid) {
+            let dir = state_dir.join(mulpex_core::PIDS_DIR);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(id.to_string()), pid.to_string());
+        }
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let master = pair.master;
@@ -840,6 +861,142 @@ fn all_pids() -> Vec<libc::pid_t> {
     pids
 }
 
+/// `KERN_PROCARGS2` from `<sys/sysctl.h>`. Returns argc, then the executable
+/// path, then the argv strings, then the environment — all NUL-separated in one
+/// blob. We do not parse it: every string we look for is distinctive enough that
+/// a substring search over the whole blob is both sufficient and immune to the
+/// layout's padding rules.
+#[cfg(target_os = "macos")]
+const KERN_PROCARGS2: libc::c_int = 49;
+
+/// A process's command line, as one lossy string with NUL turned into newline.
+/// `None` when the process is gone or is not ours to inspect.
+///
+/// **Argv only, in practice.** `KERN_PROCARGS2` is documented to return the
+/// environment after the arguments, and for our own children it does not: a
+/// legacy listener's blob came back 756 bytes — exactly its `zsh -c` line, with
+/// no `MULPEX_*` in it (measured against a live orphan). So nothing here may be
+/// keyed on an environment variable; a legacy listener's argv names
+/// `$MULPEX_STATE_DIR` unexpanded and cannot tell you *which* state dir it serves.
+/// That is why `reap_orphaned_listeners` keys on the parent instead.
+#[cfg(target_os = "macos")]
+fn argv_of(pid: libc::pid_t) -> Option<String> {
+    // The buffer has to be `KERN_ARGMAX`, not whatever a sizing call reports.
+    // Asking `KERN_PROCARGS2` for its size with a null buffer answers 32 — enough
+    // for `sleep 60` and nothing else (measured) — so a sized fetch silently
+    // returns a *truncated* command line. That cost a sweep that matched nothing
+    // at all while looking like it worked.
+    let mut argmax: libc::c_int = 0;
+    let mut argmax_len = std::mem::size_of::<libc::c_int>();
+    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let rc = unsafe {
+        libc::sysctl(
+            argmax_mib.as_mut_ptr(),
+            argmax_mib.len() as libc::c_uint,
+            &mut argmax as *mut _ as *mut libc::c_void,
+            &mut argmax_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || argmax <= 0 {
+        return None;
+    }
+
+    let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size = argmax as usize;
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    // NUL is the separator; turn the blob into one searchable line.
+    for b in buf.iter_mut() {
+        if *b == 0 {
+            *b = b'\n';
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// A process's parent pid, or `None` if it is gone.
+#[cfg(target_os = "macos")]
+fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (n == size).then_some(info.pbi_ppid as libc::pid_t)
+}
+
+/// SIGKILL every **orphaned** hub listener on this machine, and report how many.
+///
+/// This is the one cleanup no other code path can do. A listener runs in its own
+/// process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`,
+/// state `Ss`), so `Session::kill`'s `killpg` misses it and so does
+/// `kill_tty_session`. It outlives its `claude`, outlives app teardown, and is
+/// reparented to launchd still spinning `sleep 1` — six were found alive on one
+/// machine at once, the oldest more than a day old, belonging to a Mulpex that had
+/// exited the previous morning. `listen.rs` makes new listeners exit by
+/// themselves; this reaches the ones that predate that and the legacy shell loops
+/// that will never learn to.
+///
+/// **Orphanhood is the parent, not the path.** The obvious test — "does it name a
+/// scratch root that is dead?" — cannot be written: a legacy listener's argv
+/// spells its state dir as the literal `$MULPEX_STATE_DIR`, and the expanded value
+/// lives only in its environment, which `KERN_PROCARGS2` does not hand back for
+/// our own children (measured). `ppid == 1` is both available and exactly the
+/// signature that was observed. It is also safe by construction: a listener
+/// serving a live instance is a child of that `claude`, in this Mulpex or in
+/// another one or under `mpx`, and is therefore never matched.
+/// Split out from the kill so the selection can be tested without a test run
+/// SIGKILLing whatever orphans happen to be on the developer's machine.
+#[cfg(target_os = "macos")]
+fn orphaned_listener_pids() -> Vec<libc::pid_t> {
+    let me = std::process::id() as libc::pid_t;
+    all_pids()
+        .into_iter()
+        .filter(|&pid| pid != me && pid > 1 && ppid_of(pid) == Some(1))
+        .filter(|&pid| {
+            // One matcher, shared with the hook that excuses a listener from the
+            // "still working" count — two spellings of "this is a listener" is how
+            // one of them silently stops recognising the other.
+            argv_of(pid).is_some_and(|argv| mulpex_core::hook::command_is_hub_listener(&argv))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+pub fn reap_orphaned_listeners() -> usize {
+    let pids = orphaned_listener_pids();
+    for pid in &pids {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    pids.len()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reap_orphaned_listeners() -> usize {
+    0
+}
+
 #[cfg(not(target_os = "macos"))]
 fn tty_dev_of(_pid: libc::pid_t) -> Option<u32> {
     None
@@ -986,6 +1143,73 @@ fn b64encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The selection behind the one cleanup nothing else in this file can do —
+    /// and the one that has to be *narrow*, because it reaches into the process
+    /// table and SIGKILLs, with no undo.
+    ///
+    /// Both halves are load-bearing and each is the whole test on its own:
+    /// **orphaned** without **listener** is every stray daemon on the machine;
+    /// **listener** without **orphaned** is every listener still serving a live
+    /// instance — in this Mulpex, in a second one, or under `mpx`.
+    ///
+    /// The obvious third condition, "names a dead scratch root", is deliberately
+    /// absent and cannot be added: a legacy listener's argv spells its state dir
+    /// as the literal `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return
+    /// the environment that would expand it (measured — see `argv_of`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_parentless_listener_is_reaped() {
+        const MARK: &str = "\"/x/mulpex-helper\" listen";
+        let pidfile = std::env::temp_dir().join(format!(
+            "mulpex-orphan-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // A genuine orphan: the shell we spawn backgrounds a listener-shaped child
+        // and exits, so that child is reparented to launchd — exactly how a real
+        // one is made, by its `claude` dying underneath it.
+        let mut maker = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "/bin/sh -c 'echo $$ > {pf}; while :; do sleep 1; done # {MARK}' & exit 0",
+                pf = pidfile.display()
+            ))
+            .spawn()
+            .unwrap();
+        let _ = maker.wait();
+
+        // A listener whose parent is alive (us). Reaping this is the failure that
+        // would deafen a running instance.
+        let mut attached = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("while :; do sleep 1; done # {MARK}"))
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let orphan: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .expect("the orphan should have written its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(ppid_of(orphan), Some(1), "the test's orphan must be parentless");
+
+        let reapable = orphaned_listener_pids();
+        assert!(reapable.contains(&orphan), "a parentless listener is reapable");
+        assert!(
+            !reapable.contains(&(attached.id() as libc::pid_t)),
+            "a listener whose instance is still alive must never be reaped"
+        );
+
+        unsafe { libc::kill(orphan, libc::SIGKILL) };
+        let _ = attached.kill();
+        let _ = attached.wait();
+        let _ = std::fs::remove_file(&pidfile);
+    }
 
     /// The task a spawner writes must reach the child WHOLE. This is the
     /// regression that cost two instances their briefs: the prompt used to be

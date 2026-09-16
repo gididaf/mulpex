@@ -231,6 +231,10 @@ fn tick(
         if let Err(e) = core::process_name_requests(t, p) {
             eprintln!("[daemon] {} names: {e:#}", p.session);
         }
+        // A ⌘M-style mute is undone by the user simply prompting the row again.
+        if let Err(e) = core::process_user_prompts(t, p) {
+            eprintln!("[daemon] {} unmute: {e:#}", p.session);
+        }
         // Terminal ops run before the transcripts are updated, so a `send` and
         // the output it produces cannot be separated by a whole tick.
         if let Some(next) = next_ids.get_mut(&p.dir) {

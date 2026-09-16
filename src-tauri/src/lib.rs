@@ -124,8 +124,18 @@ pub fn run() {
                 let helper = state.helper_path.clone();
                 let mut ws = state.ws.lock().unwrap();
                 // Before creating ours, collect the scratch roots of Mulpex
-                // processes that died without running teardown.
+                // processes that died without running teardown...
                 ws.sweep_stale_state_roots();
+                // ...and the hub listeners those processes left running. They are
+                // not in any process group or terminal session this app can
+                // signal, so nothing has ever killed them: six were found alive on
+                // one machine at once, the oldest from the previous morning, each
+                // still forking a `sleep` once a second. Safe before we open
+                // anything, because an orphan is one whose parent is already gone.
+                let reaped = crate::pty::reap_orphaned_listeners();
+                if reaped > 0 {
+                    eprintln!("mulpex: reaped {reaped} orphaned hub listener(s)");
+                }
                 for dir in project::list_open() {
                     // open_or_focus dedups + skips non-dirs; a failed open is skipped.
                     let _ = ws.open_or_focus(&dir, &helper);

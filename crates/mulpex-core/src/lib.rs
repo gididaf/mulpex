@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod hook;
+pub mod listen;
 pub mod mcp;
 pub mod persist;
 pub mod registry;
@@ -148,9 +149,22 @@ pub const NAMEREQ_DIR: &str = "namereq";
 pub const RESUMED_DIR: &str = "resumed";
 pub const SPAWNING_DIR: &str = "spawning";
 pub const NAMED_DIR: &str = "named";
-pub const EXPLAINREQ_DIR: &str = "explainreq";
-pub const EXPLAINQ_DIR: &str = "explainq";
-pub const EXPLAINPLAN_DIR: &str = "explainplan";
+/// `userprompt/<id>` = the user (not the runtime) just submitted a prompt to that
+/// instance. See `user_prompt_path`.
+pub const USERPROMPT_DIR: &str = "userprompt";
+/// `relisten/<id>` = the task ids of hub listeners the `Stop` hook found in a
+/// state only it can see: running, but not refreshing `armed/<id>` (a listener
+/// armed from a stale copy of the command), or simply more than one of them.
+/// `UserPromptSubmit` turns it into a repair instruction and consumes it.
+pub const RELISTEN_DIR: &str = "relisten";
+/// `pids/<id>` = the pid of the `claude` serving that instance, written by the
+/// spawner. The hub listener reads it to notice its owner died — it runs in its
+/// own process group with no controlling terminal, so no signal the app sends can
+/// reach it (`listen.rs`).
+pub const PIDS_DIR: &str = "pids";
+/// `listeners/<id>` = the pid of the hub listener currently serving that
+/// instance, so a second one stands down instead of doubling every wake-up.
+pub const LISTENERS_DIR: &str = "listeners";
 
 #[cfg(test)]
 mod tests {

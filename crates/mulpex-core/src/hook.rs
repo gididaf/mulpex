@@ -453,6 +453,9 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // `notification`).
     let busy = background_work_running(ctx, payload.as_ref());
     set_background_flag(ctx, busy);
+    // Same payload, same reason it can only be read here: this is the only hook
+    // that is told which listeners are running.
+    note_listener_needs_replacing(ctx, payload.as_ref());
     // A turn boundary is proof we are not mid-compaction.
     clear_compacting(ctx);
 
@@ -597,17 +600,106 @@ fn background_work_running(_ctx: &Ctx, payload: Option<&serde_json::Value>) -> b
         })
 }
 
-/// The marker that identifies the hub listener inside its own command line. It
-/// is the inbox path every listener watches, spelled exactly as `HUB_RULES`
-/// spells it — short enough that a hand-rolled variant still carries it, and
-/// specific enough that nothing else plausibly does.
-const LISTENER_MARKER: &str = "$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID";
+/// The markers that identify a hub listener inside its own command line, each
+/// short enough that a hand-rolled variant still carries it and specific enough
+/// that nothing else plausibly does.
+///
+/// There are two because there have been two listeners. The **inbox path** is
+/// what every shell one-liner watches, spelled exactly as `HUB_RULES` used to
+/// spell it; sessions that were already running when this shipped keep re-arming
+/// that form out of their own conversation history, so it has to stay
+/// recognisable indefinitely rather than until the next release. The **helper
+/// subcommand** is the current form.
+const LEGACY_LISTENER_MARKER: &str = "$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID";
+const LISTENER_BIN: &str = "mulpex-helper";
+const LISTENER_SUBCOMMAND: &str = "listen";
+
+/// Does this command line start a hub listener?
+///
+/// The current form is matched on the binary **and** the subcommand rather than
+/// on one literal, because the path in front of it varies per install and is
+/// quoted (`"/Applications/…/mulpex-helper" listen`), while `mulpex-helper`
+/// alone would also match the hook and MCP invocations.
+pub fn command_is_hub_listener(command: &str) -> bool {
+    command.contains(LEGACY_LISTENER_MARKER)
+        || (command.contains(LISTENER_BIN) && command.contains(LISTENER_SUBCOMMAND))
+}
 
 /// Is this `background_tasks` entry the instance's own hub listener?
 fn is_hub_listener(task: &serde_json::Value) -> bool {
     task.get("command")
         .and_then(|v| v.as_str())
-        .is_some_and(|c| c.contains(LISTENER_MARKER))
+        .is_some_and(command_is_hub_listener)
+}
+
+/// The ids of every hub listener this payload reports as running.
+fn running_listener_ids(payload: Option<&serde_json::Value>) -> Vec<String> {
+    payload
+        .and_then(|j| j.get("background_tasks"))
+        .and_then(|v| v.as_array())
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter(|t| {
+                    let running = t
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == "running")
+                        .unwrap_or(true);
+                    running && is_hub_listener(t)
+                })
+                .map(|t| {
+                    t.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn relisten_path(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir
+        .join(crate::RELISTEN_DIR)
+        .join(ctx.id_str())
+}
+
+/// Record, at the one hook that can see it, a listener that needs replacing.
+///
+/// **Only `Stop` carries `background_tasks`** — measured against a real `claude`
+/// (v2.1.273, 2026-09-16): `UserPromptSubmit` does not carry it even on a prompt
+/// taken 24 s after a Monitor was armed, and neither does `PostToolUse` or the
+/// idle notification. `listener_armed` is asked from `UserPromptSubmit`, so it
+/// can never look at the task list itself; this writes down what `Stop` saw and
+/// lets the arm nudge read it back.
+///
+/// Two states are worth repairing, and both are invisible from every other angle:
+///
+/// - **A listener that runs but never refreshes `armed/<id>`.** Before the
+///   in-loop `touch` existed the command only touched the flag once at startup,
+///   and an instance re-arming from its own conversation history keeps emitting
+///   that version long after `HUB_RULES` changed — measured on a live instance
+///   that armed the superseded command 71 times over two days and only stopped
+///   when `/compact` dropped it from context. The heartbeat then reads dead
+///   forever, so the arm nudge fires every single turn and a *fresh* Monitor
+///   stacks on each one.
+/// - **More than one listener.** That is the same failure one step later, and
+///   what the user actually sees: one hub message, N wake-ups.
+///
+/// Deliberately not a `decision: block`. The arm nudge is already firing every
+/// turn in this state, so the instruction rides along on a turn that was going to
+/// happen anyway; and that channel belongs to unread mail, which must not have to
+/// queue behind housekeeping.
+fn note_listener_needs_replacing(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let ids = running_listener_ids(payload);
+    let stale_heartbeat = !ids.is_empty() && !listener_armed(ctx);
+    if stale_heartbeat || ids.len() > 1 {
+        let _ = std::fs::create_dir_all(ctx.state_dir.join(crate::RELISTEN_DIR));
+        let _ = std::fs::write(relisten_path(ctx), ids.join(" "));
+    } else {
+        let _ = std::fs::remove_file(relisten_path(ctx));
+    }
 }
 
 fn background_flag(ctx: &Ctx) -> PathBuf {
@@ -996,7 +1088,7 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     let welcome = nudges_welcome(system_turn, sanctioned_resume);
     let mut parts: Vec<String> = Vec::new();
     if welcome && !listener_armed(ctx) {
-        parts.push(ARM_LISTENER_NUDGE.to_string());
+        parts.push(arm_listener_nudge(ctx));
     }
     if welcome && !instance_named(ctx) {
         parts.push(AUTO_NAME_NUDGE.to_string());
@@ -1034,11 +1126,67 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
 /// started expiring this fires for a listener that *was* armed and has since
 /// died, which is the case the heartbeat exists to catch.
 const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not running right \
-now (never armed, or it expired). As part of THIS turn — quietly, in the background — arm it: the \
-Monitor on your inbox, exactly as described under \"INCOMING MESSAGES\" in your instructions, with \
-timeout_ms at the maximum the tool allows. Do not make arming it your whole response and do not \
-narrate it beyond a brief mention; just arm it and then continue with what I actually asked. \
-(You'll see this reminder only while the listener is down.)";
+now (never armed, or it expired). As part of THIS turn — quietly, in the background — arm it: call \
+Monitor with timeout_ms at the maximum the tool allows and exactly this command (do NOT copy a \
+Monitor call from earlier in this conversation — an earlier one may be superseded):\n";
+
+/// Tail of both nudges: the command itself, spelled the one way `HUB_RULES`
+/// spells it. `rules::listener_command` is the single source, and the helper can
+/// name its own path because the hook *is* the helper — the same binary the
+/// instance is being told to run.
+fn nudge_listener_command() -> String {
+    std::env::current_exe()
+        .map(|p| crate::rules::listener_command(&p))
+        .unwrap_or_else(|_| "\"<mulpex-helper>\" listen".to_string())
+}
+
+/// Starts with a newline so the command sits on a line of its own: run into the
+/// next sentence it reads as one long string, and the thing being copied has to
+/// be unambiguous.
+const ARM_LISTENER_TAIL: &str = "\nDo not make arming it your whole response and do not narrate it \
+beyond a brief mention; just arm it and then continue with what I actually asked. (You'll see this \
+reminder only while the listener is down.)";
+
+/// Added to the nudge when `Stop` left a `relisten/<id>` note: the instance has a
+/// listener that is *running* yet dead as far as the hub is concerned, or several
+/// of them. Without this the plain nudge would have it arm an Nth Monitor beside
+/// the ones already there — which is the pile-up the user sees as one hub message
+/// producing several wake-ups.
+///
+/// The "do not copy an earlier Monitor call" clause is the whole point, and it is
+/// stated twice on purpose: the measured failure was an instance re-emitting a
+/// superseded command out of its own history 71 times across two days and an app
+/// update, healing only when `/compact` finally dropped that call from its
+/// context.
+const RELISTEN_NUDGE: &str = "[Mulpex hub] Your current hub listener is a SUPERSEDED one: it is \
+running, but it cannot report that it is alive, so it is not usable and this reminder cannot stop \
+— and every turn you are asked again, another one piles up beside it. Fix it as part of THIS turn, \
+quietly: call TaskStop on the task id(s) listed at the end of this message, then arm ONE new \
+Monitor, with timeout_ms at the maximum the tool allows, using exactly this command (do NOT copy \
+the Monitor call from earlier in this conversation — that is the superseded one):\n";
+
+/// The arm nudge for this turn: the plain reminder, plus the repair instruction
+/// when `Stop` recorded a listener that needs replacing. The note is consumed
+/// here, so a listener that is genuinely fine after the repair does not keep
+/// being told about itself.
+///
+/// Both forms **spell the command out**. The old nudge pointed at "INCOMING
+/// MESSAGES in your instructions", and a pointer is what let a superseded copy
+/// win: the nearest, most concrete text wins, and for an instance that had armed
+/// the same command seventy times that text was its own history.
+fn arm_listener_nudge(ctx: &Ctx) -> String {
+    let cmd = nudge_listener_command();
+    match std::fs::read_to_string(relisten_path(ctx)) {
+        Ok(ids) if !ids.trim().is_empty() => {
+            let _ = std::fs::remove_file(relisten_path(ctx));
+            format!(
+                "{RELISTEN_NUDGE}{cmd}{ARM_LISTENER_TAIL} Stale listener task id(s) to stop: {}",
+                ids.trim()
+            )
+        }
+        _ => format!("{ARM_LISTENER_NUDGE}{cmd}{ARM_LISTENER_TAIL}"),
+    }
+}
 
 /// Whether this turn may carry the arm/name nudges.
 ///
@@ -1599,6 +1747,128 @@ mod tests {
             !listener_armed(&ctx),
             "an expired listener must read as unarmed, or nothing ever re-arms it"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-`003ad33` listener command: it `touch`es `armed/<id>` once at
+    /// startup and never again. Sessions that were already running keep re-arming
+    /// this out of their own conversation history, so the hook has to recognise
+    /// it as a listener *and* as one that can never report itself alive.
+    const SUPERSEDED_LISTENER_CMD: &str = r#"INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=\"$MULPEX_STATE_DIR/armed\"; mkdir -p \"$INBOX\" \"$ARMED\"; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; prev=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); while true; do cur=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); if [ \"$cur\" -gt \"$prev\" ]; then echo \"mulpex: $((cur - prev)) new hub message(s)\"; fi; prev=$cur; sleep 1; done"#;
+
+    fn stop_with_tasks(tasks: &str) -> Option<serde_json::Value> {
+        payload(&format!(
+            r#"{{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{tasks}],"session_crons":[]}}"#
+        ))
+    }
+
+    /// The state only `Stop` can see, and the whole reason `relisten/<id>` exists.
+    ///
+    /// A listener running the superseded command never refreshes the heartbeat, so
+    /// `listener_armed` is false on every turn, so the arm nudge fires on every
+    /// turn, so a fresh Monitor stacks on every turn — measured on a live instance
+    /// that reached three simultaneously. `UserPromptSubmit` cannot see this
+    /// (its payload carries no `background_tasks`, measured against a real
+    /// `claude` v2.1.273), which is why the detection has to happen at `Stop` and
+    /// be handed forward on disk.
+    #[test]
+    fn stop_records_a_listener_that_cannot_report_itself_alive() {
+        let dir = std::env::temp_dir().join(format!("mulpex-relisten-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 4);
+        std::fs::create_dir_all(dir.join("armed")).unwrap();
+        std::fs::create_dir_all(dir.join(crate::RELISTEN_DIR)).unwrap();
+        let note = relisten_path(&ctx);
+
+        // A healthy listener: heartbeat fresh, exactly one of it. Nothing to say.
+        std::fs::write(dir.join("armed").join("4"), "").unwrap();
+        note_listener_needs_replacing(
+            &ctx,
+            stop_with_tasks(&format!(
+                r#"{{"id":"bok","type":"shell","status":"running","command":"{LISTENER_CMD}"}}"#
+            ))
+            .as_ref(),
+        );
+        assert!(!note.exists(), "a listener that reports itself alive needs no repair");
+
+        // The superseded command: running, but the heartbeat it wrote once has
+        // gone stale and never will refresh.
+        let stale = SystemTime::now() - LISTENER_HEARTBEAT_GRACE - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("armed").join("4"))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        note_listener_needs_replacing(
+            &ctx,
+            stop_with_tasks(&format!(
+                r#"{{"id":"bstale1","type":"shell","status":"running","command":"{SUPERSEDED_LISTENER_CMD}"}}"#
+            ))
+            .as_ref(),
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "bstale1");
+
+        // Two listeners is the same failure one step later, and is what the user
+        // actually sees: one hub message, two wake-ups. Recorded even when the
+        // heartbeat is fine, because the duplicate still doubles every event.
+        std::fs::write(dir.join("armed").join("4"), "").unwrap();
+        note_listener_needs_replacing(
+            &ctx,
+            stop_with_tasks(&format!(
+                r#"{{"id":"b1","type":"shell","status":"running","command":"{LISTENER_CMD}"}},
+                   {{"id":"b2","type":"shell","status":"running","command":"{LISTENER_CMD}"}}"#
+            ))
+            .as_ref(),
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "b1 b2");
+
+        // No listener at all is the ordinary unarmed case — the plain nudge's job,
+        // not a repair. A leftover note must be cleared, or the instance is told
+        // to stop a task that is already gone.
+        note_listener_needs_replacing(&ctx, stop_with_tasks("").as_ref());
+        assert!(!note.exists(), "nothing running means nothing to replace");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The nudge has to name the tasks to stop, or the instance dutifully arms an
+    /// Nth Monitor beside the ones already piling up. And it is consumed on read:
+    /// once the repair has been asked for, the next turn's nudge is the ordinary
+    /// one again.
+    #[test]
+    fn the_repair_nudge_names_the_tasks_and_is_consumed() {
+        let dir = std::env::temp_dir().join(format!("mulpex-relisten-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 4);
+        std::fs::create_dir_all(dir.join(crate::RELISTEN_DIR)).unwrap();
+
+        // Both forms spell the command out rather than pointing at the rules —
+        // a pointer is what let a superseded copy in the conversation win.
+        // The command is spelled from `rules::listener_command`, the same source
+        // `HUB_RULES` prints — one spelling, so a model is never choosing between
+        // two. (Under `cargo test` the running binary is the test harness, not
+        // `mulpex-helper`; in production the hook *is* the helper, which is how it
+        // can name its own path. `rules::hub_rules_carry_the_exact_arming_command`
+        // is where the real path is checked against `is_hub_listener`.)
+        let cmd = crate::rules::listener_command(&std::env::current_exe().unwrap());
+        let plain = arm_listener_nudge(&ctx);
+        assert!(plain.starts_with(ARM_LISTENER_NUDGE));
+        assert!(
+            plain.contains(&cmd),
+            "the nudge must carry the command itself, not a reference to it"
+        );
+
+        std::fs::write(relisten_path(&ctx), "bstale1 bstale2").unwrap();
+        let nudge = arm_listener_nudge(&ctx);
+        assert!(nudge.starts_with(RELISTEN_NUDGE), "the repair instruction, not the plain one");
+        assert!(nudge.ends_with("bstale1 bstale2"), "names the tasks to TaskStop");
+        assert!(nudge.contains(&cmd), "and the command to arm instead");
+        assert!(
+            nudge.contains("do NOT copy the Monitor call from earlier in this conversation"),
+            "copying its own superseded call out of history is the failure being repaired"
+        );
+        assert!(!relisten_path(&ctx).exists(), "consumed on read");
+        assert!(arm_listener_nudge(&ctx).starts_with(ARM_LISTENER_NUDGE));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
