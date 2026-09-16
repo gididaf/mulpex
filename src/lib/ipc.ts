@@ -106,10 +106,11 @@ export interface ExplainSections {
   need: string;
 }
 
-/** The Explainer's answer for one instance: the short Hebrew explanation of the
- *  turn on screen. There is at most one of these per instance at a time.
- *  `ok: false` marks a summarizer failure (the text says so — rendered dim).
- *  Mirrors `snapshot.rs::ExplainEntry` (no codegen; keep in sync). */
+/** One item of an instance's Explainer feed: the short Hebrew explanation of
+ *  one turn, question or plan. Up to 10 per instance, newest first in the
+ *  store. `ok: false` marks a summarizer failure (the text says so — rendered
+ *  dim, with a retry button). Mirrors `snapshot.rs::ExplainEntry` (no codegen;
+ *  keep in sync). */
 export interface ExplainEntry {
   id: number;
   /** Unix epoch milliseconds. A retry that replaced a failed entry carries the
@@ -248,28 +249,15 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
-/** What one ⌘⇧E did. `cached`: the transcript hasn't moved since this
- *  instance's explanation was made, so it stands and nothing was run — opening
- *  and closing the panel is free. `running`: a job is queued, drop what you have
- *  and wait for the `explain-update`. `unavailable`: nothing to explain and
- *  nothing coming (a terminal, a gone instance, no transcript yet). */
-export type ExplainVerdict = "cached" | "running" | "unavailable";
-
-/** ⌘⇧E: explain what this instance is saying right now, reusing the answer on
- *  screen when nothing has changed. See `ExplainVerdict`. */
-export const explainNow = (projectHandle: ProjectHandle, id: number) =>
-  invoke<ExplainVerdict>("explain_now", { projectHandle, id });
-
-/** Drop this instance's explanation and cancel any job still producing one —
- *  the user sent the next prompt. NOT called when the panel merely closes: a
- *  closed panel keeps its answer so re-opening it costs nothing. */
-export const clearExplain = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("clear_explain", { projectHandle, id });
+/** A project's whole Explainer feed, for the initial paint (thereafter pushed
+ *  via `explain-update`). Flat; per instance newest first. */
+export const getExplains = (projectHandle: ProjectHandle) =>
+  invoke<ExplainEntry[]>("get_explains", { projectHandle });
 
 /** Re-run the summarizer for one failed entry; its result replaces that row in
  *  place (an ordinary `explain-update` carrying the same `seq`). False means the
- *  backend has nothing stashed under that seq any more — the entry was cleared,
- *  or its instance is gone — and the button should come back. */
+ *  backend has nothing stashed under that seq any more — the entry aged out of
+ *  the 10-entry feed, or its instance is gone — and the button should come back. */
 export const retryExplain = (
   projectHandle: ProjectHandle,
   id: number,

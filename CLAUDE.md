@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/explainer.md](docs/explainer.md) | Hebrew ⌘⇧E panel: on-demand only (no hook, no poll — the transcript is found from the session uuid), one entry and no history, the three auto-clears, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `commands::explain_now`, `ExplainerPanel.svelte`, `App.svelte`'s toggle + close effects |
+| [docs/explainer.md](docs/explainer.md) | Hebrew Explainer panel: automatic after every turn / pending question / pending plan (`Stop`/`askq`/`plan` write `explainreq/<id>`, the poll drains it), the `dialog` marker and the flush race, a feed of 10 (dimmed history, sticky scroll, bottom-pinned), three fixed parts with app-drawn headings, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs`'s `write_explain_request`, `hub.rs`'s drain, `ExplainerPanel.svelte`, `stores.ts`'s cap |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
@@ -67,9 +67,10 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
-  src/explainer.rs    the Explainer: ⌘⇧E-only worker queue summarizing the turn on
-                      screen into short Hebrew via headless `claude -p --model sonnet`;
-                      finds the transcript itself; emits explain-update / explain-pending
+  src/explainer.rs    the Explainer: worker queue fed by the poll loop from the hooks'
+                      `explainreq/<id>`, summarizing each turn / pending dialog into three
+                      short Hebrew parts via headless `claude -p --model sonnet`; a feed
+                      of 10 per instance; emits explain-update / explain-pending
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)

@@ -62,6 +62,19 @@ pub fn named_flag_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(NAMED_DIR).join(id.to_string())
 }
 
+/// Where a hook hands a turn to the Explainer: one file per instance under
+/// `<state_dir>/explainreq/`. Line 1 is the session's transcript path (from the
+/// payload's `transcript_path` — measured present on `Stop`, 2026-08-30, and a
+/// common field of every hook event per Claude Code's hook contract); an optional
+/// line 2 reading `dialog` says the writer was `askq`/`plan`, so the reader should
+/// wait for the pending `AskUserQuestion`/`ExitPlanMode` entry to land in that
+/// transcript before summarizing. Written by the helper (`Stop`, `askq`, `plan`),
+/// consumed-and-deleted by the app's poll loop (`Core::take_explain_requests`);
+/// overwriting between polls is the latest-wins coalescing.
+pub fn explain_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(EXPLAINREQ_DIR).join(id.to_string())
+}
+
 /// A spawned child's task-delivery verdict: `<state_dir>/spawning/<id>`, holding
 /// `pending` (created, not started yet), `failed` (never began a turn) or
 /// `partial` (began a turn, but on text that is not what Mulpex sent). Absent
@@ -179,6 +192,9 @@ pub const PIDS_DIR: &str = "pids";
 /// `listeners/<id>` = the pid of the hub listener currently serving that
 /// instance, so a second one stands down instead of doubling every wake-up.
 pub const LISTENERS_DIR: &str = "listeners";
+/// `explainreq/<id>` = a turn (or a pending dialog) the hooks handed to the
+/// Explainer. See `explain_request_path`.
+pub const EXPLAINREQ_DIR: &str = "explainreq";
 
 #[cfg(test)]
 mod tests {

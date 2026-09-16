@@ -26,8 +26,10 @@ and breaks `fit()`.
 
 The Explainer column (`ExplainerPanel.svelte`, the `explains` map in `stores.ts`) is documented in
 [../docs/explainer.md](../docs/explainer.md) — including why its text is hard `dir="rtl"` and never
-`dir="auto"` (entries often *start* with an English identifier, which flips auto to LTR). It opens
-**only** on ⌘⇧E and holds exactly one explanation. `App.svelte` closes it on three triggers, but only
-one of them *discards* the answer — closing and switching rows keep it, so re-opening is free, and
-only the focused claude going back to `working` clears it (see docs/explainer.md). Don't give it standing content: `showExplainer` starting at `true` would show an
-empty third column, since nothing produces an explanation until it is asked for.
+`dir="auto"` (entries often *start* with an English identifier, which flips auto to LTR). It is
+**open by default** and fills itself after every turn; ⌘⇧E is a plain show/hide and nothing in the
+frontend ever discards an entry except a row exiting. The feed is capped at 10 per instance in
+`stores.ts` (`MAX_EXPLAIN_ENTRIES`, mirroring the backend) — keep the two caps equal, or a reload
+shows a different history than the live feed did. The panel's feed rules (render-time reversal,
+sticky scroll, `opacity: 0.18` history, `:last-of-type` not `:last-child`) only make sense together;
+don't remove one piecemeal.

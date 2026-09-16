@@ -1121,6 +1121,38 @@ impl Core {
         changed
     }
 
+    /// Collect the turns the hooks handed to the Explainer: one
+    /// `explainreq/<id>` file per instance, holding that turn's transcript path
+    /// (and, from `askq`/`plan`, a second `dialog` line — the body is handed on
+    /// whole; `explainer::submit` parses it). Consume-and-delete like
+    /// `process_name_requests` — the file is gone even when the id is refused,
+    /// so a stale request can't sit on disk retrying every tick. Ids that aren't
+    /// a live claude are dropped: a shell never writes one (shells run no
+    /// hooks), so one here is leftover from a closed instance whose id a
+    /// terminal now holds, and explaining it would be a lie.
+    pub fn take_explain_requests(&mut self) -> Vec<(usize, String)> {
+        let dir = self.state_dir.join(mulpex_core::EXPLAINREQ_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<usize>().ok());
+            let payload = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            let Some(id) = id else { continue };
+            let live_claude = self.sessions.iter().any(|s| s.id == id && !s.is_shell());
+            if live_claude && !payload.trim().is_empty() {
+                out.push((id, payload.trim().to_string()));
+            }
+        }
+        out
+    }
+
     /// The label the sidebar shows for a row: the real name if there is one,
     /// otherwise the provisional one. See `fallback_names` for why the two are
     /// separate maps rather than one.
@@ -3317,6 +3349,39 @@ mod tests {
             core.store.load().iter().all(|s| !s.muted),
             "the unmute never reached the store"
         );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End to end through the Explainer's request dir: a live claude's finished
+    /// turn is collected (body whole, so a `dialog` line survives), everything
+    /// else is consumed silently — a shell's id, a reaped id, junk — so a stale
+    /// file can never sit on disk retrying every 200 ms tick.
+    #[test]
+    fn explain_requests_are_consumed_and_only_live_claudes_count() {
+        let (_env, root, mut core) = scratch_core("explain-req-test");
+        let dir = core.state_dir.join(mulpex_core::EXPLAINREQ_DIR);
+        assert!(dir.is_dir(), "open() should create the request dir");
+
+        let id = core.spawn_instance().unwrap().id;
+        let term = core.spawn_terminal(None, None, true).unwrap().id;
+        std::fs::write(dir.join(id.to_string()), "/tmp/t.jsonl\ndialog\n").unwrap();
+        std::fs::write(dir.join(term.to_string()), "/tmp/shell.jsonl").unwrap();
+        std::fs::write(dir.join("999"), "/tmp/ghost.jsonl").unwrap();
+        std::fs::write(dir.join("notanid"), "junk").unwrap();
+
+        assert_eq!(
+            core.take_explain_requests(),
+            vec![(id, "/tmp/t.jsonl\ndialog".to_string())],
+            "only the live claude's turn is handed on, body trimmed but whole"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "requests must be consumed, or the poll loop retries them every tick"
+        );
+        assert!(core.take_explain_requests().is_empty(), "consumed means gone");
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

@@ -219,9 +219,9 @@ pub struct ExplainSections {
     pub need: String,
 }
 
-/// The Explainer's answer for one instance: the short Hebrew explanation of the
-/// turn on screen. There is at most one of these per instance at a time — ⌘⇧E
-/// produces it and the next prompt clears it. `ok: false` marks a summarizer
+/// One item of an instance's Explainer feed: the short Hebrew explanation of
+/// one turn, pending question or pending plan. Up to `explainer::MAX_ENTRIES`
+/// per instance, the oldest dropped completely. `ok: false` marks a summarizer
 /// failure — the text then says so instead of pretending (never round ignorance
 /// up to an explanation), and the panel offers a retry on it.
 #[derive(Clone, PartialEq, Eq, Serialize)]

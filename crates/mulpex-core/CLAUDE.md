@@ -24,7 +24,7 @@ Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `compacting/`, `armed/`,
-  `relisten/`, `pids/`, `listeners/`,
+  `relisten/`, `pids/`, `listeners/`, `explainreq/`,
   `named/`, `namenudge/`, `spawning/`, `resumed/`, like `peers/` already does.
 - **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
   fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be

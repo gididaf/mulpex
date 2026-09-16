@@ -26,9 +26,8 @@ const POLL: Duration = Duration::from_millis(200);
 
 /// Spawn the poll loop. Runs for the life of the app on its own thread.
 pub fn start(app: AppHandle) {
-    // The Explainer's Sonnet workers. Nothing in this loop feeds them — they are
-    // fed by ⌘⇧E (`commands::explain_now`) and emit `explain-update` themselves
-    // once a summary lands.
+    // The Explainer's Sonnet workers: fed below from `take_explain_requests`,
+    // emitting `explain-update` on their own once a summary lands.
     explainer::init(app.clone());
     std::thread::spawn(move || {
         // Last-emitted snapshot per project, so we only push on change.
@@ -75,9 +74,13 @@ pub fn start(app: AppHandle) {
                 // the only path by which a machine on the other end of an ssh
                 // link can reach a local instance at all.
                 core.process_remote_signals();
-                // The Explainer is NOT driven from here. It runs only on ⌘⇧E
-                // (`commands::explain_now`), so this loop has no Explainer work
-                // per tick — only the `forget` below, when a row goes away.
+                // Turns the hooks handed to the Explainer (a transcript path per
+                // finished turn or pending dialog) → the Sonnet worker queue.
+                // Cheap here (one dir read + a queue push); the summarizing
+                // happens off-thread.
+                for (id, body) in core.take_explain_requests() {
+                    explainer::submit(core.handle, id, body, core.state_dir.clone());
+                }
                 core.refresh_worked();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on

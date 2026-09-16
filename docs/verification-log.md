@@ -1713,3 +1713,54 @@ instead.
 - **The six live orphans were left alone**, by the user's decision. The reaper's *selection* is
   tested (`only_a_parentless_listener_is_reaped`) against purpose-built processes; it has not been
   run against them.
+
+## 2026-09-16 (evening) — the Explainer back to an automatic feed
+
+The morning's on-demand Explainer (⌘⇧E only, one cached entry, three auto-clears) was reverted the
+same day at the user's request; the three-part formatting, the question/plan handling and the
+failure/retry path from that version were kept. `docs/explainer.md` has the resulting design.
+
+### Measured: `transcript_path` is on the `PreToolUse` payload
+
+The trigger's one unmeasured assumption. The original feed's `askq`/`plan` hooks forwarded
+`tool_input`, so no captured `PreToolUse` payload on this machine carried the path, and the
+documented hook contract ("common fields on every event") had never been checked here. Driven with
+a headless `claude -p --settings <capture hook>` running one `Bash` call (`scratchpad/pretool`):
+the `PreToolUse` payload carries `session_id`, `transcript_path`, `cwd`, `prompt_id`,
+`permission_mode`, `effort`, `hook_event_name`, `tool_name`, `tool_input`, `tool_use_id`. The
+`Stop` payload from the same run carries it too. So the hooks write the path for all three events.
+
+### Driven through the real helper
+
+`mulpex-helper hook askq` / `hook plan` / `hook stop` with synthetic payloads on stdin, against a
+scratch `MULPEX_STATE_DIR`: `explainreq/4` = `/tmp/x.jsonl\ndialog`, `explainreq/5` =
+`/tmp/y.jsonl\ndialog`, `explainreq/6` = `/tmp/z.jsonl` (no marker), and the status words `needs`,
+`needs`, `waiting` alongside — the two jobs of each hook, both landing.
+
+### Driven in `npm run tauri dev` (by the user)
+
+- A `say ok` turn produced a three-part entry by itself; the dev log showed
+  `[explainer] project 1 claude#3: WORK: … DID: … NEED: …`. ⌘⇧E hid and showed the column without
+  losing it.
+- The 10-entry feed with timestamps, dimmed history and sticky scroll was accepted after the same
+  QA pass.
+
+### Tests
+
+- `a_finished_turn_hands_its_transcript_to_the_explainer`, `a_pending_question_reaches_the_explainer`,
+  `a_pending_plan_reaches_the_explainer` (hook.rs, restored and adapted: path + `dialog` line);
+  `explain_requests_are_consumed_and_only_live_claudes_count` (state.rs, restored);
+  `a_dialog_request_waits_for_the_dialog_entry` (explainer.rs, new — the question entry is appended
+  from another thread 400 ms in and the reader waits for it; a dialog that never comes falls back
+  to the prose); `the_feed_is_newest_first_capped_and_forgettable` (cap of 10, oldest gone
+  completely); `queued_requests_coalesce_per_instance` (request-body parsing + latest-wins).
+- 111 `mulpex-core` tests, 92 `src-tauri` tests, `svelte-check` clean.
+
+### Not verified
+
+- **The `dialog` race live.** Whether a real `askq` hook can be drained before the `AskUserQuestion`
+  entry is in the transcript was not measured; the guard is there so it does not matter which way
+  it goes, and the unit test drives the guard, not Claude Code's write order.
+- **The frontend cap on a real 11-turn run.** `applyExplainFor`'s slice is exercised by reading, not
+  by a driven session; the backend cap is unit-tested.
+- **Live in the shipped `.app`.** Dev build only; the running Mulpex was not restarted.

@@ -12,11 +12,13 @@
 ///
 /// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
 /// `PreToolUse[AskUserQuestion]` → needs (via `<helper> hook askq`, which also
-/// hands the pending questions to the Explainer — it replaced a bare `printf
-/// needs` when the Explainer needed the payload);
+/// hands the turn's transcript path to the Explainer so the pending question is
+/// explained while it sits on screen — it replaced a bare `printf needs` when
+/// the Explainer needed a hook there);
 /// `PreToolUse[ExitPlanMode]` → needs the same way (via `<helper> hook plan`),
-/// which also hands the pending plan to the Explainer; `Stop` → waiting (via the
-/// helper, which also releases locks); the `permission_prompt`/`idle_prompt`
+/// which also hands the transcript path to the Explainer; `Stop` → waiting (via
+/// the helper, which also releases locks and hands the finished turn to the
+/// Explainer); the `permission_prompt`/`idle_prompt`
 /// notifications → waiting, or working while background work or a compaction is
 /// outstanding, and **never** needs — red is reserved for the two `PreToolUse`
 /// matchers above, the only states where the instance is genuinely holding

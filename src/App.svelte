@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick, untrack } from "svelte";
+  import { onMount, tick } from "svelte";
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
   import { open as openFolder, confirm } from "@tauri-apps/plugin-dialog";
@@ -21,8 +21,7 @@
     restartSession,
     focusSession,
     getHubSnapshot,
-    explainNow,
-    clearExplain,
+    getExplains,
     sendBytes,
     setSessionMuted,
     setMuteMenuChecked,
@@ -42,10 +41,8 @@
     project,
     sessions,
     activeId,
-    statuses,
     showMessages,
     showExplainer,
-    explainDeciding,
     showPalette,
     rename,
     addProject,
@@ -56,6 +53,7 @@
     setSessionMutedLocal,
     applyHubFor,
     applyExplainFor,
+    setExplainsFor,
     setExplainPendingFor,
     removeExplainsFor,
     displayOrder,
@@ -108,8 +106,9 @@
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle);
     if (snap) applyHubFor(info.handle, snap);
-    // Nothing to fetch for the Explainer: an explanation only exists between a
-    // ⌘⇧E and the next prompt, and the panel starts closed.
+    // The Explainer feed is push-only after this; the fetch covers what the
+    // workers produced before this webview existed (dev hot-reload, mostly).
+    setExplainsFor(info.handle, await getExplains(info.handle));
     if (makeActive) selectProject(info.handle);
   }
 
@@ -295,87 +294,6 @@
     focusSession(h, id);
     terminals.focus(h, id);
   }
-
-  /**
-   * ⌘⇧E. Open the Explainer **and ask it**, in one keystroke — the panel has no
-   * standing content of its own, so opening it without asking would show an
-   * empty column.
-   *
-   * "Ask" is usually free: the backend compares the instance's transcript
-   * against the one its answer was made from and reuses it when nothing moved,
-   * so opening and closing the panel repeatedly costs one summarizer call, not
-   * one per press. Only a turn that actually moved on produces a new answer —
-   * and only then is the old one dropped, which is what `explainDeciding` is
-   * for: the panel holds its content for the one frame the verdict takes rather
-   * than flashing an explanation it is about to discard.
-   *
-   * Terminals open the panel to its "terminals aren't explained" line and cost
-   * no Sonnet call — `explain_now` refuses them backend-side too.
-   */
-  async function toggleExplainer() {
-    if (get(showExplainer)) {
-      closeExplainer();
-      return;
-    }
-    showExplainer.set(true);
-    const h = get(activeProjectHandle);
-    const cur = get(activeId);
-    if (h == null || cur == null) return;
-    explainDeciding.set(true);
-    try {
-      if ((await explainNow(h, cur)) === "running") removeExplainsFor(h, cur);
-    } catch {
-      // The panel falls back to its "nothing to explain yet" line.
-    } finally {
-      explainDeciding.set(false);
-    }
-  }
-
-  /** Put the panel away, **keeping** its answer. A closed panel that threw its
-   *  explanation away would make every re-open a fresh Sonnet call for the same
-   *  three lines; the answer is only invalidated by the turn moving on, which
-   *  `explain_now` detects and `clearExplain` (below) forces. */
-  function closeExplainer() {
-    if (!get(showExplainer)) return;
-    showExplainer.set(false);
-    explainDeciding.set(false);
-  }
-
-  // The panel is about the focused row, so focus moving puts it away. Watching
-  // the focused (handle, id) covers every path at once — the sidebar, ⌘[ / ⌘],
-  // a project switch, ⌘W taking the row away — instead of one call per call
-  // site. It cannot fire on open: opening the panel changes neither. The rows'
-  // answers are kept, so coming back and pressing ⌘⇧E again is free.
-  $effect(() => {
-    void $activeProjectHandle;
-    void $activeId;
-    untrack(closeExplainer);
-  });
-
-  // The user sent the next prompt (or answered the question / approved the plan
-  // that was on screen): the focused claude goes back to `working`, and the
-  // explanation is now about the turn before this one. This is the one event
-  // that DISCARDS an answer rather than just hiding it — the next ⌘⇧E must not
-  // reuse a summary of the previous turn. Only the transition INTO working
-  // counts; `working` → `working` is the same turn's next tool call, which is
-  // not news.
-  let wasWorking = false;
-  $effect(() => {
-    const cur = $activeId;
-    const h = $activeProjectHandle;
-    const now = cur == null ? undefined : $statuses.get(cur);
-    const working = now === "working";
-    const started = working && !wasWorking;
-    wasWorking = working;
-    if (!started) return;
-    untrack(() => {
-      closeExplainer();
-      if (h != null && cur != null) {
-        removeExplainsFor(h, cur);
-        clearExplain(h, cur); // also cancels a job still producing an answer
-      }
-    });
-  });
 
   /**
    * Mute or unmute one session of the active project (⌘M, or the row's 🔇).
@@ -769,7 +687,9 @@
         showMessages.update((v) => !v);
         break;
       case "explainer":
-        toggleExplainer();
+        // A plain show/hide: the feed fills itself after every turn, and
+        // hiding the column never throws anything away.
+        showExplainer.update((v) => !v);
         break;
       case "minimize":
         // Custom item (muda hard-binds the predefined one to ⌘M, which is Mute).

@@ -27,8 +27,8 @@ export interface ProjectState {
   sessions: SessionInfo[];
   statuses: Map<number, Status>;
   tasks: Map<number, string>;
-  /** id → that instance's Explainer answer: 0 or 1 entries, never a history
-   *  (see ExplainerPanel). An array because a retry addresses it by `seq`. */
+  /** id → that instance's Explainer feed, newest first, capped at
+   *  `MAX_EXPLAIN_ENTRIES` (the panel renders it oldest first). */
   explains: Map<number, ExplainEntry[]>;
   /** Instances the Explainer is currently working on (the panel's busy dot). */
   explainPending: Set<number>;
@@ -209,8 +209,7 @@ export const tasks = derived(
 );
 /** The active project's hub snapshot (locks / waiting / messages / pending). */
 export const hub = derived(activeProject, (p) => p?.hub ?? null);
-/** The active project's *focused* instance's Explainer answer — an array of at
- *  most one, since the Explainer only ever speaks about the turn on screen. */
+/** The active project's *focused* instance's Explainer feed, newest first. */
 export const activeExplains = derived(activeProject, (p) =>
   p && p.activeSessionId != null
     ? (p.explains.get(p.activeSessionId) ?? [])
@@ -361,10 +360,29 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   });
 }
 
+/** Feed cap per instance — mirrors `explainer.rs::MAX_ENTRIES`. The backend
+ *  truncates its store; this is what keeps the webview's copy from growing
+ *  past it between reloads. The oldest entry is dropped completely. */
+const MAX_EXPLAIN_ENTRIES = 10;
+
+/** Replace a project's whole Explainer feed from the initial-paint fetch
+ *  (`get_explains`): a flat, per-instance-newest-first array grouped by
+ *  `entry.id`, keeping the arrival order. */
+export function setExplainsFor(
+  handle: ProjectHandle,
+  entries: ExplainEntry[],
+): void {
+  const explains = new Map<number, ExplainEntry[]>();
+  for (const e of entries) {
+    explains.set(e.id, [...(explains.get(e.id) ?? []), e].slice(0, MAX_EXPLAIN_ENTRIES));
+  }
+  patchProject(handle, { explains });
+}
+
 /** Apply one `explain-update`: an entry whose `seq` is already in the feed
  *  **replaces** it where it sits (a retry of a failed row lands in place, not as
- *  a second row at the top); anything else is prepended. The backend caps the
- *  feed, the frontend just mirrors it. */
+ *  a second row at the top); anything else is prepended and the feed is
+ *  re-capped, so the oldest row is dropped here exactly as the backend drops it. */
 export function applyExplainFor(
   handle: ProjectHandle,
   id: number,
@@ -378,7 +396,7 @@ export function applyExplainFor(
   explains.set(
     id,
     at === -1
-      ? [entry, ...feed]
+      ? [entry, ...feed].slice(0, MAX_EXPLAIN_ENTRIES)
       : [...feed.slice(0, at), entry, ...feed.slice(at + 1)],
   );
   patchProject(handle, { explains });
@@ -398,9 +416,8 @@ export function setExplainPendingFor(
   patchProject(handle, { explainPending });
 }
 
-/** Drop one instance's explanation and its busy dot. Used both when its row
- *  exits and when the explanation goes stale — the panel closed, or the user
- *  sent the next prompt. */
+/** Drop one instance's feed and its busy dot: its row exited, so the feed is
+ *  unreachable. */
 export function removeExplainsFor(handle: ProjectHandle, id: number): void {
   const p = get(projects).get(handle);
   if (!p || (!p.explains.has(id) && !p.explainPending.has(id))) return;
@@ -423,18 +440,10 @@ export function findByDir(dir: string): ProjectState | undefined {
 /** Whether the ⌘⇧M message reader panel is open. */
 export const showMessages = writable(false);
 
-/** Whether the ⌘⇧E Explainer column is visible. **Off by default, and off most
- *  of the time**: the Explainer runs only when asked, so a visible-but-empty
- *  column would be a third of the window spent on nothing. ⌘⇧E opens it and
- *  asks in one keystroke; closing it, switching rows, or sending the next
- *  prompt puts it away again. */
-export const showExplainer = writable(false);
-
-/** True between a ⌘⇧E and the backend saying whether it will reuse the answer
- *  on screen or produce a new one. The panel waits on this rather than render
- *  an entry it may be about to discard — the verdict is a `stat`, so this is a
- *  frame at most, but without it a changed turn flashes its predecessor. */
-export const explainDeciding = writable(false);
+/** Whether the ⌘⇧E Explainer column is visible. On by default — the panel's
+ *  whole point is being there after every turn; ⌘⇧E hides it for the current
+ *  run and never throws anything away. */
+export const showExplainer = writable(true);
 
 /** Whether the ⌘P project quick-switcher overlay is open. */
 export const showPalette = writable(false);
