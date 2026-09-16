@@ -86,7 +86,7 @@ same `hub_instances` entry. Mute is purely a statement about how loudly the *sid
 about it, and it's deliberately not a hub concept: nothing in `mulpex-core` knows the flag exists.
 Concretely it: dims the row, **sinks it below the unmuted claudes** (but still above the terminal
 block — see **Sidebar order** above), drops its status dot, its status word and its ⏳, removes it
-from **every attention count** — the tab's red `needs` badge, the amber unread badge, and the
+from **every attention count** — the tab's green `ready` and red `needs` badges, and the
 hub-panel/status-strip unread readouts — and takes it out of the ⌘[ / ⌘] rotation.
 
 - **Ordering is one function**, `stores.ts::displayOrder` — a stable sort on `groupOf`, so each
@@ -244,16 +244,23 @@ list runs vertically). Terminals drag like instances: one list, one behavior.
 
 ## What a project tab shows
 
-Name + **session count** (always, `0` included — "nothing running here" is information) + two
-count badges, each for a different ask, so a colored pill is never ambiguous: **red =
-sessions in `needs`** (a claude stopped to ask *you* something) and **amber = unread hub
-messages**. Both hide at zero, and **both exclude muted sessions** (see above) — the plain session
-count does not, because it says what's *here*, not what wants you. By the same rule the plain count
-includes **terminals**, while the badges exclude them for free (a terminal has no status entry and
-no inbox). The needs count is the gap this closes —
-a background project blocked on a question used to look identical to an idle one, findable only by
-switching tabs, even though `ProjectState.statuses` had the answer all along. ⌘1–9 selects a tab
-(see **Keyboard** in [../CLAUDE.md](../CLAUDE.md)).
+Name + **two count badges in the sidebar's own dot colors**, so a tab reads the way a row does:
+**green = claudes done and idle** (`readyCount`, status `waiting`) and **red = claudes stopped on
+a question** (`needsCount`, status `needs`). Both hide at zero, and **both exclude muted
+sessions** (see above). `working` is deliberately unbadged — the tab says what is *finished* and
+what is *blocked on you*, not what is busy — so a project with everything running shows no pill at
+all. Terminals are excluded for free (a terminal has no status entry). The pills are dark text on
+a saturated background; white on either of those colors fails contrast.
+
+The needs count is the gap this closes — a background project blocked on a question used to look
+identical to an idle one, findable only by switching tabs, even though `ProjectState.statuses` had
+the answer all along. ⌘1–9 selects a tab (see **Keyboard** in [../CLAUDE.md](../CLAUDE.md)).
+
+**Two things the tab used to show and no longer does.** The always-on **session count** said
+what's *here* rather than what wants you, which is the opposite of a badge's job; and the **amber
+unread-mail pill** duplicated readouts the hub panel and the bottom bar already carry, while
+competing for the eye with the two statuses that actually stop work. `unreadCount` is still
+exported and still subtracts the muted share — it simply has no tab pill any more.
 
 **Tabs drag to reorder.** `ProjectTabBar` uses **pointer events, not HTML5 drag-and-drop** —
 Tauri's webview drag-drop is enabled (App.svelte needs it to drop folders onto the window) and
