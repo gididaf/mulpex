@@ -33,6 +33,13 @@ Traps that live in this directory specifically:
   Explainer shipped a failure entry that said only `exit 1`. → [../docs/explainer.md](../docs/explainer.md)
 - **Never `wait()` a terminal's child to learn it exited.** Liveness is reader-thread EOF; a zombie
   keeps the pid unrecyclable, which is what makes the `killpg` in teardown safe.
+- **`Session::kill` cannot reach a `claude`'s background commands.** Claude Code runs each in its
+  own process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`, `Ss`), so both
+  the `killpg` and `kill_tty_session` miss it. The hub listener is the one that matters — it spins
+  forever — and it is handled from the other end: `pty.rs` publishes `pids/<id>` so `listen.rs` can
+  see its owner die, and `pty::reap_orphaned_listeners` (launch + teardown) kills the ones that
+  predate that. Anything else long-lived a child backgrounds has the same hole.
+  → [../docs/hub.md](../docs/hub.md)
 - **A task is an argv argument, not keystrokes** — for a spawned child here and for a remote peer
   in `mcp.rs`. Typing it into the TUI capped it at 1022 characters with no error anywhere. If you
   need to hand an ALREADY-RUNNING instance text, `hub_send` it — that path is a file the

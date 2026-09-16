@@ -18,13 +18,14 @@ test. See **Two hosts, one core** in the root file.
 | `remote.rs` | [../../docs/remote-peers.md](../../docs/remote-peers.md) |
 | `persist.rs` | [../../docs/sessions.md](../../docs/sessions.md) — the store's positional columns |
 | `rules.rs` (`HUB_RULES`, `PLANNING_RULES`, `spawn_prompt`), `state_dir.rs` | [../../docs/hub.md](../../docs/hub.md), [../../docs/sessions.md](../../docs/sessions.md) — moved here from `src-tauri` so `mpx` shares them rather than copying them |
+| `listen.rs` (`mulpex-helper listen`) | [../../docs/hub.md](../../docs/hub.md) — why the listener is a binary, and why it has to notice its own `claude` dying |
 
 Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `compacting/`, `armed/`,
-  `named/`, `namenudge/`, `spawning/`, `resumed/`, `explainreq/`, `explainq/`,
-  `explainplan/`, like `peers/` already does.
+  `relisten/`, `pids/`, `listeners/`,
+  `named/`, `namenudge/`, `spawning/`, `resumed/`, like `peers/` already does.
 - **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
   fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be
   gated on it (`nudges_welcome`) — an arm nudge injected there made the instance start the very
@@ -38,14 +39,24 @@ Traps that live in this crate specifically:
   claudes — silent conversation corruption, from an omission rather than a mistake. Anything that
   is not the desktop app opens the store with `SessionStore::in_home` and passes its home
   explicitly.
-- **`rules.rs` must stay byte-identical across hosts, not merely equivalent.** `HUB_RULES` carries
-  the exact Monitor command an instance arms, and **three** separate pieces of `hook.rs` read that
-  one string: the arm nudge gates on the `touch` it performs, `listener_armed` reads the *second*
-  `touch` (inside the loop) as a liveness heartbeat, and `background_work_running` identifies the
-  listener by the inbox path in the command. A character of drift re-nudges every instance forever,
-  or strands every instance on yellow. That is why it lives here instead of in each host, and why
-  `hub_rules_carry_the_exact_arming_touch` asserts all three.
+- **The listener command is a binary because prose is retyped, and retyping drifts.** `HUB_RULES`
+  asks for `"<helper>" listen` — one line, `__MULPEX_BIN__`-substituted like `settings.json` and
+  `mcp.json`. It used to be a ~400-character shell loop, and an instance re-armed a *superseded*
+  copy of it 71 times across two days and an app update, because a model copies its own last
+  `Monitor` call before it re-reads the system prompt. Never move behaviour back into that string:
+  anything the loop must do goes in `listen.rs`, which ships with the app.
   → [../../docs/hub.md](../../docs/hub.md)
+- **`rules.rs` must stay byte-identical across hosts, not merely equivalent**, and `hook.rs` reads
+  it from two ends: `command_is_hub_listener` recognises the command (which is what keeps a
+  listener from counting as work in flight, and what the orphan reaper matches on), and the arm
+  nudge repeats it verbatim. A character of drift strands every instance on yellow, or re-nudges it
+  forever. `hub_rules_carry_the_exact_arming_command` asserts both, plus that no `__MULPEX_BIN__`
+  placeholder survives into the prompt.
+  → [../../docs/hub.md](../../docs/hub.md)
+- **Only the `Stop` payload carries `background_tasks`** — not `UserPromptSubmit`, not
+  `PostToolUse`, not the idle notification (measured, `claude` v2.1.273). Anything that needs to
+  know what is running has to be decided in `stop` and handed forward on disk, which is what
+  `relisten/<id>` is. → [../../docs/hub.md](../../docs/hub.md)
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
   ambiguity once made a 91 s spawn stall indistinguishable from a lost task.
   → [../../docs/hub.md](../../docs/hub.md)

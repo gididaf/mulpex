@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/explainer.md](docs/explainer.md) | Hebrew turn-summary panel: Stop→`explainreq` handshake, pending questions + plans (`ExitPlanMode`, and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs::stop`/`askq`/`plan`, `ExplainerPanel.svelte`, turn extraction |
+| [docs/explainer.md](docs/explainer.md) | Hebrew ⌘⇧E panel: on-demand only (no hook, no poll — the transcript is found from the session uuid), one entry and no history, the three auto-clears, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the transcript-flush race, the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `commands::explain_now`, `ExplainerPanel.svelte`, `App.svelte`'s toggle + close effects |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
@@ -50,7 +50,9 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
                       + rules (HUB_RULES/PLANNING_RULES/spawn_prompt) and state_dir
                         (the scratch-dir layout) — the two things a second host would
                         otherwise copy, so they live here and must stay byte-identical
-crates/mulpex-helper/ bin: `hook <event>` / `mcp` dispatch → mulpex-core
+                      + listen (the hub listener's 1 Hz inbox watch — the loop HUB_RULES
+                        used to spell out for the model to retype)
+crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` dispatch → mulpex-core
 crates/mulpex-cli/    bin `mpx`: the SECOND host — Mulpex over tmux, for working via ssh
                       (see "Two hosts, one core" below)
 src-tauri/            the Tauri app (Rust backend)
@@ -65,9 +67,9 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
-  src/explainer.rs    the Explainer: worker queue summarizing each finished turn (and
-                      pending AskUserQuestions) into short Hebrew via headless
-                      `claude -p --model sonnet`; emits explain-update / explain-pending
+  src/explainer.rs    the Explainer: ⌘⇧E-only worker queue summarizing the turn on
+                      screen into short Hebrew via headless `claude -p --model sonnet`;
+                      finds the transcript itself; emits explain-update / explain-pending
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -201,7 +203,8 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 ## Keyboard
 
 Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
-**⌘⇧] / ⌘⇧[** next/prev project and **⌘⇧← / ⌘⇧→** move the active project's tab) are intercepted
+**⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
+**⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
 quick-switcher) is *not* a menu accelerator — it's handled in the webview (`svelte:window` keydown,
 `preventDefault` stops the print dialog).
@@ -213,7 +216,7 @@ xterm's hidden textarea, where ⌘⇧←/→ is a standard AppKit text-selection
 AppKit never falls through to the main menu. Since focus is almost always in the terminal, an
 accelerator that competes with a text-editing binding is effectively dead.
 
-So **⌘⇧] / ⌘⇧[ and ⌘⇧← / ⌘⇧→ are declared in the menu but claimed in the webview**
+So **⌘⇧] / ⌘⇧[, ⌘⇧← / ⌘⇧→ and ⌘⇧↑ / ⌘⇧↓ are declared in the menu but claimed in the webview**
 (`App.svelte::onGlobalKey`), where a DOM keydown runs *before* that default action. Matched on
 `e.code` — `e.key` is `}`/`{` for the brackets and layout-dependent. Why the brackets failed is
 *not* established (they are not a text-editing binding; AppKit matching a shifted-punctuation key
@@ -228,6 +231,13 @@ function key with no shifted variant, so it sidesteps the (suspected) bracket pr
 Moving is **clamped, not wrapped** (the edges are a no-op), unlike ⌘⇧[ / ⌘⇧] cycling: a tab
 teleporting from one end of the strip to the other reads as a mistake. It commits through
 `applyProjectOrder`, the same path a tab drag uses, so it persists to `open.txt` and remaps ⌘1–⌘9.
+
+**⌘⇧↑ / ⌘⇧↓ (Move Instance Up/Down) is the same thing one axis over**: the focused sidebar row
+slides one slot, clamped, committing through `applySessionOrder` — the path a row drag uses — so it
+persists and ⌘[ / ⌘] cycle the new order. The clamp is `stores.ts::clampToGroup`, not just the list
+ends: a row can only move inside its own block (unmuted claudes / muted claudes / terminals),
+because `displayOrder` re-applies on top of any committed order and a cross-block move would snap
+back on the next poll.
 
 **⌘M is Mute Session; the message reader moved to ⌘⇧M.** ⌘M has a *third* claimant nobody
 declares: muda hard-binds `PredefinedMenuItem::minimize` to ⌘M and exposes no accelerator setter.
@@ -331,6 +341,18 @@ and cost real time; each links to the measurement that settled it.
   truncated every task over ~1 KB (measured: 1022 characters received, whatever was sent) while
   every signal said success. A TUI is not an interface; argv is.
   → [docs/hub.md](docs/hub.md), [docs/remote-peers.md](docs/remote-peers.md)
+- **Anything an instance must get exactly right belongs in a binary, not in `HUB_RULES`.** The hub
+  listener was a ~400-character shell one-liner the model retyped from prose, and a model copies its
+  own last `Monitor` call before it re-reads the system prompt: one instance re-armed a *superseded*
+  copy 71 times across two days and an app update, healing only when `/compact` dropped that call
+  from its context. It is now one line — `"<helper>" listen` — and the loop lives in `listen.rs`.
+  Same lesson as argv-vs-TUI, one layer up. → [docs/hub.md](docs/hub.md)
+- **Nothing this app signals can reach what a `claude` backgrounds.** Claude Code runs each
+  background command in its own process group with no controlling terminal, so `Session::kill`'s
+  `killpg` *and* its tty sweep both miss it — the hub listener survived ⌘W, crashes and teardown
+  alike and was found six-deep on one machine, a day old, still spinning. Such a process has to
+  notice on its own (`pids/<id>`) and be reapable from outside (`ppid == 1`).
+  → [docs/hub.md](docs/hub.md)
 - **A child must not inherit a hub identity or `CLAUDE_CODE_CHILD_SESSION`.** The former corrupts
   the hub; the latter silently disables transcript saving, so the breakage only appears at the
   *next* launch as an unrestorable session. → [docs/sessions.md](docs/sessions.md)
