@@ -2061,11 +2061,34 @@ Read off the dev build's own trace, not inferred:
   the 82 ms quoted elsewhere in the docs.
 - **The debounce fires after every ring:** `already rung (status \`working\`)` follows each one.
 
+### The plural, driven (sequential arrival)
+
+`claude#22` sent six `hub_send`s to `claude#23` in one turn. Result — **one ring, six messages, in
+order, nothing lost**:
+
+```
+[doorbell] claude#23: rang for 1 message(s) 166 ms after the first arrived
+[doorbell] claude#23: holding 1 message(s) — already rung (status `working`)
+[doorbell] claude#23: holding 1 message(s) — busy (status `working`)
+```
+
+`claude#23`'s pane carried exactly one `<<<MPX>>>` line, and it reported *"All 6 test messages
+received, in order (1→6). Arrived in three batches of two."*
+
+The interesting part is **the two layers handing off**, which no test covers and which was not
+designed so much as inherited. The doorbell rang for message 1 only. Messages 2–6 landed while the
+instance was `working`, where the doorbell must not ring — and the `Stop` hook's unread-mail block
+picked them up instead, continuing the same turn (*"Ran 2 stop hooks… You have 1 unread hub
+message(s)"*). One user-visible wake, every message delivered. The doorbell handles the idle case
+and `Stop` handles the mid-turn case; between them there is no gap.
+
 ### Not verified
 
-- **The plural, live.** Six messages arriving at *once* producing one doorbell is still unit-tested
-  only. The `already rung` lines above show the debounce working, but for messages arriving in
-  sequence, not simultaneously.
+- **True simultaneity.** The ring above says `1 message(s)`, because the sender thought for 27 s and
+  the messages spread out. A ring reporting `N > 1` — several messages seen inside one 200 ms tick
+  — has never been observed. The code reads `unread` once and reports that count, so the risk is
+  low, but it is unwitnessed. The realistic shape is fan-in: several `hub_spawn` workers reporting
+  back at the same moment.
 - **The absence.** No run longer than ~1 hour has been observed confirming that an idle instance now
   takes zero turns. That is the entire point of the change and it remains the least-proven claim in
   it. (Counter-evidence of a kind: the session that built this re-armed its own listener **five
