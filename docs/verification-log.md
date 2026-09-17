@@ -2082,13 +2082,34 @@ picked them up instead, continuing the same turn (*"Ran 2 stop hooks… You have
 message(s)"*). One user-visible wake, every message delivered. The doorbell handles the idle case
 and `Stop` handles the mid-turn case; between them there is no gap.
 
+### Fan-in: three workers reporting at once
+
+The realistic simultaneous case, driven. `claude#24` spawned `#25`, `#26`, `#27`, each told to
+`hub_send` DONE immediately and stop:
+
+```
+[doorbell] claude#24: rang for 1 message(s) 16 ms after the first arrived
+[doorbell] claude#24: holding 1 message(s) — already rung (status `working`)
+```
+
+**One doorbell, three senders, one turn, nothing lost.** `claude#24` resolved all three inside that
+turn and marked it `⟳ hub message from claude#25, claude#26, claude#27 →` — the marker naming every
+sender, which no code enforces.
+
+**16 ms is the fastest ring observed**, and it settles the `N > 1` question rather than leaving it
+open: the ring is faster than any realistic gap between two messages, so `unread` is almost always
+1 when the poll reads it. A count above 1 needs two messages inside the same 200 ms tick, which
+means it is close to unreachable in practice — and chasing it would be testing the wording of a log
+line, not a behaviour.
+
+The behaviour that mattered — *N messages must not produce N doorbells* — is now disproven three
+independent ways: six sequential (above), three concurrent (here), and the `already rung` line that
+appears after every single ring.
+
 ### Not verified
 
-- **True simultaneity.** The ring above says `1 message(s)`, because the sender thought for 27 s and
-  the messages spread out. A ring reporting `N > 1` — several messages seen inside one 200 ms tick
-  — has never been observed. The code reads `unread` once and reports that count, so the risk is
-  low, but it is unwitnessed. The realistic shape is fan-in: several `hub_spawn` workers reporting
-  back at the same moment.
+- **The absence.** Still the one that matters. No run longer than ~1 hour has been observed
+  confirming that an idle instance now takes zero turns.
 - **The absence.** No run longer than ~1 hour has been observed confirming that an idle instance now
   takes zero turns. That is the entire point of the change and it remains the least-proven claim in
   it. (Counter-evidence of a kind: the session that built this re-armed its own listener **five
