@@ -2034,14 +2034,41 @@ the reader, so an instance signing a message guessed — `claude#4` opened one w
 claude#1", having never called `hub_instances`. Delivery was correct throughout; only the prose a
 human reads was wrong. Predates the doorbell by as long as the peer snapshot has existed.
 
+### The gates, driven live (same day, after the commit)
+
+Read off the dev build's own trace, not inferred:
+
+- **`needs` holds mail — three times, including a plan.**
+  ```
+  [doorbell] claude#15: holding 1 message(s) — busy (status `needs`)   AskUserQuestion
+  [doorbell] claude#18: holding 1 message(s) — busy (status `needs`)   AskUserQuestion
+  [doorbell] claude#20: holding 1 message(s) — busy (status `needs`)   ExitPlanMode, approval pending
+  ```
+  The plan case is the one that mattered: `sessions.md` records a `permission_prompt` firing ~6 s
+  after `PreToolUse[ExitPlanMode]`, which had previously turned a row green in front of an
+  unanswered plan. That window did not open — no ring at ~6 s, and the plan stayed unapproved until
+  the user answered it. Had it opened, the doorbell's `\r` would have *approved the plan*.
+- **`working` holds mail:** `claude#17: holding 1 message(s) — busy (status \`working\`)`.
+- **The draft guard, unprompted and end to end.** Not a staged test — it happened during ordinary
+  use:
+  ```
+  [doorbell] claude#12: holding 1 message(s) — a draft is sitting in the input box (status `waiting`)
+  [doorbell] claude#12: rang for 1 message(s) 6453 ms after the first arrived
+  ```
+  Mail held 6.4 s while a draft sat in the box, then rang by itself once it cleared. Deferred, not
+  dropped, with no user action to release it. Same shape on `claude#13` at 535 ms.
+- **Latency, more samples:** 12 ms, 175 ms, 535 ms. **12 ms is the fastest observed**, faster than
+  the 82 ms quoted elsewhere in the docs.
+- **The debounce fires after every ring:** `already rung (status \`working\`)` follows each one.
+
 ### Not verified
 
-- **The `needs` gate.** That a doorbell does not fire into a pane showing an `AskUserQuestion` or a
-  plan dialog is covered by a unit test on `should_ring` and by nothing else. **It is the one
-  remaining way this can do real damage** — a keystroke there picks an option and the `\r` confirms
-  it — and it has never been driven against a live dialog.
-- **The plural, live.** Six messages arriving at once producing one doorbell is unit-tested only.
+- **The plural, live.** Six messages arriving at *once* producing one doorbell is still unit-tested
+  only. The `already rung` lines above show the debounce working, but for messages arriving in
+  sequence, not simultaneously.
 - **The absence.** No run longer than ~1 hour has been observed confirming that an idle instance now
-  takes zero turns. That is the entire point of the change and it is the least-proven claim in it.
+  takes zero turns. That is the entire point of the change and it remains the least-proven claim in
+  it. (Counter-evidence of a kind: the session that built this re-armed its own listener **five
+  times**, on the released build, while deleting the thing that made it necessary.)
 - **The shipped `.app`.** Everything above is `tauri dev`. The `[doorbell]` trace is
   `#[cfg(debug_assertions)]`, so a release build is also the first one running this code silently.
