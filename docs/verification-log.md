@@ -1764,3 +1764,53 @@ scratch `MULPEX_STATE_DIR`: `explainreq/4` = `/tmp/x.jsonl\ndialog`, `explainreq
 - **The frontend cap on a real 11-turn run.** `applyExplainFor`'s slice is exercised by reading, not
   by a driven session; the backend cap is unit-tested.
 - **Live in the shipped `.app`.** Dev build only; the running Mulpex was not restarted.
+
+## 2026-09-17 — the Explainer explained a turn's first line as the whole turn
+
+Reported from a screenshot: a warweb turn that ended with two decisions for the user got the entry
+"בודק עכשיו את מצב ה-git… / כלום, אפשר להמשיך" — a summary of its *opening* line.
+
+### Measured: the turn was one turn, and the reader took its first line
+
+- The real transcript (`-Users-gididaf-Documents-Code-games-warweb/c30f48b2….jsonl`, 45 MB): prompt
+  at 05:38:20Z, `text` "Two decisions are open. Let me check the current state of the tree first…"
+  at 05:38:33, two `Bash` `tool_use`/`tool_result` pairs, final `text` at 05:38:58. No user entry,
+  no `<task-notification>`, no dialog in between. The panel's entry, timestamped 08:39 local,
+  matches the first `text` and nothing after it.
+- Cause by inspection, then reproduced: the evening-of-09-16 `read_turn_settled` retried only on an
+  *empty* turn; a turn that spoke mid-way is non-empty the instant `Stop` fires, and the docs even
+  recorded the partial read as "accepted". The 2026-08-30 feed slept 400 ms before its first read,
+  which is why it never showed this.
+
+### Measured: `Stop` carries `last_assistant_message`, and only the last message
+
+- `claude` 2.1.274 headless, `--settings` with a `Stop` hook that dumps its stdin, a prompt that
+  makes the model say one line, run `echo`, then say another: the payload is
+  `{session_id, transcript_path, cwd, prompt_id, permission_mode, hook_event_name, stop_hook_active,
+  last_assistant_message: "final answer", background_tasks, session_crons}`. The field holds the
+  final message alone ("final answer"), not "first line here" — exactly the text the reader must
+  wait for.
+- The same hook copying the transcript at `Stop` time: in `-p` the final `text` was **already in
+  the file** (30 lines at Stop, 32 after). So headless does not reproduce the race; the 08:38 turn
+  and the 2026-08-30 measurement are both interactive sessions.
+
+### Replayed on the real transcript
+
+- The warweb transcript cut just before its final `text` entry, that entry appended from another
+  thread 900 ms after `read_turn_settled` started. Old input (no final text): settled at once on
+  "…so the second one is accurate." — the bug. New input (the entry's text as `final_text`): the
+  turn ends with "…then one full commit." and holds the mid-turn line once, read from the file, not
+  appended. Settled ~1.1 s after the append in `--release` (one read of the 45 MB file ≈ 105 ms;
+  ≈ 770 ms in a debug build, which is why the wait budget is attempts, not wall-clock).
+
+### Tests
+
+- `a_finished_turn_forwards_the_message_it_ended_on` (hook.rs: `path\nfinal\n<text>`, blank text →
+  path alone, a dialog request never carries it); `a_turn_that_spoke_midway_waits_for_its_final_message`
+  and `a_final_message_that_never_lands_is_appended` (explainer.rs); `queued_requests_coalesce_per_instance`
+  extended for the `final` body. 112 `mulpex-core` tests, 94 `src-tauri` tests.
+
+### Not verified
+
+- **Live in the shipped `.app`.** The running Mulpex was not restarted; the fix is verified on the
+  real transcript and the real `claude`'s payload, not on a driven interactive session.

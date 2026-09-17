@@ -557,6 +557,17 @@ fn write_needs(ctx: &Ctx) {
 /// a plain turn would never get a second chance (`Stop` does not fire while the
 /// dialog waits). The marker is what tells `explainer::read_turn_settled` to
 /// wait for the dialog rather than for prose.
+///
+/// A finished turn (`Stop`) forwards the payload's **`last_assistant_message`**
+/// after a `final` marker line — the text of the message the turn ended on, as
+/// Claude Code reports it (present since v2.1.27x; measured 2026-09-17 on
+/// 2.1.274). The same flush race one entry earlier: the transcript gets that
+/// final entry a beat *after* `Stop` fires, and a turn that said something
+/// mid-way ("let me check the tree first") reads as complete without it — the
+/// reader then explained the first line of a turn as the whole turn, with
+/// `NEED: nothing` under two decisions the user had to make. With the text in
+/// hand the reader waits for exactly it, and if it never lands, appends it.
+/// A payload without the field writes the path alone, as before.
 fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog: bool) {
     let Some(path) = payload
         .and_then(|j| j.get("transcript_path"))
@@ -569,7 +580,16 @@ fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog:
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = if dialog { format!("{path}\ndialog") } else { path.to_string() };
+    let last_said = payload
+        .and_then(|j| j.get("last_assistant_message"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let body = match (dialog, last_said) {
+        (true, _) => format!("{path}\ndialog"),
+        (false, Some(text)) => format!("{path}\nfinal\n{text}"),
+        (false, None) => path.to_string(),
+    };
     let _ = std::fs::write(file, body);
 }
 
@@ -1696,6 +1716,49 @@ mod tests {
         assert!(!req.exists(), "no transcript_path in the payload → no request file");
         write_explain_request(&ctx, payload(r#"{"transcript_path":""}"#).as_ref(), false);
         assert!(!req.exists(), "an empty transcript_path is not a path");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The text a turn ended on rides along with the path, so the reader can
+    /// wait for that exact entry instead of accepting whatever the transcript
+    /// holds the instant `Stop` fires. Measured 2026-09-17 on `claude` 2.1.274:
+    /// `Stop` carries `last_assistant_message` ("Text content of the last
+    /// assistant message before stopping"), and a real turn whose first line was
+    /// "let me check the tree first" was explained from that line alone because
+    /// the final answer had not been flushed yet. Multi-line text survives
+    /// verbatim — everything after the `final` line is the message.
+    #[test]
+    fn a_finished_turn_forwards_the_message_it_ended_on() {
+        let dir = std::env::temp_dir().join(format!("mulpex-final-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 5);
+        let req = crate::explain_request_path(&ctx.state_dir, 5);
+
+        let stop = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+            "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
+            "last_assistant_message":"Two decisions.\n\n1. Armor\n- check it\n\n2. Commit\n",
+            "background_tasks":[],"session_crons":[]}"#;
+        write_explain_request(&ctx, payload(stop).as_ref(), false);
+        assert_eq!(
+            std::fs::read_to_string(&req).unwrap(),
+            "/Users/x/.claude/projects/-p/3562192c.jsonl\nfinal\nTwo decisions.\n\n1. Armor\n- check it\n\n2. Commit"
+        );
+
+        // Blank text is no text: the path alone, exactly as an older payload.
+        let blank = stop.replace("Two decisions.\\n\\n1. Armor\\n- check it\\n\\n2. Commit\\n", "  \\n ");
+        write_explain_request(&ctx, payload(&blank).as_ref(), false);
+        assert_eq!(
+            std::fs::read_to_string(&req).unwrap(),
+            "/Users/x/.claude/projects/-p/3562192c.jsonl"
+        );
+
+        // A dialog request never carries it: the reader waits for the dialog
+        // entry there, and the text before a question is read from the file.
+        write_explain_request(&ctx, payload(stop).as_ref(), true);
+        assert_eq!(
+            std::fs::read_to_string(&req).unwrap(),
+            "/Users/x/.claude/projects/-p/3562192c.jsonl\ndialog"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

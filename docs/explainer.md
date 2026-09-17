@@ -12,11 +12,11 @@ the on-demand version's content rules and dropping its trigger. Every claim belo
 ## The pipeline
 
 ```
-claude turn ends            → Stop hook   → explainreq/<id> = <transcript_path>
+claude turn ends            → Stop hook   → explainreq/<id> = <transcript_path>\nfinal\n<last_assistant_message>
 claude stops to ask/plan    → askq/plan   → explainreq/<id> = <transcript_path>\ndialog
   → 200ms poll: Core::take_explain_requests (consume-and-delete, live claudes only)
   → explainer::submit → worker queue (2 threads, latest-wins per instance)
-      read_turn_settled: wait for prose (or, with `dialog`, for the dialog entry)
+      read_turn_settled: wait for the final message (or, with `dialog`, for the dialog entry)
       read_turn: a waiting AskUserQuestion / ExitPlanMode wins, else the turn's text
       → claude -p --model sonnet   → parse_sections (WORK / DID / NEED)
   → in-memory store, newest first, MAX_ENTRIES = 10 per (handle, id)
@@ -25,10 +25,13 @@ claude stops to ask/plan    → askq/plan   → explainreq/<id> = <transcript_pa
 
 **The hook is the trigger, the transcript is the input.** The hook payload carries
 `transcript_path` on every event (*measured 2026-08-30 on `Stop`, 2026-09-16 on `PreToolUse`*), so
-the hook writes that path and nothing else. What kind of turn it is — prose, a pending question, a
-pending plan — is decided by `read_turn` from the transcript itself, which is why one request dir
-covers all three (the original feed had `explainq/` and `explainplan/` carrying the tool payloads;
-those are gone for good).
+the hook writes that path, plus — for `Stop` only — the payload's **`last_assistant_message`**
+after a `final` marker line (*measured 2026-09-17 on `claude` 2.1.274: populated, and it is the
+last message alone, not the turn*). That text is not the summarizer's input; it is what the reader
+waits for in the transcript (see the turn-end race below). What kind of turn it is — prose, a
+pending question, a pending plan — is decided by `read_turn` from the transcript itself, which is
+why one request dir covers all three (the original feed had `explainq/` and `explainplan/`
+carrying the tool payloads; those are gone for good).
 
 **`Stop` writes after the unread-mail block**, so a blocked stop (a continuing turn) writes nothing
 and a turn is explained exactly once. Overwriting `explainreq/<id>` between polls is the latest-wins
@@ -58,7 +61,8 @@ all leave every feed alone — the on-demand version's three auto-clears are gon
 ## A turn with nothing in it
 
 A `Stop` whose turn contains no prose — an interrupted turn, or one whose final entry never flushed
-in the ~1 s the reader waits — produces the entry `עדיין אין מה להסביר`, no Sonnet call. It is an
+in the ~2 s the reader waits *and* whose payload carried no `last_assistant_message` to fall back
+on — produces the entry `עדיין אין מה להסביר`, no Sonnet call. It is an
 entry and not a silent skip on purpose: a silent skip here is exactly what the feature's most
 expensive bug looked like from the outside (see the flush race below). Chosen by the user over the
 original feed's log-only skip.
@@ -172,12 +176,32 @@ presented as "the whole feature doesn't work" and cost a debugging round — the
 with nowhere to arrive". Two rules came out of it:
 
 - `read_turn_settled` tries **immediately** and retries only while the turn reads as *unsettled*
-  (250 ms × 4, ~1 s): empty, or — with the `dialog` marker — a plain turn where a dialog was
-  announced. Still empty after that is the `NOTHING_YET` entry. No silent branch anywhere in
-  `process()`.
-- The retry is only for those two states. A partial read (mid-turn text present, final message
-  still in flight) is possible in that same sub-second window and is accepted; the next turn's entry
-  is seconds away.
+  (250 ms × 8, ~2 s plus read time): the final message `Stop` reported is not in the turn text yet;
+  empty; or — with the `dialog` marker — a plain turn where a dialog was announced. Still empty
+  after that, with no final message in hand, is the `NOTHING_YET` entry. No silent branch anywhere
+  in `process()`.
+- **"Empty" was not enough — the partial read (2026-09-17).** The evening-of-2026-09-16 version
+  retried only on an empty turn and *accepted* a partial one ("the next turn's entry is seconds
+  away"). A real turn (warweb, 08:38) opened with "Two decisions are open. Let me check the current
+  state of the tree first", ran two Bash calls, and answered twenty-five seconds later with two
+  decisions for the user. `Stop` fired, the reader found the first line, took it for the turn, and
+  the panel said "I'm checking git now — nothing needed, carry on" under a turn that needed two
+  answers. Nothing corrects that: the next entry comes only with the next prompt, which the user
+  was not going to send until they had decided. The old feed (2026-08-30) never showed this only
+  because it slept 400 ms before its first read.
+- **The fix is to wait for the exact text, not for a guess at the delay.** `Stop`'s payload carries
+  `last_assistant_message`; the hook forwards it and the reader is unsettled until the turn text
+  contains its tail (`SETTLE_PROBE_BYTES` = 2 000, because the turn text is tail-capped and a long
+  answer would never match its own cut). Settled turns cost nothing; a slow flush gets the whole
+  budget. If the text never lands, it is **appended** to whatever prose the file has (or stands
+  alone) and stderr says so — `Stop` handed over the ending, and a summary of a turn with its
+  ending cut off is the wrong summary. Guarded by
+  `a_turn_that_spoke_midway_waits_for_its_final_message` (the real turn's shape, entry appended
+  900 ms in) and `a_final_message_that_never_lands_is_appended`; replayed on the real 45 MB warweb
+  transcript with the final entry cut out and appended 900 ms late — settled ~1.1 s after it landed.
+- Headless `-p` does **not** reproduce the race (*measured 2026-09-17: at `Stop` time the copied
+  transcript already held the final text*); it is an interactive-session behaviour, as the
+  2026-08-30 measurement was.
 
 ## Turn extraction (measured transcript shapes)
 
@@ -261,6 +285,7 @@ it to act on and nothing in it to diagnose.
 | When it runs | **automatically** — after every turn, and the moment a question or plan dialog appears | the morning-of-2026-09-16 on-demand version was reverted the same evening: the user prefers a panel that is always current |
 | Trigger | the `Stop`/`askq`/`plan` hooks write `explainreq/<id>`; the poll drains it | the exact turn-end event, proven; a status-transition trigger would also fire on compaction end and idle notifications |
 | Dialog race | the `askq`/`plan` request carries `dialog`; the reader waits for the entry | a question explained as a plain turn gets no second chance (`Stop` does not fire while it waits) |
+| Turn-end race | the `Stop` request carries `last_assistant_message`; the reader waits for that text, and appends it if it never lands | a turn that spoke mid-way read as complete before its answer was flushed, and was explained as "nothing needed" (2026-09-17); an up-front delay is a guess, the text is a fact |
 | ⌘⇧E | plain show/hide; panel **open by default** | the feed is always current, so a keypress has nothing to ask for |
 | Switching rows / projects, the next prompt | nothing happens to any feed | the on-demand auto-clears existed for a cache that no longer exists |
 | History | **10 per instance**, oldest dropped completely on both sides | the user's cap, with an explicit worry about memory |

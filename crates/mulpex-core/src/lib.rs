@@ -66,11 +66,15 @@ pub fn named_flag_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
 /// `<state_dir>/explainreq/`. Line 1 is the session's transcript path (from the
 /// payload's `transcript_path` — measured present on `Stop`, 2026-08-30, and a
 /// common field of every hook event per Claude Code's hook contract); an optional
-/// line 2 reading `dialog` says the writer was `askq`/`plan`, so the reader should
-/// wait for the pending `AskUserQuestion`/`ExitPlanMode` entry to land in that
-/// transcript before summarizing. Written by the helper (`Stop`, `askq`, `plan`),
-/// consumed-and-deleted by the app's poll loop (`Core::take_explain_requests`);
-/// overwriting between polls is the latest-wins coalescing.
+/// line 2 is a marker: `dialog` says the writer was `askq`/`plan`, so the reader
+/// should wait for the pending `AskUserQuestion`/`ExitPlanMode` entry to land in
+/// that transcript before summarizing; `final` says the writer was `Stop` and
+/// **everything after that line** is the payload's `last_assistant_message` — the
+/// text the turn ended on, which the reader waits for in the transcript (it lands
+/// a beat after `Stop` fires) and falls back to appending. Written by the helper
+/// (`Stop`, `askq`, `plan`), consumed-and-deleted by the app's poll loop
+/// (`Core::take_explain_requests`); overwriting between polls is the latest-wins
+/// coalescing.
 pub fn explain_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
     state_dir.join(EXPLAINREQ_DIR).join(id.to_string())
 }

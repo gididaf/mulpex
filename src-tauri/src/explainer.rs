@@ -188,12 +188,26 @@ const AUTO_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// the turn visibly ends (measured 2026-08-30: the entry landed at 11:55:15.346,
 /// within the same second as the turn's end), so a request written by the
 /// `Stop` hook can be drained while the transcript's last word hasn't arrived.
-/// The read is therefore tried **immediately** and retried while it comes back
-/// empty — or, for a request an `askq`/`plan` hook wrote, while the transcript
-/// still shows no pending dialog (the same race, one entry later). Still empty
-/// after ~1s is a turn with genuinely nothing said yet, and says so.
+/// The read is therefore tried **immediately** and retried while the turn is
+/// *unsettled*: the text `Stop` said the turn ended on is not in it yet; it is
+/// empty; or, for a request an `askq`/`plan` hook wrote, the transcript still
+/// shows no pending dialog (the same race, one entry later). Waiting only on
+/// those exact conditions is what lets the budget be ~2 s: a settled turn
+/// costs nothing, and a slow flush gets the whole of it.
+///
+/// **"Empty" alone was not enough** (2026-09-17): a turn that said "let me
+/// check the tree first", ran two commands and then answered was explained
+/// from its first line, because that line made the transcript read as a
+/// complete turn the instant `Stop` fired. That is why the hook now forwards
+/// `last_assistant_message` and the reader waits for it specifically.
 const EXTRACT_DELAY: Duration = Duration::from_millis(250);
-const EXTRACT_RETRIES: usize = 4;
+const EXTRACT_RETRIES: usize = 8;
+
+/// How much of the final message the reader looks for in the transcript. The
+/// turn text is tail-capped (`MAX_TURN_BYTES`), so the *end* of the message is
+/// what is guaranteed to survive; a whole 30 KB answer would never match its
+/// own capped tail.
+const SETTLE_PROBE_BYTES: usize = 2_000;
 
 /// What the panel says when a turn ended with nothing said in it — an
 /// interrupted turn, or one whose final entry never flushed. Not a failure and
@@ -210,8 +224,10 @@ enum Input {
     /// (`read_turn`) — all three live in the same file, so the request has one
     /// input, not three. `expect_dialog` is the `askq`/`plan` marker: the
     /// reader waits for the dialog entry rather than settling for the prose
-    /// before it (see `read_turn_settled`).
-    Now { transcript: PathBuf, expect_dialog: bool },
+    /// before it (see `read_turn_settled`). `final_text` is `Stop`'s
+    /// `last_assistant_message` — the text the turn ended on — and the reader
+    /// waits for *that* to be in the transcript before it summarizes.
+    Now { transcript: PathBuf, expect_dialog: bool, final_text: Option<String> },
     /// A manual retry of the failed entry `seq` (the panel's "נסה שוב").
     ///
     /// It carries the *already-extracted* summarizer input, stashed when the
@@ -303,19 +319,26 @@ pub fn init(app: AppHandle) {
 
 /// Queue one request the hooks wrote (`explainreq/<id>`, drained by the poll
 /// loop). The body is the file as written: line 1 the transcript path, an
-/// optional line 2 `dialog` when `askq`/`plan` wrote it. Latest-wins per
-/// instance for jobs not yet running: if a queued job for the same
-/// `(handle, id)` exists it is replaced — its transcript is the same file, and
-/// the newer request supersedes it exactly the way `explainreq/<id>` overwrites
-/// between polls. A job already *running* is not touched; the new one queues
-/// behind it.
+/// optional line 2 marker — `dialog` when `askq`/`plan` wrote it, or `final`
+/// when `Stop` did, in which case everything after that line is the text the
+/// turn ended on (`last_assistant_message`). Latest-wins per instance for jobs
+/// not yet running: if a queued job for the same `(handle, id)` exists it is
+/// replaced — its transcript is the same file, and the newer request
+/// supersedes it exactly the way `explainreq/<id>` overwrites between polls. A
+/// job already *running* is not touched; the new one queues behind it.
 pub fn submit(handle: ProjectHandle, id: usize, body: String, cwd: PathBuf) {
-    let mut lines = body.lines();
+    let mut lines = body.splitn(3, '\n');
     let Some(path) = lines.next().map(str::trim).filter(|p| !p.is_empty()) else {
         return;
     };
-    let expect_dialog = lines.any(|l| l.trim() == "dialog");
-    enqueue(handle, id, Input::Now { transcript: PathBuf::from(path), expect_dialog }, cwd);
+    let marker = lines.next().map(str::trim).unwrap_or("");
+    let expect_dialog = marker == "dialog";
+    let final_text = (marker == "final")
+        .then(|| lines.next().map(str::trim).unwrap_or(""))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let input = Input::Now { transcript: PathBuf::from(path), expect_dialog, final_text };
+    enqueue(handle, id, input, cwd);
 }
 
 fn enqueue(handle: ProjectHandle, id: usize, input: Input, cwd: PathBuf) {
@@ -440,7 +463,11 @@ fn process(inner: &Inner, job: Job) {
     // `replace` is the seq of the failed row this job is redoing, if any: a
     // retry lands *in place of* its failure rather than as a second row.
     let (kind, prompt, text, replace) = match &job.input {
-        Input::Now { transcript, expect_dialog } => match read_turn_settled(transcript, *expect_dialog) {
+        Input::Now { transcript, expect_dialog, final_text } => match read_turn_settled(
+            transcript,
+            *expect_dialog,
+            final_text.as_deref(),
+        ) {
             Some(turn) => (turn.kind, turn.prompt, turn.text, None),
             None => {
                 eprintln!(
@@ -803,16 +830,31 @@ struct Turn {
 }
 
 /// [`read_turn`] with the transcript-flush race absorbed. Tried **immediately**
-/// and retried only while the turn reads as *unsettled*: empty, which is the
-/// state the race produces after a `Stop`; or — when `expect_dialog`, i.e. the
-/// request came from `askq`/`plan` — a plain turn, because the hook fired for
-/// a dialog and the transcript that shows none has not caught up yet. A plain
-/// turn summarized in that window would have been the *wrong* explanation
-/// with no second chance (`Stop` does not fire while the dialog waits). After
-/// the last attempt whatever was read is used: a plain turn is still better
-/// than nothing, and the log line says which it was. Runs on a worker thread;
-/// the waiting costs nobody anything.
-fn read_turn_settled(path: &Path, expect_dialog: bool) -> Option<Turn> {
+/// and retried only while the turn reads as *unsettled*:
+///
+/// - **the final message is missing** — `final_text` is what `Stop` said the
+///   turn ended on, and the turn is not settled until the transcript holds it.
+///   A turn that spoke mid-way ("let me check first"), ran tools and then
+///   answered is *non-empty* the instant `Stop` fires, and was explained from
+///   that first line alone (2026-09-17, a real turn with two decisions under
+///   it, explained as "nothing needed"). Matched on the message's tail
+///   (`SETTLE_PROBE_BYTES`) because the turn text is tail-capped;
+/// - **empty**, which is the same race for a turn that said nothing before its
+///   last message;
+/// - **a plain turn where a dialog was announced** (`expect_dialog`, i.e. the
+///   request came from `askq`/`plan`): the hook fired for a dialog and the
+///   transcript that shows none has not caught up yet. A plain turn summarized
+///   in that window would have been the *wrong* explanation with no second
+///   chance (`Stop` does not fire while the dialog waits).
+///
+/// After the last attempt the best available is used, and the log line says
+/// what was missing: a dialog that never showed leaves the prose; a final
+/// message that never showed is **appended** to whatever prose there is (or
+/// stands alone), because `Stop` handed us the text itself and the user must
+/// not be shown a summary of a turn with its ending cut off. Runs on a worker
+/// thread; the waiting costs nobody anything.
+fn read_turn_settled(path: &Path, expect_dialog: bool, final_text: Option<&str>) -> Option<Turn> {
+    let probe = final_text.map(settle_probe);
     let mut last = None;
     for attempt in 0..=EXTRACT_RETRIES {
         if attempt > 0 {
@@ -822,9 +864,33 @@ fn read_turn_settled(path: &Path, expect_dialog: bool) -> Option<Turn> {
             Some(turn) if expect_dialog && matches!(turn.kind, ExplainKind::Turn) => {
                 last = Some(turn);
             }
+            Some(turn) if probe.is_some_and(|p| !turn.text.contains(p)) => {
+                last = Some(turn);
+            }
             Some(turn) => return Some(turn),
             None => {}
         }
+    }
+    if let Some(final_text) = final_text.map(str::trim).filter(|t| !t.is_empty()) {
+        // `Stop` gave us the ending; the file never did. Use both.
+        eprintln!(
+            "[explainer] {}: the turn's final message never showed in the transcript; appending it",
+            path.display()
+        );
+        return Some(match last {
+            Some(mut turn) => {
+                turn.text.push_str("\n\n");
+                turn.text.push_str(final_text);
+                turn
+            }
+            None => Turn {
+                kind: ExplainKind::Turn,
+                prompt: HEBREW_PROMPT,
+                text: read_entries(path)
+                    .map(|entries| with_recent_prompts(&entries, final_text))
+                    .unwrap_or_else(|| final_text.to_string()),
+            },
+        });
     }
     if last.is_some() {
         eprintln!(
@@ -833,6 +899,20 @@ fn read_turn_settled(path: &Path, expect_dialog: bool) -> Option<Turn> {
         );
     }
     last
+}
+
+/// The part of the final message the reader looks for: its last
+/// `SETTLE_PROBE_BYTES`, trimmed, cut on a char boundary (Hebrew is multibyte).
+fn settle_probe(final_text: &str) -> &str {
+    let s = final_text.trim();
+    if s.len() <= SETTLE_PROBE_BYTES {
+        return s;
+    }
+    let mut cut = s.len() - SETTLE_PROBE_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    &s[cut..]
 }
 
 /// The current turn out of a transcript, and what kind of turn it is.
@@ -1186,10 +1266,90 @@ mod tests {
             )
             .unwrap();
         });
-        let turn = read_turn_settled(&path, false).unwrap();
+        let turn = read_turn_settled(&path, false, None).unwrap();
         assert!(turn.text.ends_with("late answer"), "got: {}", turn.text);
         assert!(matches!(turn.kind, ExplainKind::Turn));
         writer.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The race that "empty" does not catch — reproduced from a real transcript
+    /// (warweb, 2026-09-17 08:38): the turn opened with "let me check the tree
+    /// first", ran two Bash calls, and answered twenty seconds later. When
+    /// `Stop` fired the transcript already held that first line, so the turn
+    /// was non-empty, read as settled, and the panel explained "I'm checking
+    /// git now — nothing needed" under an answer with two decisions in it.
+    /// With the text `Stop` reports the turn ended on, the reader waits for it.
+    #[test]
+    fn a_turn_that_spoke_midway_waits_for_its_final_message() {
+        const FINAL: &str = "Two decisions. Here they are in plain words.\n\n1. Ballista armor\n- How to check: click a ballista.\n\n2. Commit\n- Your options: commit now, or wait for claude#74.";
+        let path = write_transcript("midway", &[
+            r#"{"type":"user","message":{"content":"explain me again in very simple words and tell me how to check"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"…"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Two decisions are open. Let me check the current state of the tree first."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"attachment"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ]);
+        // Without the final text this is exactly the bug: settled at once.
+        let early = read_turn_settled(&path, false, None).unwrap();
+        assert!(early.text.ends_with("tree first."), "the mid-turn line reads as a whole turn");
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(900));
+            let entry = serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"thinking","thinking":"…"},{"type":"text","text":FINAL}]}});
+            let mut f = std::fs::OpenOptions::new().append(true).open(&writer_path).unwrap();
+            f.write_all(format!("\n{entry}").as_bytes()).unwrap();
+        });
+        let turn = read_turn_settled(&path, false, Some(FINAL)).unwrap();
+        writer.join().unwrap();
+        assert!(matches!(turn.kind, ExplainKind::Turn));
+        assert!(turn.text.contains("tree first."), "the mid-turn line is still part of the turn");
+        assert!(turn.text.ends_with(FINAL), "and the answer is the end of it: {}", turn.text);
+        assert_eq!(turn.text.matches("Ballista armor").count(), 1, "read from the file, not appended twice");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The final message never lands (the file is stale, or the flush is slower
+    /// than the whole wait): `Stop` handed the text over, so it is appended to
+    /// the prose rather than dropped — and stands alone when there is no prose
+    /// at all, where the reader would otherwise have reported an empty turn.
+    #[test]
+    fn a_final_message_that_never_lands_is_appended() {
+        let path = write_transcript("final-never", &[
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"בודק קודם"}]}}"#,
+        ]);
+        let turn = read_turn_settled(&path, false, Some("  זהו, סיימתי.\n")).unwrap();
+        assert!(turn.text.contains("=== RECENT USER MESSAGES"), "the prompts window is still there");
+        assert!(turn.text.ends_with("בודק קודם\n\nזהו, סיימתי."), "got: {}", turn.text);
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_transcript("final-alone", &[
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        ]);
+        let turn = read_turn_settled(&path, false, Some("רק תשובה")).unwrap();
+        assert!(turn.text.ends_with("=== MY CURRENT TURN ===\nרק תשובה"), "got: {}", turn.text);
+        assert!(matches!(turn.kind, ExplainKind::Turn));
+        let _ = std::fs::remove_file(&path);
+
+        // A message longer than the probe is matched on its tail, so a turn
+        // that holds it (tail-capped or not) still reads as settled at once.
+        let long = format!("{}END", "x".repeat(SETTLE_PROBE_BYTES * 2));
+        let line = format!(
+            r#"{{"type":"user","message":{{"content":"p"}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{long}"}}]}}}}"#
+        );
+        let path = write_transcript("final-long", &[&line]);
+        let started = std::time::Instant::now();
+        let turn = read_turn_settled(&path, false, Some(&long)).unwrap();
+        assert!(turn.text.ends_with("END"));
+        assert!(started.elapsed() < EXTRACT_DELAY, "settled on the first read, no waiting");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1206,7 +1366,7 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"בדקתי את הקוד"}]}}"#,
         ]);
         // Without the marker this is a settled plain turn, immediately.
-        let plain = read_turn_settled(&path, false).unwrap();
+        let plain = read_turn_settled(&path, false, None).unwrap();
         assert!(matches!(plain.kind, ExplainKind::Turn));
 
         let writer_path = path.clone();
@@ -1219,7 +1379,7 @@ mod tests {
             )
             .unwrap();
         });
-        let turn = read_turn_settled(&path, true).unwrap();
+        let turn = read_turn_settled(&path, true, None).unwrap();
         assert!(matches!(turn.kind, ExplainKind::Question), "waited for the dialog, not the prose");
         assert!(turn.text.contains("Which way?"));
         writer.join().unwrap();
@@ -1230,7 +1390,7 @@ mod tests {
             r#"{"type":"user","message":{"content":"go"}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"רק טקסט"}]}}"#,
         ]);
-        let turn = read_turn_settled(&path, true).unwrap();
+        let turn = read_turn_settled(&path, true, None).unwrap();
         assert!(matches!(turn.kind, ExplainKind::Turn));
         assert!(turn.text.contains("רק טקסט"));
         let _ = std::fs::remove_file(&path);
@@ -1606,28 +1766,43 @@ mod tests {
     /// the queued-not-yet-running job in place rather than stacking Sonnet
     /// calls, and a second instance queues alongside rather than being
     /// collapsed into the first. The request body is parsed here too: line 1
-    /// is the path, a `dialog` line 2 is the marker, an empty body is nothing.
+    /// is the path, a `dialog` line 2 is the marker, a `final` line 2 means the
+    /// rest of the body (newlines and all) is the turn's final message, and an
+    /// empty body is nothing.
     #[test]
     fn queued_requests_coalesce_per_instance() {
         const H: ProjectHandle = 99003;
         submit(H, 1, "/tmp/a.jsonl".into(), PathBuf::from("/tmp"));
-        submit(H, 2, "/tmp/b.jsonl".into(), PathBuf::from("/tmp"));
+        submit(H, 2, "/tmp/b.jsonl\nfinal\nline one\n\nline three".into(), PathBuf::from("/tmp"));
         submit(H, 1, "/tmp/c.jsonl\ndialog".into(), PathBuf::from("/tmp"));
         submit(H, 3, "   \n".into(), PathBuf::from("/tmp"));
+        submit(H, 4, "/tmp/d.jsonl\nfinal\n  \n".into(), PathBuf::from("/tmp"));
         {
             let q = inner().queue.lock().unwrap();
             let mine: Vec<_> = q.iter().filter(|j| j.handle == H).collect();
-            assert_eq!(mine.len(), 2, "one job per instance, and an empty body queues nothing");
+            assert_eq!(mine.len(), 3, "one job per instance, and an empty body queues nothing");
             let turn1 = mine.iter().find(|j| j.id == 1).unwrap();
             match &turn1.input {
-                Input::Now { transcript, expect_dialog } => {
+                Input::Now { transcript, expect_dialog, final_text } => {
                     assert_eq!(transcript, &PathBuf::from("/tmp/c.jsonl"), "the newer request won");
                     assert!(expect_dialog, "and it carried its dialog marker");
+                    assert!(final_text.is_none());
                 }
                 Input::Retry { .. } => unreachable!(),
             }
             let turn2 = mine.iter().find(|j| j.id == 2).unwrap();
-            assert!(matches!(turn2.input, Input::Now { expect_dialog: false, .. }));
+            match &turn2.input {
+                Input::Now { expect_dialog, final_text, .. } => {
+                    assert!(!expect_dialog);
+                    assert_eq!(final_text.as_deref(), Some("line one\n\nline three"));
+                }
+                Input::Retry { .. } => unreachable!(),
+            }
+            let turn4 = mine.iter().find(|j| j.id == 4).unwrap();
+            assert!(
+                matches!(&turn4.input, Input::Now { final_text: None, .. }),
+                "a blank final message is no final message"
+            );
         }
         forget_project(H); // also drains this test's queue entries
         assert!(inner().queue.lock().unwrap().iter().all(|j| j.handle != H));
