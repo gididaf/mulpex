@@ -32,6 +32,11 @@ export interface SessionInfo {
 export interface StatusEntry {
   id: number;
   status: Status;
+  /** Ended its turn holding a watcher (hub listener, agentalk poll loop, a line
+   *  of `watchers.txt`). NOT a status: such an instance is genuinely idle and
+   *  `status` says `waiting`. Only the updater's busy guard reads it — a restart
+   *  would kill the claude and drop whatever the watcher is attached to. */
+  watching: boolean;
 }
 export interface TaskEntry {
   id: number;

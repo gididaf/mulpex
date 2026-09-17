@@ -451,8 +451,18 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // ONLY place the fact is available — `Stop`'s payload carries
     // `background_tasks`, and the idle notification's does not (measured; see
     // `notification`).
-    let busy = background_work_running(ctx, payload.as_ref());
+    // A watcher (this instance's hub listener, an agentalk poll loop, anything in
+    // `watchers.txt`) is not work in flight, so it is subtracted here — read
+    // fresh, so an edit to that file lands at the next turn end.
+    let patterns = user_watcher_patterns();
+    let busy = background_work_running(ctx, payload.as_ref(), &patterns);
     set_background_flag(ctx, busy);
+    // ...but a watcher is still a reason not to restart the app underneath this
+    // instance: the restart kills the `claude` and drops whatever the watcher is
+    // attached to. Recorded separately, for the updater's busy guard — the status
+    // word above stays honest (`waiting`), and this is the only hook that can see
+    // the task list at all.
+    set_watching_flag(ctx, watcher_running(payload.as_ref(), &patterns));
     // Same payload, same reason it can only be read here: this is the only hook
     // that is told which listeners are running.
     note_listener_needs_replacing(ctx, payload.as_ref());
@@ -607,15 +617,16 @@ fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog:
 /// work in flight — between firings the instance genuinely is idle and a prompt
 /// really is what it is waiting for.
 ///
-/// Neither is **Mulpex's own hub listener**, for the same reason and with much
-/// worse consequences: Mulpex itself tells every instance to arm one on its
-/// inbox (`HUB_RULES` "INCOMING MESSAGES"), and it runs for as long as the tool
-/// lets it. It arrives here as
-/// `{"id":…,"type":"shell","status":"running","description":"Mulpex hub inbox","command":…}`
+/// Neither is a **watcher** — a background task that by design never finishes,
+/// so nothing will ever wake the instance by completing it. Mulpex's own hub
+/// listener was the first (and for a while the only) one; agentalk's poll loop
+/// and events `tail -f` are the second. They arrive here as
+/// `{"id":…,"type":"shell","status":"running","description":…,"command":…}`
 /// — in shape, indistinguishable from a real `run_in_background` shell. Left
-/// counted, every instance in every project is `working` forever, which used to
-/// suppress `needs` forever too: no red dot, no tab badge, no dock badge, no
-/// banner, for anyone.
+/// counted, the instance is `working` forever; when that was true of the hub
+/// listener it meant every instance in every project, which used to suppress
+/// `needs` forever too: no red dot, no tab badge, no dock badge, no banner, for
+/// anyone. Recognised by `command_is_watcher` — see `BUILTIN_WATCHER_MARKERS`.
 ///
 /// **It is recognised by its `command`, which is Mulpex's own text.** `HUB_RULES`
 /// dictates that command byte-for-byte and `hook.rs` already gates the arm nudge
@@ -638,19 +649,40 @@ fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog:
 ///   not see a Monitor armed before it, so every instance had to re-arm first.
 /// - **It depends only on a string Mulpex authors.** The previous version
 ///   depended on an optional parameter of someone else's tool, which vanished.
-fn background_work_running(_ctx: &Ctx, payload: Option<&serde_json::Value>) -> bool {
+fn background_work_running(
+    _ctx: &Ctx,
+    payload: Option<&serde_json::Value>,
+    user_patterns: &[String],
+) -> bool {
+    running_tasks(payload).any(|t| !is_watcher(t, user_patterns))
+}
+
+/// Does this `Stop` payload report a **watcher** still running?
+///
+/// The complement of `background_work_running` rather than its negation: a turn
+/// can end with both (agentalk paired *and* a build in the background), and the
+/// two answers go to different places — the status word and the updater's busy
+/// guard. Neither is derivable from the other.
+fn watcher_running(payload: Option<&serde_json::Value>, user_patterns: &[String]) -> bool {
+    running_tasks(payload).any(|t| is_watcher(t, user_patterns))
+}
+
+/// Every `background_tasks` entry this payload reports as **still running**.
+///
+/// An entry with no `status` at all counts as running: the failure that matters
+/// is calling a busy instance idle, so the unknown case errs toward quiet.
+fn running_tasks(payload: Option<&serde_json::Value>) -> impl Iterator<Item = &serde_json::Value> {
     payload
         .and_then(|j| j.get("background_tasks"))
         .and_then(|v| v.as_array())
-        .is_some_and(|tasks| {
-            tasks.iter().any(|t| {
-                let running = t
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s == "running")
-                    .unwrap_or(true);
-                running && !is_hub_listener(t)
-            })
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| {
+            t.get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "running")
+                .unwrap_or(true)
         })
 }
 
@@ -686,31 +718,155 @@ fn is_hub_listener(task: &serde_json::Value) -> bool {
         .is_some_and(command_is_hub_listener)
 }
 
+/// Commands that are a **watcher** — a background task that by design never
+/// finishes, so nothing will ever wake the instance by completing it — and so
+/// must not make `Stop` report work in flight.
+///
+/// The hub listener was the first of these, and for a while the only one, so the
+/// exemption was written as a single special case. **agentalk is the second**: a
+/// paired instance holds an infinite `curl` poll loop *and* a `tail -f` on the
+/// channel's events file, so every agentalk pane read `working` for as long as
+/// the pairing was up. Rather than add a second special case, the exemption is a
+/// list — these built-ins plus whatever the user puts in `watchers.txt`.
+///
+/// Measured verbatim off a live paired instance (`cloudraw#3`, 2026-09-17):
+///
+/// ```text
+/// . '/tmp/agentalk-session-f31d5bca82b7068a-cloudraw_.env' && curl -fsS
+///   'https://agentalk.dev/loop.sh' -o /tmp/agentalk-loop.sh && . /tmp/agentalk-loop.sh
+/// tail -f -n +1 '/tmp/agentalk-events-f31d5bca82b7068a-cloudraw_.log'
+/// ```
+///
+/// Two properties of those strings decide what may be matched:
+///
+/// - **The channel id and the participant name change on every re-pair** — that
+///   instance had replaced channel `f7517f834a94332d` half an hour earlier — so
+///   only the fixed path prefixes are stable.
+/// - **`description` is free text the model writes.** "Arm agentalk poll loop"
+///   was that instance's own wording; another Claude writes its own. Match the
+///   command, never the description.
+///
+/// Deliberately **not** the bare word `agentalk`: that repo is developed on this
+/// machine, and a background build or test run inside it is real work that must
+/// still read `working`.
+const BUILTIN_WATCHER_MARKERS: &[&str] = &[
+    "/tmp/agentalk-session-",
+    "/tmp/agentalk-events-",
+    "agentalk-loop.sh",
+];
+
+/// The file the user extends the watcher list with: one command substring per
+/// line, `#` comments and blank lines ignored. Read fresh on every `Stop`, so a
+/// line added to it takes effect at the next turn end with no restart.
+pub const WATCHERS_FILE: &str = "watchers.txt";
+
+/// `<mulpex home>/watchers.txt` — so a debug build reads `~/.mulpex-dev/` and
+/// cannot silence a watcher for the shipped app, exactly like `recents.txt`.
+pub fn watchers_path() -> PathBuf {
+    crate::mulpex_home().join(WATCHERS_FILE)
+}
+
+/// Parse a watcher list. Split from the home lookup on purpose: a test must be
+/// able to exercise the format without depending on (or writing into) the real
+/// `~/.mulpex`.
+pub fn watcher_patterns_in(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+/// The user's own watcher patterns. Missing file → no patterns, which is just
+/// the built-in list.
+pub fn user_watcher_patterns() -> Vec<String> {
+    watcher_patterns_in(&watchers_path())
+}
+
+/// What a fresh `watchers.txt` says. Every built-in is listed as a comment: the
+/// file's whole job is to be findable and self-explaining once found, and a list
+/// of what is *already* exempt is what tells you what a line here looks like.
+const WATCHERS_TEMPLATE: &str = "\
+# Mulpex watcher list.
+#
+# A background task that never finishes is a WATCHER, not work in flight: a poll
+# loop, a `tail -f`, a long-lived bridge. Mulpex subtracts these when it decides
+# whether an instance is still busy at the end of its turn, so the sidebar row
+# goes green instead of sitting yellow forever. (An auto-update still won't
+# restart the app underneath one — that would drop whatever it is attached to.)
+#
+# One command SUBSTRING per line. A line matches if it appears anywhere in the
+# background command, so use a fragment you could spot in `ps` output. Lines
+# starting with # are comments; blank lines are ignored. Read fresh at every turn
+# end, so an edit here takes effect immediately — no restart.
+#
+# Already built in, no line needed:
+#   \"mulpex-helper\" listen        Mulpex's own hub listener
+#   /tmp/agentalk-session-        agentalk's poll loop
+#   /tmp/agentalk-events-         agentalk's events tail
+#   agentalk-loop.sh              agentalk's loop script
+#
+# Your own, one per line:
+";
+
+/// Write a commented `watchers.txt` if there isn't one, so the list is found by
+/// looking in `~/.mulpex` rather than by reading the source. **Never
+/// overwrites** — the user's lines are the entire point of the file, and this
+/// runs on every launch.
+pub fn seed_watchers_template() {
+    seed_watchers_template_at(&watchers_path());
+}
+
+/// Split from the home lookup for the same reason `watcher_patterns_in` is: a
+/// test must be able to prove "never overwrites" without gambling with the
+/// developer's own file.
+fn seed_watchers_template_at(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, WATCHERS_TEMPLATE);
+}
+
+/// Is this command a watcher rather than work in flight?
+///
+/// Substring matching, which is the contract the listener match already
+/// established: a pattern is a fragment the user can read off a `ps` line, not a
+/// regex to get wrong.
+pub fn command_is_watcher(command: &str, user_patterns: &[String]) -> bool {
+    command_is_hub_listener(command)
+        || BUILTIN_WATCHER_MARKERS.iter().any(|m| command.contains(m))
+        || user_patterns.iter().any(|p| command.contains(p.as_str()))
+}
+
+/// Is this `background_tasks` entry a watcher? A `subagent` entry carries no
+/// `command` at all, so it can never be mistaken for one.
+fn is_watcher(task: &serde_json::Value, user_patterns: &[String]) -> bool {
+    task.get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| command_is_watcher(c, user_patterns))
+}
+
 /// The ids of every hub listener this payload reports as running.
+///
+/// Deliberately the **listener** match and not `is_watcher`: the re-arm nudge
+/// and the orphan reaper it feeds are about Mulpex's own listener, and asking an
+/// instance to replace agentalk's poll loop would be nonsense.
 fn running_listener_ids(payload: Option<&serde_json::Value>) -> Vec<String> {
-    payload
-        .and_then(|j| j.get("background_tasks"))
-        .and_then(|v| v.as_array())
-        .map(|tasks| {
-            tasks
-                .iter()
-                .filter(|t| {
-                    let running = t
-                        .get("status")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s == "running")
-                        .unwrap_or(true);
-                    running && is_hub_listener(t)
-                })
-                .map(|t| {
-                    t.get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string()
-                })
-                .collect()
+    running_tasks(payload)
+        .filter(|t| is_hub_listener(t))
+        .map(|t| {
+            t.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 pub(crate) fn relisten_path(ctx: &Ctx) -> PathBuf {
@@ -765,6 +921,27 @@ fn set_background_flag(ctx: &Ctx, busy: bool) {
         let _ = std::fs::write(background_flag(ctx), "");
     } else {
         let _ = std::fs::remove_file(background_flag(ctx));
+    }
+}
+
+fn watching_flag(ctx: &Ctx) -> PathBuf {
+    crate::watching_path(&ctx.state_dir, ctx.instance)
+}
+
+/// `watching/<id>`: this instance ended its turn holding a watcher. See
+/// `crate::WATCHING_DIR` for why it is not the same file as `bg/<id>`.
+fn set_watching_flag(ctx: &Ctx, watching: bool) {
+    let path = watching_flag(ctx);
+    if watching {
+        // The scratch dir is rebuilt before every spawn, but `$TMPDIR` is purged
+        // out from under a long-running Mulpex, so never assume the subdir is
+        // there — a missing dir would silently lose the flag and the guard.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, "");
+    } else {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1633,6 +1810,12 @@ mod tests {
         serde_json::from_str(s).ok()
     }
 
+    /// No user-supplied watcher patterns. Every test passes this explicitly
+    /// rather than letting the code read `<mulpex home>/watchers.txt`: a line in
+    /// the developer's own file would otherwise silence a command a test expects
+    /// to count as work, and the test would pass or fail per machine.
+    const NO_WATCHERS: &[String] = &[];
+
     /// A turn that ends with a background agent — or a `run_in_background` shell —
     /// still running is NOT the instance waiting for the user, and must not be
     /// reported as such. Both kinds arrive in the same `background_tasks` array.
@@ -1640,23 +1823,27 @@ mod tests {
     fn a_turn_that_ends_with_background_work_is_not_idle() {
         let dir = std::env::temp_dir().join(format!("mulpex-bgwork-{}", crate::persist::new_uuid()));
         let ctx = test_ctx(&dir, 3);
-        assert!(background_work_running(&ctx, payload(STOP_WITH_AGENT).as_ref()));
-        assert!(background_work_running(&ctx, payload(STOP_WITH_SHELL).as_ref()));
-        assert!(!background_work_running(&ctx, payload(STOP_IDLE).as_ref()));
+        assert!(background_work_running(&ctx, payload(STOP_WITH_AGENT).as_ref(), NO_WATCHERS));
+        assert!(background_work_running(&ctx, payload(STOP_WITH_SHELL).as_ref(), NO_WATCHERS));
+        assert!(!background_work_running(&ctx, payload(STOP_IDLE).as_ref(), NO_WATCHERS));
         assert!(
-            !background_work_running(&ctx, payload(STOP_CRON_ONLY).as_ref()),
+            !background_work_running(&ctx, payload(STOP_CRON_ONLY).as_ref(), NO_WATCHERS),
             "a scheduled cron is not work in flight — between firings the instance really is idle"
         );
         // A payload from some future Claude Code that drops the field at all, and
         // a finished task still listed, both read as idle.
-        assert!(!background_work_running(&ctx, payload(r#"{"hook_event_name":"Stop"}"#).as_ref()));
         assert!(!background_work_running(
-            &ctx, payload(r#"{"background_tasks":[{"id":"x","status":"completed"}]}"#).as_ref()
+            &ctx, payload(r#"{"hook_event_name":"Stop"}"#).as_ref(), NO_WATCHERS
+        ));
+        assert!(!background_work_running(
+            &ctx,
+            payload(r#"{"background_tasks":[{"id":"x","status":"completed"}]}"#).as_ref(),
+            NO_WATCHERS
         ));
         // ...but an entry with no status at all counts as running: the failure that
         // matters is calling a busy instance idle.
         assert!(background_work_running(
-            &ctx, payload(r#"{"background_tasks":[{"id":"x"}]}"#).as_ref()
+            &ctx, payload(r#"{"background_tasks":[{"id":"x"}]}"#).as_ref(), NO_WATCHERS
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1862,7 +2049,7 @@ mod tests {
         let ctx = test_ctx(&dir, 3);
 
         assert!(
-            !background_work_running(&ctx, payload(&stop_with_listener()).as_ref()),
+            !background_work_running(&ctx, payload(&stop_with_listener()).as_ref(), NO_WATCHERS),
             "an instance idle at its prompt with only its hub listener running is NOT working"
         );
 
@@ -1870,13 +2057,17 @@ mod tests {
         // yellow forever.
         set_background_flag(
             &ctx,
-            background_work_running(&ctx, payload(&stop_with_listener()).as_ref()),
+            background_work_running(&ctx, payload(&stop_with_listener()).as_ref(), NO_WATCHERS),
         );
         assert_eq!(notify_status(&ctx), "waiting");
 
         // Real work running alongside the listener still counts.
         assert!(
-            background_work_running(&ctx, payload(&stop_listener_and_shell()).as_ref()),
+            background_work_running(
+                &ctx,
+                payload(&stop_listener_and_shell()).as_ref(),
+                NO_WATCHERS
+            ),
             "excusing the listener must not excuse the background shell next to it"
         );
 
@@ -1888,7 +2079,8 @@ mod tests {
                 r#"{"background_tasks":[{"id":"bq7one1x","type":"shell","status":"running",
                 "description":"Wait for the build","command":"tail -f build.log"}]}"#
             )
-            .as_ref()
+            .as_ref(),
+            NO_WATCHERS
         ));
 
         // A subagent has no `command` at all, and must not be mistaken for one.
@@ -1898,8 +2090,238 @@ mod tests {
                 r#"{"background_tasks":[{"id":"ba1","type":"subagent","status":"running",
                 "description":"Explore","agent_type":"Explore"}]}"#
             )
-            .as_ref()
+            .as_ref(),
+            NO_WATCHERS
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// agentalk's two watchers, **verbatim** as a live paired instance reported
+    /// them (`cloudraw#3`, 2026-09-17). Kept as the literal strings rather than a
+    /// paraphrase: the whole fix is a substring match against exactly these, and
+    /// a tidied-up copy would test the tidying.
+    const AGENTALK_LOOP: &str = r#". '/tmp/agentalk-session-f31d5bca82b7068a-cloudraw_.env' && curl -fsS 'https://agentalk.dev/loop.sh' -o /tmp/agentalk-loop.sh && . /tmp/agentalk-loop.sh"#;
+    const AGENTALK_TAIL: &str =
+        r#"tail -f -n +1 '/tmp/agentalk-events-f31d5bca82b7068a-cloudraw_.log'"#;
+
+    /// The same pair after a re-pair: a different channel id and participant
+    /// name, which is what actually happens every time the channel is respawned
+    /// (that instance had just replaced channel `f7517f834a94332d`).
+    const AGENTALK_LOOP_REPAIRED: &str = r#". '/tmp/agentalk-session-0d1e2f3a4b5c6d7e-warweb_2.env' && curl -fsS 'https://agentalk.dev/loop.sh' -o /tmp/agentalk-loop.sh && . /tmp/agentalk-loop.sh"#;
+    const AGENTALK_TAIL_REPAIRED: &str =
+        r#"tail -f -n +1 '/tmp/agentalk-events-0d1e2f3a4b5c6d7e-warweb_2.log'"#;
+
+    fn shell_task(id: &str, description: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "type": "shell", "status": "running",
+            "description": description, "command": command,
+        })
+    }
+
+    fn stop_with(tasks: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "hook_event_name": "Stop", "stop_hook_active": false,
+            "background_tasks": tasks, "session_crons": [],
+        })
+    }
+
+    /// An agentalk-paired instance sits idle waiting for its peer, holding an
+    /// infinite `curl` poll loop and a `tail -f` on the channel's events file.
+    /// Counted as work in flight, the pane read `working` for as long as the
+    /// pairing was up — the hub-listener bug one watcher over, which is why the
+    /// exemption became a list instead of a second special case.
+    #[test]
+    fn agentalks_poll_loop_and_events_tail_are_watchers() {
+        let dir = std::env::temp_dir().join(format!("mulpex-agentalk-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 3);
+
+        // The real pair, as measured. `description` is free text the model wrote
+        // ("Arm agentalk poll loop" was that instance's own wording), so it is
+        // included here only to prove nothing depends on it.
+        let paired = stop_with(vec![
+            shell_task("bi5bpldo7", "Arm agentalk poll loop", AGENTALK_LOOP),
+            shell_task("br3blyunn", "agentalk channel events", AGENTALK_TAIL),
+        ]);
+        assert!(
+            !background_work_running(&ctx, Some(&paired), NO_WATCHERS),
+            "a pane waiting for its agentalk peer is idle, not working"
+        );
+        set_background_flag(
+            &ctx,
+            background_work_running(&ctx, Some(&paired), NO_WATCHERS),
+        );
+        assert_eq!(notify_status(&ctx), "waiting");
+
+        // A re-pair changes the channel id AND the participant name, so a match
+        // that keyed on either would go stale the first time the channel was
+        // respawned.
+        let repaired = stop_with(vec![
+            shell_task("x1", "poll", AGENTALK_LOOP_REPAIRED),
+            shell_task("x2", "events", AGENTALK_TAIL_REPAIRED),
+        ]);
+        assert!(
+            !background_work_running(&ctx, Some(&repaired), NO_WATCHERS),
+            "the exemption must key on the fixed path prefixes, never on the channel id"
+        );
+
+        // The plural case, with Mulpex's own listener in the mix as it always is.
+        let with_listener = stop_with(vec![
+            shell_task("bi5bpldo7", "Arm agentalk poll loop", AGENTALK_LOOP),
+            shell_task("br3blyunn", "agentalk channel events", AGENTALK_TAIL),
+            shell_task(
+                "bc2bdtzqi",
+                "Mulpex hub inbox",
+                r#""/Applications/Mulpex.app/Contents/MacOS/mulpex-helper" listen"#,
+            ),
+        ]);
+        assert!(!background_work_running(&ctx, Some(&with_listener), NO_WATCHERS));
+
+        // Real work alongside the watchers still counts — the verdict is per
+        // task, not per payload.
+        let with_work = stop_with(vec![
+            shell_task("bi5bpldo7", "Arm agentalk poll loop", AGENTALK_LOOP),
+            shell_task("br3blyunn", "agentalk channel events", AGENTALK_TAIL),
+            shell_task("bwg6gwcry", "Run the suite", "npm test -- --run"),
+        ]);
+        assert!(
+            background_work_running(&ctx, Some(&with_work), NO_WATCHERS),
+            "excusing agentalk must not excuse the test run next to it"
+        );
+
+        // ...and this is why the marker is the fixed /tmp paths and not the word
+        // `agentalk`: that repo is developed on this machine.
+        let building_agentalk = stop_with(vec![shell_task(
+            "b1",
+            "Build agentalk",
+            "cd /Users/gididaf/Documents/Code/utilities/agentalk && npm run build",
+        )]);
+        assert!(
+            background_work_running(&ctx, Some(&building_agentalk), NO_WATCHERS),
+            "a build inside the agentalk repo is real work, not a watcher"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The status word and the updater's busy guard want opposite answers about
+    /// a watcher, and only `Stop` can see the task list, so it records both.
+    ///
+    /// `waiting` + `watching/<id>` is the combination that matters: the row is
+    /// honestly idle *and* an auto-update must not restart the app under it —
+    /// `--resume` brings the conversation back but not the agentalk channel the
+    /// poll loop was serving.
+    #[test]
+    fn a_watcher_is_idle_to_the_sidebar_and_busy_to_the_updater() {
+        let dir = std::env::temp_dir().join(format!("mulpex-watchflag-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        std::fs::create_dir_all(dir.join(crate::WATCHING_DIR)).unwrap();
+        let ctx = test_ctx(&dir, 3);
+
+        let paired = stop_with(vec![
+            shell_task("bi5bpldo7", "Arm agentalk poll loop", AGENTALK_LOOP),
+            shell_task("br3blyunn", "agentalk channel events", AGENTALK_TAIL),
+        ]);
+        set_watching_flag(&ctx, watcher_running(Some(&paired), NO_WATCHERS));
+        assert!(watching_flag(&ctx).exists(), "a paired pane is not safe to restart");
+
+        // Real work alongside it: BOTH facts are true at once, which is why they
+        // are two files and not one.
+        let with_work = stop_with(vec![
+            shell_task("bi5bpldo7", "Arm agentalk poll loop", AGENTALK_LOOP),
+            shell_task("bwg6gwcry", "Run the suite", "npm test -- --run"),
+        ]);
+        assert!(background_work_running(&ctx, Some(&with_work), NO_WATCHERS));
+        assert!(watcher_running(Some(&with_work), NO_WATCHERS));
+
+        // Work with no watcher: busy, but not *watching*.
+        let work_only = stop_with(vec![shell_task("b1", "Run the suite", "npm test -- --run")]);
+        set_watching_flag(&ctx, watcher_running(Some(&work_only), NO_WATCHERS));
+        assert!(!watching_flag(&ctx).exists());
+
+        // The pairing ends; the next turn boundary clears the flag.
+        set_watching_flag(&ctx, watcher_running(Some(&paired), NO_WATCHERS));
+        assert!(watching_flag(&ctx).exists());
+        set_watching_flag(&ctx, watcher_running(payload(STOP_IDLE).as_ref(), NO_WATCHERS));
+        assert!(!watching_flag(&ctx).exists());
+
+        // The scratch dir is in `$TMPDIR`, which macOS purges under a
+        // long-running Mulpex: a missing subdir must not silently lose the flag.
+        std::fs::remove_dir_all(dir.join(crate::WATCHING_DIR)).unwrap();
+        set_watching_flag(&ctx, watcher_running(Some(&paired), NO_WATCHERS));
+        assert!(watching_flag(&ctx).exists(), "the subdir is rebuilt, not assumed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The user's own list: one command substring per line, `#` comments and
+    /// blanks ignored. Read fresh at every turn end, so adding a line takes
+    /// effect without restarting anything.
+    #[test]
+    fn the_user_can_add_watcher_patterns_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("mulpex-watchers-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let file = dir.join(WATCHERS_FILE);
+
+        // A missing file is not an error — it just leaves the built-ins.
+        assert!(watcher_patterns_in(&file).is_empty());
+
+        std::fs::write(
+            &file,
+            "# my own watchers\n\n  /tmp/mywatch-  \n\nkafka-console-consumer\n# trailing comment\n",
+        )
+        .unwrap();
+        assert_eq!(
+            watcher_patterns_in(&file),
+            vec!["/tmp/mywatch-".to_string(), "kafka-console-consumer".to_string()],
+            "comments, blank lines and surrounding whitespace are not patterns"
+        );
+
+        let patterns = watcher_patterns_in(&file);
+        let mine = stop_with(vec![shell_task(
+            "m1",
+            "Watch the topic",
+            "kafka-console-consumer --bootstrap-server localhost:9092 --topic jobs",
+        )]);
+        assert!(
+            background_work_running(&ctx, Some(&mine), NO_WATCHERS),
+            "without the list it is ordinary work"
+        );
+        assert!(
+            !background_work_running(&ctx, Some(&mine), &patterns),
+            "with the user's pattern it is a watcher"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The seeded template exists to be found, so it must be inert until the
+    /// user writes in it — every example line is a comment. A template that
+    /// parsed to real patterns would exempt whatever those examples mention on
+    /// every machine that ever launched Mulpex, which is the worst version of
+    /// this feature: silent, global, and nobody asked for it.
+    #[test]
+    fn the_seeded_template_is_inert_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("mulpex-seed-{}", crate::persist::new_uuid()));
+        let file = dir.join(WATCHERS_FILE);
+
+        seed_watchers_template_at(&file);
+        assert!(file.exists(), "the subdir is created, not assumed");
+        assert!(
+            watcher_patterns_in(&file).is_empty(),
+            "a freshly seeded file must add no patterns at all"
+        );
+
+        // The user writes their own line; the next launch leaves it alone.
+        std::fs::write(&file, "kafka-console-consumer\n").unwrap();
+        seed_watchers_template_at(&file);
+        assert_eq!(
+            watcher_patterns_in(&file),
+            vec!["kafka-console-consumer".to_string()],
+            "seeding runs on every launch and must never clobber the user's list"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2077,7 +2499,10 @@ mod tests {
         let ctx = test_ctx(&dir, 3);
         let status = ctx.state_dir.join("3");
         // Turn ended with an agent still running.
-        set_background_flag(&ctx, background_work_running(&ctx, payload(STOP_WITH_AGENT).as_ref()));
+        set_background_flag(
+            &ctx,
+            background_work_running(&ctx, payload(STOP_WITH_AGENT).as_ref(), NO_WATCHERS),
+        );
         assert!(background_flag(&ctx).exists());
         assert_eq!(
             notify_status(&ctx),
@@ -2087,7 +2512,10 @@ mod tests {
 
         // The agent finishes; the next turn boundary clears the flag and the
         // instance is genuinely idle at its prompt — green, not red.
-        set_background_flag(&ctx, background_work_running(&ctx, payload(STOP_IDLE).as_ref()));
+        set_background_flag(
+            &ctx,
+            background_work_running(&ctx, payload(STOP_IDLE).as_ref(), NO_WATCHERS),
+        );
         assert!(!background_flag(&ctx).exists());
         assert_eq!(
             notify_status(&ctx),

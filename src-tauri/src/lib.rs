@@ -117,6 +117,13 @@ pub fn run() {
             // a rotating token stays live in a long-running Mulpex.
             claude_bin::warm_and_refresh();
 
+            // Put a commented `watchers.txt` in the home dir if there isn't one.
+            // The watcher exemption works out of the box (the built-ins cover the
+            // hub listener and agentalk), so this file exists purely so the
+            // mechanism can be found and extended without reading the source.
+            // Never overwrites — see `hook::seed_watchers_template`.
+            mulpex_core::hook::seed_watchers_template();
+
             // Restore every project that was open when Mulpex last quit, each
             // spawning its sessions (--resume). Output buffers pre-attach, so the
             // frontend's `bootstrap` sees them ready and they paint on first frame.

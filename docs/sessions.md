@@ -232,6 +232,71 @@ listener → `waiting` and no `bg` flag; idle_prompt after it → `waiting`; Sto
 a real background shell → `working` and the flag set; idle_prompt after that → still `working`; Stop
 with nothing → `waiting`. `monitors/` is no longer created at all.
 
+### One watcher was a special case; two is a list (agentalk)
+
+The hub listener was the first watcher, so the exemption was written as a single special case.
+**agentalk is the second**, and it arrived in exactly the shape the first one had: an
+agentalk-paired pane reported `working` for as long as the pairing was up. A paired instance holds
+two background tasks, neither of which ever exits by design — verbatim off a live pane
+(`cloudraw#3`, 2026-09-17, reported by the instance itself rather than read off a screen):
+
+```
+Bash run_in_background   description: "Arm agentalk poll loop"     ← free text, NOT stable
+command: . '/tmp/agentalk-session-f31d5bca82b7068a-cloudraw_.env' && curl -fsS
+         'https://agentalk.dev/loop.sh' -o /tmp/agentalk-loop.sh && . /tmp/agentalk-loop.sh
+
+Monitor                  description: "agentalk channel events"
+command: tail -f -n +1 '/tmp/agentalk-events-f31d5bca82b7068a-cloudraw_.log'
+```
+
+So `background_work_running` now subtracts any task matching **`command_is_watcher`** — the
+listener markers, `BUILTIN_WATCHER_MARKERS`, and one substring per line of
+`<mulpex home>/watchers.txt`. Everything the listener fix established still holds unchanged (per
+task, command not description, `subagent` has no command, retroactive). What the generalisation
+adds:
+
+- **Two things decided what may be matched, and both came from the measurement.** The **channel id
+  and participant name change on every re-pair** (that pane had replaced `f7517f834a94332d` half an
+  hour earlier), so only the fixed path prefixes are stable; and **`description` is free text the
+  model writes** — "Arm agentalk poll loop" was that instance's own wording. Match the command,
+  never the description, and never the id.
+- **The built-in markers are the three `/tmp` paths, deliberately not the word `agentalk`.** That
+  repo is developed on this machine; a background build or test run inside it is real work and must
+  still read `working`. Pinned by the negative case in
+  `agentalks_poll_loop_and_events_tail_are_watchers`.
+- **`watchers.txt` is read fresh at every `Stop`**, so a line added to it takes effect at the next
+  turn end with no restart — and it is **seeded with a commented template** on launch
+  (`seed_watchers_template`, never overwriting) purely so the mechanism is findable without reading
+  source. The template is asserted to parse to **zero** patterns: an example line that wasn't a
+  comment would silently exempt it on every machine that ever launched Mulpex.
+- **The listener-specific matchers stayed listener-specific.** `running_listener_ids` /
+  `note_listener_needs_replacing` (the re-arm nudge) and `pty::reap_orphaned_listeners` still match
+  only `command_is_hub_listener`. Widening those would have Mulpex offering to replace agentalk's
+  poll loop.
+
+#### `watching/<id>`: idle to the sidebar, busy to the updater
+
+Going green cost the updater's busy guard, which reads the status word — and a watcher *is* a
+reason not to restart: `--resume` brings the conversation back but not the agentalk channel the
+poll loop was serving. The two facts are opposite and only `Stop` can see either, so it writes
+both: `bg/<id>` (work in flight → `working`) and **`watching/<id>`** (a watcher is live → status
+untouched). `StatusEntry.watching` carries it to the frontend, where `busySessionCount` is the only
+reader. A row that is watching looks exactly as idle as it is.
+
+Two consequences that are intended, not oversights: an agentalk pane now shows up in the tab's
+green "ready" count (`readyCount`) — it genuinely is waiting for a peer — and `watching/` is a
+**subdir**, because a bare integer at the state-dir root is scanned as a status file.
+
+Pinned by `agentalks_poll_loop_and_events_tail_are_watchers`,
+`a_watcher_is_idle_to_the_sidebar_and_busy_to_the_updater`,
+`the_user_can_add_watcher_patterns_of_their_own` and
+`the_seeded_template_is_inert_and_never_overwrites`, then driven through the real
+`mulpex-helper hook stop` on the verbatim payload — agentalk alone → `waiting` + `watching`;
+with the hub listener → the same; plus `npm test` → `working` + both flags; `npm test` alone →
+`working`, no `watching`; nothing → neither. `MULPEX_HOME` pointed at a scratch home with a
+`watchers.txt` flipped a `kafka-console-consumer` command from `working` to `waiting`, which is the
+user-list path end to end. → [verification-log.md](verification-log.md)
+
 ### The listener expires, so `armed/<id>` is a heartbeat
 
 Removing persistent Monitors broke a second thing, quieter and worse: **every monitor now expires**

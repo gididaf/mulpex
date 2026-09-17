@@ -1814,3 +1814,68 @@ Reported from a screenshot: a warweb turn that ended with two decisions for the 
 
 - **Live in the shipped `.app`.** The running Mulpex was not restarted; the fix is verified on the
   real transcript and the real `claude`'s payload, not on a driven interactive session.
+
+## 2026-09-17 — agentalk: the pane that was `working` forever
+
+### Measured: what an agentalk-paired instance actually holds
+
+Reported by the paired instance itself (`cloudraw#3`), not read off a screen — a screenshot of a
+Hebrew/mixed pane re-applies BiDi, and `background_tasks` never appears in a pane at all. Three
+long-running background things, verbatim:
+
+```
+1) Bash run_in_background  [bash id bi5bpldo7]   description: "Arm agentalk poll loop"
+   . '/tmp/agentalk-session-f31d5bca82b7068a-cloudraw_.env' && curl -fsS
+     'https://agentalk.dev/loop.sh' -o /tmp/agentalk-loop.sh && . /tmp/agentalk-loop.sh
+2) Monitor                 [task id br3blyunn]   description: "agentalk channel events"
+   tail -f -n +1 '/tmp/agentalk-events-f31d5bca82b7068a-cloudraw_.log'
+3) Monitor                 [task id bc2bdtzqi]   description: "Mulpex hub inbox"
+   "/Applications/Mulpex.app/Contents/MacOS/mulpex-helper" listen
+```
+
+- (1) is an infinite `curl` poll; (2) is a `tail -f`. **Neither ever exits**, so `Stop` saw work in
+  flight at every turn end and the row was yellow for as long as the pairing was up.
+- **The channel id and the participant name change on every re-pair** — that instance had replaced
+  channel `f7517f834a94332d` ~30 min earlier. Only the fixed path prefixes are stable.
+- **`description` is free text the model writes.** (1)'s was that instance's own invention. (2)'s
+  happens to be dictated by agentalk's bootstrap output, but the rule is still: match the command.
+- (1) and (2) are *different kinds* with *different command shapes* for one feature, so exempting
+  either alone leaves the pane busy.
+
+### Driven through the real `mulpex-helper hook stop`
+
+Debug helper, temp `MULPEX_STATE_DIR`, the verbatim commands above piped in as `background_tasks`
+(`scratchpad/drive-helper.sh`):
+
+| payload | status | `bg/3` | `watching/3` |
+| --- | --- | --- | --- |
+| agentalk loop + events tail | `waiting` | absent | present |
+| + the hub listener | `waiting` | absent | present |
+| + `npm test -- --run` | `working` | present | present |
+| `npm test -- --run` alone | `working` | present | absent |
+| nothing running | `waiting` | absent | absent |
+
+Then the user list end to end: `MULPEX_HOME` pointed at a scratch home whose `watchers.txt` held
+`kafka-console-consumer`, with a matching command as the only task — `working` without the file,
+`waiting` with it. Proves `mulpex_home()` resolution, the parse (comments + blanks skipped) and the
+substring match in one pass, without writing into `~/.mulpex`.
+
+### Tests
+
+`agentalks_poll_loop_and_events_tail_are_watchers` (the two commands verbatim; the same pair with a
+different channel id; plural payloads with the listener and with real work; and the negative case —
+`cd …/utilities/agentalk && npm run build` must stay `working`),
+`a_watcher_is_idle_to_the_sidebar_and_busy_to_the_updater` (both flags, and a purged `watching/`
+subdir being rebuilt), `the_user_can_add_watcher_patterns_of_their_own`,
+`the_seeded_template_is_inert_and_never_overwrites`. 116 `mulpex-core` tests;
+`cargo check --workspace` and `npm run check` (122 files, 0 errors) clean.
+
+### Not verified
+
+- **Live in the shipped `.app`.** The running Mulpex was not restarted — the user was working
+  inside it. `cloudraw#3`'s row going green is expected at its next turn end after a relaunch (the
+  match is retroactive: no re-pair, no re-arm), and has not been watched happen.
+- **`busySessionCount` with an update actually pending.** The `watching` branch is covered by the
+  Rust-side flag test and by inspection only; nothing exercised the real update banner.
+- **The seeded `watchers.txt` appearing on launch.** `seed_watchers_template_at` is tested directly;
+  the `setup()` call site was not run.

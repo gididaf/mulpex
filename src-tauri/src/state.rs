@@ -1813,7 +1813,15 @@ impl Core {
                     .ok()
                     .and_then(|w| Status::from_word(w.trim()))
                     .unwrap_or(Status::Waiting);
-                StatusEntry { id: s.id, status }
+                // A watcher leaves the status `waiting` on purpose, so this is the
+                // only thing that can tell the updater not to restart the app out
+                // from under a live agentalk channel.
+                let watching = mulpex_core::watching_path(&self.state_dir, s.id).exists();
+                StatusEntry {
+                    id: s.id,
+                    status,
+                    watching,
+                }
             })
             .collect();
         statuses.sort_by_key(|e| e.id);

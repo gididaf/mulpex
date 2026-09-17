@@ -78,12 +78,18 @@ export function dismissUpdate(): void {
 /** Sessions that would lose work to a restart, across EVERY open project — not
  * just the visible one. `working` is mid-turn; `needs` is stopped on a question
  * that a restart would discard. `waiting` (done with its turn) is free to
- * restart: `--resume` brings it back where it was. */
+ * restart: `--resume` brings it back where it was.
+ *
+ * ...with one exception that is NOT a status word: an instance holding a
+ * **watcher** reads `waiting` because it genuinely is idle, but `--resume`
+ * restores only the conversation. Whatever the watcher was attached to — a live
+ * agentalk channel, a `tail -f` — is gone, and re-establishing it is not
+ * something a restart does. So it counts as busy while looking idle. */
 export function busySessionCount(): number {
   let n = 0;
   for (const p of get(projects).values()) {
-    for (const status of p.statuses.values()) {
-      if (status === "working" || status === "needs") n++;
+    for (const [id, status] of p.statuses) {
+      if (status === "working" || status === "needs" || p.watching.has(id)) n++;
     }
   }
   return n;

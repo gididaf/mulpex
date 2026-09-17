@@ -57,6 +57,14 @@ Traps that live in this crate specifically:
   `PostToolUse`, not the idle notification (measured, `claude` v2.1.273). Anything that needs to
   know what is running has to be decided in `stop` and handed forward on disk, which is what
   `relisten/<id>` is. → [../../docs/hub.md](../../docs/hub.md)
+- **The watcher list is generic; the listener matchers are not.** `command_is_watcher` (built-ins +
+  `<mulpex home>/watchers.txt`) is what keeps a never-exiting background task from pinning a row
+  yellow — the hub listener, agentalk's poll loop and events tail, anything the user adds. But
+  `running_listener_ids`/`note_listener_needs_replacing` and `pty::reap_orphaned_listeners` still
+  match `command_is_hub_listener` alone: those re-arm and kill things, and they must only ever do
+  that to Mulpex's own listener. A watcher also writes `watching/<id>` separately from `bg/<id>`,
+  because the status word and the updater's busy guard want opposite answers about it.
+  → [../../docs/sessions.md](../../docs/sessions.md)
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
   ambiguity once made a 91 s spawn stall indistinguishable from a lost task.
   → [../../docs/hub.md](../../docs/hub.md)

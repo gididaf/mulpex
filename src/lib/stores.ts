@@ -26,6 +26,10 @@ export interface ProjectState {
   name: string;
   sessions: SessionInfo[];
   statuses: Map<number, Status>;
+  /** Instances that ended their turn holding a watcher — see
+   *  `StatusEntry.watching`. Read only by `updater.ts`'s busy guard: these rows
+   *  are idle (`waiting`) and must look it. */
+  watching: Set<number>;
   tasks: Map<number, string>;
   /** id → that instance's Explainer feed, newest first, capped at
    *  `MAX_EXPLAIN_ENTRIES` (the panel renders it oldest first). */
@@ -356,6 +360,7 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   patchProject(handle, {
     hub: snap,
     statuses: new Map(snap.statuses.map((e) => [e.id, e.status])),
+    watching: new Set(snap.statuses.filter((e) => e.watching).map((e) => e.id)),
     tasks: new Map(snap.tasks.map((e) => [e.id, e.task])),
   });
 }

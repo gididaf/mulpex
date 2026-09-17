@@ -143,6 +143,13 @@ pub struct PendingEntry {
 pub struct StatusEntry {
     pub id: usize,
     pub status: Status,
+    /// The instance ended its turn holding a **watcher** (its hub listener, an
+    /// agentalk poll loop, anything in `watchers.txt`). Not a status word: such
+    /// an instance genuinely IS idle and reads `waiting`. It rides alongside
+    /// because a restart would still kill the `claude` and drop whatever the
+    /// watcher is attached to, which is the updater's business and nobody
+    /// else's. → `mulpex_core::WATCHING_DIR`.
+    pub watching: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]

@@ -199,6 +199,21 @@ pub const LISTENERS_DIR: &str = "listeners";
 /// `explainreq/<id>` = a turn (or a pending dialog) the hooks handed to the
 /// Explainer. See `explain_request_path`.
 pub const EXPLAINREQ_DIR: &str = "explainreq";
+/// `watching/<id>` = that instance ended its turn holding a **watcher** — its
+/// hub listener, an agentalk poll loop, anything in `watchers.txt`.
+///
+/// Separate from `bg/<id>` because the two facts have opposite consequences and
+/// only the app can hold both: a watcher is not work in flight, so the status
+/// word is `waiting` (a green, honestly-idle row), but a restart would still
+/// kill the `claude` and drop whatever the watcher is attached to — a live
+/// agentalk channel — so the updater's busy guard must keep counting it.
+/// Written by `hook::stop`, read by `state::hub_snapshot`.
+pub const WATCHING_DIR: &str = "watching";
+
+/// `watching/<id>` for one instance.
+pub fn watching_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(WATCHING_DIR).join(id.to_string())
+}
 
 #[cfg(test)]
 mod tests {

@@ -97,6 +97,7 @@
       name: info.project_name,
       sessions: info.sessions,
       statuses: new Map(),
+      watching: new Set(),
       tasks: new Map(),
       explains: new Map(),
       explainPending: new Set(),
