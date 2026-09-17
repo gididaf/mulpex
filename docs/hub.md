@@ -38,7 +38,9 @@ So the 200 ms poll (`Core::ring_doorbells`, `state.rs`) types one line into the 
   and prefixes the turn `⟳ hub message from <sender> →` so the human can tell it wasn't their
   prompt.
 
-Measured (dev build, 2026-09-17): **82 ms** from the message landing to the doorbell being typed.
+Measured (dev build, 2026-09-17): **12–82 ms** from the message landing to the doorbell being
+typed — fast enough that it beats the gap between two messages, which is why a ring almost always
+reports `1 message(s)` even under fan-in.
 
 ### The three gates, and what each one prevents
 

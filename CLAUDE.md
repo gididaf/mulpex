@@ -128,8 +128,9 @@ re-arm nudge, and with them the entire class of bug where a model retypes a comm
   user never wrote — see the invariants.
 - **Once per batch.** At 200 ms, six messages would otherwise ring six times.
 
-Measured (dev build, 2026-09-17): **82 ms** from a message landing to the doorbell being typed,
-against ~500 ms average for the 1 Hz listener it replaced.
+Measured (dev build, 2026-09-17): **12–82 ms** from a message landing to the doorbell being typed
+(16 ms under fan-in from three `hub_spawn` workers), against ~500 ms average for the 1 Hz listener
+it replaced.
 
 ## The helper (why it's a separate binary)
 
@@ -448,4 +449,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`43f0ad3126029c63ffb27dcbfcb222d8aea484ba` — 2026-09-17
+`e4040ec6f559ef8817ffb64dac0b6d0963cf5196` — 2026-09-17
