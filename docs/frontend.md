@@ -246,7 +246,10 @@ list runs vertically). Terminals drag like instances: one list, one behavior.
 
 Name + **two count badges in the sidebar's own dot colors**, so a tab reads the way a row does:
 **green = claudes done and idle** (`readyCount`, status `waiting`) and **red = claudes stopped on
-a question** (`needsCount`, status `needs`). Both hide at zero, and **both exclude muted
+a question** (`needsCount`, status `needs`). An instance holding only a **watcher** — an agentalk
+pairing, its hub listener — is counted green, deliberately: it is waiting for a peer, which is
+idleness. (The updater's guard reads a separate flag for those; see
+[sessions.md](sessions.md).) Both hide at zero, and **both exclude muted
 sessions** (see above). `working` is deliberately unbadged — the tab says what is *finished* and
 what is *blocked on you*, not what is busy — so a project with everything running shows no pill at
 all. Terminals are excluded for free (a terminal has no status entry). The pills are dark text on

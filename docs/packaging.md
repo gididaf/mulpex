@@ -179,7 +179,11 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
 - **Busy guard.** `updater.ts::busySessionCount()` counts `working` (mid-turn) and `needs`
   (stopped on a question) across **every open project**, not just the visible one; non-zero parks
   the banner in a `confirming` state naming the count. `waiting` sessions don't count — `--resume`
-  restores those intact.
+  restores those intact. **One exception, and it is not a status word:** an instance holding a
+  **watcher** (`StatusEntry.watching`, from `watching/<id>`) reads `waiting` because it genuinely
+  is idle, but `--resume` restores only the conversation — the live agentalk channel its poll loop
+  was serving is gone. So it counts as busy while looking idle.
+  → [sessions.md](sessions.md)
 - **Automatic checks are silent on failure; manual ones aren't.** A laptop on flaky wifi must not
   accumulate error banners nobody asked for, but a menu-item check that silently did nothing would
   read as broken. Same function, `manual` flag.
