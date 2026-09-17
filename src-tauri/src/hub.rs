@@ -69,6 +69,12 @@ pub fn start(app: AppHandle) {
                 // shape as the name requests above: an empty dir read per tick,
                 // and the session diff below is what redraws the sidebar.
                 core.process_user_prompts();
+                // The idle wake: type a doorbell into any instance holding unread
+                // mail. This is the ONLY thing that can start a turn in an idle
+                // claude — `hub_send` just writes a file, and no hook reaches a
+                // session that is sitting at its prompt. It must run every tick,
+                // for the same reason `process_remote_signals` does.
+                core.ring_doorbells();
                 // Remote claudes calling their driver back. Cheap when there are
                 // none (one empty dir read) and it must run every tick: this is
                 // the only path by which a machine on the other end of an ssh

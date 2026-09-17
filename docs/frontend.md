@@ -127,7 +127,7 @@ hub-panel/status-strip unread readouts — and takes it out of the ⌘[ / ⌘] r
   a mark rather than a keystroke: `hook.rs::userpromptsubmit` writes `userprompt/<id>` in the one
   branch that already knows the turn is the user's (`!system_turn`, not `MULPEX_SENTINEL`), and the
   200 ms poll consumes it in `Core::process_user_prompts`, unmutes and persists. Both hosts do it —
-  `mpx` clears the window's `@mpx_muted` from `core::process_user_prompts`. Cost is one empty dir
+  Cost is one empty dir
   read per project per tick.
 
   The frontend needed no change: the poll loop's session diff republishes the row, and

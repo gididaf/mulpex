@@ -463,9 +463,6 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // word above stays honest (`waiting`), and this is the only hook that can see
     // the task list at all.
     set_watching_flag(ctx, watcher_running(payload.as_ref(), &patterns));
-    // Same payload, same reason it can only be read here: this is the only hook
-    // that is told which listeners are running.
-    note_listener_needs_replacing(ctx, payload.as_ref());
     // A turn boundary is proof we are not mid-compaction.
     clear_compacting(ctx);
 
@@ -711,12 +708,6 @@ pub fn command_is_hub_listener(command: &str) -> bool {
         || (command.contains(LISTENER_BIN) && command.contains(LISTENER_SUBCOMMAND))
 }
 
-/// Is this `background_tasks` entry the instance's own hub listener?
-fn is_hub_listener(task: &serde_json::Value) -> bool {
-    task.get("command")
-        .and_then(|v| v.as_str())
-        .is_some_and(command_is_hub_listener)
-}
 
 /// Commands that are a **watcher** — a background task that by design never
 /// finishes, so nothing will ever wake the instance by completing it — and so
@@ -850,66 +841,6 @@ fn is_watcher(task: &serde_json::Value, user_patterns: &[String]) -> bool {
     task.get("command")
         .and_then(|v| v.as_str())
         .is_some_and(|c| command_is_watcher(c, user_patterns))
-}
-
-/// The ids of every hub listener this payload reports as running.
-///
-/// Deliberately the **listener** match and not `is_watcher`: the re-arm nudge
-/// and the orphan reaper it feeds are about Mulpex's own listener, and asking an
-/// instance to replace agentalk's poll loop would be nonsense.
-fn running_listener_ids(payload: Option<&serde_json::Value>) -> Vec<String> {
-    running_tasks(payload)
-        .filter(|t| is_hub_listener(t))
-        .map(|t| {
-            t.get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string()
-        })
-        .collect()
-}
-
-pub(crate) fn relisten_path(ctx: &Ctx) -> PathBuf {
-    ctx.state_dir
-        .join(crate::RELISTEN_DIR)
-        .join(ctx.id_str())
-}
-
-/// Record, at the one hook that can see it, a listener that needs replacing.
-///
-/// **Only `Stop` carries `background_tasks`** — measured against a real `claude`
-/// (v2.1.273, 2026-09-16): `UserPromptSubmit` does not carry it even on a prompt
-/// taken 24 s after a Monitor was armed, and neither does `PostToolUse` or the
-/// idle notification. `listener_armed` is asked from `UserPromptSubmit`, so it
-/// can never look at the task list itself; this writes down what `Stop` saw and
-/// lets the arm nudge read it back.
-///
-/// Two states are worth repairing, and both are invisible from every other angle:
-///
-/// - **A listener that runs but never refreshes `armed/<id>`.** Before the
-///   in-loop `touch` existed the command only touched the flag once at startup,
-///   and an instance re-arming from its own conversation history keeps emitting
-///   that version long after `HUB_RULES` changed — measured on a live instance
-///   that armed the superseded command 71 times over two days and only stopped
-///   when `/compact` dropped it from context. The heartbeat then reads dead
-///   forever, so the arm nudge fires every single turn and a *fresh* Monitor
-///   stacks on each one.
-/// - **More than one listener.** That is the same failure one step later, and
-///   what the user actually sees: one hub message, N wake-ups.
-///
-/// Deliberately not a `decision: block`. The arm nudge is already firing every
-/// turn in this state, so the instruction rides along on a turn that was going to
-/// happen anyway; and that channel belongs to unread mail, which must not have to
-/// queue behind housekeeping.
-fn note_listener_needs_replacing(ctx: &Ctx, payload: Option<&serde_json::Value>) {
-    let ids = running_listener_ids(payload);
-    let stale_heartbeat = !ids.is_empty() && !listener_armed(ctx);
-    if stale_heartbeat || ids.len() > 1 {
-        let _ = std::fs::create_dir_all(ctx.state_dir.join(crate::RELISTEN_DIR));
-        let _ = std::fs::write(relisten_path(ctx), ids.join(" "));
-    } else {
-        let _ = std::fs::remove_file(relisten_path(ctx));
-    }
 }
 
 fn background_flag(ctx: &Ctx) -> PathBuf {
@@ -1328,11 +1259,21 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 // The sidebar task should reflect the USER's work, so skip prompts
                 // that aren't the user talking: (a) prompts Mulpex injects itself
                 // (the hub-listener bootstrap, tagged with MULPEX_SENTINEL), and
-                // (b) runtime-injected event turns — a Monitor wake or a background
-                // job completion arrives as a synthetic `<task-notification>…`
-                // prompt. Neither should overwrite the task.
+                // (b) runtime-injected event turns — a background job completion
+                // arrives as a synthetic `<task-notification>…` prompt. Neither
+                // should overwrite the task.
+                //
+                // The **doorbell** belongs with (b), not with the user: it is
+                // Mulpex typing into the input box to say mail arrived, and it
+                // arrives through the same channel a real prompt does, so nothing
+                // else can tell them apart. Counting it as the user's turn would
+                // overwrite the sidebar task with our own plumbing text and — the
+                // worse half — write `userprompt/<id>`, unmuting a ⌘M'd row every
+                // time a peer sent it mail. `peers_context` below is deliberately
+                // left ungated, exactly as for a hub wake: a doorbell turn is the
+                // one that most needs the unread count.
                 let p = prompt.trim_start();
-                system_turn = p.starts_with("<task-notification");
+                system_turn = is_system_turn(p);
                 if p.starts_with(crate::MULPEX_SENTINEL) {
                     verify_spawn_delivery(ctx, prompt);
                 } else if !system_turn {
@@ -1381,23 +1322,22 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
         }
     }
 
-    // Assemble this turn's injected context: a one-time reminder to arm the hub
-    // listener (only until it's armed), then the peer snapshot. This replaces the
-    // old visible PTY bootstrap prompt — a normal instance now starts clean and
-    // arms its listener from here, invisibly, on the user's first turn.
+    // Assemble this turn's injected context: the naming nudge, then the peer
+    // snapshot.
     //
-    // The two nudges are asked of the USER's turns only. Injected on a
-    // `<task-notification>` they are worse than useless: the arm nudge makes the
-    // instance start a fresh persistent Monitor, which is precisely the orphan
-    // that produces the next restart's wake — the reminder manufacturing the
-    // artifact that causes the next reminder. (Measured; see `docs/hub.md`.) The
-    // peer snapshot below is NOT gated — a hub wake *is* a task-notification, and
-    // it is the turn that most needs to know about unread mail.
+    // **There is no arm nudge any more.** An instance no longer arms anything: the
+    // wake is a doorbell Mulpex types into its input box from the poll loop, so
+    // there is nothing for the instance to get right and nothing to re-arm. That
+    // deletes the whole feedback loop this gate was built for — the nudge made the
+    // instance start a Monitor, whose orphaned death produced the next wake, which
+    // carried the nudge again. `nudges_welcome` stays because the naming nudge has
+    // the same "don't ask this of a turn the user didn't take" requirement, and a
+    // doorbell turn now reads as a system turn for exactly that reason.
+    //
+    // The peer snapshot below is NOT gated — a doorbell *is* a system turn, and it
+    // is the turn that most needs to know about unread mail.
     let welcome = nudges_welcome(system_turn, sanctioned_resume);
     let mut parts: Vec<String> = Vec::new();
-    if welcome && !listener_armed(ctx) {
-        parts.push(arm_listener_nudge(ctx));
-    }
     if welcome && !instance_named(ctx) {
         parts.push(AUTO_NAME_NUDGE.to_string());
     }
@@ -1423,86 +1363,36 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hidden reminder injected on each turn while this instance's hub listener is
-/// not running (see `HUB_RULES` "INCOMING MESSAGES" for the exact Monitor
-/// command). The Monitor `touch`es `armed/<id>` when it starts and again every
-/// second it lives, `listener_armed` reads that heartbeat, and the reminder
-/// stops. Kept low-key so arming happens in the background of the user's actual
-/// first request, not as a separate visible turn.
+/// Is this prompt something other than the user talking?
 ///
-/// It says "not running" rather than "not armed yet" because since monitors
-/// started expiring this fires for a listener that *was* armed and has since
-/// died, which is the case the heartbeat exists to catch.
-const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not running right \
-now (never armed, or it expired). As part of THIS turn — quietly, in the background — arm it: call \
-Monitor with timeout_ms at the maximum the tool allows and exactly this command (do NOT copy a \
-Monitor call from earlier in this conversation — an earlier one may be superseded):\n";
-
-/// Tail of both nudges: the command itself, spelled the one way `HUB_RULES`
-/// spells it. `rules::listener_command` is the single source, and the helper can
-/// name its own path because the hook *is* the helper — the same binary the
-/// instance is being told to run.
-fn nudge_listener_command() -> String {
-    std::env::current_exe()
-        .map(|p| crate::rules::listener_command(&p))
-        .unwrap_or_else(|_| "\"<mulpex-helper>\" listen".to_string())
+/// Two things reach `UserPromptSubmit` through the same field as a typed prompt,
+/// and neither is one:
+///
+/// - a `<task-notification>`, which the runtime injects for a finished background
+///   job or a subagent result;
+/// - a **doorbell**, which Mulpex itself types into the input box to say peer mail
+///   has arrived (`crate::DOORBELL_PREFIX`).
+///
+/// Getting this wrong is silent in both directions, which is why it is a function
+/// with a test rather than an inline `starts_with`. Counting a doorbell as the
+/// user would overwrite the sidebar task with our own plumbing text and unmute a
+/// ⌘M'd row every time a peer sent it mail; counting a real prompt as a system
+/// turn would stop the instance ever being asked to name itself.
+fn is_system_turn(prompt: &str) -> bool {
+    prompt.starts_with("<task-notification") || prompt.starts_with(crate::DOORBELL_PREFIX)
 }
 
-/// Starts with a newline so the command sits on a line of its own: run into the
-/// next sentence it reads as one long string, and the thing being copied has to
-/// be unambiguous.
-const ARM_LISTENER_TAIL: &str = "\nDo not make arming it your whole response and do not narrate it \
-beyond a brief mention; just arm it and then continue with what I actually asked. (You'll see this \
-reminder only while the listener is down.)";
-
-/// Added to the nudge when `Stop` left a `relisten/<id>` note: the instance has a
-/// listener that is *running* yet dead as far as the hub is concerned, or several
-/// of them. Without this the plain nudge would have it arm an Nth Monitor beside
-/// the ones already there — which is the pile-up the user sees as one hub message
-/// producing several wake-ups.
-///
-/// The "do not copy an earlier Monitor call" clause is the whole point, and it is
-/// stated twice on purpose: the measured failure was an instance re-emitting a
-/// superseded command out of its own history 71 times across two days and an app
-/// update, healing only when `/compact` finally dropped that call from its
-/// context.
-const RELISTEN_NUDGE: &str = "[Mulpex hub] Your current hub listener is a SUPERSEDED one: it is \
-running, but it cannot report that it is alive, so it is not usable and this reminder cannot stop \
-— and every turn you are asked again, another one piles up beside it. Fix it as part of THIS turn, \
-quietly: call TaskStop on the task id(s) listed at the end of this message, then arm ONE new \
-Monitor, with timeout_ms at the maximum the tool allows, using exactly this command (do NOT copy \
-the Monitor call from earlier in this conversation — that is the superseded one):\n";
-
-/// The arm nudge for this turn: the plain reminder, plus the repair instruction
-/// when `Stop` recorded a listener that needs replacing. The note is consumed
-/// here, so a listener that is genuinely fine after the repair does not keep
-/// being told about itself.
-///
-/// Both forms **spell the command out**. The old nudge pointed at "INCOMING
-/// MESSAGES in your instructions", and a pointer is what let a superseded copy
-/// win: the nearest, most concrete text wins, and for an instance that had armed
-/// the same command seventy times that text was its own history.
-fn arm_listener_nudge(ctx: &Ctx) -> String {
-    let cmd = nudge_listener_command();
-    match std::fs::read_to_string(relisten_path(ctx)) {
-        Ok(ids) if !ids.trim().is_empty() => {
-            let _ = std::fs::remove_file(relisten_path(ctx));
-            format!(
-                "{RELISTEN_NUDGE}{cmd}{ARM_LISTENER_TAIL} Stale listener task id(s) to stop: {}",
-                ids.trim()
-            )
-        }
-        _ => format!("{ARM_LISTENER_NUDGE}{cmd}{ARM_LISTENER_TAIL}"),
-    }
-}
-
-/// Whether this turn may carry the arm/name nudges.
+/// Whether this turn may carry the naming nudge.
 ///
 /// A function rather than an inline `||` because getting it wrong is silent both
 /// ways, and it was in fact wrong once: gating on `system_turn` alone suppressed
 /// the nudges on ⌘⇧R's *sanctioned* wake too, so the exemption bought a turn that
 /// still never re-armed — the precise failure it exists to prevent, and invisible
 /// except by reading the hook's stdout.
+///
+/// The arm nudge it was written for is gone with the listener; what remains is the
+/// same requirement one nudge down — don't ask a turn the user didn't take to go
+/// and name itself. A doorbell counts as a system turn for this reason.
 fn nudges_welcome(system_turn: bool, sanctioned_resume: bool) -> bool {
     !system_turn || sanctioned_resume
 }
@@ -1545,42 +1435,6 @@ fn orphaned_task_wake(prompt: &str) -> bool {
 fn take_resumed_in_place(ctx: &Ctx) -> bool {
     let path = crate::resumed_in_place_path(&ctx.state_dir, ctx.instance);
     path.exists() && std::fs::remove_file(&path).is_ok()
-}
-
-/// How long `armed/<id>` may go untouched before the listener counts as dead.
-/// The loop touches it once a second, so anything past a few seconds is a
-/// stopped listener; the margin is for a machine that slept or a very loaded box.
-const LISTENER_HEARTBEAT_GRACE: Duration = Duration::from_secs(30);
-
-/// Whether this instance's hub listener is **alive**, not merely whether it was
-/// ever armed.
-///
-/// `armed/<id>` is a heartbeat: the listener `touch`es it when it starts and then
-/// again on every pass of its one-second loop (`HUB_RULES` "INCOMING MESSAGES"),
-/// so the file's *mtime* is the liveness signal and its mere existence is not.
-///
-/// The distinction became load-bearing when Claude Code removed persistent
-/// Monitors. Every monitor now expires (30 min at most), so a listener stops on
-/// its own while the flag it wrote sits there forever — and the arm nudge, which
-/// is the only thing that ever gets one re-armed, is gated on exactly this
-/// function. Testing existence meant a listener died silently at the 30-minute
-/// mark and the instance was never woken by peer mail again, with nothing
-/// anywhere saying so. Testing freshness makes the nudge come back by itself.
-///
-/// A fresh `state_dir` per Mulpex launch (and thus per `--resume`, which kills
-/// the old Monitor) still means the flag is absent at startup, so restored
-/// instances re-arm as before.
-fn listener_armed(ctx: &Ctx) -> bool {
-    let path = ctx.state_dir.join("armed").join(ctx.id_str());
-    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
-        return false;
-    };
-    // A clock that moved backwards leaves `elapsed()` erroring; treat that as
-    // alive rather than nudging an instance whose listener is probably fine.
-    modified
-        .elapsed()
-        .map(|age| age < LISTENER_HEARTBEAT_GRACE)
-        .unwrap_or(true)
 }
 
 /// Hidden reminder injected each turn until this instance has named its own
@@ -2456,163 +2310,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `armed/<id>` is a heartbeat, not a one-off flag: the listener re-`touch`es
-    /// it every second, so a monitor that has expired — which every monitor now
-    /// does — goes stale and the arm nudge comes back on its own. Testing mere
-    /// existence meant a dead listener was indistinguishable from a live one and
-    /// the instance was never woken by peer mail again.
-    #[test]
-    fn a_dead_listener_goes_stale_so_the_nudge_comes_back() {
-        let dir = std::env::temp_dir().join(format!("mulpex-armed-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 4);
-        let armed = dir.join("armed");
-        std::fs::create_dir_all(&armed).unwrap();
-        let flag = armed.join("4");
-
-        assert!(!listener_armed(&ctx), "never armed");
-
-        std::fs::write(&flag, "").unwrap();
-        assert!(listener_armed(&ctx), "just touched — the listener is alive");
-
-        // Age the heartbeat past the grace: the monitor expired and stopped
-        // touching it, while the file it wrote sits there forever.
-        let stale = SystemTime::now() - LISTENER_HEARTBEAT_GRACE - Duration::from_secs(5);
-        std::fs::File::options()
-            .write(true)
-            .open(&flag)
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
-        assert!(
-            !listener_armed(&ctx),
-            "an expired listener must read as unarmed, or nothing ever re-arms it"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The pre-`003ad33` listener command: it `touch`es `armed/<id>` once at
-    /// startup and never again. Sessions that were already running keep re-arming
-    /// this out of their own conversation history, so the hook has to recognise
-    /// it as a listener *and* as one that can never report itself alive.
-    const SUPERSEDED_LISTENER_CMD: &str = r#"INBOX=\"$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID\"; ARMED=\"$MULPEX_STATE_DIR/armed\"; mkdir -p \"$INBOX\" \"$ARMED\"; touch \"$ARMED/$MULPEX_INSTANCE_ID\"; prev=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); while true; do cur=$(ls -1 \"$INBOX\" 2>/dev/null | wc -l | tr -d \" \"); if [ \"$cur\" -gt \"$prev\" ]; then echo \"mulpex: $((cur - prev)) new hub message(s)\"; fi; prev=$cur; sleep 1; done"#;
-
-    fn stop_with_tasks(tasks: &str) -> Option<serde_json::Value> {
-        payload(&format!(
-            r#"{{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{tasks}],"session_crons":[]}}"#
-        ))
-    }
-
-    /// The state only `Stop` can see, and the whole reason `relisten/<id>` exists.
-    ///
-    /// A listener running the superseded command never refreshes the heartbeat, so
-    /// `listener_armed` is false on every turn, so the arm nudge fires on every
-    /// turn, so a fresh Monitor stacks on every turn — measured on a live instance
-    /// that reached three simultaneously. `UserPromptSubmit` cannot see this
-    /// (its payload carries no `background_tasks`, measured against a real
-    /// `claude` v2.1.273), which is why the detection has to happen at `Stop` and
-    /// be handed forward on disk.
-    #[test]
-    fn stop_records_a_listener_that_cannot_report_itself_alive() {
-        let dir = std::env::temp_dir().join(format!("mulpex-relisten-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 4);
-        std::fs::create_dir_all(dir.join("armed")).unwrap();
-        std::fs::create_dir_all(dir.join(crate::RELISTEN_DIR)).unwrap();
-        let note = relisten_path(&ctx);
-
-        // A healthy listener: heartbeat fresh, exactly one of it. Nothing to say.
-        std::fs::write(dir.join("armed").join("4"), "").unwrap();
-        note_listener_needs_replacing(
-            &ctx,
-            stop_with_tasks(&format!(
-                r#"{{"id":"bok","type":"shell","status":"running","command":"{LISTENER_CMD}"}}"#
-            ))
-            .as_ref(),
-        );
-        assert!(!note.exists(), "a listener that reports itself alive needs no repair");
-
-        // The superseded command: running, but the heartbeat it wrote once has
-        // gone stale and never will refresh.
-        let stale = SystemTime::now() - LISTENER_HEARTBEAT_GRACE - Duration::from_secs(5);
-        std::fs::File::options()
-            .write(true)
-            .open(dir.join("armed").join("4"))
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
-        note_listener_needs_replacing(
-            &ctx,
-            stop_with_tasks(&format!(
-                r#"{{"id":"bstale1","type":"shell","status":"running","command":"{SUPERSEDED_LISTENER_CMD}"}}"#
-            ))
-            .as_ref(),
-        );
-        assert_eq!(std::fs::read_to_string(&note).unwrap(), "bstale1");
-
-        // Two listeners is the same failure one step later, and is what the user
-        // actually sees: one hub message, two wake-ups. Recorded even when the
-        // heartbeat is fine, because the duplicate still doubles every event.
-        std::fs::write(dir.join("armed").join("4"), "").unwrap();
-        note_listener_needs_replacing(
-            &ctx,
-            stop_with_tasks(&format!(
-                r#"{{"id":"b1","type":"shell","status":"running","command":"{LISTENER_CMD}"}},
-                   {{"id":"b2","type":"shell","status":"running","command":"{LISTENER_CMD}"}}"#
-            ))
-            .as_ref(),
-        );
-        assert_eq!(std::fs::read_to_string(&note).unwrap(), "b1 b2");
-
-        // No listener at all is the ordinary unarmed case — the plain nudge's job,
-        // not a repair. A leftover note must be cleared, or the instance is told
-        // to stop a task that is already gone.
-        note_listener_needs_replacing(&ctx, stop_with_tasks("").as_ref());
-        assert!(!note.exists(), "nothing running means nothing to replace");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The nudge has to name the tasks to stop, or the instance dutifully arms an
-    /// Nth Monitor beside the ones already piling up. And it is consumed on read:
-    /// once the repair has been asked for, the next turn's nudge is the ordinary
-    /// one again.
-    #[test]
-    fn the_repair_nudge_names_the_tasks_and_is_consumed() {
-        let dir = std::env::temp_dir().join(format!("mulpex-relisten-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 4);
-        std::fs::create_dir_all(dir.join(crate::RELISTEN_DIR)).unwrap();
-
-        // Both forms spell the command out rather than pointing at the rules —
-        // a pointer is what let a superseded copy in the conversation win.
-        // The command is spelled from `rules::listener_command`, the same source
-        // `HUB_RULES` prints — one spelling, so a model is never choosing between
-        // two. (Under `cargo test` the running binary is the test harness, not
-        // `mulpex-helper`; in production the hook *is* the helper, which is how it
-        // can name its own path. `rules::hub_rules_carry_the_exact_arming_command`
-        // is where the real path is checked against `is_hub_listener`.)
-        let cmd = crate::rules::listener_command(&std::env::current_exe().unwrap());
-        let plain = arm_listener_nudge(&ctx);
-        assert!(plain.starts_with(ARM_LISTENER_NUDGE));
-        assert!(
-            plain.contains(&cmd),
-            "the nudge must carry the command itself, not a reference to it"
-        );
-
-        std::fs::write(relisten_path(&ctx), "bstale1 bstale2").unwrap();
-        let nudge = arm_listener_nudge(&ctx);
-        assert!(nudge.starts_with(RELISTEN_NUDGE), "the repair instruction, not the plain one");
-        assert!(nudge.ends_with("bstale1 bstale2"), "names the tasks to TaskStop");
-        assert!(nudge.contains(&cmd), "and the command to arm instead");
-        assert!(
-            nudge.contains("do NOT copy the Monitor call from earlier in this conversation"),
-            "copying its own superseded call out of history is the failure being repaired"
-        );
-        assert!(!relisten_path(&ctx).exists(), "consumed on read");
-        assert!(arm_listener_nudge(&ctx).starts_with(ARM_LISTENER_NUDGE));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Red is reserved for a pending question or plan, and a `Notification` can
     /// neither light it nor put it out.
     ///
@@ -2798,22 +2495,48 @@ assuming it completed.</summary>\n</task-notification>";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The gate that decides whether a turn is allowed to be asked to arm.
+    /// The gate that decides whether a turn may be asked to go and name itself.
     #[test]
-    fn only_a_wake_we_asked_for_is_allowed_to_re_arm() {
+    fn only_a_wake_we_asked_for_carries_a_nudge() {
         assert!(
             nudges_welcome(false, false),
-            "the user talking stopped being nudged — instances never arm or name themselves"
+            "the user talking is the turn a nudge is meant to ride on"
         );
         assert!(
             !nudges_welcome(true, false),
-            "restart noise is still asked to arm, which is the loop itself"
+            "restart noise must not be asked to do housekeeping"
         );
         assert!(
             nudges_welcome(true, true),
-            "\u{2318}\u{21e7}R's own wake was not allowed to re-arm, so the restarted \
-             instance stays deaf to hub mail with nothing to say so"
+            "\u{2318}\u{21e7}R's own wake is sanctioned, and was the case a bare \
+             `system_turn` check silently broke"
         );
+    }
+
+    /// A doorbell arrives through the same field as a typed prompt and must land
+    /// on the system side of every decision that follows.
+    ///
+    /// Both halves matter and neither is visible at runtime: if a doorbell read as
+    /// the user, `tasks/<id>` would show Mulpex's own plumbing text as what this
+    /// instance is working on, and `userprompt/<id>` would unmute a ⌘M'd row every
+    /// time a peer messaged it. If a real prompt read as a system turn, the
+    /// instance would never be asked to name itself.
+    #[test]
+    fn a_doorbell_is_not_the_user_talking() {
+        assert!(
+            is_system_turn(&crate::doorbell_line(1)),
+            "the doorbell Mulpex types is Mulpex talking, not the user"
+        );
+        assert!(is_system_turn(&crate::doorbell_line(6)), "any count, not just one");
+        assert!(is_system_turn("<task-notification>done</task-notification>"));
+
+        assert!(!is_system_turn("fix the parser"), "an ordinary prompt is the user");
+        assert!(
+            !is_system_turn("what does <<<MPX>>> mean?"),
+            "the marker has to be at the HEAD of the prompt — asking about it is not being rung"
+        );
+        // A doorbell is never nudged, because it is a system turn.
+        assert!(!nudges_welcome(is_system_turn(&crate::doorbell_line(1)), false));
     }
 
     /// `SessionStart` fires for startup, resume and clear as well as compaction,

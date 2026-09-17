@@ -1942,3 +1942,106 @@ condition removed**: `left: "working" right: "needs"` on the agent's first `Tool
 - **Live in the shipped `.app`.** The probe drove a standalone `claude`, not a Mulpex pane; the
   status file it would have written was inferred from the hook events, not read off a running
   instance.
+
+## 2026-09-17 — the doorbell replaces the hub listener, and `mpx` is deleted
+
+Driven against a real `npm run tauri dev` build (`~/.mulpex-dev`, its own projects), with a
+debug-only `[doorbell]` trace printing why each ring fired or was held. The user QA'd in the window;
+the numbers below are from the app's own stderr, not from a stopwatch.
+
+### What forced it
+
+- **`persistent: true` is gone from `Monitor` and the cap is 30 minutes** — confirmed live, not from
+  release notes: a call with `timeout_ms: 3600000` came back `expires in 30m`. The schema's
+  `maximum: 3600000` is dead weight. Removed in Claude Code v2.1.271 (2026-09-14);
+  anthropics/claude-code#94553, and the requested-but-unimplemented `SessionIdle` hook is #94812.
+- **Observed cost, from the user's own panes:** `warweb#74` woke at 12:05, 12:35, 1:05, 1:35, 2:05
+  and `warweb#81` at 11:43, 12:13, 12:43, 1:13, 1:43, 2:13 — exact 30-minute spacing, ~48 wakes a
+  day each. Each one also files an `explainreq/<id>` (`hook.rs` `stop` is unconditional), so a
+  headless Sonnet summarised a turn that said "Re-armed. Nothing changed" — ~96 model calls a day
+  per idle instance. **This session re-armed three times while fixing it.**
+- **No alternative wake channel exists.** Checked against the Claude Code docs: hooks cannot reach
+  an idle session, MCP channels only deliver to a session already live, and nothing else can
+  originate a turn. A keystroke can, and Mulpex owns the PTY.
+
+### Measured latency
+
+| Case | Result |
+| --- | --- |
+| Message → doorbell typed, untouched pane | **82 ms** (and 102 ms, 152 ms on other runs) |
+| Same, under the first design's 3 s quiet timer, into a pane just typed in | **3051 ms** |
+| Old listener | 1 Hz poll, so ~500 ms average, 1 s worst case |
+
+End-to-end round trip measured by the instances themselves was 9.81 s, and that number is *not*
+the transport: it is the recipient's model turn. The doorbell's share is the 82 ms.
+
+### The draft guard took three designs, two of which shipped to the user
+
+Mulpex cannot read `claude`'s input box, so it infers from the bytes it forwards. Both failures were
+found by the user in normal use, neither produced any error:
+
+1. **3 s quiet timer** — cost every round trip 3 s (above) *and* protected nothing: a person
+   composing a prompt pauses longer than that, after which the doorbell appended itself to the draft
+   and submitted it. Caught by the user asking the right question before it bit him.
+2. **"Was the last key Return"** — safe but latching. Clicking a pane, scrolling it or an arrow key
+   all arrive through xterm's `onData` like keystrokes, so any of them silenced that pane until the
+   next Return. Reported as *"now they read my messages only after ENTER."*
+3. **Counting the box** (`pty::draft_len_after`) — typing adds, backspace removes, Return/Ctrl+C/
+   Ctrl+U zero it, escape sequences change nothing, UTF-8 lead bytes counted so Hebrew is one
+   character each. Resynced on the edge into `working`, since a turn starting proves the box was
+   emptied. Confirmed by the user, including backspace returning a pane to ringable.
+
+**What actually found both:** printing the *reason* a gate held. `[doorbell] claude#5: holding 1
+message(s) — …` turned an unexplained 11.3 s wait into a one-line answer. Before that, two wrong
+hypotheses (the sender's turn; focus events) both looked plausible and both were wrong — #4, the
+pane the user had typed in, rang in 152 ms while #5, the one he was only watching, waited 11326 ms.
+
+### A probe that measured nothing
+
+Writing a message straight into `inbox/<id>/` to time the doorbell returned "file disappeared at
++0.103s" — which was not the doorbell. That project's claudes were **dead**, so `live` was empty,
+`bounce_dead_inbox` deleted the mail as undeliverable, and `ring_doorbells` had no sessions to
+iterate. The instrument was measuring reaping. Check that the thing under test is alive before
+trusting a reading from it.
+
+### `mpx` deleted
+
+`crates/mulpex-cli/` removed entirely (25 files) along with its workspace entry and lockfile
+package. The user's reason was that two things called Mulpex confused every conversation about
+either. It was also the host that *could not* have the draft guard: tmux owns its PTYs, so `mpx`
+never sees a keystroke at all.
+
+Kept deliberately, with their reasons rewritten to survive the example: `SessionStore::in_home`
+(the ambient-`MULPEX_HOME` hazard belongs to the design, not to its one caller), `listen.rs` +
+`command_is_hub_listener` + `reap_orphaned_listeners` (released builds are running listeners right
+now, and agentalk's watchers share the shape), and the `armed/` deletion in ⌘⇧R.
+
+`rules::listener_command` was deleted: zero callers, and its doc asserted the orphan reaper matched
+"on this shape" when the reaper matches `hook.rs`'s own constants.
+
+### Tests
+
+96 `mulpex_lib` + 117 `mulpex-core`, all passing. New: `draft_len_after` across typing, backspace,
+focus/arrow/mouse sequences, meta-Return, Ctrl+C/U and Hebrew; `should_ring` across all four gates
+including the plural; `is_system_turn` for the doorbell; `hub_rules_carry_the_doorbell_contract`;
+`doorbell_is_not_a_remote_signal` (`DOORBELL_PREFIX` literally begins with `remote::SIG_OPEN`);
+`the_peer_snapshot_says_which_instance_you_are`.
+
+### Also fixed, found while measuring
+
+**The hub never told an instance its own address.** `peers_context` listed every peer and omitted
+the reader, so an instance signing a message guessed — `claude#4` opened one with "Hi from
+claude#1", having never called `hub_instances`. Delivery was correct throughout; only the prose a
+human reads was wrong. Predates the doorbell by as long as the peer snapshot has existed.
+
+### Not verified
+
+- **The `needs` gate.** That a doorbell does not fire into a pane showing an `AskUserQuestion` or a
+  plan dialog is covered by a unit test on `should_ring` and by nothing else. **It is the one
+  remaining way this can do real damage** — a keystroke there picks an option and the `\r` confirms
+  it — and it has never been driven against a live dialog.
+- **The plural, live.** Six messages arriving at once producing one doorbell is unit-tested only.
+- **The absence.** No run longer than ~1 hour has been observed confirming that an idle instance now
+  takes zero turns. That is the entire point of the change and it is the least-proven claim in it.
+- **The shipped `.app`.** Everything above is `tauri dev`. The `[doorbell]` trace is
+  `#[cfg(debug_assertions)]`, so a release build is also the first one running this code silently.

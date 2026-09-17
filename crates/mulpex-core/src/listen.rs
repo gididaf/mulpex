@@ -102,8 +102,10 @@ fn read_pid(path: &Path) -> Option<libc::pid_t> {
 /// reparented to launchd still spinning. Six such orphans were found alive on one
 /// machine, the oldest more than a day old.
 ///
-/// A missing `pids/<id>` is deliberately *not* treated as death: `mpx` does not
-/// write one, and neither did any Mulpex before this shipped.
+/// A missing `pids/<id>` is deliberately *not* treated as death: no Mulpex before
+/// this shipped wrote one, and listeners armed by those builds are still running
+/// on this machine. (`mpx`, deleted 2026-09-17, did not write one either; the
+/// older-builds half is what keeps the leniency necessary.)
 fn owner_is_gone(w: &Watch) -> bool {
     match read_pid(&w.owner_pid) {
         Some(pid) => !alive(pid),

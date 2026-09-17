@@ -78,13 +78,21 @@ impl SessionStore {
 
     /// The same, under an **explicitly given** home.
     ///
-    /// The CLI needs this rather than `new`. `mulpex_home()` resolves through the
-    /// process-wide `MULPEX_HOME`, which `mpx` deliberately does not set — so a
-    /// store opened with `new` from `mpx` would land in the desktop app's
-    /// `~/.mulpex/sessions/`, and the two frontends would hand the same `--resume`
-    /// uuid to two claudes at once. That is silent conversation corruption, and it
-    /// is the exact case `mulpex-cli/src/statedir.rs` exists to prevent; passing
-    /// the home makes it impossible instead of merely documented.
+    /// **Any host that is not the desktop app must open the store through this,
+    /// never through `new`** — and the signature is what enforces it.
+    ///
+    /// `new` resolves its home through the process-wide `MULPEX_HOME`. A second
+    /// host that does not set that variable therefore lands in the desktop app's
+    /// own `~/.mulpex/sessions/` — not by making a mistake, but by *omitting* one
+    /// line — and the two then hand the same `--resume` uuid to two live claudes.
+    /// That is silent conversation corruption: nothing fails, nothing logs, and
+    /// the damage shows up as a mangled transcript later.
+    ///
+    /// This was written for `mpx`, the tmux host, which was deleted on 2026-09-17
+    /// and was the only caller. It is kept deliberately. The hazard belongs to the
+    /// *ambient-home* design, not to that binary, so it returns the moment anything
+    /// else links this crate — and taking an explicit `home` is what makes the bug
+    /// impossible to write rather than merely documented as forbidden.
     ///
     /// The filename is a readable tail of the path plus a stable FNV-1a hash of
     /// the full path, so it is unique per project, bounded in length, and stable

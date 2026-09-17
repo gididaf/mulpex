@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,11 +24,11 @@ use tauri::ipc::Channel;
 use crate::claude_bin;
 use crate::vtgrid::Recorder;
 
-/// The spawn-time text and the `hub_spawn` child's first prompt now live in
-/// `mulpex_core::rules`, shared with `mpx`. `HUB_RULES` is a two-process contract
-/// with `hook.rs` (the arming `touch`) and with `registry.rs` (the address
-/// grammar), so it has exactly one copy. Re-exported here because `state.rs`
-/// builds a `SpawnTask`.
+/// The spawn-time text and the `hub_spawn` child's first prompt live in
+/// `mulpex_core::rules`. `HUB_RULES` is a two-process contract with `hook.rs`
+/// (which has to recognise the doorbell it describes) and with `registry.rs` (the
+/// address grammar), so it has exactly one copy. Re-exported here because
+/// `state.rs` builds a `SpawnTask`.
 pub use mulpex_core::rules::SpawnTask;
 use mulpex_core::rules::{append_system_prompt, spawn_prompt};
 
@@ -216,6 +216,92 @@ impl OutputSink {
     }
 }
 
+/// How this chunk of the user's keystrokes changes the number of characters
+/// sitting in `claude`'s input box, given `before`.
+///
+/// Mulpex cannot read that box, so it counts what it forwards. Zero means empty,
+/// which is the doorbell's licence to type; anything above zero is a draft that
+/// must not be touched.
+///
+/// **Why counting, and not "was the last key Enter".** That was the first version
+/// and it latched: every byte that was not a Return marked the pane as drafting
+/// until the user pressed Enter, so clicking into a pane, scrolling it or pressing
+/// an arrow key silenced its doorbell indefinitely. Those are not typing at all —
+/// they are escape sequences, and the fix is to know the difference.
+///
+/// The rules, each earning its place:
+///
+/// - **Escape sequences are not text.** Arrow keys, focus reports (`\x1b[I`/`O`),
+///   mouse reports and bracketed-paste markers all arrive through `onData` exactly
+///   like a keystroke. They leave the box unchanged, so they are skipped.
+/// - **Meta-Return is the exception** — Shift+Enter / Option+Enter is mapped to
+///   `\x1b\r` (root `CLAUDE.md`) and inserts a newline *into* the prompt. It is an
+///   escape sequence that does add a character.
+/// - **A bare Return sends**, emptying the box.
+/// - **Backspace removes one**, so a line typed and then deleted comes back to
+///   zero and the doorbell is allowed again. The latching version could not do
+///   this at all.
+/// - **Ctrl+C and Ctrl+U clear the line** in `claude`'s input.
+/// - Counting UTF-8 *lead* bytes, not bytes, so one Hebrew character is one
+///   character and a two-byte letter cannot leave a phantom draft behind.
+///
+/// Errors resolve upward (toward "there is a draft"): being wrong that way makes
+/// mail wait visibly in the sidebar badge, while being wrong the other way submits
+/// something the user never wrote.
+fn draft_len_after(before: usize, bytes: &[u8]) -> usize {
+    let mut n = before;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                match bytes.get(i + 1) {
+                    // Meta-Return: a newline inside the prompt, not a send.
+                    Some(b'\r') | Some(b'\n') => {
+                        n += 1;
+                        i += 2;
+                    }
+                    // CSI / SS3: run to the final byte (0x40..=0x7e).
+                    Some(b'[') | Some(b'O') => {
+                        i += 2;
+                        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    // A bare ESC clears `claude`'s input box, but a lone ESC is
+                    // also how a sequence split across two reads begins. Left
+                    // alone on purpose: mis-reading a split arrow key as "the box
+                    // is empty" is the failure that loses a draft.
+                    _ => i += 2,
+                }
+            }
+            b'\r' | b'\n' => {
+                n = 0;
+                i += 1;
+            }
+            // Backspace / DEL.
+            0x08 | 0x7f => {
+                n = n.saturating_sub(1);
+                i += 1;
+            }
+            // Ctrl+C (clear input) and Ctrl+U (kill line).
+            0x03 | 0x15 => {
+                n = 0;
+                i += 1;
+            }
+            // Other C0 controls change no text.
+            c if c < 0x20 => i += 1,
+            // A UTF-8 continuation byte is the tail of a character already counted.
+            c if (0x80..0xc0).contains(&c) => i += 1,
+            _ => {
+                n += 1;
+                i += 1;
+            }
+        }
+    }
+    n
+}
+
 /// A live `claude` or shell process on a PTY, streaming to one frontend terminal.
 pub struct Session {
     pub id: usize,
@@ -236,6 +322,23 @@ pub struct Session {
     /// child is definitely up. `killpg` alone is not enough to tear a session
     /// down — see `kill`.
     tty_dev: Arc<AtomicU32>,
+    /// How many characters the user is believed to have sitting in `claude`'s
+    /// input box, maintained by `draft_len_after`. Zero is the doorbell's licence
+    /// to type into this pane.
+    ///
+    /// The doorbell reads it and nothing else does. Mulpex cannot see that box, so
+    /// it counts what it forwards — and two earlier models of this both failed in
+    /// the user's hands, which is why the counting one is worth its size:
+    ///
+    /// - **A quiet-period timer (3 s).** Slow where it should not be — a reply to
+    ///   the pane you had just typed in rang at 3051 ms against 82 ms for an
+    ///   untouched one — and no protection where it mattered, since anyone
+    ///   composing a prompt pauses for longer than a timer you would dare set, and
+    ///   the doorbell then fired straight into the draft.
+    /// - **"Was the last key Enter".** Safe but latching: clicking into a pane,
+    ///   scrolling it or pressing an arrow key all arrive through `onData`, so any
+    ///   of them silenced the doorbell until the next Return.
+    draft_len: Arc<AtomicUsize>,
     rows: u16,
     cols: u16,
 }
@@ -379,10 +482,16 @@ impl Session {
         // controlling terminal in the forked half and may not have got there
         // yet. First output is proof it has.
         let tty_dev = Arc::new(AtomicU32::new(0));
-        // Readiness signals for the one-shot hub-listener bootstrap: the reader
-        // thread marks when `claude` first paints (`saw_output`) and when it last
-        // emitted (`last_activity`), so the injector can wait until the initial UI
-        // has painted and then settled before typing into it.
+        // Readiness signals for the shell-seed thread below: the reader marks when
+        // the child first paints (`saw_output`) and when it last emitted
+        // (`last_activity`), so a seeded command waits for the shell to have
+        // started and settled before being typed into it.
+        //
+        // These once served a hub-listener bootstrap that typed into `claude`
+        // itself; that was deleted when a task moved to argv, and only the comment
+        // survived it. The doorbell does type into `claude`, but it is gated on the
+        // instance's hub *status* rather than on painting — see
+        // `Core::ring_doorbells`.
         let saw_output = Arc::new(AtomicBool::new(false));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         {
@@ -534,6 +643,11 @@ impl Session {
             recorder,
             child_pid,
             tty_dev,
+            // A freshly spawned `claude` has an empty input box. It has to start
+            // at zero or a spawned child could never be rung until the user typed
+            // into it by hand — and a child nobody ever types into is exactly the
+            // case `hub_spawn` creates.
+            draft_len: Arc::new(AtomicUsize::new(0)),
             rows,
             cols,
         })
@@ -544,13 +658,44 @@ impl Session {
         self.sink.attach(ch);
     }
 
-    /// Forward raw bytes to Claude's stdin (from xterm `onData`). Shares the PTY
-    /// writer (behind a mutex) with the one-shot hub-listener bootstrap thread.
+    /// Forward raw bytes to the child's stdin. Shares the PTY writer (behind a
+    /// mutex) with the shell-seed thread.
+    ///
+    /// Deliberately does **not** stamp `last_input`: this is also how Mulpex
+    /// writes the doorbell, and a doorbell that marked the pane as "the user is
+    /// typing" would suppress the next one. Keystrokes come in through
+    /// `send_from_user`.
     pub fn send(&mut self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(bytes);
             let _ = w.flush();
         }
+    }
+
+    /// `send`, plus tracking what the keystroke did to the input box. The one
+    /// caller is the `send_bytes` command (xterm `onData`).
+    pub fn send_from_user(&mut self, bytes: &[u8]) {
+        let before = self.draft_len.load(Ordering::Relaxed);
+        self.draft_len
+            .store(draft_len_after(before, bytes), Ordering::Relaxed);
+        self.send(bytes);
+    }
+
+    /// Whether this pane's input box is believed empty, and so safe for the
+    /// doorbell to type into.
+    pub fn input_box_empty(&self) -> bool {
+        self.draft_len.load(Ordering::Relaxed) == 0
+    }
+
+    /// Forget any draft we think this pane holds.
+    ///
+    /// The count can only drift upward (a key we read as text that `claude` did
+    /// not, a sequence split across two reads), and drift upward is silence: the
+    /// doorbell stops for a box that is actually empty. A finished turn is proof
+    /// the box *was* emptied, so the poll loop resyncs there rather than letting
+    /// an error live for the rest of the session.
+    pub fn clear_draft(&self) {
+        self.draft_len.store(0, Ordering::Relaxed);
     }
 
     /// Resize the PTY so the child re-lays-out. No-op if unchanged.
@@ -965,7 +1110,7 @@ fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// our own children (measured). `ppid == 1` is both available and exactly the
 /// signature that was observed. It is also safe by construction: a listener
 /// serving a live instance is a child of that `claude`, in this Mulpex or in
-/// another one or under `mpx`, and is therefore never matched.
+/// another one, and is therefore never matched.
 /// Split out from the kill so the selection can be tested without a test run
 /// SIGKILLing whatever orphans happen to be on the developer's machine.
 #[cfg(target_os = "macos")]
@@ -1144,6 +1289,53 @@ fn b64encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// What the doorbell's safety rests on: knowing whether the user has a draft
+    /// sitting in `claude`'s input box.
+    ///
+    /// Wrong in the permissive direction, Mulpex types into a half-written prompt
+    /// and submits it — the user loses the draft and sends something they never
+    /// wrote. Wrong in the strict direction, the doorbell goes quiet and mail
+    /// waits behind the sidebar badge. Both have now happened in the user's hands,
+    /// which is why each case below is spelled out.
+    #[test]
+    fn the_draft_count_tracks_what_is_in_the_input_box() {
+        // Typing fills it; Return empties it.
+        assert_eq!(draft_len_after(0, b"hi"), 2, "typing is a draft");
+        assert_eq!(draft_len_after(2, b"\r"), 0, "Return sends, so the box is empty");
+        assert_eq!(draft_len_after(0, "fix the parser\r".as_bytes()), 0, "paste-then-send");
+
+        // Typed, then deleted. The latching version could never come back from
+        // this — the pane stayed silent until the next Return.
+        assert_eq!(draft_len_after(0, b"ab\x7f\x7f"), 0, "deleted back to empty");
+        assert_eq!(draft_len_after(1, b"\x7f\x7f"), 0, "never underflows");
+
+        // NOT typing. All three arrive through `onData` exactly like a keystroke,
+        // and treating them as text is what made clicking into a pane silence its
+        // doorbell for the rest of the session.
+        assert_eq!(draft_len_after(0, b"\x1b[I"), 0, "focus in");
+        assert_eq!(draft_len_after(0, b"\x1b[O"), 0, "focus out");
+        assert_eq!(draft_len_after(0, b"\x1b[A"), 0, "arrow key");
+        assert_eq!(draft_len_after(0, b"\x1b[<0;10;5M"), 0, "mouse report");
+        assert_eq!(draft_len_after(3, b"\x1b[C"), 3, "and they leave a real draft alone");
+
+        // Shift+Enter / Option+Enter is mapped to meta-Return: a newline INSIDE
+        // the prompt, not a send. Read as a send, the doorbell would ring into the
+        // middle of a multi-line prompt.
+        assert_eq!(draft_len_after(5, b"\x1b\r"), 6, "meta-Return adds a line, not a send");
+        assert_eq!(draft_len_after(5, b"\x1b\n"), 6);
+
+        // Clearing the line.
+        assert_eq!(draft_len_after(9, b"\x03"), 0, "Ctrl+C clears the input");
+        assert_eq!(draft_len_after(9, b"\x15"), 0, "Ctrl+U kills the line");
+
+        // One Hebrew character is one character, not two. The user works in
+        // Hebrew, so a byte count would leave a phantom draft after every word.
+        assert_eq!(draft_len_after(0, "שלום".as_bytes()), 4);
+        assert_eq!(draft_len_after(0, "שלום\r".as_bytes()), 0);
+
+        assert_eq!(draft_len_after(4, b""), 4, "nothing said changes nothing");
+    }
+
     /// The selection behind the one cleanup nothing else in this file can do —
     /// and the one that has to be *narrow*, because it reaches into the process
     /// table and SIGKILLs, with no undo.
@@ -1151,7 +1343,7 @@ mod tests {
     /// Both halves are load-bearing and each is the whole test on its own:
     /// **orphaned** without **listener** is every stray daemon on the machine;
     /// **listener** without **orphaned** is every listener still serving a live
-    /// instance — in this Mulpex, in a second one, or under `mpx`.
+    /// instance — in this Mulpex or in a second one.
     ///
     /// The obvious third condition, "names a dead scratch root", is deliberately
     /// absent and cannot be added: a legacy listener's argv spells its state dir

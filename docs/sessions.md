@@ -312,10 +312,10 @@ adds:
   (`seed_watchers_template`, never overwriting) purely so the mechanism is findable without reading
   source. The template is asserted to parse to **zero** patterns: an example line that wasn't a
   comment would silently exempt it on every machine that ever launched Mulpex.
-- **The listener-specific matchers stayed listener-specific.** `running_listener_ids` /
-  `note_listener_needs_replacing` (the re-arm nudge) and `pty::reap_orphaned_listeners` still match
-  only `command_is_hub_listener`. Widening those would have Mulpex offering to replace agentalk's
-  poll loop.
+- **The listener-specific matcher stayed listener-specific.** `pty::reap_orphaned_listeners`
+  matches only `command_is_hub_listener`, never `command_is_watcher`. It SIGKILLs, and widening it
+  would have Mulpex killing agentalk's poll loop. (The re-arm nudge that shared this matcher is gone
+  with the listener; the reaper is not — released builds are still starting them.)
 
 #### `watching/<id>`: idle to the sidebar, busy to the updater
 
@@ -340,36 +340,39 @@ with the hub listener → the same; plus `npm test` → `working` + both flags; 
 `watchers.txt` flipped a `kafka-console-consumer` command from `working` to `waiting`, which is the
 user-list path end to end. → [verification-log.md](verification-log.md)
 
-### The listener expires, so `armed/<id>` is a heartbeat
+### The listener expired every 30 minutes, so it was deleted
 
-Removing persistent Monitors broke a second thing, quieter and worse: **every monitor now expires**
-(30 min at most). The hub listener is therefore not permanent, and when it stops, peer mail can no
-longer wake an idle instance — the whole point of arming it.
+**Superseded 2026-09-17 by the doorbell** ([hub.md](hub.md#the-doorbell--idle-wake)). Kept here
+because the status machinery still carries its shape, and because the ending is the point.
 
-The arm nudge is the only thing that ever gets one re-armed, and it was gated on `armed/<id>`
-*existing*. The dead listener's flag sits there forever, so the nudge never came back and the
-instance went deaf silently, with nothing anywhere saying so.
+Removing persistent Monitors broke the hub listener quietly: **every monitor expires** (30 min at
+most), so peer mail could no longer wake an idle instance — the whole reason for arming one. The
+first fix made `armed/<id>` a **heartbeat rather than a flag**, so a dead listener went stale within
+seconds and the arm nudge returned by itself instead of the instance going deaf in silence.
 
-So `armed/<id>` is now a **heartbeat, not a flag**: the `HUB_RULES` command `touch`es it when it
-starts *and again on every pass of its one-second loop*, and `hook::listener_armed` tests the
-file's **mtime** against `LISTENER_HEARTBEAT_GRACE` (30 s) rather than its existence. A listener
-that dies goes stale within seconds and the nudge returns by itself. `HUB_RULES` also tells the
-instance to re-arm immediately when it is told its monitor expired, which is the fast path; the
-heartbeat is the one that does not depend on the model noticing.
+That worked, and it was still the wrong shape. The nudge returning *is* a wake: an instance that
+had nothing to do woke twice an hour to start a new Monitor, and each of those turns also filed an
+`explainreq/<id>`, so a headless Sonnet summarised a turn whose entire content was "re-armed,
+nothing changed" — around 96 model calls a day, per instance, forever. The triangle has no interior
+solution: instant wake needs a live Monitor, a live Monitor needs re-arming, re-arming needs a turn.
+Only moving the watch out of the instance and into the host escapes it.
 
-- **The grace is 30 s for a one-second heartbeat** — wide enough for a slept machine or a loaded
-  box, still far inside the 30-minute expiry it exists to catch.
-- **A clock that moved backwards reads as alive.** `elapsed()` errors there, and nudging an
-  instance whose listener is probably fine is the worse failure.
-- **`HUB_RULES` must not ask for `persistent` any more.** The Monitor tool's schema is
-  `additionalProperties: false`, so passing it is now rejected outright — an instruction that would
-  have made a literal-minded instance fail to arm at all. Asserted absent by the same rules test.
+What remains in *this* file's subject matter:
 
-Pinned by `a_dead_listener_goes_stale_so_the_nudge_comes_back`, confirmed to fail with
-`listener_armed` reverted to `.exists()`. Driven end to end afterwards: the `HUB_RULES` command run
-as literal shell ticks the mtime every second (1789538468 → 1789538470 over two seconds), and
-through the real `mulpex-helper`, a fresh heartbeat emits no arm nudge while a 120-s-old one and a
-missing flag both do.
+- **`command_is_watcher` still matters**, and more than before — see the two sections above. Legacy
+  listeners from released builds are running now, and agentalk's watchers have the same shape.
+- **`armed/<id>`, `listeners/<id>`, `relisten/<id>`** are still written by those legacy listeners
+  and read by nothing. Removable once no released build is in the wild.
+- **A doorbell turn is a system turn.** `hook::is_system_turn` classes it with a
+  `<task-notification>`, so it does not overwrite the sidebar task and — the half that bites —
+  does not write `userprompt/<id>`, which would unmute a ⌘M'd row on every peer message.
+
+Two details worth keeping from the heartbeat design, because the same reasoning recurs:
+
+- **A grace of 30 s for a one-second heartbeat** — wide enough for a slept machine or a loaded box,
+  far inside the 30-minute expiry it existed to catch.
+- **A clock that moved backwards read as alive.** `elapsed()` errors there, and the wrong failure
+  was the one that nudges an instance whose listener is fine.
 
 ### Compaction is work too
 
@@ -620,14 +623,16 @@ Five things it does that are not obvious:
 - **The status file and `armed/<id>` are deleted.** Both are assertions about a process that no
   longer exists. A claude killed while it was waiting on the user would go on telling the sidebar,
   the dock badge and every peer that it `needs` something (removing the file reads as `waiting`,
-  `mcp::status_of`'s default, which is the truth about a claude that is booting). `armed/` is worse:
-  it tracks a live hub-listener Monitor, so left behind, the hook skips the arm nudge for good and
-  the resumed instance is never woken by hub mail again — silently. The inbox, the task line and
-  `named/<id>` are deliberately kept: they describe the *instance*, which is the thing being kept.
-- **…and `resumed/<id>` is written, which is what lets it re-arm at all.** Clearing `armed/<id>`
-  only creates the obligation; something still has to make the resumed child take a turn, and with
-  no task on its command line the only thing that does is the "orphaned background task" wake its
-  dead Monitor produces. The `UserPromptSubmit` hook **swallows that wake by default** — it is what
+  `mcp::status_of`'s default, which is the truth about a claude that is booting). `armed/<id>` is
+  cleared too — it asserted that a hub-listener Monitor was alive, and left behind it used to make
+  the hook skip the arm nudge for good, so the resumed instance was never woken by hub mail again,
+  silently. Since the doorbell that flag drives nothing; the deletion stays because a stale
+  assertion about a dead process is worth nothing to keep. The inbox, the task line and `named/<id>`
+  are deliberately kept: they describe the *instance*, which is the thing being kept.
+- **…and `resumed/<id>` is written, which is what lets the resumed child take a turn at all.**
+  With no task on its command line, the only thing that starts one is the "orphaned background task"
+  wake produced by whatever it had running — a legacy hub listener, an agentalk watcher, any
+  background command. The `UserPromptSubmit` hook **swallows that wake by default** — it is what
   made every instance open itself after an app update — so ⌘⇧R has to mark its own wake as wanted.
   The flag is consumed on read, so the *next* app restart of that instance is ordinary noise again.
   This is the one place the two `--resume` paths need opposite answers to the identical

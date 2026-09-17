@@ -47,6 +47,32 @@ pub fn mulpex_home() -> std::path::PathBuf {
 /// injected prompt in `src-tauri`'s `pty.rs` must begin with this exact string.
 pub const MULPEX_SENTINEL: &str = "[mulpex:hub]";
 
+/// Prefix on the **doorbell**: the one line Mulpex types into an idle instance's
+/// input box to tell it peer mail has arrived. It replaces the hub-listener
+/// Monitor, which since Claude Code v2.1.271 expires after 30 minutes at most and
+/// so woke every instance twice an hour purely to re-arm itself.
+///
+/// It is a doorbell and not a delivery: the message body stays in
+/// `inbox/<id>/*.json` and is read with `hub_inbox`, exactly as when a listener
+/// printed the wake. Only the trigger is typed, and it has to stay this short —
+/// `claude` reads a fast burst as a paste and truncates it at one tty read
+/// (measured: 1022 characters, silently). See `rules.rs`'s INCOMING MESSAGES,
+/// which tells the instance what this line means; the two must not drift.
+///
+/// **Not to be confused with `remote.rs`'s `<<<MPX …>>>` signal marker.** That one
+/// is matched in a shell terminal's *transcript*, this one at the head of a
+/// *prompt*, so they cannot collide in code — but the near-identical spelling is
+/// the kind of thing this repo has drifted on before, and
+/// `doorbell_is_not_a_remote_signal` pins them apart.
+pub const DOORBELL_PREFIX: &str = "<<<MPX>>>";
+
+/// The doorbell line for `n` waiting messages. One spelling, in `mulpex-core`,
+/// because two processes have to agree on it: `src-tauri`'s poll loop types it and
+/// the `UserPromptSubmit` hook recognises it.
+pub fn doorbell_line(n: usize) -> String {
+    format!("{DOORBELL_PREFIX} {n} new hub message(s)")
+}
+
 /// Where an instance asks Mulpex to name its own sidebar row (`hub_set_name`):
 /// one file per instance under `<state_dir>/namereq/`, holding the label. Written
 /// by the helper, consumed by the app's poll loop (`Core::process_name_requests`).
@@ -138,10 +164,9 @@ pub fn user_prompt_path(state_dir: &std::path::Path, id: usize) -> std::path::Pa
 /// if it is safely idle. The refusal `hub_close` reports when it was called
 /// without `force`.
 ///
-/// It lives here rather than in either frontend because both of them answer this
-/// question — the desktop app's poll loop and the `mpx` daemon each apply the
-/// same request — and a policy about when it is safe to kill someone's work is
-/// exactly the kind of thing that must not drift between two copies.
+/// It lives here, beside the `hub_close` that asks the question, rather than in
+/// the app that answers it: a policy about when it is safe to kill someone's work
+/// should be stated once, where the refusal text and the rule cannot drift apart.
 ///
 /// **The delivery mark is checked before the status, and that order is the whole
 /// point.** A just-spawned instance whose task has not been typed in yet has
