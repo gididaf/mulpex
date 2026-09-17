@@ -10,7 +10,10 @@
 /// Claude Code settings injected per session via `--settings`, wiring lifecycle
 /// hooks for both the status dots and the file-locking coordinator.
 ///
-/// **Status dots** — `UserPromptSubmit`/`PostToolUse` → working;
+/// **Status dots** — `UserPromptSubmit` → working; `PostToolUse` → working
+/// *unless a dialog is waiting and this is not that dialog's own tool*, because a
+/// background agent's tool calls fire `PostToolUse` in the parent session and used
+/// to paint over the red (see `hook::write_working_unless_a_dialog_waits`);
 /// `PreToolUse[AskUserQuestion]` → needs (via `<helper> hook askq`, which also
 /// hands the turn's transcript path to the Explainer so the pending question is
 /// explained while it sits on screen — it replaced a bare `printf needs` when

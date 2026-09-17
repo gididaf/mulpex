@@ -1087,8 +1087,44 @@ fn release_my_locks(ctx: &Ctx) {
     }
 }
 
+/// The tools whose `PostToolUse` legitimately ends a `needs`: answering the
+/// question, or approving/rejecting the plan. Their `PreToolUse` is what wrote
+/// `needs` in the first place (`askq`, `plan`), so this is the same pair read
+/// from the other end.
+const DIALOG_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+
+/// `PostToolUse`'s status write: `working`, unless a dialog is on screen and this
+/// is not that dialog's own tool call.
+///
+/// Split out of the handler so a test can drive it without stdin — the handler
+/// reads stdin to EOF, which never comes under a test runner. Same reason
+/// `write_needs` is split out of `askq`/`plan`.
+fn write_working_unless_a_dialog_waits(ctx: &Ctx, payload: &str) {
+    let status_path = ctx.state_dir.join(ctx.id_str());
+    let pending_dialog = read_field_or_line(&status_path).as_deref() == Some("needs");
+    if !pending_dialog || tool_name_is_dialog(payload) {
+        let _ = std::fs::write(&status_path, "working");
+    }
+}
+
+/// Is this `PostToolUse` payload the dialog's own — i.e. the user just answered?
+///
+/// A payload that will not parse, or carries no `tool_name`, reads as **not** the
+/// dialog: the failure that matters is clearing a red dot nobody attended to, so
+/// the unknown case leaves the question visible. (The opposite default would turn
+/// any malformed payload into a silently answered question.)
+fn tool_name_is_dialog(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .as_ref()
+        .and_then(|j| j.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|name| DIALOG_TOOLS.contains(&name))
+}
+
 /// Handle a PostToolUse event: keep the sidebar status `working` (preserving the
-/// old `printf` hook), and inject a mid-turn nudge (once) when (a) new hub mail
+/// old `printf` hook) *unless* a dialog is on screen, and inject a mid-turn nudge
+/// (once) when (a) new hub mail
 /// has arrived, (b) a peer this instance knew about has closed — so it stops
 /// messaging / waiting on / deferring to an instance that's gone — or (c) this
 /// instance still hasn't named its sidebar row. All three are deduped: mail via
@@ -1096,18 +1132,48 @@ fn release_my_locks(ctx: &Ctx) {
 /// (see `departed_peers`), naming via the per-turn `namenudge/<id>` count. At most
 /// one nudge is emitted per tool call (a hook can print only one decision), so the
 /// notes are combined.
+///
+/// ## Why the status write is conditional
+///
+/// **A background agent's tool calls fire `PostToolUse` in the PARENT session.**
+/// Measured on a real `claude` 2.1.274 (`scratchpad/askqprobe.py`, 2026-09-17):
+/// an instance that launches a background agent and then opens an
+/// `AskUserQuestion` dialog gets ~one `PostToolUse` every two seconds for as long
+/// as the agent runs, *while the dialog sits unanswered* —
+///
+/// ```text
+/// 11:44:30  PreToolUse   tool=AskUserQuestion      → needs
+/// 11:44:32  PostToolUse  tool=ToolSearch           → working   (the agent's)
+/// 11:44:35  PostToolUse  tool=Bash                 → working
+/// 11:44:36  Notification ntype=permission_prompt   → waiting (!)
+/// …20 more PostToolUse tool=Bash…
+/// 11:45:54  PostToolUse  tool=AskUserQuestion      → the answer, at last
+/// ```
+///
+/// — so an unconditional write painted over the one status that means "one
+/// keystroke from you unblocks this". And it did not stop at yellow: the dialog's
+/// own `permission_prompt` fires ~6 s later, `notification`'s needs-preserving
+/// guard found `working` rather than `needs` by then, and the row went **green**
+/// in front of a question nobody had answered.
+///
+/// It cannot be a blanket guard, because the event that *legitimately* ends a
+/// `needs` is also a `PostToolUse` — `tool=AskUserQuestion` at 11:45:54 above, the
+/// user's answer. So the rule is keyed on the tool: while the status reads
+/// `needs`, only `DIALOG_TOOLS` may clear it, and everything else leaves it
+/// alone.
+///
+/// The payload is parsed **only** in that state. This hook forks on every single
+/// tool call and the payload carries the whole `tool_response` (a `Read` of a big
+/// file, a long `Bash` output), so paying `serde_json` on the common path to learn
+/// one field would be the wrong trade — and a pending dialog is rare.
 fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
-    let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
-
-    // Drained but never parsed. This hook forks on EVERY tool call and the
-    // payload carries the whole `tool_response` (a Read of a big file, a long
-    // Bash output), so the cheapest thing it can do with it is nothing. It used
-    // to scan for `Monitor` and record persistent Monitors' task ids here; `Stop`
-    // now recognises the hub listener from its own command line instead, which is
-    // why there is nothing left to learn from this payload — see
-    // `background_work_running`.
+    // Drained whatever we do with it. It used to scan for `Monitor` and record
+    // persistent Monitors' task ids here; `Stop` now recognises the hub listener
+    // from its own command line instead (see `background_work_running`), so the
+    // only thing left worth reading out of it is the tool name.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    write_working_unless_a_dialog_waits(ctx, &input);
     drop(input);
 
     let mut notes: Vec<String> = Vec::new();
@@ -2293,6 +2359,70 @@ mod tests {
             !background_work_running(&ctx, Some(&mine), &patterns),
             "with the user's pattern it is a watcher"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `PostToolUse` fires for a BACKGROUND AGENT's tool calls in the parent
+    /// session, so an unconditional `working` painted over the `needs` that a
+    /// dialog had just written — and then, because `notification`'s guard had
+    /// nothing left to preserve, the dialog's own `permission_prompt` turned the
+    /// row **green** in front of an unanswered question.
+    ///
+    /// The sequence below is the measured one, timestamps and tool names verbatim
+    /// from a real `claude` 2.1.274 (`scratchpad/askqprobe.py`, 2026-09-17).
+    #[test]
+    fn a_background_agents_tool_calls_do_not_clear_a_pending_dialog() {
+        let dir = std::env::temp_dir().join(format!("mulpex-askq-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let status = ctx.state_dir.join("3");
+        let post = |tool: &str| {
+            format!(r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}","tool_response":{{}}}}"#)
+        };
+
+        // 11:44:29 the agent is launched — an ordinary tool call, ordinary yellow.
+        write_working_unless_a_dialog_waits(&ctx, &post("Agent"));
+        assert_eq!(std::fs::read_to_string(&status).unwrap(), "working");
+
+        // 11:44:30 PreToolUse[AskUserQuestion] → the row goes red.
+        write_needs(&ctx);
+
+        // 11:44:32 … 11:45:05 the agent's own calls, ~one every two seconds.
+        for tool in ["ToolSearch", "Bash", "Bash", "Bash", "Bash", "Bash"] {
+            write_working_unless_a_dialog_waits(&ctx, &post(tool));
+            assert_eq!(
+                std::fs::read_to_string(&status).unwrap(),
+                "needs",
+                "{tool} belongs to the background agent, not to the user's question"
+            );
+        }
+
+        // 11:44:36 the dialog's own permission_prompt. It only ever preserved
+        // `needs`; what makes that work is there being a `needs` left to find.
+        assert_eq!(notify_status(&ctx), "needs");
+
+        // 11:45:54 PostToolUse[AskUserQuestion] — the answer. THIS clears it, and
+        // it is the reason the guard cannot simply be "never overwrite needs".
+        write_working_unless_a_dialog_waits(&ctx, &post("AskUserQuestion"));
+        assert_eq!(std::fs::read_to_string(&status).unwrap(), "working");
+
+        // The same for a plan: `PreToolUse[ExitPlanMode]` writes needs, and only
+        // approving it clears the red.
+        write_needs(&ctx);
+        write_working_unless_a_dialog_waits(&ctx, &post("Read"));
+        assert_eq!(std::fs::read_to_string(&status).unwrap(), "needs");
+        write_working_unless_a_dialog_waits(&ctx, &post("ExitPlanMode"));
+        assert_eq!(std::fs::read_to_string(&status).unwrap(), "working");
+
+        // An unparseable or tool-less payload must NOT read as the answer: the
+        // failure that matters is a red dot cleared by something that was not the
+        // user.
+        write_needs(&ctx);
+        for junk in ["", "not json at all", r#"{"hook_event_name":"PostToolUse"}"#] {
+            write_working_unless_a_dialog_waits(&ctx, junk);
+            assert_eq!(std::fs::read_to_string(&status).unwrap(), "needs");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

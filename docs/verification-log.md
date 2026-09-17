@@ -1879,3 +1879,66 @@ subdir being rebuilt), `the_user_can_add_watcher_patterns_of_their_own`,
   Rust-side flag test and by inspection only; nothing exercised the real update banner.
 - **The seeded `watchers.txt` appearing on launch.** `seed_watchers_template_at` is tested directly;
   the `setup()` call site was not run.
+
+## 2026-09-17 — a question that reported itself as `working` (then as idle)
+
+Reported: "when I have AskUserQuestion triggered but claude also has some plan agent or something
+similar in the background, he appears as WORKING instead of NEED YOU."
+
+### Measured: a background agent's `PostToolUse` fires in the parent session
+
+`scratchpad/askqprobe.py` — real `claude` 2.1.274 on a PTY, all ten hooks wired to a recorder, one
+prompt that launches a background agent and *then* opens an `AskUserQuestion` dialog. The dialog was
+deliberately left unanswered for 90 s and answered at the end, so the same log shows both the
+clobbering and what legitimately clears red:
+
+```text
+11:44:24  UserPromptSubmit  prompt='Two steps, in this order…'
+11:44:29  PreToolUse        tool=Agent
+11:44:29  PostToolUse       tool=Agent
+11:44:29  SubagentStart
+11:44:30  PreToolUse        tool=AskUserQuestion        ← Mulpex writes `needs`
+11:44:32  PostToolUse       tool=ToolSearch             ← the AGENT's call
+11:44:35  PostToolUse       tool=Bash
+11:44:36  Notification      ntype=permission_prompt     ← the dialog's own, +6 s
+11:44:39 … 11:45:05         PostToolUse tool=Bash  ×20
+11:45:00  SubagentStop      bg=3
+11:45:09  SubagentStop      bg=1
+11:45:54  PostToolUse       tool=AskUserQuestion        ← I answered here
+11:45:54  UserPromptSubmit  prompt='<task-notification>…'
+11:45:54  UserPromptSubmit  prompt='<task-notification>…'
+11:45:56  Stop              bg=0
+```
+
+Four findings, three of which changed the fix:
+
+- **`PostToolUse` fires for the subagent's own tool calls, in the parent session**, ~one every two
+  seconds. `posttooluse` wrote `working` unconditionally, so the red lasted ~2 s.
+- **The row does not stop at yellow — it goes green.** The dialog fires its own `permission_prompt`
+  at +6 s (11:44:36). `notification` never clears `needs`, but by then there was no `needs` to
+  preserve, so it took the other branch and wrote `waiting`.
+- **The event that legitimately clears red is also a `PostToolUse`** (11:45:54, the answer), so the
+  guard cannot be "never overwrite `needs`". It is keyed on `tool_name` ∈ {`AskUserQuestion`,
+  `ExitPlanMode`}.
+- **`UserPromptSubmit` needed no guard after all.** Both `<task-notification>` turns from the
+  finished agent landed at 11:45:54, *after* the answer — the runtime queues an injected turn while
+  a dialog is up. It was going to be changed on the strength of the same inference that got
+  `PostToolUse` right; the log is the only reason it wasn't.
+
+Incidental: `SubagentStop` carries `background_tasks` too (`bg=3`, `bg=1`), so `Stop` is not the
+only hook that can see the task list — but it remains the only one at a *turn boundary*, which is
+what `bg/<id>` and `watching/<id>` are written from.
+
+### Tests
+
+`a_background_agents_tool_calls_do_not_clear_a_pending_dialog` replays that timeline verbatim
+(agent launch → `needs` → six agent tool calls → `notify_status` still `needs` → the answer clears
+it), plus the `ExitPlanMode` pair and three unparseable payloads. **Confirmed to fail with the
+condition removed**: `left: "working" right: "needs"` on the agent's first `ToolSearch`. 117
+`mulpex-core` tests.
+
+### Not verified
+
+- **Live in the shipped `.app`.** The probe drove a standalone `claude`, not a Mulpex pane; the
+  status file it would have written was inferred from the hook events, not read off a running
+  instance.

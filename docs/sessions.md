@@ -102,11 +102,54 @@ What still earns the hook its place is the downgrade: a turn that ended without 
 interrupt) leaves `working` behind, and the idle notification is the only event that then says
 otherwise.
 
-Red is cleared by anything that proves the instance moved on — `PostToolUse` (answering the
-question or approving the plan) writes `working`, `UserPromptSubmit` the same, `Stop` writes
-`waiting`. The one residual case is escaping the dialog and then doing nothing at all: the row
-stays red until the next prompt. It is a true statement about a question that was never answered,
-so it is left alone.
+Red is cleared by anything that proves the instance moved on — `PostToolUse` **for the dialog's own
+tool** (answering the question, approving the plan) writes `working`, `UserPromptSubmit` the same,
+`Stop` writes `waiting`. The one residual case is escaping the dialog and then doing nothing at all:
+the row stays red until the next prompt. It is a true statement about a question that was never
+answered, so it is left alone.
+
+#### "the dialog's own tool" is load-bearing: a background agent's `PostToolUse` fires here too
+
+`posttooluse` wrote `working` unconditionally, which was correct until an instance could be asking
+a question *and* running a background agent at the same time. **A background agent's tool calls
+fire `PostToolUse` in the PARENT session's hooks** — measured on a real `claude` 2.1.274
+(`scratchpad/askqprobe.py`, 2026-09-17), ~one every two seconds for as long as the agent runs, all
+of it while the dialog sat unanswered:
+
+```text
+11:44:29  PostToolUse  tool=Agent                → working  (launching it; fine)
+11:44:30  PreToolUse   tool=AskUserQuestion      → needs
+11:44:32  PostToolUse  tool=ToolSearch           → working  ← the agent's, not the user's
+11:44:35  PostToolUse  tool=Bash                 → working
+11:44:36  Notification ntype=permission_prompt   → waiting (!)
+          …20 more PostToolUse tool=Bash…
+11:45:54  PostToolUse  tool=AskUserQuestion      → the answer
+```
+
+Reported as "appears as WORKING instead of NEEDS YOU", and it was worse than that. The dialog's own
+`permission_prompt` fires ~6 s after `PreToolUse` (the same +6 s the plan dialog was measured at),
+and `notification`'s rule is *never clear `needs`* — but by 11:44:36 there was no `needs` left to
+preserve, so it took its other branch and wrote `waiting`. **The row went green in front of an
+unanswered question**, which is the one thing the whole `needs` narrowing exists to prevent.
+
+So the write is conditional, and keyed on **`tool_name`** rather than on `needs` alone: 11:45:54 is
+also a `PostToolUse`, and it is the user answering. While the status reads `needs`, only
+`DIALOG_TOOLS` (`AskUserQuestion`, `ExitPlanMode`) may clear it. Three things about the shape:
+
+- **The payload is parsed only while a dialog is pending.** This hook forks on *every* tool call and
+  carries the whole `tool_response` (a `Read` of a big file, a long `Bash` output), so `serde_json`
+  on the common path to learn one field is the wrong trade. The state that needs it is rare.
+- **A payload that will not parse, or has no `tool_name`, reads as NOT the dialog.** The failure
+  that matters is a red dot cleared by something that was not the user, so the unknown case leaves
+  the question visible.
+- **`UserPromptSubmit` did NOT need the same guard**, which was the surprise. Both
+  `<task-notification>` turns from the finished agent arrived at 11:45:54 — *after* the answer. The
+  runtime queues an injected turn while a dialog is on screen, so it cannot clobber one. Measured,
+  not assumed; it was going to be changed until the log said otherwise.
+
+Pinned by `a_background_agents_tool_calls_do_not_clear_a_pending_dialog`, which replays that exact
+timeline and is confirmed to fail with the condition removed (`left: "working" right: "needs"` on
+the agent's first `ToolSearch`).
 
 Everything keyed off `needs` narrows with it for free — the dock badge, the red tab badge and the
 desktop banner (`attention.ts`, `stores.ts::needsCount`) all read the same word.

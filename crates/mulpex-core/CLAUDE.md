@@ -57,6 +57,12 @@ Traps that live in this crate specifically:
   `PostToolUse`, not the idle notification (measured, `claude` v2.1.273). Anything that needs to
   know what is running has to be decided in `stop` and handed forward on disk, which is what
   `relisten/<id>` is. → [../../docs/hub.md](../../docs/hub.md)
+- **A background agent's tool calls fire `PostToolUse` in the PARENT session.** So does anything
+  else the instance started; the hook cannot tell whose call it is answering except by `tool_name`.
+  This is why `posttooluse` may not write `working` blindly: it ran ~once every two seconds over an
+  `AskUserQuestion` dialog, and once the red was gone the `permission_prompt` that follows it turned
+  the row green in front of an unanswered question. Only `DIALOG_TOOLS` may clear a `needs`.
+  → [../../docs/sessions.md](../../docs/sessions.md)
 - **The watcher list is generic; the listener matchers are not.** `command_is_watcher` (built-ins +
   `<mulpex home>/watchers.txt`) is what keeps a never-exiting background task from pinning a row
   yellow — the hub listener, agentalk's poll loop and events tail, anything the user adds. But
