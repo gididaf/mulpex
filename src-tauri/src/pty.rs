@@ -1023,7 +1023,7 @@ const KERN_PROCARGS2: libc::c_int = 49;
 /// no `MULPEX_*` in it (measured against a live orphan). So nothing here may be
 /// keyed on an environment variable; a legacy listener's argv names
 /// `$MULPEX_STATE_DIR` unexpanded and cannot tell you *which* state dir it serves.
-/// That is why `reap_orphaned_listeners` keys on the parent instead.
+/// That is why the reaper keys on the command line alone (`hub_listener_pids`).
 #[cfg(target_os = "macos")]
 fn argv_of(pid: libc::pid_t) -> Option<String> {
     // The buffer has to be `KERN_ARGMAX`, not whatever a sizing call reports.
@@ -1075,7 +1075,13 @@ fn argv_of(pid: libc::pid_t) -> Option<String> {
 }
 
 /// A process's parent pid, or `None` if it is gone.
-#[cfg(target_os = "macos")]
+///
+/// Test-only since the reaper stopped requiring `ppid == 1`: the selection no
+/// longer cares who a listener's parent is, but the test still has to prove its
+/// own fixture is genuinely parentless before asserting anything about it. Kept
+/// rather than inlined because "is this process an orphan" is a question this
+/// file has needed twice and will need again.
+#[cfg(all(target_os = "macos", test))]
 fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1091,34 +1097,45 @@ fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     (n == size).then_some(info.pbi_ppid as libc::pid_t)
 }
 
-/// SIGKILL every **orphaned** hub listener on this machine, and report how many.
+/// SIGKILL **every** hub listener on this machine, and report how many.
 ///
-/// This is the one cleanup no other code path can do. A listener runs in its own
-/// process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`,
-/// state `Ss`), so `Session::kill`'s `killpg` misses it and so does
-/// `kill_tty_session`. It outlives its `claude`, outlives app teardown, and is
-/// reparented to launchd still spinning `sleep 1` — six were found alive on one
-/// machine at once, the oldest more than a day old, belonging to a Mulpex that had
-/// exited the previous morning. `listen.rs` makes new listeners exit by
-/// themselves; this reaches the ones that predate that and the legacy shell loops
-/// that will never learn to.
+/// A listener runs in its own process group with no controlling terminal
+/// (measured: `PGID == pid`, `SESS 0`, state `Ss`), so `Session::kill`'s `killpg`
+/// misses it and so does `kill_tty_session`. It outlives its `claude`, outlives
+/// app teardown, and is reparented to launchd still spinning — six were found
+/// alive on one machine at once, the oldest more than a day old, belonging to a
+/// Mulpex that had exited the previous morning. Nothing else can reach one.
 ///
-/// **Orphanhood is the parent, not the path.** The obvious test — "does it name a
-/// scratch root that is dead?" — cannot be written: a legacy listener's argv
-/// spells its state dir as the literal `$MULPEX_STATE_DIR`, and the expanded value
-/// lives only in its environment, which `KERN_PROCARGS2` does not hand back for
-/// our own children (measured). `ppid == 1` is both available and exactly the
-/// signature that was observed. It is also safe by construction: a listener
-/// serving a live instance is a child of that `claude`, in this Mulpex or in
-/// another one, and is therefore never matched.
+/// **This used to require `ppid == 1`, and dropping that is the point.** While
+/// Mulpex still asked instances to arm a listener, a live-parented one was a
+/// listener doing its job, and killing it would have deafened a working instance.
+/// Since the doorbell, **Mulpex never starts one** — so any process matching
+/// `command_is_hub_listener` is unwanted by construction, whatever its parent.
+///
+/// It has to be unconditional because the rules cannot win the argument. The new
+/// `HUB_RULES` say "you do NOT arm anything", and an instance ignored that:
+/// `warweb#75`, spawned 2026-09-17 with the new prompt, went on arming a Monitor
+/// every 30 minutes through the night. Its transcript explains it — **141 arm
+/// calls reaching back to 2026-09-14**. A model copies its own last `Monitor`
+/// call before it re-reads the system prompt, so four days of self-evidence beat
+/// one sentence, exactly as `warweb#65` did 71 times. Prose cannot revoke a habit;
+/// killing the process can. Same lesson as argv-vs-TUI: put it on this side.
+///
+/// Safe for everything that is *not* ours: `command_is_hub_listener` matches only
+/// `mulpex-helper … listen` and the legacy inbox one-liner, never
+/// `command_is_watcher`'s wider set, so agentalk's poll loop and the user's own
+/// `watchers.txt` entries are untouched. And the death is quiet — Claude Code
+/// reports the killed Monitor as a "stopped, no completion record" wake, which
+/// `hook::orphaned_task_wake` already swallows.
+///
 /// Split out from the kill so the selection can be tested without a test run
-/// SIGKILLing whatever orphans happen to be on the developer's machine.
+/// SIGKILLing whatever listeners happen to be on the developer's machine.
 #[cfg(target_os = "macos")]
-fn orphaned_listener_pids() -> Vec<libc::pid_t> {
+fn hub_listener_pids() -> Vec<libc::pid_t> {
     let me = std::process::id() as libc::pid_t;
     all_pids()
         .into_iter()
-        .filter(|&pid| pid != me && pid > 1 && ppid_of(pid) == Some(1))
+        .filter(|&pid| pid != me && pid > 1)
         .filter(|&pid| {
             // One matcher, shared with the hook that excuses a listener from the
             // "still working" count — two spellings of "this is a listener" is how
@@ -1130,7 +1147,7 @@ fn orphaned_listener_pids() -> Vec<libc::pid_t> {
 
 #[cfg(target_os = "macos")]
 pub fn reap_orphaned_listeners() -> usize {
-    let pids = orphaned_listener_pids();
+    let pids = hub_listener_pids();
     for pid in &pids {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
@@ -1336,22 +1353,30 @@ mod tests {
         assert_eq!(draft_len_after(4, b""), 4, "nothing said changes nothing");
     }
 
-    /// The selection behind the one cleanup nothing else in this file can do —
-    /// and the one that has to be *narrow*, because it reaches into the process
-    /// table and SIGKILLs, with no undo.
+    /// The selection behind the one cleanup nothing else in this file can do, and
+    /// one that reaches into the process table and SIGKILLs, with no undo — so
+    /// what it must NOT match is as much of the test as what it must.
     ///
-    /// Both halves are load-bearing and each is the whole test on its own:
-    /// **orphaned** without **listener** is every stray daemon on the machine;
-    /// **listener** without **orphaned** is every listener still serving a live
-    /// instance — in this Mulpex or in a second one.
+    /// **A live parent is no longer a reprieve.** It was while Mulpex still asked
+    /// instances to arm a listener: killing a live-parented one would have
+    /// deafened a working instance. Since the doorbell nothing starts one, so a
+    /// running listener is unwanted whoever its parent is — and it has to be,
+    /// because `warweb#75` kept arming one every 30 minutes *while running the new
+    /// rules that say not to*, out of 141 arm calls in its own history.
     ///
-    /// The obvious third condition, "names a dead scratch root", is deliberately
+    /// What still narrows it is the **command match**, and that is now the only
+    /// thing standing between this and `kill -9` on arbitrary processes. It must
+    /// stay `command_is_hub_listener` (ours alone) and never widen to
+    /// `command_is_watcher`, which deliberately also covers agentalk's poll loop
+    /// and anything in the user's `watchers.txt`.
+    ///
+    /// The obvious extra condition, "names a dead scratch root", is deliberately
     /// absent and cannot be added: a legacy listener's argv spells its state dir
     /// as the literal `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return
     /// the environment that would expand it (measured — see `argv_of`).
     #[cfg(target_os = "macos")]
     #[test]
-    fn only_a_parentless_listener_is_reaped() {
+    fn every_hub_listener_is_reaped_and_nothing_else_is() {
         const MARK: &str = "\"/x/mulpex-helper\" listen";
         let pidfile = std::env::temp_dir().join(format!(
             "mulpex-orphan-test-{}",
@@ -1374,11 +1399,22 @@ mod tests {
             .unwrap();
         let _ = maker.wait();
 
-        // A listener whose parent is alive (us). Reaping this is the failure that
-        // would deafen a running instance.
+        // A listener whose parent is alive (us). This is the case that changed:
+        // it used to be spared, and sparing it is what let `warweb#75` go on
+        // waking itself every 30 minutes.
         let mut attached = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(format!("while :; do sleep 1; done # {MARK}"))
+            .spawn()
+            .unwrap();
+
+        // NOT a listener: a watcher of the kind `command_is_watcher` covers. It
+        // has a live parent and it never exits, exactly like the one above — the
+        // command is the only thing telling them apart, and killing this one
+        // would take out the user's agentalk channel.
+        let mut watcher = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done # tail -f /tmp/agentalk-events-deadbeef.log")
             .spawn()
             .unwrap();
 
@@ -1390,16 +1426,23 @@ mod tests {
             .unwrap();
         assert_eq!(ppid_of(orphan), Some(1), "the test's orphan must be parentless");
 
-        let reapable = orphaned_listener_pids();
+        let reapable = hub_listener_pids();
         assert!(reapable.contains(&orphan), "a parentless listener is reapable");
         assert!(
-            !reapable.contains(&(attached.id() as libc::pid_t)),
-            "a listener whose instance is still alive must never be reaped"
+            reapable.contains(&(attached.id() as libc::pid_t)),
+            "a live-parented listener must be reaped too — nothing starts one any more, \
+             and an instance re-arming from its own history is exactly why"
+        );
+        assert!(
+            !reapable.contains(&(watcher.id() as libc::pid_t)),
+            "a watcher is not a hub listener and must never be SIGKILLed"
         );
 
         unsafe { libc::kill(orphan, libc::SIGKILL) };
         let _ = attached.kill();
         let _ = attached.wait();
+        let _ = watcher.kill();
+        let _ = watcher.wait();
         let _ = std::fs::remove_file(&pidfile);
     }
 

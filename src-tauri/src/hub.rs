@@ -24,6 +24,21 @@ use crate::state::AppState;
 /// but the idle notification produces none, so we poll as a backstop.
 const POLL: Duration = Duration::from_millis(200);
 
+/// How often to sweep the process table for hub listeners.
+///
+/// Launch and teardown are not enough. An instance that arms one *while Mulpex is
+/// running* — which `warweb#75` did every 30 minutes all night, out of 141 arm
+/// calls in its own history and against rules telling it not to — would otherwise
+/// keep waking itself until the user happened to restart the app. That is the
+/// whole failure this reaper now exists to end, so it has to run while the app is
+/// up, not only at its edges.
+///
+/// A minute, not a tick: the sweep walks every process on the machine and reads
+/// each one's argv, which is far too expensive at 200 ms and pointless at any
+/// speed — the cost of catching a stray listener a minute late is one wake-up that
+/// was going to happen anyway.
+const LISTENER_SWEEP: Duration = Duration::from_secs(60);
+
 /// Spawn the poll loop. Runs for the life of the app on its own thread.
 pub fn start(app: AppHandle) {
     // The Explainer's Sonnet workers: fed below from `take_explain_requests`,
@@ -38,8 +53,21 @@ pub fn start(app: AppHandle) {
         // sidebar. It also closes a standing gap: a rename or a mute changed the
         // backend and emitted nothing.
         let mut last_sessions: HashMap<ProjectHandle, Vec<SessionInfo>> = HashMap::new();
+        // Deliberately in the past, so the first sweep runs on the first tick
+        // rather than a minute in.
+        let mut last_sweep = std::time::Instant::now() - LISTENER_SWEEP;
         loop {
             std::thread::sleep(POLL);
+            if last_sweep.elapsed() >= LISTENER_SWEEP {
+                last_sweep = std::time::Instant::now();
+                // Outside the workspace lock: it is a process-table walk that
+                // touches no Mulpex state, and holding the lock across it would
+                // stall every session command for its duration.
+                let reaped = crate::pty::reap_orphaned_listeners();
+                if reaped > 0 {
+                    eprintln!("mulpex: reaped {reaped} hub listener(s)");
+                }
+            }
             let state = app.state::<AppState>();
             let mut ws = state.ws.lock().unwrap();
 

@@ -366,10 +366,17 @@ and cost real time; each links to the measurement that settled it.
 - **Nothing this app signals can reach what a `claude` backgrounds.** Claude Code runs each
   background command in its own process group with no controlling terminal, so `Session::kill`'s
   `killpg` *and* its tty sweep both miss it — the hub listener survived ⌘W, crashes and teardown
-  alike and was found six-deep on one machine, a day old, still spinning. Such a process has to
-  notice on its own (`pids/<id>`) and be reapable from outside (`ppid == 1`). Mulpex no longer
-  *starts* one, but `reap_orphaned_listeners` still matters: released builds are running them now,
-  and agentalk's watchers have the same shape. → [docs/hub.md](docs/hub.md)
+  alike and was found six-deep on one machine, a day old, still spinning. The only way to reach one
+  is a process-table sweep, which is what `reap_orphaned_listeners` is: launch, teardown, and once
+  a minute from the poll loop.
+- **It kills EVERY hub listener, not just orphaned ones, and that is deliberate.** Mulpex starts
+  none since the doorbell, so any live `mulpex-helper … listen` is unwanted whoever its parent is.
+  It has to be unconditional because `HUB_RULES` cannot win the argument: `warweb#75`, running the
+  new prompt that says *"you do NOT arm anything"*, armed one every 30 minutes all night — its
+  transcript holds **141 arm calls going back four days**, and a model copies its own last `Monitor`
+  call before it re-reads the system prompt. What narrows the kill is now only the command match, so
+  it must stay `command_is_hub_listener` and never widen to `command_is_watcher`, which also covers
+  agentalk's poll loop. → [docs/hub.md](docs/hub.md)
 - **`SessionStore::new` picks its home from the ambient `MULPEX_HOME`.** Anything that is not the
   desktop app must use `SessionStore::in_home` with an explicit home, or it writes into the app's
   own `~/.mulpex/sessions/` and two claudes get handed the same `--resume` uuid — silent

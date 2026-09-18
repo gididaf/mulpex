@@ -112,8 +112,10 @@ heartbeat, and the whole class of bug where an instance must get a command exact
 **What survives the deletion**, and why:
 
 - `listen.rs`, `command_is_hub_listener` and `pty::reap_orphaned_listeners` — **released builds are
-  still running listeners right now**, and they have to be recognised and reaped. See the next
-  section; the reaper also covers agentalk's watchers, which have the same shape.
+  still running listeners right now**, and so is any instance that re-arms one out of its own
+  history. They have to be recognised and killed; see the next section. The reaper matches
+  `command_is_hub_listener` and deliberately **not** `command_is_watcher`, so it never touches
+  agentalk's poll loop — the two matchers exist precisely so this one can stay narrow.
 - `armed/`, `listeners/`, `relisten/` in the scratch tree: written by those legacy listeners, read
   by nothing. Removable once no released build is in the wild.
 - `nudges_welcome` — it was written for the arm nudge but the naming nudge has the same requirement,
@@ -133,8 +135,27 @@ its own process group with no controlling terminal — measured on live listener
 adopts it still spinning `sleep 1`. Six were found alive on one machine at once, the oldest from
 the previous morning, belonging to a Mulpex that had already exited.
 
-Mulpex no longer *starts* a listener, but this section is not historical: released builds are
-running them on this machine right now, and agentalk's watchers have the same shape.
+Mulpex no longer *starts* a listener, but this section is not historical — it got stronger. The
+reaper now kills **every** hub listener it finds, not only the parentless ones, and runs once a
+minute from the poll loop as well as at launch and teardown.
+
+Dropping the `ppid == 1` condition was safe the moment nothing armed a listener, and it turned out
+to be necessary the same day. `warweb#75` was spawned on 2026-09-17 with the new rules — its argv
+contains `do NOT arm anything` — and it went on arming a Monitor every 30 minutes through the
+night. Its transcript says why: **141 `Monitor` arm calls, the first on 2026-09-14.** Four days of
+watching itself do a thing beats one sentence telling it not to, which is `warweb#65`'s 71-times
+failure again at a larger number. Prose cannot revoke a habit; SIGKILL can.
+
+The sweep runs *while the app is up* for the same reason: an instance that arms one at 03:00 would
+otherwise keep waking itself until the user happened to restart Mulpex. A minute is the interval —
+the walk reads every process's argv, which is far too expensive per tick and pointless faster,
+since catching a stray a minute late costs one wake-up that was going to happen anyway.
+
+Two things keep it safe. The command match is now the *only* thing between this and `kill -9` on
+arbitrary pids, so it stays `command_is_hub_listener` — never `command_is_watcher`, which
+deliberately also covers agentalk's poll loop and the user's `watchers.txt`. And the death is
+quiet: Claude Code reports the killed Monitor as a "stopped, no completion record" wake, which
+`orphaned_task_wake` already swallows.
 
 Two halves close it, and both are needed:
 
