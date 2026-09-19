@@ -454,6 +454,7 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // A watcher (this instance's hub listener, an agentalk poll loop, anything in
     // `watchers.txt`) is not work in flight, so it is subtracted here — read
     // fresh, so an edit to that file lands at the next turn end.
+    write_session_uuid(ctx, payload.as_ref());
     let patterns = user_watcher_patterns();
     let busy = background_work_running(ctx, payload.as_ref(), &patterns);
     set_background_flag(ctx, busy);
@@ -598,6 +599,34 @@ fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog:
         (false, None) => path.to_string(),
     };
     let _ = std::fs::write(file, body);
+}
+
+/// Report which transcript this instance is actually writing to, so the app can
+/// store *that* uuid rather than the one it minted. See `SESSIONID_DIR` for the
+/// failure this exists to end.
+///
+/// Written from `SessionStart` (every source — `startup`, `resume`, `clear` and
+/// `compact` alike) and again from `Stop`. `SessionStart` alone would be enough
+/// for a divergence that happens at launch; it is not enough for one that
+/// happens *mid-run*, which is the case actually observed — an in-TUI `/resume`
+/// switches the file under a process that never restarts. `Stop` fires at every
+/// turn boundary, costs one small write, and closes that window.
+///
+/// A payload with no usable `transcript_path` writes nothing: leaving the last
+/// known-good answer in place beats replacing it with a guess.
+fn write_session_uuid(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let Some(uuid) = payload
+        .and_then(|j| j.get("transcript_path"))
+        .and_then(|v| v.as_str())
+        .and_then(crate::uuid_from_transcript_path)
+    else {
+        return;
+    };
+    let file = crate::session_id_path(&ctx.state_dir, ctx.instance);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, uuid);
 }
 
 /// Does this `Stop` payload say work the instance started is still running?
@@ -966,8 +995,13 @@ fn precompact(ctx: &Ctx) -> anyhow::Result<()> {
 fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let source = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let payload = serde_json::from_str::<serde_json::Value>(&input).ok();
+    // Before the `source` gate: which transcript this session opened is worth
+    // knowing whatever started it, and a `clear` or a `resume` is exactly when
+    // the answer changes.
+    write_session_uuid(ctx, payload.as_ref());
+    let source = payload
+        .as_ref()
         .and_then(|j| j.get("source").and_then(|v| v.as_str()).map(str::to_owned))
         .unwrap_or_default();
     if !is_compaction_end(&source) {
@@ -1796,6 +1830,69 @@ mod tests {
         "session_id":"3562192c-a1ad-48c3-a94c-94b6e742499c",
         "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
         "background_tasks":[],"session_crons":[]}"#;
+
+    /// The uuid the app stores has to be the one the transcript is FILED under,
+    /// not the one Mulpex minted — those diverged for warweb#75 and cost a 64 MB
+    /// conversation its restore. `session_id` in the payload is deliberately the
+    /// wrong answer here: the fixture carries `3562192c-…` under both keys in
+    /// the real capture, so this one is edited to make the two disagree the way
+    /// the bug did, and the filename is what must win.
+    #[test]
+    fn the_stored_uuid_comes_from_the_transcript_filename_not_the_reported_session() {
+        let dir = std::env::temp_dir().join(format!("mulpex-sid-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 7);
+        let file = crate::session_id_path(&dir, 7);
+
+        let diverged = r#"{"hook_event_name":"Stop",
+            "session_id":"7c1591ba-fb45-4b07-b044-03a7b2527742",
+            "transcript_path":"/Users/x/.claude/projects/-p/c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9.jsonl"}"#;
+        write_session_uuid(&ctx, payload(diverged).as_ref());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9"
+        );
+
+        // Nothing usable in the payload must not erase a good answer — the last
+        // one we know beats a blank.
+        for junk in [
+            r#"{"hook_event_name":"Stop"}"#,
+            r#"{"transcript_path":""}"#,
+            r#"{"transcript_path":"/Users/x/.claude/projects/-p/summary.jsonl"}"#,
+            r#"{"transcript_path":"/Users/x/.claude/projects/-p/c30f48b2-ac30-4fad-8d29.jsonl"}"#,
+        ] {
+            write_session_uuid(&ctx, payload(junk).as_ref());
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9",
+                "a payload we cannot read overwrote a uuid we could: {junk}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SessionStart` reports the transcript for **every** source, not just the
+    /// compaction one it otherwise cares about. `clear` and `resume` are exactly
+    /// the moments the answer changes, and the old early return sat above them.
+    #[test]
+    fn every_session_start_source_reports_its_transcript() {
+        for source in ["startup", "resume", "clear", "compact"] {
+            let dir =
+                std::env::temp_dir().join(format!("mulpex-sids-{}", crate::persist::new_uuid()));
+            let ctx = test_ctx(&dir, 2);
+            let json = format!(
+                r#"{{"hook_event_name":"SessionStart","source":"{source}",
+                    "transcript_path":"/p/906cb9b6-15d6-4ac3-abeb-6c77c309d792.jsonl"}}"#
+            );
+            write_session_uuid(&ctx, payload(&json).as_ref());
+            assert_eq!(
+                std::fs::read_to_string(crate::session_id_path(&dir, 2)).unwrap(),
+                "906cb9b6-15d6-4ac3-abeb-6c77c309d792",
+                "SessionStart[{source}] did not report its transcript"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     /// The Explainer request must mirror exactly what the payload says — and say
     /// nothing when the payload doesn't. A missing or empty `transcript_path`

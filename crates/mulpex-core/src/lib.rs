@@ -240,6 +240,51 @@ pub fn watching_path(state_dir: &std::path::Path, id: usize) -> std::path::PathB
     state_dir.join(WATCHING_DIR).join(id.to_string())
 }
 
+/// `sessionid/<id>` = the uuid of the transcript that instance's `claude` is
+/// **actually writing to**, taken from the `transcript_path` every hook payload
+/// carries.
+///
+/// Mulpex mints a uuid, spawns with `--session-id`, and restores with
+/// `--resume <that uuid>` — so the store has only ever held the id Mulpex *asked
+/// for*, never the one the conversation ended up under. The two can diverge:
+/// warweb#75 spent Sep 14–19 2026 in
+/// `c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9.jsonl` while every record after
+/// 2026-09-17T17:22 was stamped `session_id: 7c1591ba-…`, the id Mulpex had
+/// spawned it with and dutifully saved. The next launch resumed `7c1591ba` — a
+/// file Claude Code never created — and the row came back "failed to start"
+/// with a 64 MB conversation sitting intact on disk under the other name.
+///
+/// The filename is the declared contract; our minted id is an assumption. So
+/// the hook reports the filename and the app believes it.
+pub const SESSIONID_DIR: &str = "sessionid";
+
+/// `sessionid/<id>` for one instance.
+pub fn session_id_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(SESSIONID_DIR).join(id.to_string())
+}
+
+/// The conversation uuid a `transcript_path` names — its file stem.
+///
+/// Returns `None` for anything that is not a plain `<uuid>.jsonl`, because the
+/// value's only use is as a `--resume` argument: a stem we cannot recognise is
+/// worse than none, since recording it would overwrite the id that at least
+/// might still work.
+pub fn uuid_from_transcript_path(path: &str) -> Option<String> {
+    let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+    let shape = [8usize, 4, 4, 4, 12];
+    let mut parts = stem.split('-');
+    for want in shape {
+        let part = parts.next()?;
+        if part.len() != want || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

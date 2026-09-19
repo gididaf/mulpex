@@ -383,6 +383,13 @@ and cost real time; each links to the measurement that settled it.
   conversation corruption, produced by *omitting* a line rather than writing a wrong one. `mpx` was
   the caller that forced this and is gone; the hazard belongs to the ambient-home design, so the
   signature stays. → [docs/sessions.md](docs/sessions.md)
+- **The store follows the transcript FILENAME, never the uuid Mulpex minted.** Those two can
+  diverge under a `claude` that never restarts, and then `--resume` names a file Claude Code never
+  created: warweb#75 came back "failed to start" over a 64 MB conversation sitting intact on disk
+  under another name. The hook reports `transcript_path`'s stem to `sessionid/<id>` and
+  `reconcile_session_ids` adopts it; a uuid another row already holds is refused, because two
+  claudes resuming one transcript is worse than one row that fails to restore.
+  → [docs/sessions.md](docs/sessions.md)
 - **A child must not inherit a hub identity or `CLAUDE_CODE_CHILD_SESSION`.** The former corrupts
   the hub; the latter silently disables transcript saving, so the breakage only appears at the
   *next* launch as an unrestorable session. → [docs/sessions.md](docs/sessions.md)

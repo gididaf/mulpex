@@ -595,6 +595,63 @@ transcript resumes fine, through Mulpex's full invocation; and quitting preserve
 **Note the tests take `env_guard()`** — `HOME` is process-global and the session store path is
 derived from it, so the tests that repoint it must take turns or they race.
 
+## The store follows the transcript, not the uuid we minted
+
+The sentence above — "`--resume` appends to the same transcript rather than forking a new id" — is
+true of `--resume` and was read as true of everything. It is not. **The conversation can move to a
+different file under a `claude` that never restarts**, and when it does, the uuid Mulpex stored
+stops naming anything.
+
+Found in the field on 2026-09-19, reported as a row that came back `failed to start` after an app
+update. warweb#75's store line said `7c1591ba-fb45-4b07-b044-03a7b2527742`; no such `.jsonl` existed
+anywhere on the machine. The conversation was in
+`c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9.jsonl` — 64 MB, 2026-09-14 to 2026-09-19, sitting intact next
+to the three transcripts that *had* restored. Inside that one file, 13 139 records are stamped
+`session_id: c30f48b2-…` and the 3 745 after 2026-09-17T17:22 are stamped `session_id: 7c1591ba-…`,
+picking up the earlier conversation's `parentUuid` chain at the boundary. So one process wrote the
+first half, a second process continued the same conversation in the same file under a different
+reported id, and only the *filename* was ever the truth. (What moved it on the 17th is **not**
+established — an in-TUI `/resume` fits the evidence; nothing proves it.)
+
+Mulpex could not notice, by construction: `state.rs` mints a uuid, spawns `--session-id <uuid>`,
+restores `--resume <uuid>`, and `persist_sessions` writes `Session::session_id` — the id we *asked
+for*, at every step. Nothing ever compared it to what Claude Code did.
+
+The fix moves the answer onto the declared contract. Every hook payload carries `transcript_path`
+(the Explainer has relied on it since 2026-08-30), so `hook::write_session_uuid` writes its file
+stem to `sessionid/<id>` from **`SessionStart` and `Stop`**, and `Core::reconcile_session_ids`
+(poll loop, next to `refresh_worked`) adopts it into `Session::session_id` and re-persists.
+`SessionStart` alone is not enough — it fires at launch, and the divergence observed happened
+mid-run — which is why `Stop` repeats it at every turn boundary. A payload with no readable
+`<uuid>.jsonl` stem writes nothing: keeping the last answer beats replacing it with a guess.
+
+**A uuid another row already holds is refused**, and logged rather than shown
+(`[sessionid] claude#N: refusing … — another row already resumes it`). Two rows naming one
+transcript is the same silent corruption `SessionStore::in_home` exists to prevent, one layer up: a
+refusal costs one row that fails to restore, which is recoverable; two claudes appending to one
+conversation is not. `forget_session_files` deletes `sessionid/<id>` so a recycled number cannot
+inherit a dead instance's conversation.
+
+Guarded by `the_store_follows_the_transcript_the_hook_reports` and
+`a_transcript_another_row_already_resumes_is_refused` (unit), and end-to-end by
+`the_store_follows_a_transcript_that_moves_under_a_live_claude` — `#[ignore]`d, spawns a real
+`claude` and uses **`/clear`** as a drivable stand-in for the divergence, because it starts a new
+transcript file without restarting the process. It asserts the new uuid has a `.jsonl` behind it,
+which is the only claim that would have caught the original bug.
+
+Two things that test taught, both of which cost a run:
+
+- **A fresh temp project dir is not a usable `claude` fixture.** Three first-run dialogs stand in
+  front of the prompt — folder trust, theme onboarding, and the bypass-permissions warning — and the
+  first keystroke lands on `❯ No, exit`. The symptom is `alive=false` and no hook having fired. The
+  test pre-answers all three in an isolated `CLAUDE_CONFIG_DIR` (`.claude.json` with
+  `hasCompletedOnboarding` + the dir under `projects.<path>.hasTrustDialogAccepted`, and a
+  `settings.json` with `skipDangerousModePermissionPrompt`). None of them appear in real use: the
+  user's own dirs are trusted and their global settings already skip the warning.
+- **`target/debug/mulpex-helper` is a hardlink cargo re-points.** One run tested a helper eleven
+  hours older than the change in it — every other hook fired normally, so it looked like the new
+  write was simply not happening. The test copies the binary into its own root first.
+
 ## Restarting an instance in place (⌘⇧R)
 
 A `claude` reads its world exactly **once, at exec**: `CLAUDE_CODE_OAUTH_TOKEN` and the rest of the

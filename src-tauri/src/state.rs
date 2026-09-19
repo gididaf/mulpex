@@ -1804,6 +1804,9 @@ impl Core {
     fn forget_session_files(&self, id: usize) {
         let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
         let _ = std::fs::remove_file(self.state_dir.join("tasks").join(id.to_string()));
+        // The transcript this id was writing to. Left behind, a recycled number
+        // would adopt the dead instance's conversation on its first tick.
+        let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         crate::pty::clear_delivery(&self.state_dir, id);
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
@@ -1957,6 +1960,70 @@ impl Core {
             }
         }
         if newly {
+            self.persist_sessions();
+        }
+    }
+
+    /// Adopt the uuid each instance's `claude` says it is **actually writing
+    /// to** (`sessionid/<id>`, written by the hook from `transcript_path`), in
+    /// place of the one Mulpex minted and assumed had stuck.
+    ///
+    /// Those two can diverge, and when they do the conversation is not lost —
+    /// only unreachable. warweb#75 ran from 2026-09-14 to 2026-09-19 inside
+    /// `c30f48b2-…jsonl` while Mulpex stored `7c1591ba-…`, the id it had spawned
+    /// with; the next launch ran `--resume 7c1591ba`, Claude Code said
+    /// *"No conversation found with session ID"*, and the row came back "failed
+    /// to start" over a 64 MB transcript sitting intact on disk under the other
+    /// name. Nothing in the old code could notice: the store only ever held what
+    /// we asked for, never what we got.
+    ///
+    /// A uuid another row already holds is **refused**. Two rows resuming one
+    /// transcript is the silent-corruption case `SessionStore::in_home` exists
+    /// for, one layer up — and a refusal costs at worst one row that fails to
+    /// restore, which is recoverable, against two claudes appending to one
+    /// conversation, which is not. The refusal is logged rather than shown,
+    /// because a guard that can silently decline to act has to say why.
+    pub fn reconcile_session_ids(&mut self) {
+        let mut changed = false;
+        let reports: Vec<(usize, String)> = self
+            .instances()
+            .filter_map(|s| {
+                let uuid = std::fs::read_to_string(mulpex_core::session_id_path(
+                    &self.state_dir,
+                    s.id,
+                ))
+                .ok()?;
+                let uuid = uuid.trim().to_string();
+                (!uuid.is_empty() && uuid != s.session_id).then_some((s.id, uuid))
+            })
+            .collect();
+        for (id, uuid) in reports {
+            // Held by another live row, or by a failed restore we are still
+            // keeping the record of — either way it is not ours to take.
+            let taken = self
+                .sessions
+                .iter()
+                .any(|s| s.id != id && s.session_id == uuid)
+                || self.sticky.iter().any(|(_, s)| s.session_id == uuid);
+            let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
+                continue;
+            };
+            if taken {
+                eprintln!(
+                    "[sessionid] claude#{id}: refusing {uuid} — another row already resumes it; \
+                     keeping {}",
+                    session.session_id
+                );
+                continue;
+            }
+            eprintln!(
+                "[sessionid] claude#{id}: transcript is {uuid}, not {} — store follows the file",
+                session.session_id
+            );
+            session.session_id = uuid;
+            changed = true;
+        }
+        if changed {
             self.persist_sessions();
         }
     }
@@ -3123,6 +3190,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The store must follow the transcript, not the uuid we minted.
+    ///
+    /// This is warweb#75, reproduced from the store outward. Mulpex spawned it
+    /// with `7c1591ba-…`; the conversation ended up in
+    /// `c30f48b2-…jsonl` and stayed there for five days. Because the store only
+    /// ever held what Mulpex *asked for*, the next launch resumed a uuid Claude
+    /// Code had never created, and a 64 MB transcript became unreachable while
+    /// sitting right there on disk.
+    #[test]
+    fn the_store_follows_the_transcript_the_hook_reports() {
+        let minted = "7c1591ba-fb45-4b07-b044-03a7b2527742";
+        let real = "c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9";
+        let saved = [persist::SavedSession {
+            session_id: minted.into(),
+            name: Some("WC2 spells phase 2".into()),
+            muted: false,
+            id: Some(75),
+        }];
+        let (_env, root, mut core) = core_from_store("sidfollow", &saved);
+
+        // Nothing reported yet: the minted id stands.
+        core.reconcile_session_ids();
+        assert_eq!(core.sessions[0].session_id, minted);
+
+        let sid = mulpex_core::session_id_path(&core.state_dir, 75);
+        std::fs::create_dir_all(sid.parent().unwrap()).unwrap();
+        std::fs::write(&sid, format!("{real}\n")).unwrap();
+        core.reconcile_session_ids();
+
+        assert_eq!(core.sessions[0].session_id, real, "the row kept a uuid with no transcript");
+        assert_eq!(
+            core.store.load()[0].session_id,
+            real,
+            "the next launch would still --resume a file that does not exist"
+        );
+        assert_eq!(
+            core.display_name(75).as_deref(),
+            Some("WC2 spells phase 2"),
+            "adopting the real uuid must not disturb the row's identity"
+        );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two rows may never name one transcript.
+    ///
+    /// `/resume`-ing the same conversation in a second instance would otherwise
+    /// point both store lines at one file, and the launch after that hands two
+    /// live claudes the same `--resume` — the silent conversation corruption
+    /// `SessionStore::in_home` guards against one layer down. The first row
+    /// keeps it; the second keeps its own (recoverable) id.
+    #[test]
+    fn a_transcript_another_row_already_resumes_is_refused() {
+        let shared = "c30f48b2-ac30-4fad-8d29-4cf92cd5a7b9";
+        let saved = [
+            persist::SavedSession {
+                session_id: shared.into(),
+                name: Some("holder".into()),
+                muted: false,
+                id: Some(1),
+            },
+            record("copycat", Some(2)),
+        ];
+        let (_env, root, mut core) = core_from_store("siddup", &saved);
+        let mine = core.sessions[1].session_id.clone();
+
+        let sid = mulpex_core::session_id_path(&core.state_dir, 2);
+        std::fs::create_dir_all(sid.parent().unwrap()).unwrap();
+        std::fs::write(&sid, shared).unwrap();
+        core.reconcile_session_ids();
+
+        assert_eq!(core.sessions[1].session_id, mine, "two rows now --resume one transcript");
+        assert_eq!(core.sessions[0].session_id, shared, "the holder lost its own conversation");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// ⌘⇧R must never kill what it cannot bring back.
     ///
     /// An instance that has never had a prompt submitted has no transcript on
@@ -4212,6 +4358,157 @@ mod tests {
         core.teardown();
         // Leave the cached environment as the next test would expect it.
         crate::claude_bin::refresh_login_env();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// END-TO-END, against a real `claude`: when the transcript moves under a
+    /// live process, the store follows it.
+    ///
+    /// The one thing a unit test cannot prove. Every piece of this was already
+    /// green while warweb#75 was breaking — the hook fired, the store was
+    /// written, `--resume` was passed a uuid. What nobody checked was whether
+    /// that uuid still named a file Claude Code had, and only a real child can
+    /// answer that.
+    ///
+    /// `/clear` is the divergence, chosen because it is drivable: it starts a
+    /// new conversation in a **new transcript file** without restarting the
+    /// process, which is the same shape as the in-TUI `/resume` that actually
+    /// did it. The assertions are deliberately about files on disk, not about
+    /// our own bookkeeping: the new uuid must have a `.jsonl` behind it and the
+    /// old one is allowed to be anything.
+    ///
+    /// `#[ignore]`d — it spawns a real `claude`, burns a turn and takes ~a
+    /// minute. Run alone:
+    ///   cargo test --lib -- --ignored --nocapture --exact \
+    ///     state::tests::the_store_follows_a_transcript_that_moves_under_a_live_claude
+    #[test]
+    #[ignore]
+    fn the_store_follows_a_transcript_that_moves_under_a_live_claude() {
+        let _env = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-sidlive-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        // An isolated store, not the app's own `~/.mulpex/sessions/`.
+        std::env::set_var("MULPEX_HOME", root.join("mulpex-home"));
+        // An isolated Claude Code config too, so this test writes no transcript
+        // into a real project's history and reads back its own. HOME stays real
+        // — only the config dir moves — and `CLAUDE_CODE_OAUTH_TOKEN` from the
+        // environment is what keeps it logged in.
+        //
+        // Three first-run dialogs have to be pre-answered, or `claude` sits on a
+        // prompt and the first keystroke picks "No, exit" (which is exactly how
+        // this test failed the first time it ran — `alive=false`, and no hook
+        // had ever fired). They are artefacts of a fresh config, not of Mulpex:
+        // a real user's dir is already trusted and onboarded, and the bypass
+        // warning is off in their own `settings.json`.
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let trusted = std::fs::canonicalize(&project_dir).unwrap();
+        std::fs::write(
+            cfg.join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "lastOnboardingVersion": "99.0.0",
+                "theme": "dark",
+                "projects": { trusted.to_string_lossy(): { "hasTrustDialogAccepted": true } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"skipDangerousModePermissionPrompt":true}"#,
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+
+        // Copied, not referenced. `target/debug/mulpex-helper` is a hardlink
+        // cargo re-points as it builds other members of the workspace, and this
+        // test ran once against a helper eleven hours older than the change it
+        // was testing — the hooks fired, wrote everything else, and simply did
+        // not know about this one. A copy cannot be swapped underneath it.
+        let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/debug/mulpex-helper");
+        assert!(built.exists(), "build mulpex-helper first: {built:?}");
+        let helper = root.join("mulpex-helper");
+        std::fs::copy(&built, &helper).unwrap();
+
+        let mut core =
+            Core::open(1, project_dir.clone(), &helper, root.join("state"), TEST_GEOMETRY).unwrap();
+        let id = core.spawn_instance().unwrap().id;
+        let minted = core.sessions[0].session_id.clone();
+        eprintln!("root {root:?}\nspawned claude#{id} with --session-id {minted}");
+
+        // One real turn, so a transcript exists and the hooks have fired.
+        let poll = |core: &mut Core, secs: u64, f: &dyn Fn(&Core) -> bool| -> bool {
+            for _ in 0..(secs * 5) {
+                std::thread::sleep(Duration::from_millis(200));
+                // Both halves of what the real poll loop does per tick:
+                // `refresh_worked` is what puts the instance in the store at
+                // all, and `reconcile_session_ids` is what keeps its uuid true.
+                core.refresh_worked();
+                core.reconcile_session_ids();
+                if f(core) {
+                    return true;
+                }
+            }
+            false
+        };
+        std::thread::sleep(Duration::from_secs(8));
+        core.sessions[0].send(b"say only the word ok\r");
+        let reported = |core: &Core| -> Option<String> {
+            std::fs::read_to_string(mulpex_core::session_id_path(&core.state_dir, id))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        if !poll(&mut core, 90, &|c| reported(c).is_some()) {
+            let alive = core.sessions.first().is_some_and(|s| s.is_alive());
+            let listing: Vec<String> = std::fs::read_dir(&core.state_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            panic!(
+                "no claude ever reported its transcript — the hook never ran.\n\
+                 alive={alive} state_dir={:?}\n{listing:?}",
+                core.state_dir
+            );
+        }
+        assert_eq!(
+            reported(&core).as_deref(),
+            Some(minted.as_str()),
+            "a fresh instance's transcript should be the uuid we minted"
+        );
+
+        // Now move the transcript under it.
+        core.sessions[0].send(b"/clear\r");
+        let moved = poll(&mut core, 60, &|c| reported(c).as_deref() != Some(minted.as_str()));
+        assert!(moved, "/clear did not move the transcript — pick another divergence");
+        let real = reported(&core).unwrap();
+        eprintln!("transcript moved: {minted} -> {real}");
+
+        // The claim that matters: the uuid now in the store names a file that
+        // exists, and `--resume` would therefore find it.
+        assert_eq!(core.sessions[0].session_id, real);
+        assert_eq!(core.store.load()[0].session_id, real, "the store kept the stale uuid");
+        let slug: String = trusted
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let transcript = cfg.join("projects").join(&slug).join(format!("{real}.jsonl"));
+        assert!(
+            transcript.exists(),
+            "the store now names a transcript that does not exist either: {transcript:?}"
+        );
+
+        core.teardown();
+        std::env::remove_var("MULPEX_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&root);
     }
 

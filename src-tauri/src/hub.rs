@@ -116,6 +116,13 @@ pub fn start(app: AppHandle) {
                     explainer::submit(core.handle, id, body, core.state_dir.clone());
                 }
                 core.refresh_worked();
+                // Which transcript each instance is really writing to. Same
+                // shape as `refresh_worked` — one small read per instance, and
+                // it only writes the store when an answer actually changed —
+                // and it must run every tick because the answer can change
+                // mid-run: an in-TUI `/resume` moves the file under a `claude`
+                // that never restarts, which is how warweb#75 lost its restore.
+                core.reconcile_session_ids();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on
                 // advertising it as running. Writes only on change.
