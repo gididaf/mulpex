@@ -2169,3 +2169,48 @@ Two traps, both found before anything was committed:
   nothing but the 30-minute re-arm burn back.
 - **The shipped `.app`.** Tests and greps only; no driven run of the restored listener, and no QA
   in a real Mulpex window.
+
+## 2026-09-19 — a re-arm-only wake is silent (`quietturn/<id>`)
+
+Driven through the **real `mulpex-helper` binary**, copied out of `target/debug` first so cargo
+could not re-point the hardlink under the probe. Four scratch state dirs, each seeded
+`status=waiting`, each fed the three hook events in order on stdin.
+
+| case | after UserPromptSubmit | after the tool call | after Stop |
+| --- | --- | --- | --- |
+| **A** expiry wake, re-arm only | `waiting`, mark present | `waiting`, mark present | `waiting`, **no `explainreq`** |
+| **B** same wake + a `Bash` call | `waiting`, mark present | `working`, mark gone | `waiting`, `explainreq` WRITTEN |
+| **C** ordinary user prompt | `working`, no mark | — | `waiting`, `explainreq` WRITTEN |
+| **D** wake re-arming a foreign `Monitor` (`tail -f deploy.log`) | `waiting`, mark present | `working`, mark gone | `waiting`, `explainreq` WRITTEN |
+
+A is the change; B, C and D are the three ways it must NOT fire, and D is the one that matters
+most — `is_listener_rearm` keys on `command_is_hub_listener`, so a `Monitor` that is not ours stays
+fully visible.
+
+Read off the live Monitor tool schema in the same session: `timeout_ms` declares
+`maximum: 3600000` while its description says deadlines above `1800000` are capped — arming at the
+advertised maximum returned `expires in 30m`. No `persistent` parameter exists any more, and
+`additionalProperties: false` means passing one is rejected outright.
+
+### The harness lied first, and it lied quietly
+
+Run one of this probe used `echo "$JSON"` under zsh, **where `echo` interprets `\n`**. The `\n`
+inside the task-notification string became a real newline, the JSON stopped parsing,
+`system_turn` fell back to `false`, and case A reported `quietturn=absent`, `status=working`,
+`explainreq=WRITTEN` — a perfect, legible picture of a feature that did not work. Nothing errored;
+the hook fails open on an unparseable payload by design. `printf '%s'` fixed it and all four cases
+passed unchanged.
+
+The same lesson as the `inbox/` probe that measured a file `bounce_dead_inbox` had already deleted:
+**the reading was not wrong, it was of something else.** When a hook's own contract is "an
+unreadable payload behaves like the ordinary case", a corrupted fixture and a broken feature are
+byte-identical in the output — so check the fixture survives the shell before believing the result.
+
+### Not verified
+
+- **Live in the shipped `.app`.** Hook events were fed by hand; no real `claude` was woken by a real
+  Monitor expiry and watched to see the row stay still. The one thing this cannot prove is the thing
+  the user will actually look at.
+- **That a real expiry wake only ever calls `Monitor`.** If some instance also calls, say,
+  `hub_inbox` on every wake out of habit, the mark clears and the turn is explained — correct by the
+  contract, but it would mean the saving is smaller than expected in practice.

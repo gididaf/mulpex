@@ -496,7 +496,16 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // on purpose: a blocked stop is a continuing turn, and writing here twice
     // would explain the same turn twice. The summarizer itself must never run in
     // this hook — a Stop hook blocks the claude's turn end.
-    write_explain_request(ctx, payload.as_ref(), false);
+    //
+    // ...unless the marker survived every tool call, which means this turn was a
+    // `<task-notification>` the instance answered by re-arming its hub listener
+    // and nothing more. There is no explanation to write: a Monitor expired and a
+    // Monitor was started. → `QUIETTURN_DIR`
+    let rearm_only = quiet_turn(ctx);
+    clear_quiet_turn(ctx);
+    if !rearm_only {
+        write_explain_request(ctx, payload.as_ref(), false);
+    }
     // Preserve the sidebar status the old `printf waiting` Stop hook produced —
     // unless work this instance started is still running, in which case the turn
     // ended but the instance did not, and `waiting` (a green "ready" dot, and 60 s
@@ -554,6 +563,11 @@ fn plan(ctx: &Ctx) -> anyhow::Result<()> {
 /// have).
 fn write_needs(ctx: &Ctx) {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "needs");
+    // A turn that stops to ask the user something is not a silent re-arm,
+    // whatever it did first. Cleared here rather than left to `posttooluse`
+    // because an *escaped* dialog fires no `PostToolUse` at all — the marker
+    // would survive to `Stop` and swallow the explanation of a real turn.
+    clear_quiet_turn(ctx);
 }
 
 /// Record where this turn's transcript lives, for the Explainer. Every hook
@@ -1141,6 +1155,48 @@ fn write_working_unless_a_dialog_waits(ctx: &Ctx, payload: &str) {
     }
 }
 
+/// Is this `PostToolUse` payload the instance re-arming its own hub listener?
+///
+/// Matched on the **command**, not on the tool name alone — `command_is_hub_listener`
+/// is the one spelling of "this is our listener", shared with `background_work_running`
+/// and `reap_orphaned_listeners`. A `Monitor` watching anything else is ordinary
+/// work and must not be hidden.
+///
+/// An unparseable payload reads as **not** the re-arm, which is the safe
+/// direction: the cost of being wrong that way is one explanation the user did
+/// not need, against silently hiding a turn that did something real.
+fn is_listener_rearm(payload: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    if json.get("tool_name").and_then(|v| v.as_str()) != Some("Monitor") {
+        return false;
+    }
+    json.get("tool_input")
+        .and_then(|i| i.get("command"))
+        .and_then(|v| v.as_str())
+        .is_some_and(command_is_hub_listener)
+}
+
+/// Mark this turn as a re-arm-only candidate (see `QUIETTURN_DIR`).
+fn mark_quiet_turn(ctx: &Ctx) {
+    let path = crate::quiet_turn_path(&ctx.state_dir, ctx.instance);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, "");
+}
+
+/// This turn did something other than re-arm, or has ended: it is explained and
+/// shown like any other.
+fn clear_quiet_turn(ctx: &Ctx) {
+    let _ = std::fs::remove_file(crate::quiet_turn_path(&ctx.state_dir, ctx.instance));
+}
+
+fn quiet_turn(ctx: &Ctx) -> bool {
+    crate::quiet_turn_path(&ctx.state_dir, ctx.instance).exists()
+}
+
 /// Is this `PostToolUse` payload the dialog's own — i.e. the user just answered?
 ///
 /// A payload that will not parse, or carries no `tool_name`, reads as **not** the
@@ -1207,6 +1263,15 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     // only thing left worth reading out of it is the tool name.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    // The re-arm itself is the one tool call allowed to leave the row alone: a
+    // `working` dot here is the twice-an-hour flicker this whole marker exists to
+    // remove. Anything else ends the candidacy on its first call — including a
+    // second Monitor watching something real — and the turn is shown normally
+    // from that moment on, status included.
+    if quiet_turn(ctx) && is_listener_rearm(&input) {
+        return Ok(());
+    }
+    clear_quiet_turn(ctx);
     write_working_unless_a_dialog_waits(ctx, &input);
     drop(input);
 
@@ -1367,6 +1432,28 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 // prompt. Neither should overwrite the task.
                 let p = prompt.trim_start();
                 system_turn = p.starts_with("<task-notification");
+                if system_turn {
+                    // Provisionally silent, and the status write above is undone
+                    // with it: the overwhelming majority of these wakes are a
+                    // Monitor expiry the instance can only answer by re-arming,
+                    // and a row that goes yellow for three seconds twice an hour
+                    // is the visible half of that cost. `posttooluse` restores
+                    // `working` the instant the turn does anything else, so the
+                    // dot is late rather than wrong — and a turn that ends here
+                    // never moved it at all. → `QUIETTURN_DIR`
+                    match &prior_status {
+                        Some(s) => {
+                            let _ = std::fs::write(&status_path, s);
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(&status_path);
+                        }
+                    }
+                    mark_quiet_turn(ctx);
+                } else {
+                    // The user is talking. Nothing about this turn is hidden.
+                    clear_quiet_turn(ctx);
+                }
                 if p.starts_with(crate::MULPEX_SENTINEL) {
                     verify_spawn_delivery(ctx, prompt);
                 } else if !system_turn {
@@ -1976,6 +2063,59 @@ mod tests {
         "session_id":"3562192c-a1ad-48c3-a94c-94b6e742499c",
         "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
         "background_tasks":[],"session_crons":[]}"#;
+
+    /// A re-arm-only wake leaves no trace; anything else in the same turn ends
+    /// that immediately.
+    ///
+    /// This is the whole contract of `QUIETTURN_DIR`, and both halves matter. The
+    /// instance is woken twice an hour by a Monitor expiry it cannot prevent, and
+    /// hiding that is the point — but hiding a turn that *did* something would be
+    /// the far worse bug, and it is invisible by construction: the symptom is an
+    /// explanation that never appears, which looks exactly like a quiet instance.
+    #[test]
+    fn a_rearm_only_wake_is_silent_and_anything_else_cancels_it() {
+        let dir = std::env::temp_dir().join(format!("mulpex-quiet-{}", crate::persist::new_uuid()));
+        let ctx = test_ctx(&dir, 4);
+
+        let rearm = r#"{"tool_name":"Monitor","tool_input":{
+            "command":"\"/Applications/Mulpex.app/Contents/MacOS/mulpex-helper\" listen",
+            "timeout_ms":1800000,"description":"mulpex hub inbox listener"}}"#;
+        assert!(is_listener_rearm(rearm));
+
+        // A Monitor is not automatically ours. Watching a log is real work and
+        // must be explained like any other.
+        let other_monitor = r#"{"tool_name":"Monitor","tool_input":{
+            "command":"tail -f deploy.log | grep --line-buffered ERROR",
+            "timeout_ms":1800000,"description":"deploy errors"}}"#;
+        assert!(!is_listener_rearm(other_monitor));
+
+        // Neither is another tool, nor a payload we cannot read — the unknown
+        // case must resolve toward "this turn was real".
+        assert!(!is_listener_rearm(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#));
+        for junk in ["", "not json", r#"{"tool_name":"Monitor"}"#, r#"{"tool_input":{}}"#] {
+            assert!(!is_listener_rearm(junk), "{junk} read as our listener");
+        }
+
+        // The lifecycle: a task-notification marks the turn, the re-arm leaves
+        // the mark standing, and it survives to `Stop` — which is what makes the
+        // turn silent.
+        assert!(!quiet_turn(&ctx), "a fresh instance is not mid-quiet-turn");
+        mark_quiet_turn(&ctx);
+        assert!(quiet_turn(&ctx));
+        assert!(quiet_turn(&ctx) && is_listener_rearm(rearm), "the re-arm ended the candidacy");
+
+        // ...and any other call ends it, so the rest of that turn — status dot
+        // included — behaves exactly as it always did.
+        clear_quiet_turn(&ctx);
+        assert!(!quiet_turn(&ctx));
+
+        // Clearing something that was never marked must not error: a user turn
+        // clears unconditionally, and that is the common path.
+        clear_quiet_turn(&ctx);
+        assert!(!quiet_turn(&ctx));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The uuid the app stores has to be the one the transcript is FILED under,
     /// not the one Mulpex minted — those diverged for warweb#75 and cost a 64 MB

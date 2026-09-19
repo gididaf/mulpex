@@ -64,6 +64,43 @@ depend on the model noticing.
 arm at all. The full story, including what the same change did to the sidebar's yellow dot, is in
 [sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
 
+### A re-arm is not news: `quietturn/<id>`
+
+The expiry is not ours to fix. What *was* ours is what it cost to watch.
+
+Read off the live tool schema, 2026-09-19: `timeout_ms` declares `maximum: 3600000` and the
+description says *"Deadlines above 1800000ms are capped to 1800000ms"* — ask for the advertised
+maximum and the tool answers `expires in 30m`. There is no parameter that opts out; `persistent` is
+gone from the schema entirely. So every instance is woken twice an hour, forever, by an event it can
+only answer by doing the same thing again.
+
+Each of those wakes used to cost two visible things, neither of them Anthropic's doing:
+
+- the sidebar dot flipped to `working` and back, because `userpromptsubmit` writes `working` before
+  it knows what kind of turn this is;
+- `Stop` handed the turn to the Explainer, which spent a Sonnet call writing a Hebrew paragraph
+  explaining that a watchdog had been restarted.
+
+At five instances that is ~480 model calls a day, none of which say anything. `quietturn/<id>` is
+the fix, and its whole design is about *earning* the right to hide a turn:
+
+| hook | what it does |
+| --- | --- |
+| `userpromptsubmit` | on a `<task-notification>`, restore the status it just overwrote and mark the turn a candidate |
+| `posttooluse` | `is_listener_rearm` → return, touching nothing. Anything else → clear the mark, write `working`, carry on |
+| `write_needs` (`askq`/`plan`) | clear the mark — an **escaped** dialog fires no `PostToolUse`, so this is the only place that catches it |
+| `stop` | mark still there → skip `write_explain_request`. Either way, clear it |
+
+**Surviving to `Stop` is evidence, not a guess** — the mark is cleared by the *first* call that is
+not the re-arm, so a wake that reads its inbox and acts on mail is explained exactly as before. And
+`is_listener_rearm` matches on the **command** via `command_is_hub_listener`, not on the tool name:
+a `Monitor` watching a deploy log is real work and stays visible.
+
+Both defaults point the same way, deliberately. An unparseable payload reads as *not* the re-arm,
+and a turn that is not clearly a system turn is never a candidate. Being wrong in that direction
+costs one explanation nobody needed; being wrong in the other hides a turn that did something, and
+the symptom — an explanation that never appears — is indistinguishable from a quiet instance.
+
 ### The command is a binary now, and the old one is why
 
 Adding that in-loop `touch` is what exposed the real problem: **the listener command was

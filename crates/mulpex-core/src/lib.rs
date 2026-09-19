@@ -238,6 +238,31 @@ pub fn session_id_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(SESSIONID_DIR).join(id.to_string())
 }
 
+/// `quietturn/<id>` = this turn is, so far, nothing but the instance re-arming
+/// its own hub listener — so it must leave no trace in the UI.
+///
+/// The listener is a `Monitor`, and Claude Code caps every Monitor at 30 minutes
+/// (v2.1.271, 2026-09-14; the schema still advertises `maximum: 3600000` and
+/// silently clamps to `1800000`, measured 2026-09-19). So every instance is woken
+/// twice an hour by an expiry it can do nothing about, re-arms, and stops. That
+/// wake is a real turn: it flips the sidebar dot to `working` and it ends in a
+/// `Stop`, which hands the turn to the Explainer — a Sonnet call and a Hebrew
+/// paragraph explaining that a watchdog was restarted. Five instances is ~480 of
+/// those a day, and not one of them says anything.
+///
+/// The expiry is Anthropic's; the *noise* was ours. This marker is what makes a
+/// re-arm-only turn silent: written when a `<task-notification>` turn starts,
+/// **cleared by the first tool call that is not the re-arm**, and read at `Stop`.
+/// Surviving to `Stop` is therefore proof the turn did nothing else, which is the
+/// only honest basis for hiding it — a wake that reads its inbox and acts on mail
+/// clears the marker on that very first call and is explained as normal.
+pub const QUIETTURN_DIR: &str = "quietturn";
+
+/// `quietturn/<id>` for one instance.
+pub fn quiet_turn_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(QUIETTURN_DIR).join(id.to_string())
+}
+
 /// The conversation uuid a `transcript_path` names — its file stem.
 ///
 /// Returns `None` for anything that is not a plain `<uuid>.jsonl`, because the

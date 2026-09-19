@@ -106,9 +106,17 @@ itself as a background `Monitor` on its first turn — `HUB_RULES` carries the e
 `hook.rs`'s arm nudge re-asks until `armed/<id>` says it is running.
 
 **Its known cost, accepted deliberately:** Claude Code caps every Monitor at 30 minutes
-(v2.1.271, 2026-09-14), so each instance wakes twice an hour purely to re-arm — a full turn plus an
-Explainer run. That is the price of the listener actually noticing mail, and it is the price the
-user chose on 2026-09-19 after the alternative failed (below).
+(v2.1.271, 2026-09-14; the schema advertises `maximum: 3600000` and silently clamps to `1800000` —
+read off the live tool, 2026-09-19), so each instance wakes twice an hour purely to re-arm. That is
+the price of the listener actually noticing mail, and it is the price the user chose on 2026-09-19
+after the alternative failed (below).
+
+**The expiry is theirs; the noise was ours.** That wake used to flip the sidebar dot and spend a
+Sonnet call explaining that a watchdog had restarted — ~480 model calls a day across five
+instances, none of them saying anything. `quietturn/<id>` now makes a re-arm-**only** wake leave no
+trace: marked when a `<task-notification>` starts, cleared by the first tool call that is not the
+re-arm, and read at `Stop`. Surviving to `Stop` is what earns the silence, so a wake that handles
+mail is still explained in full. → [docs/hub.md](docs/hub.md)
 
 **A host-typed "doorbell" replaced this between 2026-09-17 and 2026-09-19 and was reverted.** It
 had the poll loop type `<<<MPX>>> 1 new hub message(s)` into an idle pane instead of arming
