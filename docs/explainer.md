@@ -41,7 +41,7 @@ coalescing; `enqueue` repeats it for a job already queued but not yet running.
 hooks), so such a file is leftover from a closed instance whose id a terminal now holds. The file is
 deleted either way, so a refused request cannot sit on disk retrying every tick.
 
-`mpx` (the tmux host, deleted 2026-09-17) ran the same hook and drained nothing, so it accumulated one `explainreq/<id>`
+`mpx` (the tmux host) runs the same hook and drains nothing, so it accumulates one `explainreq/<id>`
 per instance — overwritten per turn, gone with its state dir. Bounded; deliberately unhandled.
 
 ## The feed: ten entries, dropped completely

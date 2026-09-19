@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,11 +24,11 @@ use tauri::ipc::Channel;
 use crate::claude_bin;
 use crate::vtgrid::Recorder;
 
-/// The spawn-time text and the `hub_spawn` child's first prompt live in
-/// `mulpex_core::rules`. `HUB_RULES` is a two-process contract with `hook.rs`
-/// (which has to recognise the doorbell it describes) and with `registry.rs` (the
-/// address grammar), so it has exactly one copy. Re-exported here because
-/// `state.rs` builds a `SpawnTask`.
+/// The spawn-time text and the `hub_spawn` child's first prompt now live in
+/// `mulpex_core::rules`, shared with `mpx`. `HUB_RULES` is a two-process contract
+/// with `hook.rs` (the arming `touch`) and with `registry.rs` (the address
+/// grammar), so it has exactly one copy. Re-exported here because `state.rs`
+/// builds a `SpawnTask`.
 pub use mulpex_core::rules::SpawnTask;
 use mulpex_core::rules::{append_system_prompt, spawn_prompt};
 
@@ -216,92 +216,6 @@ impl OutputSink {
     }
 }
 
-/// How this chunk of the user's keystrokes changes the number of characters
-/// sitting in `claude`'s input box, given `before`.
-///
-/// Mulpex cannot read that box, so it counts what it forwards. Zero means empty,
-/// which is the doorbell's licence to type; anything above zero is a draft that
-/// must not be touched.
-///
-/// **Why counting, and not "was the last key Enter".** That was the first version
-/// and it latched: every byte that was not a Return marked the pane as drafting
-/// until the user pressed Enter, so clicking into a pane, scrolling it or pressing
-/// an arrow key silenced its doorbell indefinitely. Those are not typing at all —
-/// they are escape sequences, and the fix is to know the difference.
-///
-/// The rules, each earning its place:
-///
-/// - **Escape sequences are not text.** Arrow keys, focus reports (`\x1b[I`/`O`),
-///   mouse reports and bracketed-paste markers all arrive through `onData` exactly
-///   like a keystroke. They leave the box unchanged, so they are skipped.
-/// - **Meta-Return is the exception** — Shift+Enter / Option+Enter is mapped to
-///   `\x1b\r` (root `CLAUDE.md`) and inserts a newline *into* the prompt. It is an
-///   escape sequence that does add a character.
-/// - **A bare Return sends**, emptying the box.
-/// - **Backspace removes one**, so a line typed and then deleted comes back to
-///   zero and the doorbell is allowed again. The latching version could not do
-///   this at all.
-/// - **Ctrl+C and Ctrl+U clear the line** in `claude`'s input.
-/// - Counting UTF-8 *lead* bytes, not bytes, so one Hebrew character is one
-///   character and a two-byte letter cannot leave a phantom draft behind.
-///
-/// Errors resolve upward (toward "there is a draft"): being wrong that way makes
-/// mail wait visibly in the sidebar badge, while being wrong the other way submits
-/// something the user never wrote.
-fn draft_len_after(before: usize, bytes: &[u8]) -> usize {
-    let mut n = before;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            0x1b => {
-                match bytes.get(i + 1) {
-                    // Meta-Return: a newline inside the prompt, not a send.
-                    Some(b'\r') | Some(b'\n') => {
-                        n += 1;
-                        i += 2;
-                    }
-                    // CSI / SS3: run to the final byte (0x40..=0x7e).
-                    Some(b'[') | Some(b'O') => {
-                        i += 2;
-                        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                        i += 1;
-                    }
-                    // A bare ESC clears `claude`'s input box, but a lone ESC is
-                    // also how a sequence split across two reads begins. Left
-                    // alone on purpose: mis-reading a split arrow key as "the box
-                    // is empty" is the failure that loses a draft.
-                    _ => i += 2,
-                }
-            }
-            b'\r' | b'\n' => {
-                n = 0;
-                i += 1;
-            }
-            // Backspace / DEL.
-            0x08 | 0x7f => {
-                n = n.saturating_sub(1);
-                i += 1;
-            }
-            // Ctrl+C (clear input) and Ctrl+U (kill line).
-            0x03 | 0x15 => {
-                n = 0;
-                i += 1;
-            }
-            // Other C0 controls change no text.
-            c if c < 0x20 => i += 1,
-            // A UTF-8 continuation byte is the tail of a character already counted.
-            c if (0x80..0xc0).contains(&c) => i += 1,
-            _ => {
-                n += 1;
-                i += 1;
-            }
-        }
-    }
-    n
-}
-
 /// A live `claude` or shell process on a PTY, streaming to one frontend terminal.
 pub struct Session {
     pub id: usize,
@@ -322,23 +236,6 @@ pub struct Session {
     /// child is definitely up. `killpg` alone is not enough to tear a session
     /// down — see `kill`.
     tty_dev: Arc<AtomicU32>,
-    /// How many characters the user is believed to have sitting in `claude`'s
-    /// input box, maintained by `draft_len_after`. Zero is the doorbell's licence
-    /// to type into this pane.
-    ///
-    /// The doorbell reads it and nothing else does. Mulpex cannot see that box, so
-    /// it counts what it forwards — and two earlier models of this both failed in
-    /// the user's hands, which is why the counting one is worth its size:
-    ///
-    /// - **A quiet-period timer (3 s).** Slow where it should not be — a reply to
-    ///   the pane you had just typed in rang at 3051 ms against 82 ms for an
-    ///   untouched one — and no protection where it mattered, since anyone
-    ///   composing a prompt pauses for longer than a timer you would dare set, and
-    ///   the doorbell then fired straight into the draft.
-    /// - **"Was the last key Enter".** Safe but latching: clicking into a pane,
-    ///   scrolling it or pressing an arrow key all arrive through `onData`, so any
-    ///   of them silenced the doorbell until the next Return.
-    draft_len: Arc<AtomicUsize>,
     rows: u16,
     cols: u16,
 }
@@ -482,16 +379,10 @@ impl Session {
         // controlling terminal in the forked half and may not have got there
         // yet. First output is proof it has.
         let tty_dev = Arc::new(AtomicU32::new(0));
-        // Readiness signals for the shell-seed thread below: the reader marks when
-        // the child first paints (`saw_output`) and when it last emitted
-        // (`last_activity`), so a seeded command waits for the shell to have
-        // started and settled before being typed into it.
-        //
-        // These once served a hub-listener bootstrap that typed into `claude`
-        // itself; that was deleted when a task moved to argv, and only the comment
-        // survived it. The doorbell does type into `claude`, but it is gated on the
-        // instance's hub *status* rather than on painting — see
-        // `Core::ring_doorbells`.
+        // Readiness signals for the one-shot hub-listener bootstrap: the reader
+        // thread marks when `claude` first paints (`saw_output`) and when it last
+        // emitted (`last_activity`), so the injector can wait until the initial UI
+        // has painted and then settled before typing into it.
         let saw_output = Arc::new(AtomicBool::new(false));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         {
@@ -643,11 +534,6 @@ impl Session {
             recorder,
             child_pid,
             tty_dev,
-            // A freshly spawned `claude` has an empty input box. It has to start
-            // at zero or a spawned child could never be rung until the user typed
-            // into it by hand — and a child nobody ever types into is exactly the
-            // case `hub_spawn` creates.
-            draft_len: Arc::new(AtomicUsize::new(0)),
             rows,
             cols,
         })
@@ -658,44 +544,13 @@ impl Session {
         self.sink.attach(ch);
     }
 
-    /// Forward raw bytes to the child's stdin. Shares the PTY writer (behind a
-    /// mutex) with the shell-seed thread.
-    ///
-    /// Deliberately does **not** stamp `last_input`: this is also how Mulpex
-    /// writes the doorbell, and a doorbell that marked the pane as "the user is
-    /// typing" would suppress the next one. Keystrokes come in through
-    /// `send_from_user`.
+    /// Forward raw bytes to Claude's stdin (from xterm `onData`). Shares the PTY
+    /// writer (behind a mutex) with the one-shot hub-listener bootstrap thread.
     pub fn send(&mut self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(bytes);
             let _ = w.flush();
         }
-    }
-
-    /// `send`, plus tracking what the keystroke did to the input box. The one
-    /// caller is the `send_bytes` command (xterm `onData`).
-    pub fn send_from_user(&mut self, bytes: &[u8]) {
-        let before = self.draft_len.load(Ordering::Relaxed);
-        self.draft_len
-            .store(draft_len_after(before, bytes), Ordering::Relaxed);
-        self.send(bytes);
-    }
-
-    /// Whether this pane's input box is believed empty, and so safe for the
-    /// doorbell to type into.
-    pub fn input_box_empty(&self) -> bool {
-        self.draft_len.load(Ordering::Relaxed) == 0
-    }
-
-    /// Forget any draft we think this pane holds.
-    ///
-    /// The count can only drift upward (a key we read as text that `claude` did
-    /// not, a sequence split across two reads), and drift upward is silence: the
-    /// doorbell stops for a box that is actually empty. A finished turn is proof
-    /// the box *was* emptied, so the poll loop resyncs there rather than letting
-    /// an error live for the rest of the session.
-    pub fn clear_draft(&self) {
-        self.draft_len.store(0, Ordering::Relaxed);
     }
 
     /// Resize the PTY so the child re-lays-out. No-op if unchanged.
@@ -1023,7 +878,7 @@ const KERN_PROCARGS2: libc::c_int = 49;
 /// no `MULPEX_*` in it (measured against a live orphan). So nothing here may be
 /// keyed on an environment variable; a legacy listener's argv names
 /// `$MULPEX_STATE_DIR` unexpanded and cannot tell you *which* state dir it serves.
-/// That is why the reaper keys on the command line alone (`hub_listener_pids`).
+/// That is why `reap_orphaned_listeners` keys on the parent instead.
 #[cfg(target_os = "macos")]
 fn argv_of(pid: libc::pid_t) -> Option<String> {
     // The buffer has to be `KERN_ARGMAX`, not whatever a sizing call reports.
@@ -1075,13 +930,7 @@ fn argv_of(pid: libc::pid_t) -> Option<String> {
 }
 
 /// A process's parent pid, or `None` if it is gone.
-///
-/// Test-only since the reaper stopped requiring `ppid == 1`: the selection no
-/// longer cares who a listener's parent is, but the test still has to prove its
-/// own fixture is genuinely parentless before asserting anything about it. Kept
-/// rather than inlined because "is this process an orphan" is a question this
-/// file has needed twice and will need again.
-#[cfg(all(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1097,45 +946,34 @@ fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     (n == size).then_some(info.pbi_ppid as libc::pid_t)
 }
 
-/// SIGKILL **every** hub listener on this machine, and report how many.
+/// SIGKILL every **orphaned** hub listener on this machine, and report how many.
 ///
-/// A listener runs in its own process group with no controlling terminal
-/// (measured: `PGID == pid`, `SESS 0`, state `Ss`), so `Session::kill`'s `killpg`
-/// misses it and so does `kill_tty_session`. It outlives its `claude`, outlives
-/// app teardown, and is reparented to launchd still spinning — six were found
-/// alive on one machine at once, the oldest more than a day old, belonging to a
-/// Mulpex that had exited the previous morning. Nothing else can reach one.
+/// This is the one cleanup no other code path can do. A listener runs in its own
+/// process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`,
+/// state `Ss`), so `Session::kill`'s `killpg` misses it and so does
+/// `kill_tty_session`. It outlives its `claude`, outlives app teardown, and is
+/// reparented to launchd still spinning `sleep 1` — six were found alive on one
+/// machine at once, the oldest more than a day old, belonging to a Mulpex that had
+/// exited the previous morning. `listen.rs` makes new listeners exit by
+/// themselves; this reaches the ones that predate that and the legacy shell loops
+/// that will never learn to.
 ///
-/// **This used to require `ppid == 1`, and dropping that is the point.** While
-/// Mulpex still asked instances to arm a listener, a live-parented one was a
-/// listener doing its job, and killing it would have deafened a working instance.
-/// Since the doorbell, **Mulpex never starts one** — so any process matching
-/// `command_is_hub_listener` is unwanted by construction, whatever its parent.
-///
-/// It has to be unconditional because the rules cannot win the argument. The new
-/// `HUB_RULES` say "you do NOT arm anything", and an instance ignored that:
-/// `warweb#75`, spawned 2026-09-17 with the new prompt, went on arming a Monitor
-/// every 30 minutes through the night. Its transcript explains it — **141 arm
-/// calls reaching back to 2026-09-14**. A model copies its own last `Monitor`
-/// call before it re-reads the system prompt, so four days of self-evidence beat
-/// one sentence, exactly as `warweb#65` did 71 times. Prose cannot revoke a habit;
-/// killing the process can. Same lesson as argv-vs-TUI: put it on this side.
-///
-/// Safe for everything that is *not* ours: `command_is_hub_listener` matches only
-/// `mulpex-helper … listen` and the legacy inbox one-liner, never
-/// `command_is_watcher`'s wider set, so agentalk's poll loop and the user's own
-/// `watchers.txt` entries are untouched. And the death is quiet — Claude Code
-/// reports the killed Monitor as a "stopped, no completion record" wake, which
-/// `hook::orphaned_task_wake` already swallows.
-///
+/// **Orphanhood is the parent, not the path.** The obvious test — "does it name a
+/// scratch root that is dead?" — cannot be written: a legacy listener's argv
+/// spells its state dir as the literal `$MULPEX_STATE_DIR`, and the expanded value
+/// lives only in its environment, which `KERN_PROCARGS2` does not hand back for
+/// our own children (measured). `ppid == 1` is both available and exactly the
+/// signature that was observed. It is also safe by construction: a listener
+/// serving a live instance is a child of that `claude`, in this Mulpex or in
+/// another one or under `mpx`, and is therefore never matched.
 /// Split out from the kill so the selection can be tested without a test run
-/// SIGKILLing whatever listeners happen to be on the developer's machine.
+/// SIGKILLing whatever orphans happen to be on the developer's machine.
 #[cfg(target_os = "macos")]
-fn hub_listener_pids() -> Vec<libc::pid_t> {
+fn orphaned_listener_pids() -> Vec<libc::pid_t> {
     let me = std::process::id() as libc::pid_t;
     all_pids()
         .into_iter()
-        .filter(|&pid| pid != me && pid > 1)
+        .filter(|&pid| pid != me && pid > 1 && ppid_of(pid) == Some(1))
         .filter(|&pid| {
             // One matcher, shared with the hook that excuses a listener from the
             // "still working" count — two spellings of "this is a listener" is how
@@ -1147,7 +985,7 @@ fn hub_listener_pids() -> Vec<libc::pid_t> {
 
 #[cfg(target_os = "macos")]
 pub fn reap_orphaned_listeners() -> usize {
-    let pids = hub_listener_pids();
+    let pids = orphaned_listener_pids();
     for pid in &pids {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
@@ -1306,77 +1144,22 @@ fn b64encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// What the doorbell's safety rests on: knowing whether the user has a draft
-    /// sitting in `claude`'s input box.
+    /// The selection behind the one cleanup nothing else in this file can do —
+    /// and the one that has to be *narrow*, because it reaches into the process
+    /// table and SIGKILLs, with no undo.
     ///
-    /// Wrong in the permissive direction, Mulpex types into a half-written prompt
-    /// and submits it — the user loses the draft and sends something they never
-    /// wrote. Wrong in the strict direction, the doorbell goes quiet and mail
-    /// waits behind the sidebar badge. Both have now happened in the user's hands,
-    /// which is why each case below is spelled out.
-    #[test]
-    fn the_draft_count_tracks_what_is_in_the_input_box() {
-        // Typing fills it; Return empties it.
-        assert_eq!(draft_len_after(0, b"hi"), 2, "typing is a draft");
-        assert_eq!(draft_len_after(2, b"\r"), 0, "Return sends, so the box is empty");
-        assert_eq!(draft_len_after(0, "fix the parser\r".as_bytes()), 0, "paste-then-send");
-
-        // Typed, then deleted. The latching version could never come back from
-        // this — the pane stayed silent until the next Return.
-        assert_eq!(draft_len_after(0, b"ab\x7f\x7f"), 0, "deleted back to empty");
-        assert_eq!(draft_len_after(1, b"\x7f\x7f"), 0, "never underflows");
-
-        // NOT typing. All three arrive through `onData` exactly like a keystroke,
-        // and treating them as text is what made clicking into a pane silence its
-        // doorbell for the rest of the session.
-        assert_eq!(draft_len_after(0, b"\x1b[I"), 0, "focus in");
-        assert_eq!(draft_len_after(0, b"\x1b[O"), 0, "focus out");
-        assert_eq!(draft_len_after(0, b"\x1b[A"), 0, "arrow key");
-        assert_eq!(draft_len_after(0, b"\x1b[<0;10;5M"), 0, "mouse report");
-        assert_eq!(draft_len_after(3, b"\x1b[C"), 3, "and they leave a real draft alone");
-
-        // Shift+Enter / Option+Enter is mapped to meta-Return: a newline INSIDE
-        // the prompt, not a send. Read as a send, the doorbell would ring into the
-        // middle of a multi-line prompt.
-        assert_eq!(draft_len_after(5, b"\x1b\r"), 6, "meta-Return adds a line, not a send");
-        assert_eq!(draft_len_after(5, b"\x1b\n"), 6);
-
-        // Clearing the line.
-        assert_eq!(draft_len_after(9, b"\x03"), 0, "Ctrl+C clears the input");
-        assert_eq!(draft_len_after(9, b"\x15"), 0, "Ctrl+U kills the line");
-
-        // One Hebrew character is one character, not two. The user works in
-        // Hebrew, so a byte count would leave a phantom draft after every word.
-        assert_eq!(draft_len_after(0, "שלום".as_bytes()), 4);
-        assert_eq!(draft_len_after(0, "שלום\r".as_bytes()), 0);
-
-        assert_eq!(draft_len_after(4, b""), 4, "nothing said changes nothing");
-    }
-
-    /// The selection behind the one cleanup nothing else in this file can do, and
-    /// one that reaches into the process table and SIGKILLs, with no undo — so
-    /// what it must NOT match is as much of the test as what it must.
+    /// Both halves are load-bearing and each is the whole test on its own:
+    /// **orphaned** without **listener** is every stray daemon on the machine;
+    /// **listener** without **orphaned** is every listener still serving a live
+    /// instance — in this Mulpex, in a second one, or under `mpx`.
     ///
-    /// **A live parent is no longer a reprieve.** It was while Mulpex still asked
-    /// instances to arm a listener: killing a live-parented one would have
-    /// deafened a working instance. Since the doorbell nothing starts one, so a
-    /// running listener is unwanted whoever its parent is — and it has to be,
-    /// because `warweb#75` kept arming one every 30 minutes *while running the new
-    /// rules that say not to*, out of 141 arm calls in its own history.
-    ///
-    /// What still narrows it is the **command match**, and that is now the only
-    /// thing standing between this and `kill -9` on arbitrary processes. It must
-    /// stay `command_is_hub_listener` (ours alone) and never widen to
-    /// `command_is_watcher`, which deliberately also covers agentalk's poll loop
-    /// and anything in the user's `watchers.txt`.
-    ///
-    /// The obvious extra condition, "names a dead scratch root", is deliberately
+    /// The obvious third condition, "names a dead scratch root", is deliberately
     /// absent and cannot be added: a legacy listener's argv spells its state dir
     /// as the literal `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return
     /// the environment that would expand it (measured — see `argv_of`).
     #[cfg(target_os = "macos")]
     #[test]
-    fn every_hub_listener_is_reaped_and_nothing_else_is() {
+    fn only_a_parentless_listener_is_reaped() {
         const MARK: &str = "\"/x/mulpex-helper\" listen";
         let pidfile = std::env::temp_dir().join(format!(
             "mulpex-orphan-test-{}",
@@ -1399,22 +1182,11 @@ mod tests {
             .unwrap();
         let _ = maker.wait();
 
-        // A listener whose parent is alive (us). This is the case that changed:
-        // it used to be spared, and sparing it is what let `warweb#75` go on
-        // waking itself every 30 minutes.
+        // A listener whose parent is alive (us). Reaping this is the failure that
+        // would deafen a running instance.
         let mut attached = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(format!("while :; do sleep 1; done # {MARK}"))
-            .spawn()
-            .unwrap();
-
-        // NOT a listener: a watcher of the kind `command_is_watcher` covers. It
-        // has a live parent and it never exits, exactly like the one above — the
-        // command is the only thing telling them apart, and killing this one
-        // would take out the user's agentalk channel.
-        let mut watcher = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("while :; do sleep 1; done # tail -f /tmp/agentalk-events-deadbeef.log")
             .spawn()
             .unwrap();
 
@@ -1426,23 +1198,16 @@ mod tests {
             .unwrap();
         assert_eq!(ppid_of(orphan), Some(1), "the test's orphan must be parentless");
 
-        let reapable = hub_listener_pids();
+        let reapable = orphaned_listener_pids();
         assert!(reapable.contains(&orphan), "a parentless listener is reapable");
         assert!(
-            reapable.contains(&(attached.id() as libc::pid_t)),
-            "a live-parented listener must be reaped too — nothing starts one any more, \
-             and an instance re-arming from its own history is exactly why"
-        );
-        assert!(
-            !reapable.contains(&(watcher.id() as libc::pid_t)),
-            "a watcher is not a hub listener and must never be SIGKILLed"
+            !reapable.contains(&(attached.id() as libc::pid_t)),
+            "a listener whose instance is still alive must never be reaped"
         );
 
         unsafe { libc::kill(orphan, libc::SIGKILL) };
         let _ = attached.kill();
         let _ = attached.wait();
-        let _ = watcher.kill();
-        let _ = watcher.wait();
         let _ = std::fs::remove_file(&pidfile);
     }
 

@@ -2,33 +2,24 @@
 //! prompt a `hub_spawn` child starts on.
 //!
 //! **Why this lives in `mulpex-core` rather than beside the spawner.** `HUB_RULES`
-//! is a two-process contract, not documentation. It tells an instance what the
-//! **doorbell** looks like — the line `src-tauri`'s poll loop types into its input
-//! box when peer mail arrives — and `hook.rs` recognises that same line to keep it
-//! off the sidebar task. Both spellings come from `crate::doorbell_line`. It also
-//! fixes the `claude#1` / `term#5` / `<project>#<n>` address grammar that
-//! `registry.rs` parses and `mcp.rs` prints.
+//! is a two-process contract, not documentation. It contains the exact `Monitor`
+//! command an instance must arm, and `hook.rs` both recognises that command
+//! (`is_hub_listener`, which is what keeps a listener from counting as work in
+//! flight) and repeats it verbatim in the arm nudge. It also fixes the
+//! `claude#1` / `term#5` / `<project>#<n>` address grammar that `registry.rs`
+//! parses and `mcp.rs` prints.
 //!
-//! **The instance is asked to *set up* nothing, and that is the point.** This text
-//! used to carry a `Monitor` command the model had to retype, and a model retypes
-//! whatever version is nearest in its context — usually its own last `Monitor`
-//! call. One instance re-armed a superseded copy 71 times across two days and an
-//! app update before `/compact` finally dropped it from context. Then Claude Code
-//! capped every Monitor at 30 minutes, and the survivors woke twice an hour for
-//! the rest of their lives just to start a new one. The doorbell ends both: the
-//! host watches the inbox, so there is no command to retype and nothing to re-arm.
-//! Anything that must be got exactly right belongs on this side of the boundary.
+//! **The command is one line naming a binary, and that is the point.** It used to
+//! be a ~400-character shell loop the model had to retype from this prose, and a
+//! model retypes whatever version is nearest in its context — usually its own last
+//! `Monitor` call. One instance re-armed a superseded copy 71 times across two days
+//! and an app update before `/compact` finally dropped it from context. Anything
+//! that must be got exactly right belongs in a program; see `listen.rs`.
 //!
-//! It lives in `mulpex-core` rather than beside the spawner because it is read
-//! from both sides of a process boundary: the app builds it, and the *helper*
-//! (`hook.rs`) has to recognise what it promised. A second copy would drift
-//! silently — an address would stop parsing, or the hook would stop matching a
-//! doorbell, with nothing anywhere reporting the mismatch.
-//!
-//! This argument used to be about two *frontends* — the desktop app and `mpx`, a
-//! tmux host that linked the same core. `mpx` was deleted (2026-09-17); the
-//! process boundary above is what the single copy is really for, and it did not
-//! go away with it.
+//! Two frontends now spawn claudes (the desktop app and `mpx`), and a second copy
+//! of this text would drift silently: the nudge would keep firing, or an address
+//! would stop parsing, with nothing anywhere reporting a mismatch. One copy, both
+//! callers.
 //!
 //! It is delivered by `--append-system-prompt`, which is re-sent every turn — that
 //! is why standing contracts live here and not in an injected first prompt.
@@ -164,14 +155,28 @@ mod.rs or any file you know others also touch) — you dispatched a subagent, ra
 many steps passed — RE-READ it right before editing. Editing against a stale read fails with \
 \"File has been modified since read\" and costs you a re-read+retry anyway; reading first avoids \
 the round-trip and silently picking up the peer's changes.\n\
-INCOMING MESSAGES (the doorbell) — You do NOT run a listener and you do NOT arm anything: there \
-is nothing for you to set up, and no Monitor to start or re-arm for this. Mulpex watches your \
-inbox for you, and when a peer messages you while you are idle it RINGS A DOORBELL by typing one \
-line into your input box, which starts a turn. That line looks exactly like this:\n\
-__MULPEX_DOORBELL__\n\
-A line beginning \"<<<MPX>>>\" is Mulpex telling you mail has arrived — it is NOT something I \
-typed, and it is NOT the message itself. The message body is waiting in your inbox. When you see \
-it, handle it immediately and autonomously: (1) call \
+INCOMING MESSAGES (hub listener) — To be woken when another instance messages you, even while \
+you are idle between my prompts, you run a background listener on your inbox. TO ARM \
+IT: call the Monitor tool (if it is a deferred tool, load it first via ToolSearch with query \
+select:Monitor) with timeout_ms set to the MAXIMUM the tool allows and this EXACT command, which \
+is one line and takes no arguments:\n\
+\"__MULPEX_BIN__\" listen\n\
+Do NOT pass a `persistent` parameter — the Monitor tool no longer has one and the call would be \
+rejected. Every monitor EXPIRES, so the listener is not permanent: when you are told yours \
+expired, RE-ARM IT IMMEDIATELY with the identical command, quietly, whatever else you were doing. \
+An expired listener means peer mail can no longer wake you. NEVER re-arm by copying a Monitor \
+call from earlier in this conversation — an earlier turn may hold a superseded command, a \
+listener started from one cannot report that it is alive, and you will then be asked to arm \
+another on every single turn. Read the command off the line above, every time.\n\
+WHEN TO ARM: as soon as you start working. You are NOT prompted to arm it by a separate startup \
+turn; instead, on your first turn Mulpex injects a hidden reminder (and repeats it each turn ONLY \
+until the listener is armed). When you see that reminder, arm the Monitor QUIETLY as part of the \
+same turn — do not make arming your whole response and do not announce it beyond a brief mention — \
+then carry on with whatever I asked. The listener reports itself alive to Mulpex for as long as \
+it runs, so the reminder stops once it is up and comes back on its own if it dies. \
+Once armed, a peer message shows up as a Monitor event whose line starts with \"mulpex:\" \
+(for example \"mulpex: 1 new hub message(s)\") — that is a peer message arriving, NOT something \
+I typed. When it happens, handle it immediately and autonomously: (1) call \
 mcp__mulpex__hub_inbox to read and clear the message(s); (2) act on them yourself — a message \
 may ask you to do something, may coordinate, or may just inform you; use your judgment and carry \
 it out; (3) reply to the sender via mcp__mulpex__hub_send ONLY if it genuinely adds value (they \
@@ -202,25 +207,25 @@ pub struct SpawnTask {
 }
 
 /// The full `--append-system-prompt` payload: the hub contract plus the planning
-/// discipline, joined by a single newline. ~14 KB — big enough to be worth
-/// building once per spawn rather than per call site.
+/// discipline, joined by a single newline. ~14 KB — large enough that it cannot go
+/// on a tmux command line (see `mulpex-cli`'s `spec.rs`), and large enough that it
+/// is worth building once per spawn rather than per call site.
 ///
 /// `helper` is the absolute path of `mulpex-helper`, substituted for
 /// `__MULPEX_BIN__` exactly as `state_dir::write_state_dir` does it for
 /// `settings.json` and `mcp.json` — and for the same reason: the path differs per
-/// install and per build, and a child invokes the binary directly. `HUB_RULES` no
-/// longer names the helper itself (the instance arms nothing), but the terminal
-/// and remote sections still do.
-///
-/// `__MULPEX_DOORBELL__` is substituted from `crate::doorbell_line`, so the line
-/// the rules show an instance is generated by the same function the poll loop
-/// types. Showing a hand-written copy instead is how the listener command drifted
-/// — one spelling, or two processes that disagree about what a wake looks like.
+/// install and per build, and a child invokes the binary directly. Here it is the
+/// listener command `HUB_RULES` asks the instance to arm.
 pub fn append_system_prompt(helper: &std::path::Path) -> String {
-    let hub = HUB_RULES
-        .replace("__MULPEX_BIN__", &helper.to_string_lossy())
-        .replace("__MULPEX_DOORBELL__", &crate::doorbell_line(1));
+    let hub = HUB_RULES.replace("__MULPEX_BIN__", &helper.to_string_lossy());
     format!("{hub}\n{PLANNING_RULES}")
+}
+
+/// The command `HUB_RULES` tells an instance to arm, spelled out for anything
+/// that has to name it outside the rules text — the arm nudge, which repeats it
+/// so a model has no reason to reach back into its own history for one.
+pub fn listener_command(helper: &std::path::Path) -> String {
+    format!("\"{}\" listen", helper.display())
 }
 
 /// The first prompt a `hub_spawn` child starts on: its assignment plus a
@@ -263,73 +268,46 @@ pub fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The doorbell in `HUB_RULES` is a contract with two *processes*: the poll
-    /// loop in `src-tauri` types the line, and `hook::userpromptsubmit` recognises
-    /// it. The rules text is the third party that has to agree with both, and it
-    /// is the one nobody can compile-check — hence this.
+    /// The arming command in `HUB_RULES` is a contract with `hook.rs`, and it is
+    /// now a contract about a *path* rather than about a shell loop:
     ///
-    /// The example the instance is shown must be generated by `doorbell_line`, not
-    /// hand-written beside it. A hand-written copy is precisely how the listener
-    /// command drifted: one instance re-armed a superseded spelling 71 times
-    /// across two days because the nearest text in its context won (`listen.rs`).
+    /// - the placeholder must be substituted, or the instance arms the literal
+    ///   string `__MULPEX_BIN__` and no listener ever starts;
+    /// - the substituted command must carry `hook::LISTENER_MARKERS`' helper
+    ///   mark, which is how `background_work_running` tells the listener from a
+    ///   real background shell — diverge and every instance is stuck `working`
+    ///   (yellow) for good, exactly as a missing `persistent` flag did on
+    ///   2026-09-16;
+    /// - `rules::listener_command` is what the arm nudge repeats, so it must be
+    ///   the same string the rules print. Two spellings of one command is how a
+    ///   model ends up choosing between them.
+    ///
+    /// It no longer asserts a `touch`: the heartbeat moved into the binary, which
+    /// is the point — a contract the model has to retype correctly was one an
+    /// instance broke 71 times in a row (see `listen.rs`).
     #[test]
-    fn hub_rules_carry_the_doorbell_contract() {
+    fn hub_rules_carry_the_exact_arming_command() {
         let helper = std::path::Path::new("/Applications/Mulpex.app/Contents/MacOS/mulpex-helper");
         let prompt = append_system_prompt(helper);
 
         assert!(
-            !prompt.contains("__MULPEX_BIN__") && !prompt.contains("__MULPEX_DOORBELL__"),
-            "an unsubstituted placeholder is a contract the instance cannot read"
+            !prompt.contains("__MULPEX_BIN__"),
+            "an unsubstituted placeholder is a listener that can never start"
         );
+        assert!(prompt.contains(&listener_command(helper)), "one spelling, not two");
         assert!(
-            prompt.contains(&crate::doorbell_line(1)),
-            "the rules must show the line the poll loop actually types"
+            crate::hook::command_is_hub_listener(&listener_command(helper)),
+            "the mark `hook::is_hub_listener` matches must survive in the command"
         );
+        // The tool no longer has this parameter, and passing it is rejected.
         assert!(
-            prompt.contains(crate::DOORBELL_PREFIX),
-            "the prefix is what the instance is told to recognise"
+            !prompt.contains("persistent set to true"),
+            "HUB_RULES must not ask for a Monitor parameter that no longer exists"
         );
-        // The doorbell replaced the listener, so nothing may ask an instance to
-        // arm anything. `Monitor` itself is still allowed to appear — the rules
-        // say "no Monitor to start or re-arm", and saying so explicitly is worth
-        // it for a `--resume`d session whose own history is full of the old
-        // instruction. What must be gone is every form that could be *followed*.
-        for gone in ["timeout_ms", "persistent", "TO ARM IT", "WHEN TO ARM", "select:Monitor"] {
-            assert!(
-                !prompt.contains(gone),
-                "HUB_RULES must not carry `{gone}` — an instance arms nothing now"
-            );
-        }
-        assert!(
-            prompt.contains("do NOT arm anything"),
-            "and it has to say so outright, for a session that remembers otherwise"
-        );
-    }
-
-    /// `DOORBELL_PREFIX` literally begins with `remote::SIG_OPEN` (`<<<MPX`), so
-    /// these two markers are not merely similar — one is a prefix of the other.
-    /// They stay apart for two independent reasons and it is worth pinning both,
-    /// because either one alone would be luck:
-    ///
-    /// - different channels: a doorbell is matched at the head of a *prompt*
-    ///   (`hook::userpromptsubmit`), a signal inside a shell terminal's
-    ///   *transcript* (`state::process_remote_signals`);
-    /// - and even fed to the wrong one, `find_signals` rejects it — the body
-    ///   between the delimiters is empty, so it carries no per-remote token.
-    ///
-    /// If the doorbell text is ever changed, change it to something that does not
-    /// start with `<<<MPX` and this test can go.
-    #[test]
-    fn doorbell_is_not_a_remote_signal() {
-        let line = crate::doorbell_line(1);
-        assert!(
-            line.starts_with(crate::remote::SIG_OPEN),
-            "the overlap this test exists for — if it's gone, so can the test be"
-        );
-        assert!(
-            crate::remote::find_signals(&line, "deadbeef").is_empty(),
-            "a doorbell must never be read as a remote peer calling its driver"
-        );
+        // The event wording is the other half of the contract: `HUB_RULES` tells
+        // the instance a line starting `mulpex:` is peer mail, and `listen.rs`
+        // prints exactly that.
+        assert!(prompt.contains("mulpex: 1 new hub message(s)"));
     }
 
     /// The address grammar `registry::parse_address` reads.

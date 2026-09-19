@@ -1278,9 +1278,9 @@ fn read_prefix(path: &Path, n: usize) -> Option<Vec<u8>> {
 ///
 /// The directory is still called `termreq` because terminals were the first thing
 /// to need it; it is the general "ask the app to do something to a row" channel,
-/// and `hub_close` rides it too. The name is a wire format between two processes
-/// — the helper writes this directory and the app's poll loop reads it — so it is
-/// left alone rather than renamed for tidiness.
+/// and `hub_close` rides it too. The name is a wire format shared with a second
+/// process (and a third — the `mpx` daemon reads the same dir), so it is left
+/// alone rather than renamed for tidiness.
 fn app_request(ctx: &Ctx, body: Value) -> Result<Value, String> {
     let dir = ctx.state_dir.join("termreq");
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not reach Mulpex: {e}"))?;
@@ -2285,22 +2285,8 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
         return None;
     }
 
-    // **Say which one it is.** This line used to read "You are one of several
-    // parallel Claude instances in this project" and then list only the *others* —
-    // so an instance was shown every address but its own, every single turn, and
-    // the one fact it needs to describe itself was the one fact withheld.
-    //
-    // `hub_instances` reports `your_address`, but nothing makes an instance call
-    // it, and a model that needs the answer mid-sentence does not stop to. Measured
-    // (dev build, 2026-09-17): claude#4 opened a message to a peer with "Hi from
-    // claude#1", having never asked. The hub delivered it correctly attributed, so
-    // the only thing wrong was the prose — which is exactly the part a human reads.
-    //
-    // Same shape as `status_of` defaulting to `waiting`: the fact was available and
-    // simply not said.
-    let mut s = format!(
-        "[Mulpex hub] You are claude#{}, one of several parallel Claude instances in this project.",
-        ctx.instance
+    let mut s = String::from(
+        "[Mulpex hub] You are one of several parallel Claude instances in this project.",
     );
     if !peers.is_empty() {
         s.push_str(" Other instances here right now:");
@@ -2416,34 +2402,9 @@ fn task_of(ctx: &Ctx, id: usize) -> String {
 }
 
 pub(crate) fn unread_for(ctx: &Ctx, id: usize) -> usize {
-    unread_in(&ctx.state_dir, id)
-}
-
-/// Unread hub messages waiting for `id`, keyed on the **state dir** instead of a
-/// `Ctx`.
-///
-/// The app has no `Ctx` — that type belongs to the helper process — and the
-/// doorbell is asked from the app's poll loop, which is the only place that can
-/// both see the inbox and type into the instance's PTY. One implementation, two
-/// callers: `unread_for` above is the helper's spelling of the same question.
-pub fn unread_in(state_dir: &std::path::Path, id: usize) -> usize {
-    std::fs::read_dir(state_dir.join("inbox").join(id.to_string()))
+    std::fs::read_dir(ctx.inbox_dir.join(id.to_string()))
         .map(|d| d.flatten().count())
         .unwrap_or(0)
-}
-
-/// That instance's status word, read from the state dir.
-///
-/// Same default as `status_of`, and the same caveat: a **missing** file reads as
-/// `waiting`, so this reports "nothing has been written about this instance" in
-/// the same word it reports "idle". For the doorbell that is the safe direction —
-/// a claude Mulpex knows nothing about is one sitting at a prompt.
-pub fn status_in(state_dir: &std::path::Path, id: usize) -> String {
-    std::fs::read_to_string(state_dir.join(id.to_string()))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "waiting".to_string())
 }
 
 /// `holder id → basenames of the files it currently locks`.
@@ -2838,31 +2799,6 @@ mod tests {
         let ids = close_targets(&ctx, &json!({ "to": ["40", "claude#40", 41] })).unwrap();
         assert_eq!(ids, vec![40, 41]);
         assert_eq!(close_targets(&ctx, &json!({ "to": 40 })).unwrap(), vec![40]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The peer snapshot must name the instance reading it.
-    ///
-    /// It lists every *other* address every turn, so leaving this out showed an
-    /// instance everybody's address except its own — and a model asked to sign a
-    /// message then guesses. Measured in the dev build: claude#4 wrote "Hi from
-    /// claude#1" to a peer, having never called `hub_instances`.
-    #[test]
-    fn the_peer_snapshot_says_which_instance_you_are() {
-        let dir = std::env::temp_dir().join(format!("mulpex-whoami-{}", new_uuid()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Two live instances, so the snapshot is produced at all.
-        std::fs::write(dir.join("4"), "waiting").unwrap();
-        std::fs::write(dir.join("5"), "waiting").unwrap();
-
-        let ctx = test_ctx(&dir, 4);
-        let snap = peers_context(&ctx).expect("a peer is live, so there is a snapshot");
-        assert!(
-            snap.contains("You are claude#4"),
-            "the reader's own address is the one fact it cannot get anywhere else: {snap}"
-        );
-        assert!(snap.contains("claude#5"), "and the peers are still listed");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -283,21 +283,6 @@ pub struct Core {
     /// only — a muted instance runs and coordinates exactly like any other; the
     /// frontend just dims it, sorts it last, and leaves it out of the badges.
     pub muted: HashSet<usize>,
-    /// Instances whose doorbell has been rung for the mail currently in their
-    /// inbox (`ring_doorbells`). Cleared when that inbox drains.
-    ///
-    /// In memory rather than on disk, deliberately: it is a fact about *this*
-    /// run's poll loop, and a file surviving a restart would silence the first
-    /// real doorbell after one. The cost of losing it is one extra doorbell to an
-    /// instance that already knew — the cost of persisting it wrong is silence.
-    rung: HashSet<usize>,
-    /// Instances currently mid-turn, so `ring_doorbells` can spot the *edge* into
-    /// `working` and resync their draft count there. See `Session::clear_draft`.
-    turn_running: HashSet<usize>,
-    /// Last reason each instance's doorbell was held back, so the debug log prints
-    /// on change instead of five times a second.
-    #[cfg(debug_assertions)]
-    blocked_reason: HashMap<usize, String>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -381,40 +366,6 @@ const RESTORE_GRACE: Duration = Duration::from_secs(120);
 /// batch starts several at once), and far short of a session someone actually
 /// worked in — so "died this fast" really does mean "never started".
 const EARLY_DEATH_GRACE: Duration = Duration::from_secs(10);
-
-/// Should `ring_doorbells` type into this instance right now?
-///
-/// Split out of the loop so the gates can be tested without spawning a `claude` on
-/// a PTY. Every one of them is a way to do real damage:
-///
-/// - **`needs`** means a dialog is on screen. A keystroke there picks an option
-///   and the `\r` confirms it, so a doorbell would answer a question on the user's
-///   behalf.
-/// - **`working`** means a turn is running, and it will find the mail itself at
-///   its own `Stop` (the unread-mail block). Ringing would only queue a second,
-///   redundant turn behind it.
-/// - **a non-empty input box** means the user has a prompt half-written in that
-///   pane. The doorbell ends in `\r`, so typing into it would submit their draft
-///   with our text stapled on the end. See `pty::submits_the_prompt` — this
-///   replaced a quiet-period timer that was both slower and less safe.
-/// - **`rung`** is the plural guard: at 200 ms, six messages arriving together
-///   would otherwise ring six times before the instance drained the first.
-fn should_ring(unread: usize, status: &str, input_box_empty: bool, already_rung: bool) -> bool {
-    unread > 0 && status == "waiting" && input_box_empty && !already_rung
-}
-
-/// Age of the oldest message sitting in an instance's inbox — how long the
-/// doorbell has kept it waiting. Debug builds only; it exists to measure the poll
-/// hop, which is the one part of end-to-end latency this app is responsible for.
-#[cfg(debug_assertions)]
-fn oldest_unread_age(state_dir: &Path, id: usize) -> Option<Duration> {
-    std::fs::read_dir(state_dir.join("inbox").join(id.to_string()))
-        .ok()?
-        .flatten()
-        .filter_map(|e| e.metadata().ok()?.modified().ok())
-        .filter_map(|t| t.elapsed().ok())
-        .max()
-}
 
 /// One in-flight `hub_spawn` batch. The request file is consumed immediately, but
 /// its children are launched across successive poll ticks — so the batch's state
@@ -548,10 +499,6 @@ impl Core {
             names,
             fallback_names: HashMap::new(),
             muted,
-            rung: HashSet::new(),
-            turn_running: HashSet::new(),
-            #[cfg(debug_assertions)]
-            blocked_reason: HashMap::new(),
             worked,
             closing: HashSet::new(),
             remote_awaiting: HashSet::new(),
@@ -1292,123 +1239,6 @@ impl Core {
             self.muted.remove(&id);
         }
         self.persist_sessions();
-    }
-
-    /// Ring the **doorbell** for any instance holding unread hub mail: type one
-    /// short line into its input box so it takes a turn and reads its inbox.
-    ///
-    /// This is the whole idle-wake mechanism, and it lives here because this is
-    /// the only process that can both see the inbox and write to the PTY. It
-    /// replaced a `Monitor` the instance armed on itself, which Claude Code caps
-    /// at 30 minutes — so every instance woke twice an hour for the rest of its
-    /// life purely to start a new one, and each of those wakes cost a full turn
-    /// *and* an Explainer run. Nothing about that was tunable from this side.
-    ///
-    /// **The message is not typed, only the doorbell.** The body stays in
-    /// `inbox/<id>/` and is read with `hub_inbox`, exactly as when a listener
-    /// printed the wake line. Typing content into a TUI is what truncated a task
-    /// at 1022 characters with no error anywhere; `doorbell_line` is ~30.
-    ///
-    /// Three gates, and each one is load-bearing:
-    ///
-    /// - **`waiting` only.** Never `needs` — that instance is showing an
-    ///   `AskUserQuestion` or a plan dialog, where a keystroke picks an option and
-    ///   a `\r` confirms it. Never `working` either: the turn will read the inbox
-    ///   at its own `Stop` (the unread-mail block), so a doorbell would only
-    ///   queue a redundant second turn.
-    /// - **Quiet since the user last typed.** Mulpex cannot see `claude`'s input
-    ///   buffer, so a doorbell landing on a half-written sentence would append
-    ///   itself to it and submit. `Session::idle_since_input` is the only evidence
-    ///   available that nobody is mid-thought here.
-    /// - **Once per batch.** At 200 ms this would otherwise ring five times a
-    ///   second until the instance got around to draining the inbox. Six messages
-    ///   must produce one doorbell, not six — `rung` clears only when the inbox
-    ///   goes empty.
-    ///
-    /// Terminals are skipped: a shell is not a hub peer and has no inbox.
-    pub fn ring_doorbells(&mut self) {
-        for i in 0..self.sessions.len() {
-            let (id, is_claude) = {
-                let s = &self.sessions[i];
-                (s.id, matches!(s.kind, crate::pty::SessionKind::Claude))
-            };
-            if !is_claude {
-                continue;
-            }
-            let unread = mulpex_core::mcp::unread_in(&self.state_dir, id);
-            if unread == 0 {
-                // Drained (or never had any): re-arm this instance's doorbell for
-                // the next batch.
-                self.rung.remove(&id);
-                continue;
-            }
-            let status = mulpex_core::mcp::status_in(&self.state_dir, id);
-            // A turn that has just started is proof the box was emptied — the user
-            // pressed Return to start it. Resync there, on the *transition* only,
-            // so a draft typed while the turn runs (queued input) still counts.
-            //
-            // Without this, the count is write-only and every over-count is
-            // permanent: one key `claude` treated differently from us, or one
-            // escape sequence split across two reads, and that pane's doorbell is
-            // silent for the rest of the session with nothing to say why.
-            if status == "working" {
-                if self.turn_running.insert(id) {
-                    self.sessions[i].clear_draft();
-                }
-            } else {
-                self.turn_running.remove(&id);
-            }
-            let box_empty = self.sessions[i].input_box_empty();
-            if !should_ring(unread, &status, box_empty, self.rung.contains(&id)) {
-                // Why we are holding mail back, logged only when the answer
-                // changes — at 200 ms an unconditional print is five lines a
-                // second. A doorbell that is late is indistinguishable from one
-                // that is broken unless the gate says which it was.
-                #[cfg(debug_assertions)]
-                {
-                    // Dedup on the *category*, never on a formatted elapsed time —
-                    // the first version of this interpolated `idle.as_millis()`
-                    // into the key, so the string differed on every tick and the
-                    // dedup printed five lines a second, which is the exact thing
-                    // it was written to prevent.
-                    let why = if self.rung.contains(&id) {
-                        "already rung"
-                    } else if status != "waiting" {
-                        "busy"
-                    } else {
-                        "a draft is sitting in the input box"
-                    };
-                    if self.blocked_reason.get(&id).map(String::as_str) != Some(why) {
-                        eprintln!(
-                            "[doorbell] claude#{id}: holding {unread} message(s) — {why} \
-                             (status `{status}`)"
-                        );
-                        self.blocked_reason.insert(id, why.to_string());
-                    }
-                }
-                continue;
-            }
-            #[cfg(debug_assertions)]
-            self.blocked_reason.remove(&id);
-            // Text and submit in ONE write. Split across two, `claude` can read
-            // the line, redraw, and take the `\r` as a separate keystroke — the
-            // same class of split that made Shift+Enter send the message it was
-            // supposed to be adding a newline to.
-            let line = format!("{}\r", mulpex_core::doorbell_line(unread));
-            self.sessions[i].send(line.as_bytes());
-            self.rung.insert(id);
-            // How long the mail actually sat before we rang — the poll hop and
-            // nothing else. The end-to-end number a user sees is dominated by the
-            // turn that follows, so this is the only part attributable to Mulpex,
-            // and the only honest way to say whether "it takes time" is ours.
-            #[cfg(debug_assertions)]
-            if let Some(waited) = oldest_unread_age(&self.state_dir, id) {
-                eprintln!(
-                    "[doorbell] claude#{id}: rang for {unread} message(s) {} ms after the first arrived",
-                    waited.as_millis()
-                );
-            }
-        }
     }
 
     /// Unmute any instance the user has just spoken to: one `userprompt/<id>`
@@ -2628,46 +2458,6 @@ mod tests {
     /// DEFAULT pair, so a test asserting a spawn used the *workspace's* size
     /// can't pass by accidentally reading the default.
     const TEST_GEOMETRY: (u16, u16) = (100, 40);
-
-    /// The doorbell's gates. Each one of these, wrong, is a distinct real-world
-    /// failure rather than a cosmetic one — see `should_ring`.
-    #[test]
-    fn a_doorbell_rings_once_and_only_into_an_idle_empty_pane() {
-        const EMPTY: bool = true;
-        const DRAFT: bool = false;
-
-        assert!(should_ring(1, "waiting", EMPTY, false), "mail + idle + empty box = ring");
-
-        // The plural: six messages at once are one doorbell, not six. At a 200 ms
-        // poll the un-guarded version rings five times a second until the instance
-        // gets round to draining its inbox.
-        assert!(should_ring(6, "waiting", EMPTY, false), "six messages still ring");
-        assert!(
-            !should_ring(6, "waiting", EMPTY, true),
-            "...but only once — `rung` clears when the inbox drains, not before"
-        );
-
-        assert!(!should_ring(0, "waiting", EMPTY, false), "no mail, no doorbell");
-
-        // A dialog is on screen: typing picks an option and `\r` confirms it, so
-        // this ring would answer a question in the user's name.
-        assert!(
-            !should_ring(1, "needs", EMPTY, false),
-            "never into a pending question or plan"
-        );
-        // A running turn reads its own inbox at `Stop`; a doorbell only queues a
-        // redundant second turn behind it.
-        assert!(!should_ring(1, "working", EMPTY, false), "never mid-turn");
-
-        // The one that destroys the user's work: a prompt half-written in the box.
-        // The doorbell ends in `\r`, so ringing submits their draft with our text
-        // stapled to the end. Unlike the quiet timer this replaced, *waiting does
-        // not make it safe* — so there is no elapsed time at which this turns true.
-        assert!(
-            !should_ring(1, "waiting", DRAFT, false),
-            "never on top of an unsent draft, however long ago it was typed"
-        );
-    }
 
     /// Opening a project must never start a `claude` the user didn't ask for.
     /// With nothing to restore the project comes up empty and waits for ⌘T.

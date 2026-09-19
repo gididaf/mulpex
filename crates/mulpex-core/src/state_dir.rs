@@ -2,11 +2,9 @@
 //! files it is launched with, and the directory tree the hook and MCP server
 //! expect to find.
 //!
-//! The app writes this tree and the **helper** reads it, as a different process
-//! with no shared memory — the hook and the MCP server look these paths up by
-//! name. That is why the layout lives in `mulpex-core` where both link it, rather
-//! than next to the spawner. (It was also shared with `mpx`, a second host deleted
-//! on 2026-09-17; the process split is the reason that outlived it.)
+//! Shared by both frontends. The desktop app and `mpx` must agree on this tree
+//! exactly — the hook binary and the MCP server are the *same* processes in both
+//! cases, and they look for these paths by name.
 //!
 //! Everything here is rewritten before **every** spawn, not once per project. See
 //! the note on the three-day fuse below.

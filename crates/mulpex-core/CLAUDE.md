@@ -12,14 +12,14 @@ the reason that outlived it.)
 
 | Module | Read first |
 | --- | --- |
-| `hook.rs`, `config.rs` | [../../docs/sessions.md](../../docs/sessions.md) — what each status word means and why `needs` must mean "needs YOU"; [../../docs/hub.md](../../docs/hub.md) — the doorbell contract (`is_system_turn`) and the naming nudge |
+| `hook.rs`, `config.rs` | [../../docs/sessions.md](../../docs/sessions.md) — what each status word means and why `needs` must mean "needs YOU"; [../../docs/hub.md](../../docs/hub.md) — listener arming and naming nudges |
 | `mcp.rs` (`hub_send`/`hub_spawn`/`hub_set_name`) | [../../docs/hub.md](../../docs/hub.md) |
 | `mcp.rs` (`hub_terminal_*`), `termlog.rs` | [../../docs/shell-terminals.md](../../docs/shell-terminals.md) |
 | `registry.rs` | [../../docs/hub.md](../../docs/hub.md) — the `<project>#<n>` grammar and its ordered parser |
 | `remote.rs` | [../../docs/remote-peers.md](../../docs/remote-peers.md) |
 | `persist.rs` | [../../docs/sessions.md](../../docs/sessions.md) — the store's positional columns |
-| `rules.rs` (`HUB_RULES`, `PLANNING_RULES`, `spawn_prompt`, `DOORBELL_PREFIX`), `state_dir.rs` | [../../docs/hub.md](../../docs/hub.md), [../../docs/sessions.md](../../docs/sessions.md) — one copy, because the app writes them and the helper reads them back |
-| `listen.rs` (`mulpex-helper listen`) | [../../docs/hub.md](../../docs/hub.md) — **superseded by the doorbell**; kept only because released builds still run listeners that must be recognised and reaped |
+| `rules.rs` (`HUB_RULES`, `PLANNING_RULES`, `spawn_prompt`), `state_dir.rs` | [../../docs/hub.md](../../docs/hub.md), [../../docs/sessions.md](../../docs/sessions.md) — one copy, because the app writes them and the helper reads them back |
+| `listen.rs` (`mulpex-helper listen`) | [../../docs/hub.md](../../docs/hub.md) — why the listener is a binary, and why it has to notice its own `claude` dying |
 
 Traps that live in this crate specifically:
 
@@ -29,34 +29,35 @@ Traps that live in this crate specifically:
   `named/`, `namenudge/`, `spawning/`, `resumed/`, like `peers/` already does.
 - **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
   fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be
-  gated on it (`nudges_welcome`) — the old arm nudge injected there made the instance start the very
-  Monitor whose death causes the next one. A **doorbell** is the same kind of turn and is classed
-  with it by `is_system_turn`. The peer snapshot is the deliberate exception: a hub wake *is* a
-  task-notification, and is the turn that most needs the unread count. → [../../docs/hub.md](../../docs/hub.md)
+  gated on it (`nudges_welcome`) — an arm nudge injected there made the instance start the very
+  Monitor whose death causes the next one. The peer snapshot is the deliberate exception: a hub
+  wake *is* a task-notification. → [../../docs/hub.md](../../docs/hub.md)
 - **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>]]]`). Only
   *trailing* empties may be dropped, or the id is read back as the name.
 - **`SessionStore::new` picks the home from the ambient `MULPEX_HOME`, so anything that is not the
   desktop app must not use it.** Leave that variable unset and the first write lands in the app's
   own `~/.mulpex/sessions/`, handing the same `--resume` uuid to two claudes — silent conversation
-  corruption, produced by an *omission* rather than a mistake. `SessionStore::in_home` takes the
-  home explicitly, which is what makes the bug unwritable. `mpx` was the caller that forced this
-  and is gone; the hazard is in the ambient-home design, so the signature stays.
-- **Never ask an instance to set something up that this side could do itself.** `HUB_RULES` used to
-  carry a `Monitor` command the model retyped, and an instance re-armed a *superseded* copy 71 times
-  across two days and an app update, because a model copies its own last `Monitor` call before it
-  re-reads the system prompt. Moving the loop into `listen.rs` fixed the retyping; the **doorbell**
-  finished it by leaving nothing to arm. `HUB_RULES` now only *describes* what a doorbell looks
-  like. → [../../docs/hub.md](../../docs/hub.md)
-- **`rules.rs` and `hook.rs` are two ends of one contract.** `HUB_RULES` tells the instance a line
-  starting `<<<MPX>>>` is Mulpex ringing; `hook::is_system_turn` has to recognise the same line, or
-  a doorbell overwrites the sidebar task and unmutes a ⌘M'd row. Both spellings come from
-  `crate::doorbell_line` and `hub_rules_carry_the_doorbell_contract` asserts it, along with the
-  absence of any surviving `__MULPEX_*__` placeholder and of anything still asking an instance to
-  arm. → [../../docs/hub.md](../../docs/hub.md)
+  corruption, from an omission rather than a mistake. `SessionStore::in_home` takes the home
+  explicitly, which is what makes the bug unwritable. `mpx` was the caller that forced this and is
+  gone; the hazard is in the ambient-home design, so the signature stays.
+- **The listener command is a binary because prose is retyped, and retyping drifts.** `HUB_RULES`
+  asks for `"<helper>" listen` — one line, `__MULPEX_BIN__`-substituted like `settings.json` and
+  `mcp.json`. It used to be a ~400-character shell loop, and an instance re-armed a *superseded*
+  copy of it 71 times across two days and an app update, because a model copies its own last
+  `Monitor` call before it re-reads the system prompt. Never move behaviour back into that string:
+  anything the loop must do goes in `listen.rs`, which ships with the app.
+  → [../../docs/hub.md](../../docs/hub.md)
+- **`rules.rs` must stay byte-identical across hosts, not merely equivalent**, and `hook.rs` reads
+  it from two ends: `command_is_hub_listener` recognises the command (which is what keeps a
+  listener from counting as work in flight, and what the orphan reaper matches on), and the arm
+  nudge repeats it verbatim. A character of drift strands every instance on yellow, or re-nudges it
+  forever. `hub_rules_carry_the_exact_arming_command` asserts both, plus that no `__MULPEX_BIN__`
+  placeholder survives into the prompt.
+  → [../../docs/hub.md](../../docs/hub.md)
 - **Only the `Stop` payload carries `background_tasks`** — not `UserPromptSubmit`, not
   `PostToolUse`, not the idle notification (measured, `claude` v2.1.273). Anything that needs to
-  know what is running has to be decided in `stop` and handed forward on disk.
-  → [../../docs/hub.md](../../docs/hub.md)
+  know what is running has to be decided in `stop` and handed forward on disk, which is what
+  `relisten/<id>` is. → [../../docs/hub.md](../../docs/hub.md)
 - **A background agent's tool calls fire `PostToolUse` in the PARENT session.** So does anything
   else the instance started; the hook cannot tell whose call it is answering except by `tool_name`.
   This is why `posttooluse` may not write `working` blindly: it ran ~once every two seconds over an
@@ -65,10 +66,11 @@ Traps that live in this crate specifically:
   → [../../docs/sessions.md](../../docs/sessions.md)
 - **The watcher list is generic; the listener matchers are not.** `command_is_watcher` (built-ins +
   `<mulpex home>/watchers.txt`) is what keeps a never-exiting background task from pinning a row
-  yellow — agentalk's poll loop and events tail, legacy hub listeners, anything the user adds. But
-  `pty::reap_orphaned_listeners` matches `command_is_hub_listener` alone, because it SIGKILLs, and
-  must only ever do that to Mulpex's own listener. A watcher also writes `watching/<id>` separately
-  from `bg/<id>`, because the status word and the updater's busy guard want opposite answers.
+  yellow — the hub listener, agentalk's poll loop and events tail, anything the user adds. But
+  `running_listener_ids`/`note_listener_needs_replacing` and `pty::reap_orphaned_listeners` still
+  match `command_is_hub_listener` alone: those re-arm and kill things, and they must only ever do
+  that to Mulpex's own listener. A watcher also writes `watching/<id>` separately from `bg/<id>`,
+  because the status word and the updater's busy guard want opposite answers about it.
   → [../../docs/sessions.md](../../docs/sessions.md)
 - **Don't report a default as a fact.** `status_of` returns `waiting` for a *missing* file, and that
   ambiguity once made a 91 s spawn stall indistinguishable from a lost task.

@@ -217,11 +217,6 @@ pub fn set_mute_menu_checked(app: AppHandle, checked: bool) {
 }
 
 /// Forward raw bytes to a session's PTY (from xterm `onData`).
-///
-/// `send_from_user`, not `send`: this is the one path carrying the user's own
-/// keystrokes, and the doorbell needs to know when they last landed so it does not
-/// type into a half-written sentence. Everything Mulpex writes itself goes through
-/// plain `send`.
 #[tauri::command]
 pub fn send_bytes(
     state: State<AppState>,
@@ -231,7 +226,7 @@ pub fn send_bytes(
 ) {
     if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
         if let Some(session) = core.session_mut(id) {
-            session.send_from_user(&data);
+            session.send(&data);
         }
     }
 }

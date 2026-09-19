@@ -1945,6 +1945,11 @@ condition removed**: `left: "working" right: "needs"` on the agent's first `Tool
 
 ## 2026-09-17 — the doorbell replaces the hub listener, and `mpx` is deleted
 
+> **REVERTED 2026-09-19.** The doorbell was removed and the `Monitor`-armed listener restored, on
+> the user's instruction, after mail stopped arriving. Everything measured below was measured, and
+> is kept because the numbers are the only record of what that design actually cost and delivered —
+> but **none of it describes current behaviour.** `mpx` stayed deleted. See the 2026-09-19 entry.
+
 Driven against a real `npm run tauri dev` build (`~/.mulpex-dev`, its own projects), with a
 debug-only `[doorbell]` trace printing why each ring fired or was held. The user QA'd in the window;
 the numbers below are from the app's own stderr, not from a stopwatch.
@@ -2116,3 +2121,51 @@ appears after every single ring.
   times**, on the released build, while deleting the thing that made it necessary.)
 - **The shipped `.app`.** Everything above is `tauri dev`. The `[doorbell]` trace is
   `#[cfg(debug_assertions)]`, so a release build is also the first one running this code silently.
+
+## 2026-09-19 — the doorbell is reverted; the Monitor listener comes back
+
+Reported by the user: *"we totally messed up Mulpex since doorbell"*, symptom **mail never
+arrives**. Reverted on instruction, as v0.22.3.
+
+### What was reverted, and what deliberately was not
+
+Only three substantive commits existed between v0.21.1 (the last pre-doorbell release) and HEAD:
+
+| commit | verdict |
+| --- | --- |
+| `43f0ad3` feat(hub): the doorbell | reverted — **doorbell half only** |
+| `932895d` fix(hub): reap every hub listener | reverted in full |
+| `d3672bd` fix(sessions): store the transcript uuid | **kept** — unrelated, and it is what recovered warweb#75 |
+
+Two traps, both found before anything was committed:
+
+- **`43f0ad3` also deleted `crates/mulpex-cli/` (~9,400 lines).** A plain `git revert` resurrects
+  the whole `mpx` crate and re-adds it to the workspace members — which `cargo build` then accepts,
+  so nothing would have complained. It was force-removed again and `Cargo.toml`/`Cargo.lock` taken
+  from HEAD. Check what else rode along in a commit before reverting it.
+- **`932895d` had to go too, and reverting the doorbell alone would have looked like a failed
+  revert.** It made `reap_orphaned_listeners` kill *every* `mulpex-helper … listen` process
+  unconditionally, once a minute from the poll loop. Restore the Monitor listener under that sweep
+  and it is SIGKILLed within 60 s — producing exactly the reported symptom, mail never arriving,
+  with the newly-restored code looking like the culprit.
+
+### Verified
+
+- **Builds and tests.** `cargo build --workspace` clean; 96 app + 119 core tests pass (98 before —
+  the two doorbell tests went with it).
+- **The revert is complete in the code**, by grep: no `ring_doorbells` / `doorbell_line` /
+  `draft_len_after` anywhere in `state.rs`, `pty.rs` or `rules.rs`; `HUB_RULES` carries the
+  `Monitor` arming command again; `reap_orphaned_listeners` keys on `ppid == 1` again.
+- **The kept fix survived the three-way merge intact**: `SESSIONID_DIR`, `uuid_from_transcript_path`,
+  `session_id_path`, `hook::write_session_uuid` and `Core::reconcile_session_ids` are all still
+  present and still wired into the poll loop.
+
+### NOT verified
+
+- **That reverting actually fixes "mail never arrives".** Nothing here reproduced the symptom
+  first — the revert was done on instruction, not on a diagnosis, and the old listener has its own
+  history of exactly this failure (see **Unread messages only arrived at the next prompt**). If mail
+  still does not arrive on v0.22.3, the cause is upstream of both mechanisms and this revert bought
+  nothing but the 30-minute re-arm burn back.
+- **The shipped `.app`.** Tests and greps only; no driven run of the restored listener, and no QA
+  in a real Mulpex window.

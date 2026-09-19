@@ -53,5 +53,5 @@ Traps that live in this directory specifically:
   being the only write-once files in the tree is exactly how a Mulpex left open over a long weekend
   lost the two files `claude --settings` needs — while every running instance carried on, so
   nothing looked wrong until the next ⌘T. New scratch state goes in `mulpex-core`'s
-  `state_dir.rs::write_state_dir` — it lives there so the helper reads back the same layout the app
-  writes — which every spawn re-runs. → [../docs/sessions.md](../docs/sessions.md)
+  `state_dir.rs::write_state_dir` — it lives there so the helper reads back the same layout the
+  app writes — which every spawn re-runs. → [../docs/sessions.md](../docs/sessions.md)

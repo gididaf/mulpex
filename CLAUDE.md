@@ -24,7 +24,7 @@ reasoning in `docs/`.
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
-| [docs/hub.md](docs/hub.md) | The doorbell (idle wake) and its gates, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes, `ring_doorbells` |
+| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explainer.md](docs/explainer.md) | Hebrew Explainer panel: automatic after every turn / pending question / pending plan (`Stop`/`askq`/`plan` write `explainreq/<id>`, the poll drains it), the `dialog` marker and the flush race, a feed of 10 (dimmed history, sticky scroll, bottom-pinned), three fixed parts with app-drawn headings, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs`'s `write_explain_request`, `hub.rs`'s drain, `ExplainerPanel.svelte`, `stores.ts`'s cap |
@@ -48,12 +48,13 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
                       + termlog (the terminal-transcript header, written by the app and
                         parsed by the helper — the one format both processes must agree on)
                       + rules (HUB_RULES/PLANNING_RULES/spawn_prompt) and state_dir
-                        (the scratch-dir layout) — the app writes both and the HELPER
-                        reads them back, so one copy or the two processes disagree
-                      + listen (the old hub listener's 1 Hz inbox watch — superseded by
-                        the doorbell; kept only to recognise/reap listeners that
-                        released builds are still running)
+                        (the scratch-dir layout) — the two things a second host would
+                        otherwise copy, so they live here and must stay byte-identical
+                      + listen (the hub listener's 1 Hz inbox watch — the loop HUB_RULES
+                        used to spell out for the model to retype)
 crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` dispatch → mulpex-core
+crates/mulpex-cli/    bin `mpx`: the SECOND host — Mulpex over tmux, for working via ssh
+                      (see "Two hosts, one core" below)
 src-tauri/            the Tauri app (Rust backend)
   src/pty.rs          Session = one claude OR one shell on a PTY (SessionKind), streaming
                       to a frontend Channel
@@ -93,44 +94,31 @@ docs/                 the deferred half of these notes — see the table above
 It was deleted on 2026-09-17** because having two things called Mulpex confused every conversation
 about either. `mulpex-core` still exists for the reason that outlived it: the app and the **helper**
 are different processes sharing state only through files, so anything both must agree on
-(`HUB_RULES`, the scratch-dir layout, `termlog`'s header) has exactly one copy. Two artifacts are
-kept deliberately even though their second caller is gone — `SessionStore::in_home`
-(see the invariants below) and `listen.rs` — and the `docs/verification-log.md` entries measuring
-`mpx` are history, not current behavior.
+(`HUB_RULES`, the scratch-dir layout, `termlog`'s header) has exactly one copy. `SessionStore::in_home`
+is kept deliberately even though its second caller is gone (see the invariants below), and the
+`docs/verification-log.md` entries measuring `mpx` are history, not current behavior.
 
-## The doorbell: how an idle instance is woken
+## Why the hub listener is a Monitor, and what that costs
 
-`hub_send` writes `inbox/<id>/<uuid>.json` and nothing else. **The only thing that can start a turn
-in an idle `claude` is a keystroke**, so the 200 ms poll types one line into it:
+`hub_send` writes `inbox/<id>/<uuid>.json` and nothing else, so something has to be *watching* that
+directory on the instance's behalf. That something is `mulpex-helper listen`, armed by the instance
+itself as a background `Monitor` on its first turn — `HUB_RULES` carries the exact command, and
+`hook.rs`'s arm nudge re-asks until `armed/<id>` says it is running.
 
-```
-<<<MPX>>> 1 new hub message(s)
-```
+**Its known cost, accepted deliberately:** Claude Code caps every Monitor at 30 minutes
+(v2.1.271, 2026-09-14), so each instance wakes twice an hour purely to re-arm — a full turn plus an
+Explainer run. That is the price of the listener actually noticing mail, and it is the price the
+user chose on 2026-09-19 after the alternative failed (below).
 
-The instance then calls `hub_inbox` and reads the real message off disk — **the body is never
-typed**, only the trigger. `Core::ring_doorbells` rings, `crate::doorbell_line` is the one spelling
-(`HUB_RULES` shows it to the instance from that same function), and `hook::is_system_turn`
-recognises it so it does not overwrite the sidebar task or unmute a ⌘M'd row.
-
-This replaced a `Monitor` the instance armed on itself. Claude Code capped every Monitor at 30
-minutes (v2.1.271, 2026-09-14), so each instance woke twice an hour purely to re-arm — a full turn
-plus an Explainer run, ~96 model calls a day, saying "nothing changed". Nothing about that was
-tunable from this side. The doorbell deletes the whole apparatus: no arming, no heartbeat, no
-re-arm nudge, and with them the entire class of bug where a model retypes a command wrong.
-
-**Three gates gate the ring, and each is a way to do real damage** (`state::should_ring`):
-
-- **`waiting` only.** Never `needs` — a dialog is on screen and a keystroke picks an option while
-  the `\r` confirms it. Never `working` — that turn reads its own inbox at `Stop`.
-- **The input box must be empty.** Mulpex cannot see `claude`'s input buffer, so `pty::draft_len_after`
-  counts what it forwards: typing adds, backspace removes, Return/Ctrl+C/Ctrl+U zero it, and escape
-  sequences (arrows, focus reports, mouse) change nothing. Getting this wrong submits a prompt the
-  user never wrote — see the invariants.
-- **Once per batch.** At 200 ms, six messages would otherwise ring six times.
-
-Measured (dev build, 2026-09-17): **12–82 ms** from a message landing to the doorbell being typed
-(16 ms under fan-in from three `hub_spawn` workers), against ~500 ms average for the 1 Hz listener
-it replaced.
+**A host-typed "doorbell" replaced this between 2026-09-17 and 2026-09-19 and was reverted.** It
+had the poll loop type `<<<MPX>>> 1 new hub message(s)` into an idle pane instead of arming
+anything, behind three gates (`waiting` only, empty input box, once per batch). It measured 12–82 ms
+end to end and deleted the whole re-arm burn — and then **mail stopped arriving**, which is the one
+thing the mechanism exists to do, and which a gate that silently declines to ring looks exactly
+like. Reverted on the user's instruction. The measurements are kept in
+[docs/verification-log.md](docs/verification-log.md); do not read them as current behavior, and do
+not reintroduce the doorbell without first solving *delivery you can see* — a ring that does not
+happen has to be as visible as one that does.
 
 ## The helper (why it's a separate binary)
 
@@ -347,36 +335,20 @@ and cost real time; each links to the measurement that settled it.
   truncated every task over ~1 KB (measured: 1022 characters received, whatever was sent) while
   every signal said success. A TUI is not an interface; argv is.
   → [docs/hub.md](docs/hub.md), [docs/remote-peers.md](docs/remote-peers.md)
-- **Anything an instance must get exactly right belongs on THIS side, not in `HUB_RULES`.** The hub
+- **Anything an instance must get exactly right belongs in a binary, not in `HUB_RULES`.** The hub
   listener was a ~400-character shell one-liner the model retyped from prose, and a model copies its
   own last `Monitor` call before it re-reads the system prompt: one instance re-armed a *superseded*
   copy 71 times across two days and an app update, healing only when `/compact` dropped that call
-  from its context. Moving the loop into `listen.rs` fixed the retyping; the **doorbell** finished
-  the job by giving the instance nothing to set up at all. Each step moved work from the model to
-  the program, and each one deleted a class of bug rather than an instance of one. Same lesson as
-  argv-vs-TUI, one layer up. → [docs/hub.md](docs/hub.md)
-- **Never type into a `claude` whose input box might not be empty.** The doorbell ends in `\r`, so
-  a ring landing on a half-written prompt submits the user's draft with Mulpex's text stapled on the
-  end — their words, sent by us, to a turn they never chose. `pty::draft_len_after` is the whole
-  defence, and every ambiguous case in it resolves toward "there is a draft": being wrong that way
-  only makes mail wait behind the sidebar badge. Two earlier models of this shipped to the user and
-  both failed — a 3 s quiet timer (no protection at all; people pause longer than that while
-  composing) and "was the last key Return" (latched, so clicking or scrolling a pane silenced it
-  until the next Return). → [docs/hub.md](docs/hub.md)
+  from its context. It is now one line — `"<helper>" listen` — and the loop lives in `listen.rs`.
+  Same lesson as argv-vs-TUI, one layer up. → [docs/hub.md](docs/hub.md)
 - **Nothing this app signals can reach what a `claude` backgrounds.** Claude Code runs each
   background command in its own process group with no controlling terminal, so `Session::kill`'s
   `killpg` *and* its tty sweep both miss it — the hub listener survived ⌘W, crashes and teardown
-  alike and was found six-deep on one machine, a day old, still spinning. The only way to reach one
-  is a process-table sweep, which is what `reap_orphaned_listeners` is: launch, teardown, and once
-  a minute from the poll loop.
-- **It kills EVERY hub listener, not just orphaned ones, and that is deliberate.** Mulpex starts
-  none since the doorbell, so any live `mulpex-helper … listen` is unwanted whoever its parent is.
-  It has to be unconditional because `HUB_RULES` cannot win the argument: `warweb#75`, running the
-  new prompt that says *"you do NOT arm anything"*, armed one every 30 minutes all night — its
-  transcript holds **141 arm calls going back four days**, and a model copies its own last `Monitor`
-  call before it re-reads the system prompt. What narrows the kill is now only the command match, so
-  it must stay `command_is_hub_listener` and never widen to `command_is_watcher`, which also covers
-  agentalk's poll loop. → [docs/hub.md](docs/hub.md)
+  alike and was found six-deep on one machine, a day old, still spinning. Such a process has to
+  notice on its own (`pids/<id>`) and be reapable from outside (`ppid == 1`). `reap_orphaned_listeners`
+  is that outside reaper, and it must stay **orphans-only** (`ppid == 1`): an unconditional sweep
+  shipped on 2026-09-18 and killed live listeners once a minute, which is indistinguishable from
+  mail never arriving. → [docs/hub.md](docs/hub.md)
 - **`SessionStore::new` picks its home from the ambient `MULPEX_HOME`.** Anything that is not the
   desktop app must use `SessionStore::in_home` with an explicit home, or it writes into the app's
   own `~/.mulpex/sessions/` and two claudes get handed the same `--resume` uuid — silent
@@ -429,18 +401,11 @@ new work more than any individual fix is.
 - **The one-item case passes.** Six concurrent `hub_spawn` children blew a timeout that one child
   never approached; a `hub_terminal` bug appeared only on the second command. **Test the plural.**
 - **A self-healing reminder that fires on the wrong turn heals a wound it inflicts.** The arm nudge
-  re-injected until the listener was armed, which is right; injected on the *restart* turn it made
-  the instance arm the Monitor whose orphaned death causes the next restart turn. Nothing looked
-  broken at any single step — each part did exactly its job — and it never settled. When a nudge
-  asks for an action, check whether that action recreates the nudge's own trigger. (That nudge is
-  gone with the listener; the shape is not.) → [docs/hub.md](docs/hub.md)
-- **A safety gate nobody can see is a gate nobody knows is shut.** The doorbell's draft guard went
-  through three designs in one afternoon, and each intermediate one *looked* fine from the code: a
-  quiet timer that protected nothing, then a latch that silenced whole panes indefinitely. Neither
-  produced an error, a log line or a failing test — the only symptom was mail that quietly did not
-  arrive, which is indistinguishable from no mail. What ended it was printing the *reason* a gate
-  held (`[doorbell] claude#5: holding 1 message(s) — …`), at which point the answer was one line of
-  output. **When a guard can silently decline to act, make it say why it declined.**
+  re-injects until the listener is armed, which is right; injected on the *restart* turn it made the
+  instance arm the Monitor whose orphaned death causes the next restart turn. Nothing looked broken
+  at any single step — each part did exactly its job — and it never settled. When a nudge asks for
+  an action, check whether that action recreates the nudge's own trigger.
+  → [docs/hub.md](docs/hub.md)
 - **Someone else's UI is not an interface.** Delivering data by typing it into `claude`'s input box
   worked for months and then silently started truncating at 1022 characters, because that program
   changed how it handles a paste. Nothing in this repo moved. Prefer the contract that is declared
@@ -449,17 +414,11 @@ new work more than any individual fix is.
   measurement is long: the Shift+Enter byte (never the problem — the stray `keypress` `\r` was), the
   `__MPX__` marker (markdown ate the underscores), the spawn-truncation bug (neither Mulpex nor the
   kernel touched the string — the TUI did, and only the child's transcript could show it), the
-  earlier task-truncation report (it was a 91 s readiness stall), reading Hebrew off a
-  screenshot (transcription re-applies BiDi and hides which end is which), and the doorbell's
-  "it takes time" (the transport was 82 ms; the wait was a gate of ours, and only the log said so).
+  earlier task-truncation report (it was a 91 s readiness stall), and reading Hebrew off a
+  screenshot (transcription re-applies BiDi and hides which end is which).
   Drive a real `claude` on a PTY, replay real bytes through the real xterm build, and read the live
-  scratch dir — `namereq/` drained with `named/` absent distinguishes "never called" from "refused"
-  in one listing. → [docs/verification-log.md](docs/verification-log.md)
-
-  **And check your instrument before you trust it.** Writing a probe message straight into
-  `inbox/<id>/` looked like a clean way to time the doorbell; it measured nothing, because the
-  project's claudes were dead and `bounce_dead_inbox` deleted the file 103 ms later. The reading was
-  not wrong, it was of something else entirely.
+  scratch dir — `armed/` present with `named/` absent distinguishes "never called" from "refused" in
+  one listing. → [docs/verification-log.md](docs/verification-log.md)
 
 ## Last Synced Commit
 

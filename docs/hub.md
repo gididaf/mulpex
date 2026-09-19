@@ -9,122 +9,104 @@ Shell terminals are in [shell-terminals.md](shell-terminals.md); remote peers in
 
 Back to [CLAUDE.md](../CLAUDE.md).
 
-## The doorbell — idle wake
+## Hub listener — idle wake (A2)
 
-A `claude` reads its inbox only when it takes a turn, so a peer's message sits unread while the
-instance is idle between the user's prompts. **Nothing in Claude Code can start a turn in an idle
-session** — no hook reaches one (hooks run only when the session already does something), MCP
-channels deliver only to a session that is already live, and `SessionIdle` is requested but
-unimplemented (anthropics/claude-code#94812). The one thing that *does* start a turn is a keystroke,
-and Mulpex owns the PTY.
+By default a `claude` instance only reads its inbox when it takes a turn, so a message from a
+peer sits unread while the instance is idle between the user's prompts. To make an idle instance
+react on its own **without host-side stdin polling**, each instance runs the agentalk pattern
+against the *local* hub:
 
-So the 200 ms poll (`Core::ring_doorbells`, `state.rs`) types one line into the instance:
+- **Watcher:** the instance arms a `Monitor` running **`"<helper>" listen`** (`mulpex-core`'s
+  `listen.rs`, reached through `mulpex-helper`), a ~1 s poll of its own inbox dir
+  (`$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID/`), emitting a `mulpex: N new hub message(s)`
+  line only when new message files appear (seeded to the current count, so only post-arm
+  arrivals fire). Each such line is a wake event the Claude Code runtime injects as a new turn —
+  even while the instance is idle waiting for the user. It was a shell one-liner until 2026-09-16;
+  see [the command is a binary now](#the-command-is-a-binary-now-and-the-old-one-is-why) for why
+  that had to stop.
+- **Arming (hook-driven, no injected prompt):** only the agent can arm its *own* Monitor, and a
+  `--resume` restart kills the previous one — but instead of typing a visible bootstrap prompt
+  into the PTY (which looked ugly/confusing on every spawn and resume), a normal instance now
+  **starts completely clean** and arms its listener from the **`UserPromptSubmit` hook** on the
+  user's first turn. The hook (`hook.rs::userpromptsubmit`) injects `ARM_LISTENER_NUDGE` as hidden
+  `additionalContext` — a low-key "arm your listener quietly as part of this turn" reminder — but
+  only while `listener_armed(ctx)` is false, i.e. while `state_dir/armed/<id>`'s mtime is stale.
+  The listener **rewrites that flag on every pass of its loop**, so it tracks a *live* Monitor:
+  once armed the reminder stops; if arming was missed, or the Monitor expired, it re-injects next
+  turn (self-healing). Because `state_dir` is fresh per Mulpex launch (hence per `--resume`), the
+  flag is absent at startup, so restored instances re-arm on their first prompt. The full arming
+  procedure + exact Monitor command live in `HUB_RULES` (append-system-prompt, so the wake→act
+  contract survives compaction), and the nudge **repeats that command verbatim** rather than
+  pointing at it. *(`hub_spawn` children are the one case that still gets an injected
+  PTY prompt — their assigned task — via `mulpex-core`'s `rules.rs::spawn_prompt`; they arm the
+  listener from the same hook on that first turn.)*
+- **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
+  autonomously, replies to the sender only when it adds value (no bare acks), and prefixes the
+  self-triggered turn with a `⟳ hub message from <sender> →` marker so the human can tell it
+  wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
+  still covers the "notice on your next prompt" path.
 
-```
-<<<MPX>>> 1 new hub message(s)
-```
+### The listener is not permanent, and `armed/<id>` is a heartbeat
 
-- **The body is never typed**, only the trigger. `hub_send` still writes `inbox/<id>/<uuid>.json`
-  and the instance still reads it with `hub_inbox`. Typing content into a TUI is what truncated a
-  task at 1022 characters (see `hub_spawn` below); `crate::doorbell_line` is ~30.
-- **One spelling.** `doorbell_line` generates both the line the poll loop types and the example
-  `HUB_RULES` shows the instance (`__MULPEX_DOORBELL__` is substituted from it), so the two cannot
-  drift — the failure that ended the previous design.
-- **`hook::is_system_turn` recognises it** and puts it on the same side as a `<task-notification>`:
-  no sidebar-task overwrite, and **no `userprompt/<id>` unmute mark**, or every peer message would
-  undo a ⌘M. `peers_context` is still injected, deliberately — a doorbell turn is the one that most
-  needs the unread count.
-- **On wake** the instance calls `hub_inbox`, acts autonomously, replies only when it adds value,
-  and prefixes the turn `⟳ hub message from <sender> →` so the human can tell it wasn't their
-  prompt.
+Claude Code removed persistent Monitors (measured 2026-09-16), so **every hub listener expires** —
+30 minutes at most. A listener that has stopped cannot wake an idle instance, which is the only
+reason it exists.
 
-Measured (dev build, 2026-09-17): **12–82 ms** from the message landing to the doorbell being
-typed — fast enough that it beats the gap between two messages, which is why a ring almost always
-reports `1 message(s)` even under fan-in.
+The arm nudge is what gets one re-armed, and it reads `armed/<id>`. That file is now written by the
+listener *on every pass of its one-second loop*, not once at startup, and `hook::listener_armed`
+tests its **mtime** (grace: 30 s) instead of its existence — so a dead listener goes stale within
+seconds and the nudge comes back on its own. `HUB_RULES` separately tells the instance to re-arm the
+moment it is told its monitor expired; that is the fast path, the heartbeat is the one that does not
+depend on the model noticing.
 
-### The three gates, and what each one prevents
+`HUB_RULES` must also no longer ask for `persistent: true`: the Monitor schema is
+`additionalProperties: false`, so passing it is rejected and a literal-minded instance would fail to
+arm at all. The full story, including what the same change did to the sidebar's yellow dot, is in
+[sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
 
-`state::should_ring` — all four conditions, each a way to do real damage:
+### The command is a binary now, and the old one is why
 
-| Gate | What ringing anyway would do |
-| --- | --- |
-| status is `waiting` | On `needs`, a dialog is on screen: the keystroke picks an option and the `\r` confirms it — Mulpex answers a question in the user's name. |
-| …and not `working` | That turn reads its own inbox at its `Stop` (the unread-mail block). A doorbell only queues a redundant second turn. |
-| the input box is empty | The doorbell ends in `\r`, so it submits the user's half-written prompt with our text stapled on. See below. |
-| not already rung | At 200 ms, six messages arriving together ring six times before the instance drains the first. `rung` clears only when the inbox empties. |
+Adding that in-loop `touch` is what exposed the real problem: **the listener command was
+transcribed by the model, and a model copies whichever version is nearest in its context — which is
+its own previous `Monitor` call, not the system prompt.**
 
-### Knowing whether the input box is empty took three tries
+Measured on live instances, 2026-09-16, from their own transcripts:
 
-Mulpex cannot read `claude`'s input buffer. It only sees the bytes it forwards, so it infers — and
-the first two inferences both shipped to the user and both failed in his hands the same afternoon:
+- `warweb#65` armed the listener **72 times** across two days. Arms #1–#71 all carried the
+  pre-in-loop-`touch` command. It went straight through the app update that changed the text, and
+  only picked up the current version at arm #72 — immediately after a `/compact` dropped the old
+  call from its context. Its sibling `warweb#74` never recovered at all.
+- `cloudraw#3` is the control: it compacted earlier in the day and has armed the current command
+  ever since.
 
-1. **A 3-second quiet timer.** Slow where it shouldn't be: a reply to the pane he had just typed in
-   rang at **3051 ms**, against **82 ms** for an untouched one — and the round trip is the common
-   case, so nearly every doorbell paid it. Worse, it protected nothing: anyone composing a prompt
-   pauses for longer than a timer you would dare set, and the doorbell then fired straight into the
-   draft. *"if for example i prepare a prompt in a claude but not send it yet, the doorbell will
-   force send it?"* — yes, it would have.
-2. **"Was the last key Return."** Safe, but it latched. Clicking into a pane, scrolling it or
-   pressing an arrow key all arrive through xterm's `onData` exactly like a keystroke, so any of
-   them marked the pane as drafting until the next Return. *"now they read my messages only after
-   ENTER."*
-3. **Counting what is in the box** (`pty::draft_len_after`). Typing adds, backspace removes,
-   Return/Ctrl+C/Ctrl+U zero it, escape sequences change nothing, and UTF-8 *lead* bytes are counted
-   so one Hebrew character is one character.
+The consequence is a feedback loop, not just a stale string. No in-loop `touch` ⇒ `armed/<id>` never
+refreshes ⇒ `listener_armed` is false every turn ⇒ the arm nudge fires every turn ⇒ **another
+Monitor stacks on each one**. `warweb#65` was seen running three at once; one hub message woke it
+three times, which is how the whole thing was noticed.
 
-The lesson is (2): **an escape sequence is not a keystroke**, even though it arrives through the
-same callback. And the count is resynced on the edge into `working` (`Core::turn_running`), because
-a turn starting proves the box was emptied — without that, any over-count is permanent and silences
-that pane for the session with nothing to say why.
+So the command stopped being prose to retype and became **`"<helper>" listen`** — one line naming a
+binary:
 
-Errors resolve toward "there is a draft". Being wrong that way makes mail wait behind the sidebar's
-unread badge; being wrong the other way sends something the user never wrote.
+- The loop's behaviour ships with the app. Changing it never asks a model to retype anything, and a
+  session running last week's binary gets this week's logic at its next re-arm.
+- The helper lives inside the `.app`, so the **three-day `$TMPDIR` fuse** cannot reach it. A script
+  in the scratch dir would have been unrunnable for an instance open over a long weekend — at
+  exactly the moment it needed to re-arm.
+- `hook::command_is_hub_listener` is one matcher used by everything that has to recognise a
+  listener (the `Stop` hook's working/idle count, and the orphan reaper). Two spellings is how one
+  of them silently stops recognising the other.
 
-### What the doorbell replaced, and why it was deleted
+**Recognising the old form is permanent, not transitional.** A session that was already running
+keeps re-emitting the shell one-liner out of its history for as long as it lives, so
+`command_is_hub_listener` matches both forms. For those sessions there is a repair path: only the
+`Stop` payload carries `background_tasks` (see below), so `Stop` writes `relisten/<id>` when it sees
+a listener that is running yet not refreshing the heartbeat — or more than one — and the next arm
+nudge names those task ids and tells the instance to `TaskStop` them and arm one current listener.
 
-Until 2026-09-17 each instance armed a **`Monitor`** on its own inbox, running `"<helper>" listen`
-(`mulpex-core/src/listen.rs`) — a 1 Hz poll printing `mulpex: N new hub message(s)`, which the
-runtime injected as a turn. `hook.rs` nudged it to arm from `UserPromptSubmit` while
-`armed/<id>`'s mtime was stale.
-
-Two measured failures killed it, in order:
-
-- **A command the model retypes, drifts.** The listener was a ~400-character shell one-liner, and a
-  model copies whichever version is nearest in its context — its own previous `Monitor` call, not
-  the system prompt. Measured 2026-09-16 from live transcripts: `warweb#65` armed a **superseded**
-  copy **71 times across two days** and an app update, healing only when `/compact` finally dropped
-  that call from its context; its sibling `warweb#74` never recovered. And the failure fed itself —
-  the old command never refreshed `armed/<id>`, so the nudge fired every turn and stacked *another*
-  Monitor each time. `warweb#65` ran three at once; one hub message woke it three times, which is
-  how it was noticed. Moving the loop into a binary fixed that half.
-- **Claude Code capped every Monitor at 30 minutes** (v2.1.271, 2026-09-14; `persistent: true` was
-  removed, and the schema's `maximum: 3600000` is dead weight — a request for 3600000 comes back
-  "expires in 30m", anthropics/claude-code#94553). So every instance woke twice an hour purely to
-  re-arm. Each wake cost a full-context turn **and** an Explainer run, because `Stop` files
-  `explainreq/<id>` unconditionally — ~96 model calls a day per instance, to say "nothing changed".
-  Observed across `warweb#74` and `warweb#81` at exact 30-minute spacing.
-
-Nothing about the second was tunable from this side: instant wake needs a live Monitor, a live
-Monitor needs re-arming, and re-arming needs a model turn. The doorbell breaks that triangle by
-moving the watch into the host, which also deletes the arm nudge, the `relisten` repair, the
-heartbeat, and the whole class of bug where an instance must get a command exactly right.
-
-**What survives the deletion**, and why:
-
-- `listen.rs`, `command_is_hub_listener` and `pty::reap_orphaned_listeners` — **released builds are
-  still running listeners right now**, and so is any instance that re-arms one out of its own
-  history. They have to be recognised and killed; see the next section. The reaper matches
-  `command_is_hub_listener` and deliberately **not** `command_is_watcher`, so it never touches
-  agentalk's poll loop — the two matchers exist precisely so this one can stay narrow.
-- `armed/`, `listeners/`, `relisten/` in the scratch tree: written by those legacy listeners, read
-  by nothing. Removable once no released build is in the wild.
-- `nudges_welcome` — it was written for the arm nudge but the naming nudge has the same requirement,
-  and a doorbell counts as a system turn for exactly that reason.
-
-**`background_tasks` is a `Stop`-only field** (measured, `claude` v2.1.273): present on `Stop`,
-absent from `UserPromptSubmit` even 24 s after a Monitor was armed, from `PostToolUse`, and from the
-idle notification. It no longer drives a repair, but it is still what `background_work_running`
-reads, and the constraint bites anything that needs to know what is running.
+**`background_tasks` is a `Stop`-only field.** Measured against a real `claude` v2.1.273 with
+dumping hooks: it is present on `Stop`, and absent from `UserPromptSubmit` (even on a prompt taken
+24 s after a Monitor was armed), from `PostToolUse`, and from the idle notification. That is the
+whole reason the repair is a two-hook file handshake instead of a check inside `listener_armed`.
 
 ### A listener outlives everything that is supposed to kill it
 
@@ -133,29 +115,8 @@ reads, and the constraint bites anything that needs to know what is running.
 its own process group with no controlling terminal — measured on live listeners: `PGID == pid`,
 `SESS 0`, state `Ss` (no `+`). So it survives ⌘W, a crash and app teardown alike, and launchd
 adopts it still spinning `sleep 1`. Six were found alive on one machine at once, the oldest from
-the previous morning, belonging to a Mulpex that had already exited.
-
-Mulpex no longer *starts* a listener, but this section is not historical — it got stronger. The
-reaper now kills **every** hub listener it finds, not only the parentless ones, and runs once a
-minute from the poll loop as well as at launch and teardown.
-
-Dropping the `ppid == 1` condition was safe the moment nothing armed a listener, and it turned out
-to be necessary the same day. `warweb#75` was spawned on 2026-09-17 with the new rules — its argv
-contains `do NOT arm anything` — and it went on arming a Monitor every 30 minutes through the
-night. Its transcript says why: **141 `Monitor` arm calls, the first on 2026-09-14.** Four days of
-watching itself do a thing beats one sentence telling it not to, which is `warweb#65`'s 71-times
-failure again at a larger number. Prose cannot revoke a habit; SIGKILL can.
-
-The sweep runs *while the app is up* for the same reason: an instance that arms one at 03:00 would
-otherwise keep waking itself until the user happened to restart Mulpex. A minute is the interval —
-the walk reads every process's argv, which is far too expensive per tick and pointless faster,
-since catching a stray a minute late costs one wake-up that was going to happen anyway.
-
-Two things keep it safe. The command match is now the *only* thing between this and `kill -9` on
-arbitrary pids, so it stays `command_is_hub_listener` — never `command_is_watcher`, which
-deliberately also covers agentalk's poll loop and the user's `watchers.txt`. And the death is
-quiet: Claude Code reports the killed Monitor as a "stopped, no completion record" wake, which
-`orphaned_task_wake` already swallows.
+the previous morning, belonging to a Mulpex that had already exited. `mulpex-cli/src/sweep.rs`
+named this hole; nothing acted on it.
 
 Two halves close it, and both are needed:
 
@@ -177,14 +138,7 @@ looking like it works.
 
 ### The nudge that fed itself: why instances opened by themselves after an update
 
-> **Historical as to cause, current as to code.** The arm nudge this describes was deleted with the
-> listener (2026-09-17), so the loop below can no longer start. `orphaned_task_wake` and the
-> `resumed/<id>` exemption are **still live** and still needed — a killed Monitor from a released
-> build still produces the wake, agentalk watchers produce it too, and the reasoning about what a
-> `<task-notification>` *is* underpins `is_system_turn`, which the doorbell now depends on. Kept in
-> full because the shape recurs and the measurement was expensive.
-
-The arming nudge was self-healing by design, and for a while it healed a wound it was itself
+The arming nudge is self-healing by design, and for a while it healed a wound it was itself
 inflicting. Every Mulpex update made idle instances — including ones in *other* projects the user
 wasn't looking at — wake up and take a turn nobody asked for.
 
@@ -560,7 +514,8 @@ the user to close by hand. It rides the **same request channel** `hub_terminal_c
 `state_dir/termreq/<token>.json` → poll loop → `<token>.done` — because the helper is a separate
 process and cannot touch a PTY. (`mcp::terminal_request` is now `app_request` for that reason; the
 directory keeps its old name, which is a wire format three processes agree on rather than a
-description of what rides it.)
+description of what rides it. The `mpx` daemon reads the same dir and applies the same op in
+`mulpex-cli/src/terminals.rs`.)
 
 **Two halves of the decision, on two sides, on purpose.**
 
