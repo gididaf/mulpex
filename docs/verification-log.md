@@ -2214,3 +2214,148 @@ byte-identical in the output — so check the fixture survives the shell before 
 - **That a real expiry wake only ever calls `Monitor`.** If some instance also calls, say,
   `hub_inbox` on every wake out of habit, the mark clears and the turn is explained — correct by the
   contract, but it would mean the saving is smaller than expected in practice.
+
+## 2026-09-20 — the listener stops being the model's job (plugin monitor)
+
+**Claim under test:** a plugin-declared monitor is not subject to the 30-minute cap that kills every
+tool-armed `Monitor`, and can carry Mulpex's hub listener with no model involvement at all.
+
+Driven against a real `claude` **2.1.278** on a PTY (in Mulpex terminals), with the probe env
+scrubbed the usual way and an isolated `CLAUDE_CONFIG_DIR` holding pre-answered trust/onboarding.
+Ground truth was read from the probe's own session `.jsonl` and from files on disk, never off the
+pane.
+
+### The cap, measured from both ends in the same half hour
+
+A throwaway plugin whose monitor printed one line a minute:
+
+- **36/36 ticks delivered over 35 minutes** (14:26:12Z → 15:01:13Z), every one present in the
+  transcript, `Monitor expired` notices: **0**, and the tick process still alive on its original pid
+  at the end.
+- In the same window, **this session's own tool-armed listener expired at exactly 30:00** and had to
+  be re-armed by hand — twice, over the course of the work.
+
+Same machine, same binary, same clock. The difference is only which path armed it.
+
+### What else the probe answered
+
+| Question | Result |
+| --- | --- |
+| Does it arm without a model turn? | Yes — the model's first sight of it is the event; status bar shows `1 monitor`, pane empty, no `Monitor` tool call in the transcript |
+| On `--resume`? | Yes — relaunched with `--resume <uuid>`, the monitor re-armed within 2 s |
+| Does the process inherit the spawn env? | Yes — `MULPEX_STATE_DIR` and `MULPEX_INSTANCE_ID` verbatim (dumped from the monitor's own `env`) |
+| Does `${VAR}` substitute in the command? | Yes — `${MULPEX_STATE_DIR}` arrived expanded in `argv[1]` |
+| Under `--dangerously-skip-permissions` + `--plugin-dir`? | Yes, with the project trusted |
+| What shape does the event have? | Identical to a tool-armed one: `<task-notification>`, `promptSource: "system"` |
+
+### Then against the real generated files
+
+`write_state_dir` was called for real (a throwaway bin with a path dependency on `mulpex-core`), and
+a `claude` was launched on the output with `--settings`, `--mcp-config`, `--plugin-dir` and the real
+`append_system_prompt`:
+
+- `claude plugin validate` passes on the generated folder.
+- The real `mulpex-helper listen` armed itself: `armed/1` written, `listeners/1` lock taken.
+- A file dropped into `inbox/1` woke the **idle** instance within seconds —
+  `mulpex: 1 new hub message(s)` in its transcript.
+- **`Stop`'s `background_tasks` lists the plugin monitor** with the same shape as a tool-armed one
+  (`{"type":"shell","status":"running","description":"Mulpex hub inbox listener","command":"… listen"}`),
+  so `command_is_watcher`, `running_listener_ids` and the stale/duplicate detection need no change —
+  confirmed on disk by `watching/1` being written and `relisten/` staying empty.
+- With the rewritten `HUB_RULES`: **arm nudge injected 0 times, `Monitor` tool calls by the model
+  0**, across a fresh start and two turns.
+
+### A blank status file that was not a bug
+
+Twice the probe's status file read empty just after a turn, which looked like a regression in the
+`Stop` hook. Replaying the captured payload through the helper printed
+`{"decision":"block","reason":"You have 1 unread hub message(s)…"}` and wrote `working` — correct:
+the probe's MCP server was disconnected (it is not a live Mulpex project), so the test message was
+never consumed and the turn could not end clean. **The reading was of something else again** — the
+third time this log records that shape.
+
+### Not verified
+
+- **Live in the shipped `.app`.** Everything above was driven against probe `claude` processes with
+  hand-built state dirs; no Mulpex window was restarted, because the user was working inside one.
+  What a real ⌘T looks like — and what happens to five restored instances at once on the next
+  launch — is unmeasured. **Test the plural.**
+- **Long-run behaviour past ~35 minutes**, and across a laptop sleep.
+- **What Claude Code does when a plugin monitor dies mid-session.** The docs say it is not
+  restarted; the crash-only arm nudge is supposed to cover it, and that path was never triggered
+  here because nothing ever died.
+- **Older/newer `claude` versions.** Monitors are an experimental plugin component; only 2.1.278 was
+  measured.
+
+## 2026-09-20 — seven instances died in 22 ms, and it was a `pkill` in another repo
+
+**What it looked like:** an hour after v0.23.0 shipped the plugin monitor, every `claude` instance in
+the `warweb` project stopped at 19:42:20 within a 22 ms window, their sidebar rows vanished, and the
+store was rewritten down to one entry. The app stayed up, the project stayed open, a shell terminal
+in the same project — a direct child of the same app pid, started 13 minutes earlier — was
+untouched, and so was a `claude` running outside Mulpex in iTerm2. The new feature was one hour old
+and had shipped with no QA. It was the obvious suspect and it was innocent.
+
+**What it was:** at 19:42:15.9 the iTerm2 `claude`, working in a different repository, ran
+`(npx vite … &) && sleep 4 && curl … ; pkill -f "vite" 2>/dev/null; true`. The `sleep 4` fired an
+**unanchored** `pkill -f "vite"` at ≈19:42:19.95. A `hub_spawn` task rides on `claude`'s **argv**
+(see the invariant), and all seven tasks contained `npx vitest run tests/wc2-*.test.ts` — `vitest`
+contains `vite`. `pkill` walked the process table and matched all seven; the 22 ms spread is that
+walk. `reap_dead` then removed the dead claudes and kept the terminal, exactly as designed, which is
+what made the sidebar look like a Mulpex action.
+
+**The control that settles it**, checked per-instance against the first `[mulpex:hub]` user message:
+
+| instance | task length | `vite` in argv | outcome |
+| --- | --- | --- | --- |
+| seven instances | 4,215–8,348 chars | **yes** (×1, two of them ×2) | **died** |
+| the eighth | 61 chars | **no** | **survived, conversation intact** |
+
+Seven for seven, with a negative control in the same project, under the same parent, at the same
+second.
+
+### Two wrong inferences, and what each one cost
+
+Both were made from real data, and both pointed away from the answer:
+
+- **"They died politely, so it was a graceful teardown."** Drawn from every transcript ending in
+  `last-prompt` / `cost-state` / `queue-operation` and a trailing `0x0a`. Measured against a **live,
+  still-running** session: those types occur 62 / 2 / 27 times in 1,266 records. They are routine
+  bookkeeping, and each record is one line-buffered append, so a SIGKILL leaves a newline-terminated
+  file too. **The tail of a transcript says nothing about which signal ended it** — and this
+  inference had been used to rule out precisely the violent sweep that turned out to be the answer.
+- **"`pkill -f vite` can't match a claude, I checked the argv."** True of the argv that was checked —
+  the investigating instance's own, whose 61-character task named no tooling. The seven that
+  mattered had different argv. **Check the argv of the process that died, not of the one doing the
+  checking.**
+
+### What was ruled out, and how
+
+Worth keeping, because each of these is a plausible story that fits the headline and dies on one
+measurement:
+
+- **OOM / jetsam** — zero `JetsamEvent` reports, zero crash reports in 24 h, 84 % memory free, and a
+  614 MB non-Mulpex `claude` on the same machine survived untouched.
+- **System sleep** — `pmset -g log` over 19:30–19:50 shows assertion churn only: no sleep, no
+  darkwake. (This also leaves the iTerm2 session's unexplained 2 m 22 s stall at the same instant as
+  a genuine loose end, not a sleep.)
+- **Project teardown / process-group sweep** — both take the project's shell terminal with them, and
+  a teardown closes the tab. The terminal lived and the tab stayed.
+- **`reap_orphaned_listeners`** — orphans-only (`ppid == 1`), SIGKILLs a single pid rather than a
+  group, and is called at launch and teardown only. Not periodic; cannot fire mid-session.
+- **The plugin monitor's shared watched directory** — the one mechanism in the new code with the
+  right shape. Failed to reproduce twice: rewriting the watched dir under a live instance, and four
+  instances sharing one plugin dir while a fifth spawns and rewrites it. All survived, and the four
+  soaked past the interval at which the seven died.
+- **A process-group cascade from listener to claude** — measured live: a plugin-armed listener sits
+  in the intermediate shell's process group (`pgid 57478`), not its claude's (`pgid 56919`).
+
+### What actually changed as a result
+
+The feature was reverted (v0.23.1) on correlation alone — every process that died had
+`--plugin-dir`, every survivor did not — and re-landed unchanged (v0.24.0) once the cause was
+established. That revert was unnecessary in hindsight and was still the right call at the time: the
+stake was the user's conversations and the feature bought only quieter panes.
+
+The durable output is the invariant in `CLAUDE.md`: **the task is on argv, so every word of it is a
+`pkill -f` target, from any process on the machine, including one that has never heard of Mulpex.**

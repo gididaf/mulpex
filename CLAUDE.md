@@ -98,25 +98,34 @@ are different processes sharing state only through files, so anything both must 
 is kept deliberately even though its second caller is gone (see the invariants below), and the
 `docs/verification-log.md` entries measuring `mpx` are history, not current behavior.
 
-## Why the hub listener is a Monitor, and what that costs
+## Why the hub listener is a plugin monitor, and not the model's job
 
 `hub_send` writes `inbox/<id>/<uuid>.json` and nothing else, so something has to be *watching* that
-directory on the instance's behalf. That something is `mulpex-helper listen`, armed by the instance
-itself as a background `Monitor` on its first turn — `HUB_RULES` carries the exact command, and
-`hook.rs`'s arm nudge re-asks until `armed/<id>` says it is running.
+directory on the instance's behalf. That something is `mulpex-helper listen` — and since
+2026-09-20 **Claude Code arms it, not the model**. Every `claude` is spawned with
+`--plugin-dir <state_dir>/plugin`, a one-purpose plugin Mulpex *generates* beside `settings.json`
+and `mcp.json`, whose `monitors/monitors.json` declares the listener. It starts at session start
+and on `--resume`, costs no turn, and does not expire.
 
-**Its known cost, accepted deliberately:** Claude Code caps every Monitor at 30 minutes
-(v2.1.271, 2026-09-14; the schema advertises `maximum: 3600000` and silently clamps to `1800000` —
-read off the live tool, 2026-09-19), so each instance wakes twice an hour purely to re-arm. That is
-the price of the listener actually noticing mail, and it is the price the user chose on 2026-09-19
-after the alternative failed (below).
+**What it replaced.** A model-armed `Monitor` is capped at 30 minutes and has no `persistent`
+option (server-side flag `tengu_breezy_crescent`, live 2026-09-14; `anthropics/claude-code#94553`
+and #94393, both open with no Anthropic reply). Every instance therefore woke twice an hour purely
+to re-arm — a turn, a tool call and a line of pane noise each time — and the user watched three
+panes fill with `Monitor started` / `Listener re-armed` and nothing else. Measured on a real
+`claude` 2.1.278 PTY on 2026-09-20: a plugin monitor ticking once a minute delivered **36/36 ticks
+over 35 minutes, zero expiry notices, same pid**, while the session's own tool-armed listener died
+at exactly 30:00 in the same half hour. The monitor process inherits the spawn env
+(`MULPEX_STATE_DIR`, `MULPEX_INSTANCE_ID`) and `${VAR}` substitution works in its command, which is
+what lets one generated file serve every instance like the other two.
 
-**The expiry is theirs; the noise was ours.** That wake used to flip the sidebar dot and spend a
-Sonnet call explaining that a watchdog had restarted — ~480 model calls a day across five
-instances, none of them saying anything. `quietturn/<id>` now makes a re-arm-**only** wake leave no
-trace: marked when a `<task-notification>` starts, cleared by the first tool call that is not the
-re-arm, and read at `Stop`. Surviving to `Stop` is what earns the silence, so a wake that handles
-mail is still explained in full. → [docs/hub.md](docs/hub.md)
+**Nothing is installed.** "Plugin" here is a folder shape Claude Code reads, not someone's
+software: two JSON files in the scratch dir, running our own helper. It ships with the app.
+
+**The teeth.** Plugin monitors are an *experimental* component, and a dead one is never restarted —
+so the arm nudge stays as the **crash-only fallback**, still gated on `armed/<id>`'s heartbeat and
+therefore silent unless the monitor is genuinely gone. `HUB_RULES` now tells instances *not* to arm
+one (two listeners deliver every message twice), and `quietturn/<id>` still exists to keep the rare
+fallback re-arm from spending a Sonnet call on nothing. → [docs/hub.md](docs/hub.md)
 
 **A host-typed "doorbell" replaced this between 2026-09-17 and 2026-09-19 and was reverted.** It
 had the poll loop type `<<<MPX>>> 1 new hub message(s)` into an idle pane instead of arming
@@ -343,12 +352,25 @@ and cost real time; each links to the measurement that settled it.
   truncated every task over ~1 KB (measured: 1022 characters received, whatever was sent) while
   every signal said success. A TUI is not an interface; argv is.
   → [docs/hub.md](docs/hub.md), [docs/remote-peers.md](docs/remote-peers.md)
-- **Anything an instance must get exactly right belongs in a binary, not in `HUB_RULES`.** The hub
-  listener was a ~400-character shell one-liner the model retyped from prose, and a model copies its
-  own last `Monitor` call before it re-reads the system prompt: one instance re-armed a *superseded*
-  copy 71 times across two days and an app update, healing only when `/compact` dropped that call
-  from its context. It is now one line — `"<helper>" listen` — and the loop lives in `listen.rs`.
-  Same lesson as argv-vs-TUI, one layer up. → [docs/hub.md](docs/hub.md)
+- **Because the task is on argv, every word of it is a `pkill -f` target.** On 2026-09-20 a `claude`
+  running in iTerm2, in a different repo, ended a command with an unanchored
+  `pkill -f "vite"`. Seven instances in one Mulpex project died inside 22 ms — because their spawn
+  tasks each contained `npx vitest`, and `vitest` contains `vite`. The eighth instance in that
+  project, whose 61-character task named no tooling, was untouched; so were the shell terminal, the
+  app, and the `claude` that fired the pkill. Seven conversations became unreachable. **This is not
+  a bug in anything — it is the cost of the argv contract, and it is unfixable from inside Mulpex**
+  (the killer need not be a Mulpex process at all). Know it when you write a spawn task, and
+  suspect it first the next time a cohort dies together for no reason.
+  → [docs/verification-log.md](docs/verification-log.md)
+- **Anything an instance must get exactly right belongs in a binary, not in `HUB_RULES` — and
+  better still, not asked of the instance at all.** The hub listener was a ~400-character shell
+  one-liner the model retyped from prose, and a model copies its own last `Monitor` call before it
+  re-reads the system prompt: one instance re-armed a *superseded* copy 71 times across two days
+  and an app update, healing only when `/compact` dropped that call from its context. It became one
+  line — `"<helper>" listen` — with the loop in `listen.rs`; then the 30-minute cap made even a
+  correct re-arm happen twice an hour. The end of that road is that `HUB_RULES` no longer carries
+  the command at all: Claude Code arms it from the generated plugin monitor, and the rules only say
+  *don't arm a second one*. Same lesson as argv-vs-TUI, two layers up. → [docs/hub.md](docs/hub.md)
 - **Nothing this app signals can reach what a `claude` backgrounds.** Claude Code runs each
   background command in its own process group with no controlling terminal, so `Session::kill`'s
   `killpg` *and* its tty sweep both miss it — the hub listener survived ⌘W, crashes and teardown

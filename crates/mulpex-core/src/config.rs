@@ -76,3 +76,54 @@ pub const MCP_CONFIG_JSON: &str = r#"{
   }
 }
 "#;
+
+/// The manifest of the one-purpose plugin every `claude` is launched with
+/// (`--plugin-dir <state_dir>/plugin`).
+///
+/// Nothing is installed and nothing is fetched: this is a folder shape Claude
+/// Code reads, generated into the scratch dir beside `settings.json` and
+/// `mcp.json` and rewritten before every spawn for the same three-day-fuse
+/// reason. The plugin carries exactly one thing — the monitor below.
+pub const PLUGIN_MANIFEST_JSON: &str = r#"{
+  "name": "mulpex-hub",
+  "description": "Mulpex coordination hub: the inbox listener, armed by the host.",
+  "version": "1.0.0"
+}
+"#;
+
+/// `monitors/monitors.json`: the hub inbox listener, armed by **Claude Code
+/// itself** at session start instead of by the model.
+///
+/// This is the same `"<helper>" listen` command `HUB_RULES` asks an instance to
+/// arm by hand, and `hook::command_is_hub_listener` matches it identically — so
+/// the watcher exemption, `armed/<id>`'s heartbeat and the orphan reaper all
+/// keep working unchanged. What changes is who arms it, and for how long.
+///
+/// **Why this exists.** A model-armed `Monitor` is capped at 30 minutes and has
+/// no `persistent` option (server-side flag `tengu_breezy_crescent`, live since
+/// 2026-09-14; `anthropics/claude-code#94553`, #94393, both open). Every
+/// instance therefore woke twice an hour purely to re-arm — a turn, a tool call
+/// and a line of pane noise each time, for nothing. A plugin monitor is armed on
+/// a different path and is not capped: measured on a real `claude` 2.1.278 PTY
+/// on 2026-09-20, a once-a-minute heartbeat delivered **36/36 ticks over 35
+/// minutes with zero expiry notices and the same pid throughout**, while this
+/// session's own tool-armed listener died at exactly 30:00 in the same half
+/// hour. It also arms on `--resume`, and the monitor process inherits the full
+/// spawn env (`MULPEX_STATE_DIR`, `MULPEX_INSTANCE_ID`), which is what lets one
+/// static file serve every instance exactly like the two above.
+///
+/// The event reaches the model as the same `<task-notification>` a tool-armed
+/// Monitor produced (`promptSource: system`), so every hook that keys on that
+/// shape is unaffected.
+///
+/// **Two teeth.** Monitors are an *experimental* plugin component, so the schema
+/// may move under us; and a dead monitor is never restarted. Both are why the
+/// arm nudge stays as a crash-only fallback rather than being deleted.
+pub const PLUGIN_MONITORS_JSON: &str = r#"[
+  {
+    "name": "hub-listener",
+    "command": "\"__MULPEX_BIN__\" listen",
+    "description": "Mulpex hub inbox listener"
+  }
+]
+"#;

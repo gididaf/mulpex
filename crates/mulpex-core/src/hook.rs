@@ -1555,15 +1555,17 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
 /// started expiring this fires for a listener that *was* armed and has since
 /// died, which is the case the heartbeat exists to catch.
 const ARM_LISTENER_NUDGE: &str = "[Mulpex hub] Your background hub listener is not running right \
-now (never armed, or it expired). As part of THIS turn — quietly, in the background — arm it: call \
-Monitor with timeout_ms at the maximum the tool allows and exactly this command (do NOT copy a \
-Monitor call from earlier in this conversation — an earlier one may be superseded):\n";
+now. Mulpex normally starts it for you at session start, so this is the exceptional case the \
+rules mention: it either died or never came up. As part of THIS turn — quietly, in the \
+background — arm it yourself: call Monitor with timeout_ms at the maximum the tool allows and \
+exactly this command (do NOT copy a Monitor call from earlier in this conversation — an earlier \
+one may be superseded):\n";
 
 /// Tail of both nudges: the command itself, spelled the one way `HUB_RULES`
 /// spells it. `rules::listener_command` is the single source, and the helper can
 /// name its own path because the hook *is* the helper — the same binary the
 /// instance is being told to run.
-fn nudge_listener_command() -> String {
+pub(crate) fn nudge_listener_command() -> String {
     std::env::current_exe()
         .map(|p| crate::rules::listener_command(&p))
         .unwrap_or_else(|_| "\"<mulpex-helper>\" listen".to_string())
