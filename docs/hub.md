@@ -16,7 +16,7 @@ peer sits unread while the instance is idle between the user's prompts. To make 
 react on its own **without host-side stdin polling**, each instance runs the agentalk pattern
 against the *local* hub:
 
-- **Watcher:** a `Monitor` runs **`"<helper>" listen`** (`mulpex-core`'s
+- **Watcher:** the instance arms a `Monitor` running **`"<helper>" listen`** (`mulpex-core`'s
   `listen.rs`, reached through `mulpex-helper`), a ~1 s poll of its own inbox dir
   (`$MULPEX_STATE_DIR/inbox/$MULPEX_INSTANCE_ID/`), emitting a `mulpex: N new hub message(s)`
   line only when new message files appear (seeded to the current count, so only post-arm
@@ -24,88 +24,54 @@ against the *local* hub:
   even while the instance is idle waiting for the user. It was a shell one-liner until 2026-09-16;
   see [the command is a binary now](#the-command-is-a-binary-now-and-the-old-one-is-why) for why
   that had to stop.
-- **Arming (a plugin monitor — the host does it, not the model):** every `claude` is spawned with
-  `--plugin-dir <state_dir>/plugin`, a one-purpose plugin Mulpex *generates* beside `settings.json`
-  and `mcp.json` (`config::PLUGIN_MANIFEST_JSON` + `PLUGIN_MONITORS_JSON`, written by
-  `state_dir::write_state_dir`). Its `monitors/monitors.json` declares the listener, and **Claude
-  Code arms it itself at session start** — including on `--resume`. No turn is spent arming it,
-  nothing expires, and `HUB_RULES` now tells the instance the opposite of what it used to: do
-  *not* arm one, because a second listener delivers every message twice. See
-  [the 30-minute cap, and how the arming moved off the model](#the-30-minute-cap-and-how-the-arming-moved-off-the-model).
-  The `UserPromptSubmit` arm nudge survives as the **crash-only fallback**: it still fires only
-  while `listener_armed(ctx)` is false (i.e. `state_dir/armed/<id>`'s mtime is stale), which the
-  living listener refreshes every second — so it is silent in normal operation and comes back on
-  its own if the monitor dies or a Claude Code version drops the feature. *(`hub_spawn` children
-  still get an injected PTY prompt — their assigned task — via `rules.rs::spawn_prompt`; nothing
-  about arming rides on it.)*
+- **Arming (hook-driven, no injected prompt):** only the agent can arm its *own* Monitor, and a
+  `--resume` restart kills the previous one — but instead of typing a visible bootstrap prompt
+  into the PTY (which looked ugly/confusing on every spawn and resume), a normal instance now
+  **starts completely clean** and arms its listener from the **`UserPromptSubmit` hook** on the
+  user's first turn. The hook (`hook.rs::userpromptsubmit`) injects `ARM_LISTENER_NUDGE` as hidden
+  `additionalContext` — a low-key "arm your listener quietly as part of this turn" reminder — but
+  only while `listener_armed(ctx)` is false, i.e. while `state_dir/armed/<id>`'s mtime is stale.
+  The listener **rewrites that flag on every pass of its loop**, so it tracks a *live* Monitor:
+  once armed the reminder stops; if arming was missed, or the Monitor expired, it re-injects next
+  turn (self-healing). Because `state_dir` is fresh per Mulpex launch (hence per `--resume`), the
+  flag is absent at startup, so restored instances re-arm on their first prompt. The full arming
+  procedure + exact Monitor command live in `HUB_RULES` (append-system-prompt, so the wake→act
+  contract survives compaction), and the nudge **repeats that command verbatim** rather than
+  pointing at it. *(`hub_spawn` children are the one case that still gets an injected
+  PTY prompt — their assigned task — via `mulpex-core`'s `rules.rs::spawn_prompt`; they arm the
+  listener from the same hook on that first turn.)*
 - **On wake (auto-act):** the instance calls `mcp__mulpex__hub_inbox`, acts on the message(s)
   autonomously, replies to the sender only when it adds value (no bare acks), and prefixes the
   self-triggered turn with a `⟳ hub message from <sender> →` marker so the human can tell it
   wasn't their prompt. This coexists with the `userpromptsubmit` hook's unread-count nudge, which
   still covers the "notice on your next prompt" path.
 
-### The 30-minute cap, and how the arming moved off the model
+### The listener is not permanent, and `armed/<id>` is a heartbeat
 
-Claude Code removed persistent Monitors and capped every one at 30 minutes (server-side flag
-`tengu_breezy_crescent`, live for binary 2.1.270 on 2026-09-14; the schema advertises
-`maximum: 3600000` and clamps to `1800000`). `anthropics/claude-code#94553` and `#94393` are both
-open, with no Anthropic reply and no setting or env var that opts out. A listener that has stopped
-cannot wake an idle instance, which is the only reason it exists — so for six days every instance
-re-armed twice an hour, and the user's three panes filled with `Monitor started` / `Listener
-re-armed` and nothing else.
+Claude Code removed persistent Monitors (measured 2026-09-16), so **every hub listener expires** —
+30 minutes at most. A listener that has stopped cannot wake an idle instance, which is the only
+reason it exists.
 
-**The fix is a plugin monitor**, and it is not a workaround so much as the interface Anthropic
-documents for exactly this: a plugin may declare `monitors/monitors.json`, and *Claude Code* arms
-each entry at session start as a persistent task on a different code path from the `Monitor` tool.
-Mulpex generates such a plugin into the scratch dir (`config::PLUGIN_MANIFEST_JSON` +
-`PLUGIN_MONITORS_JSON`, written by `state_dir::write_state_dir`, rewritten before every spawn for
-the same three-day-fuse reason as `settings.json`) and spawns with `--plugin-dir`. Nothing is
-installed, downloaded or registered; the plugin runs our own `mulpex-helper`.
+The arm nudge is what gets one re-armed, and it reads `armed/<id>`. That file is now written by the
+listener *on every pass of its one-second loop*, not once at startup, and `hook::listener_armed`
+tests its **mtime** (grace: 30 s) instead of its existence — so a dead listener goes stale within
+seconds and the nudge comes back on its own. `HUB_RULES` separately tells the instance to re-arm the
+moment it is told its monitor expired; that is the fast path, the heartbeat is the one that does not
+depend on the model noticing.
 
-Measured on a real `claude` 2.1.278 PTY, 2026-09-20 (see
-[verification-log.md](verification-log.md)):
-
-| | tool-armed `Monitor` | plugin monitor |
-| --- | --- | --- |
-| lifetime | dies at exactly 30:00 | 36/36 once-a-minute ticks over 35 min, 0 expiry notices, same pid |
-| arming | a model turn, every 30 min | none — the host arms it, pane stays empty |
-| `--resume` | model must re-arm | arms itself |
-| env | — | inherits `MULPEX_STATE_DIR` / `MULPEX_INSTANCE_ID`; `${VAR}` substitutes in the command |
-| event shape | `<task-notification>`, `promptSource: system` | **identical**, so every hook is unaffected |
-| `Stop`'s `background_tasks` | listed | **listed, same shape** — so `command_is_watcher`, `running_listener_ids` and the duplicate/stale detection all keep working untouched |
-
-Both halves of the old machinery survive, and deliberately:
-
-- **`armed/<id>` is still a heartbeat.** The listener rewrites it on every pass of its one-second
-  loop and `hook::listener_armed` tests its **mtime** (grace: 30 s), not its existence. That is now
-  what makes the arm nudge *crash-only*: silent while the monitor lives, back within seconds if it
-  dies or a Claude Code version drops the feature.
-- **`HUB_RULES` says the opposite of what it used to.** It no longer carries the command at all —
-  it tells the instance the listener is already running and not to arm one, because two listeners
-  deliver every message twice. `rules::listener_command` is the single spelling shared by the
-  generated `monitors.json`, the nudge and `hook::command_is_hub_listener`;
-  `rules::tests::hub_rules_leave_the_arming_to_mulpex` asserts the rules do *not* contain it, which
-  is the guard against someone helpfully putting it back.
-
-Two teeth worth remembering: monitors are an **experimental** plugin component, so the schema may
-move; and a dead monitor is **never restarted** by Claude Code. Neither is a reason to delete the
-fallback. What the 30-minute cap did to the sidebar's yellow dot is in
+`HUB_RULES` must also no longer ask for `persistent: true`: the Monitor schema is
+`additionalProperties: false`, so passing it is rejected and a literal-minded instance would fail to
+arm at all. The full story, including what the same change did to the sidebar's yellow dot, is in
 [sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
 
 ### A re-arm is not news: `quietturn/<id>`
 
-**Mostly history since the plugin monitor landed** — a routine re-arm no longer happens at all, so
-this machinery now only covers the crash-only fallback. It is kept because the fallback is real,
-and because what it protects (an Explainer call and a dot flip for a turn that said nothing) comes
-straight back the moment any wake becomes routine again. Read the rest as the reasoning behind a
-guard, not as the daily path.
-
-The expiry was not ours to fix. What *was* ours is what it cost to watch.
+The expiry is not ours to fix. What *was* ours is what it cost to watch.
 
 Read off the live tool schema, 2026-09-19: `timeout_ms` declares `maximum: 3600000` and the
 description says *"Deadlines above 1800000ms are capped to 1800000ms"* — ask for the advertised
 maximum and the tool answers `expires in 30m`. There is no parameter that opts out; `persistent` is
-gone from the schema entirely. So every instance was woken twice an hour by an event it could
+gone from the schema entirely. So every instance is woken twice an hour, forever, by an event it can
 only answer by doing the same thing again.
 
 Each of those wakes used to cost two visible things, neither of them Anthropic's doing:

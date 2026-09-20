@@ -48,17 +48,12 @@ Traps that live in this crate specifically:
   corruption, from an omission rather than a mistake. `SessionStore::in_home` takes the home
   explicitly, which is what makes the bug unwritable. `mpx` was the caller that forced this and is
   gone; the hazard is in the ambient-home design, so the signature stays.
-- **The listener is armed by the generated plugin monitor, and `HUB_RULES` must NOT name the
-  command.** `state_dir::write_state_dir` writes `plugin/monitors/monitors.json` with
-  `"<helper>" listen` (`__MULPEX_BIN__`-substituted like `settings.json` and `mcp.json`), and
-  `pty.rs` spawns with `--plugin-dir` — Claude Code arms it, so no turn is spent and nothing
-  expires. Putting the command back in the rules gives the instance a second listener and every
-  hub message arrives twice; `rules::tests::hub_rules_leave_the_arming_to_mulpex` is the guard.
-  `rules::listener_command` stays the one spelling shared by the monitor, the crash-only arm nudge
-  and `hook::command_is_hub_listener`. It was a ~400-character shell loop once, and an instance
-  re-armed a *superseded* copy 71 times across two days because a model copies its own last
-  `Monitor` call before it re-reads the system prompt — so never move behaviour into that string
-  either: anything the loop must do goes in `listen.rs`, which ships with the app.
+- **The listener command is a binary because prose is retyped, and retyping drifts.** `HUB_RULES`
+  asks for `"<helper>" listen` — one line, `__MULPEX_BIN__`-substituted like `settings.json` and
+  `mcp.json`. It used to be a ~400-character shell loop, and an instance re-armed a *superseded*
+  copy of it 71 times across two days and an app update, because a model copies its own last
+  `Monitor` call before it re-reads the system prompt. Never move behaviour back into that string:
+  anything the loop must do goes in `listen.rs`, which ships with the app.
   → [../../docs/hub.md](../../docs/hub.md)
 - **`rules.rs` must stay byte-identical across hosts, not merely equivalent**, and `hook.rs` reads
   it from two ends: `command_is_hub_listener` recognises the command (which is what keeps a

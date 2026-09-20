@@ -2,24 +2,19 @@
 //! prompt a `hub_spawn` child starts on.
 //!
 //! **Why this lives in `mulpex-core` rather than beside the spawner.** `HUB_RULES`
-//! is a two-process contract, not documentation. It fixes the `claude#1` /
-//! `term#5` / `<project>#<n>` address grammar that `registry.rs` parses and
-//! `mcp.rs` prints, and the `mulpex:` wording `listen.rs` prints and the rules
-//! promise. `listener_command` is the other half: one spelling of the listener
-//! command, shared by the generated plugin monitor, the arm nudge and
-//! `hook::command_is_hub_listener`.
+//! is a two-process contract, not documentation. It contains the exact `Monitor`
+//! command an instance must arm, and `hook.rs` both recognises that command
+//! (`is_hub_listener`, which is what keeps a listener from counting as work in
+//! flight) and repeats it verbatim in the arm nudge. It also fixes the
+//! `claude#1` / `term#5` / `<project>#<n>` address grammar that `registry.rs`
+//! parses and `mcp.rs` prints.
 //!
-//! **The rules no longer ask the model to arm anything.** They used to carry the
-//! `Monitor` command, and before that a ~400-character shell loop the model had
-//! to retype from this prose — and a model retypes whatever version is nearest in
-//! its context, usually its own last `Monitor` call. One instance re-armed a
-//! superseded copy 71 times across two days and an app update before `/compact`
-//! finally dropped it from context. Then Claude Code capped every `Monitor` at 30
-//! minutes, so even a correctly armed one died twice an hour. Both problems end
-//! the same way: Claude Code arms the listener itself from a plugin monitor
-//! Mulpex generates (`config::PLUGIN_MONITORS_JSON`), and the only text left here
-//! is the instruction *not* to arm a second one. Anything that must be got
-//! exactly right belongs in a program; see `listen.rs`.
+//! **The command is one line naming a binary, and that is the point.** It used to
+//! be a ~400-character shell loop the model had to retype from this prose, and a
+//! model retypes whatever version is nearest in its context — usually its own last
+//! `Monitor` call. One instance re-armed a superseded copy 71 times across two days
+//! and an app update before `/compact` finally dropped it from context. Anything
+//! that must be got exactly right belongs in a program; see `listen.rs`.
 //!
 //! Two frontends now spawn claudes (the desktop app and `mpx`), and a second copy
 //! of this text would drift silently: the nudge would keep firing, or an address
@@ -161,17 +156,25 @@ many steps passed — RE-READ it right before editing. Editing against a stale r
 \"File has been modified since read\" and costs you a re-read+retry anyway; reading first avoids \
 the round-trip and silently picking up the peer's changes.\n\
 INCOMING MESSAGES (hub listener) — To be woken when another instance messages you, even while \
-you are idle between my prompts, a background listener watches your inbox. MULPEX STARTS IT FOR \
-YOU, automatically, every time your session starts. You do NOT arm it, there is nothing that \
-expires and nothing to re-arm, and you must NOT start one of your own — a second listener \
-delivers every message twice. If you find yourself about to call Monitor for the hub, don't; it \
-is already running. THE ONE EXCEPTION: if Mulpex tells you in so many words that your listener is \
-not running, that message carries the exact command on a line of its own — arm it with the \
-Monitor tool exactly as given there, quietly, as part of the turn you are already in, and NEVER \
-by copying a Monitor call from earlier in this conversation (an earlier one may be superseded, \
-and a listener started from one cannot report that it is alive). That reminder is the only thing \
-that should ever make you arm anything.\n\
-A peer message shows up as a Monitor event whose line starts with \"mulpex:\" \
+you are idle between my prompts, you run a background listener on your inbox. TO ARM \
+IT: call the Monitor tool (if it is a deferred tool, load it first via ToolSearch with query \
+select:Monitor) with timeout_ms set to the MAXIMUM the tool allows and this EXACT command, which \
+is one line and takes no arguments:\n\
+\"__MULPEX_BIN__\" listen\n\
+Do NOT pass a `persistent` parameter — the Monitor tool no longer has one and the call would be \
+rejected. Every monitor EXPIRES, so the listener is not permanent: when you are told yours \
+expired, RE-ARM IT IMMEDIATELY with the identical command, quietly, whatever else you were doing. \
+An expired listener means peer mail can no longer wake you. NEVER re-arm by copying a Monitor \
+call from earlier in this conversation — an earlier turn may hold a superseded command, a \
+listener started from one cannot report that it is alive, and you will then be asked to arm \
+another on every single turn. Read the command off the line above, every time.\n\
+WHEN TO ARM: as soon as you start working. You are NOT prompted to arm it by a separate startup \
+turn; instead, on your first turn Mulpex injects a hidden reminder (and repeats it each turn ONLY \
+until the listener is armed). When you see that reminder, arm the Monitor QUIETLY as part of the \
+same turn — do not make arming your whole response and do not announce it beyond a brief mention — \
+then carry on with whatever I asked. The listener reports itself alive to Mulpex for as long as \
+it runs, so the reminder stops once it is up and comes back on its own if it dies. \
+Once armed, a peer message shows up as a Monitor event whose line starts with \"mulpex:\" \
 (for example \"mulpex: 1 new hub message(s)\") — that is a peer message arriving, NOT something \
 I typed. When it happens, handle it immediately and autonomously: (1) call \
 mcp__mulpex__hub_inbox to read and clear the message(s); (2) act on them yourself — a message \
@@ -210,12 +213,9 @@ pub struct SpawnTask {
 ///
 /// `helper` is the absolute path of `mulpex-helper`, substituted for
 /// `__MULPEX_BIN__` exactly as `state_dir::write_state_dir` does it for
-/// `settings.json`, `mcp.json` and the plugin's `monitors.json` — and for the
-/// same reason: the path differs per install and per build, and a child invokes
-/// the binary directly. The rules themselves no longer carry the listener
-/// command (the plugin monitor arms it; see `config::PLUGIN_MONITORS_JSON`), so
-/// today the substitution is a no-op here and the parameter is kept because the
-/// prompt is the natural place for the next such path to land.
+/// `settings.json` and `mcp.json` — and for the same reason: the path differs per
+/// install and per build, and a child invokes the binary directly. Here it is the
+/// listener command `HUB_RULES` asks the instance to arm.
 pub fn append_system_prompt(helper: &std::path::Path) -> String {
     let hub = HUB_RULES.replace("__MULPEX_BIN__", &helper.to_string_lossy());
     format!("{hub}\n{PLANNING_RULES}")
@@ -286,7 +286,7 @@ mod tests {
     /// is the point — a contract the model has to retype correctly was one an
     /// instance broke 71 times in a row (see `listen.rs`).
     #[test]
-    fn hub_rules_leave_the_arming_to_mulpex() {
+    fn hub_rules_carry_the_exact_arming_command() {
         let helper = std::path::Path::new("/Applications/Mulpex.app/Contents/MacOS/mulpex-helper");
         let prompt = append_system_prompt(helper);
 
@@ -294,32 +294,10 @@ mod tests {
             !prompt.contains("__MULPEX_BIN__"),
             "an unsubstituted placeholder is a listener that can never start"
         );
+        assert!(prompt.contains(&listener_command(helper)), "one spelling, not two");
         assert!(
             crate::hook::command_is_hub_listener(&listener_command(helper)),
             "the mark `hook::is_hub_listener` matches must survive in the command"
-        );
-        // The listener is armed by the plugin monitor Mulpex generates
-        // (`config::PLUGIN_MONITORS_JSON`), so the rules must NOT hand the
-        // instance the command as well. Both arming it means two listeners, and
-        // two listeners means one hub message delivered twice — which is what
-        // the user actually sees when this drifts.
-        assert!(
-            !prompt.contains(&listener_command(helper)),
-            "the rules must not also ask the model to arm the listener"
-        );
-        assert!(
-            HUB_RULES.contains("MULPEX STARTS IT FOR YOU"),
-            "the rules have to say the listener is not the model's job"
-        );
-        // The crash-only fallback is the one path that still arms by hand, and
-        // it carries its own copy of the command — built from `listener_command`
-        // and not hand-spelled, so the nudge, the plugin monitor and the
-        // matchers cannot drift apart. (Under `cargo test` `current_exe` is the
-        // test binary, so this compares the spelling, not the path.)
-        assert_eq!(
-            crate::hook::nudge_listener_command(),
-            listener_command(&std::env::current_exe().expect("a test binary path")),
-            "the arm nudge must build its command from rules::listener_command"
         );
         // The tool no longer has this parameter, and passing it is rejected.
         assert!(

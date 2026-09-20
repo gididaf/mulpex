@@ -11,14 +11,7 @@
 
 use std::path::Path;
 
-use crate::config::{
-    HOOK_SETTINGS_JSON, MCP_CONFIG_JSON, PLUGIN_MANIFEST_JSON, PLUGIN_MONITORS_JSON,
-};
-
-/// The generated plugin `claude` is launched with (`--plugin-dir`), relative to
-/// the state dir. Carries one background monitor: the hub inbox listener, armed
-/// by the host rather than by the model. See `config::PLUGIN_MONITORS_JSON`.
-pub const PLUGIN_DIR: &str = "plugin";
+use crate::config::{HOOK_SETTINGS_JSON, MCP_CONFIG_JSON};
 
 /// Lay out (or repair) a project's scratch dir: the `--settings` / `--mcp-config`
 /// files every `claude` is spawned with, plus the subdirectories the hub writes
@@ -44,19 +37,6 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
     std::fs::write(
         state_dir.join("mcp.json"),
         MCP_CONFIG_JSON.replace("__MULPEX_BIN__", &helper),
-    )?;
-    // The `--plugin-dir` plugin. Two more write-once files, so they are rewritten
-    // here with the other two rather than at open — same three-day fuse.
-    let plugin = state_dir.join(PLUGIN_DIR);
-    std::fs::create_dir_all(plugin.join(".claude-plugin"))?;
-    std::fs::create_dir_all(plugin.join("monitors"))?;
-    std::fs::write(
-        plugin.join(".claude-plugin/plugin.json"),
-        PLUGIN_MANIFEST_JSON,
-    )?;
-    std::fs::write(
-        plugin.join("monitors/monitors.json"),
-        PLUGIN_MONITORS_JSON.replace("__MULPEX_BIN__", &helper),
     )?;
     // Every name here contains no bare integer at the top level, which is what
     // keeps `mcp::live_ids`' integer-filename scan from mistaking one for an
@@ -126,40 +106,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mpxsd2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_state_dir(&dir, Path::new("/opt/mulpex-helper")).expect("write");
-        for f in ["settings.json", "mcp.json", "plugin/monitors/monitors.json"] {
+        for f in ["settings.json", "mcp.json"] {
             let text = std::fs::read_to_string(dir.join(f)).unwrap();
             assert!(!text.contains("__MULPEX_BIN__"), "{f} still has the placeholder");
             assert!(text.contains("/opt/mulpex-helper"), "{f} lost the helper path");
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The monitor must run the *same* command `HUB_RULES` names, or the two
-    /// arming paths diverge: `command_is_hub_listener` is what exempts the
-    /// listener from counting as work in flight and what the orphan reaper kills
-    /// on, and `listener_command` is what the crash-only arm nudge repeats. A
-    /// monitor spelled any other way would be reaped as a stranger, or armed a
-    /// second time on top of itself.
-    #[test]
-    fn the_plugin_monitor_runs_the_listener_command_verbatim() {
-        let dir = std::env::temp_dir().join(format!("mpxsd4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let helper = Path::new("/opt/mulpex-helper");
-        write_state_dir(&dir, helper).expect("write");
-
-        let text = std::fs::read_to_string(dir.join("plugin/monitors/monitors.json")).unwrap();
-        let monitors: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let command = monitors[0]["command"].as_str().expect("a command string");
-        assert_eq!(command, crate::rules::listener_command(helper));
-        assert!(crate::hook::command_is_hub_listener(command));
-
-        // Claude Code reads the manifest by this exact path, and rejects the
-        // plugin if `name` is missing.
-        let manifest = std::fs::read_to_string(dir.join("plugin/.claude-plugin/plugin.json"))
-            .expect("manifest written");
-        let manifest: serde_json::Value = serde_json::from_str(&manifest).expect("valid JSON");
-        assert_eq!(manifest["name"], "mulpex-hub");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
