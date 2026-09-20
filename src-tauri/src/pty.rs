@@ -287,6 +287,13 @@ impl Session {
                 cmd.arg(settings_path);
                 cmd.arg("--mcp-config");
                 cmd.arg(state_dir.join("mcp.json"));
+                // The generated one-monitor plugin, written beside those two by
+                // `write_state_dir`. Claude Code arms its hub listener itself at
+                // session start (and on `--resume`), which is what replaced the
+                // model arming a `Monitor` and re-arming it every 30 minutes.
+                // See `config::PLUGIN_MONITORS_JSON` for the measurement.
+                cmd.arg("--plugin-dir");
+                cmd.arg(state_dir.join(mulpex_core::state_dir::PLUGIN_DIR));
                 cmd.arg("--append-system-prompt");
                 cmd.arg(append_system_prompt(helper_path));
                 // A spawned child's task is handed over as `claude`'s POSITIONAL
