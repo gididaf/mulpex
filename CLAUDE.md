@@ -53,8 +53,8 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
                       + listen (the hub listener's 1 Hz inbox watch — the loop HUB_RULES
                         used to spell out for the model to retype)
 crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` dispatch → mulpex-core
-crates/mulpex-cli/    bin `mpx`: the SECOND host — Mulpex over tmux, for working via ssh
-                      (see "Two hosts, one core" below)
+                      (there was a `crates/mulpex-cli/` here — `mpx`, a second host over
+                       tmux — deleted 2026-09-17; see the note under this block)
 src-tauri/            the Tauri app (Rust backend)
   src/pty.rs          Session = one claude OR one shell on a PTY (SessionKind), streaming
                       to a frontend Channel
@@ -452,4 +452,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`d3672bdc38f637d29cd56d9ac85b7a130d5576b5` — 2026-09-19
+`f278704485bc4a13ba692ec35cf3b7a899b0bafa` — 2026-09-21

@@ -342,9 +342,15 @@ user-list path end to end. → [verification-log.md](verification-log.md)
 
 ### The listener expires, so `armed/<id>` is a heartbeat
 
-Removing persistent Monitors broke a second thing, quieter and worse: **every monitor now expires**
-(30 min at most). The hub listener is therefore not permanent, and when it stops, peer mail can no
-longer wake an idle instance — the whole point of arming it.
+**Since 2026-09-20 the listener is armed by a generated plugin monitor and does not expire** — see
+[hub.md](hub.md#the-30-minute-cap-and-how-the-arming-moved-off-the-model). What survives from this
+section is the heartbeat itself, which is now what makes the arm nudge *crash-only*: it fires only
+when a live listener stops refreshing `armed/<id>`. Read the rest as the reasoning behind that
+heartbeat, not as the daily path.
+
+Removing persistent Monitors broke a second thing, quieter and worse: **every monitor then expired**
+(30 min at most). The hub listener was therefore not permanent, and when it stopped, peer mail could
+no longer wake an idle instance — the whole point of arming it.
 
 The arm nudge is the only thing that ever gets one re-armed, and it was gated on `armed/<id>`
 *existing*. The dead listener's flag sits there forever, so the nudge never came back and the
