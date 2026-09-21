@@ -649,6 +649,49 @@ Two things that test taught, both of which cost a run:
   hours older than the change in it — every other hook fired normally, so it looked like the new
   write was simply not happening. The test copies the binary into its own root first.
 
+## Recovering a conversation whose row is gone
+
+A conversation is never lost when its instance dies — only the **store row that points at it** is.
+The transcript stays in `~/.claude/projects/<slug>/<uuid>.jsonl`, and putting the uuid back in the
+store is enough for `Core::open` to `--resume` it. This was done for real on 2026-09-20, after seven
+instances were killed at once (see the `pkill`/argv invariant in [CLAUDE.md](../CLAUDE.md)) and the
+store was rewritten down to the one row that survived.
+
+**The one thing that makes this hard is that Mulpex owns the file while the project is open** — it
+rewrites the store from its live session list, so any row you add is overwritten within a tick. The
+instinct is therefore to quit the app, and that is wrong twice over: an instance doing the recovery
+lives *inside* Mulpex and dies with it, and quitting is not actually required.
+
+**`Core::teardown()` does not persist.** It kills the sessions, clears the list and removes the
+scratch dir — there is no `persist_sessions()` on that path, and `close_project` removes the `Core`
+from the workspace *before* tearing it down, so the poll loop cannot touch it either. Closing one
+project's **tab** therefore leaves that project's store file alone and unowned. That is the window.
+
+Closing the tab is also what makes the restore happen at all: the store is read only by
+`Core::open`, so the project has to be closed and reopened either way.
+
+The procedure, then:
+
+1. **Close the project's tab** (⌘⇧W or the tab's ✕) — not the instances, and not the app. Closing
+   the instances leaves the project open, and Mulpex rewrites the store when they go.
+2. **Append the rows.** Format is `persist.rs`'s positional
+   `<uuid>\t<name>\t<muted>\t<id>` — the empty muted field must be kept, because `id` is the fourth
+   column and only *trailing* empties may be dropped. Back the file up first, refuse any uuid whose
+   `.jsonl` is not on disk (a row that cannot resume comes back as "failed to start", which is worse
+   than no row), and give each one an `id` no live row holds.
+3. **Reopen the project** (⌘O / ⌘P). Every row `--resume`s into its original conversation.
+
+Names are worth recovering too: a spawned instance's assigned task is the first `[mulpex:hub]` user
+message in its transcript, which is enough to label each restored row rather than leaving Mulpex to
+auto-name eight identical-looking rows.
+
+**A guard on this must fail closed.** Two process-based ones were tried and *both silently passed*
+while Mulpex was running — `pgrep -x mulpex` (macOS reports `comm` as a full path, so the
+exact-name match never fires) and `ps -axo comm= | grep -qx <path>` (matched interactively, not from
+inside a script). Each wrote rows to the live store exactly as if no guard existed. The signal that
+does work is positive and not a guess about process names: **Mulpex removes its whole scratch root at
+teardown, so the root still existing proves it is still running.**
+
 ## Restarting an instance in place (⌘⇧R)
 
 A `claude` reads its world exactly **once, at exec**: `CLAUDE_CODE_OAUTH_TOKEN` and the rest of the

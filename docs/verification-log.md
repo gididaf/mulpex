@@ -2359,3 +2359,19 @@ stake was the user's conversations and the feature bought only quieter panes.
 
 The durable output is the invariant in `CLAUDE.md`: **the task is on argv, so every word of it is a
 `pkill -f` target, from any process on the machine, including one that has never heard of Mulpex.**
+
+### Observed and unexplained: a 1-in-120 test failure, 2026-09-20
+
+`cargo test -p mulpex-core --lib` reported `119 passed; 1 failed` **twice** during the evening of
+2026-09-20, both times while the tree was at the *reverted* state (120 tests) and while a probe rig
+was building against the same crate from a sibling workspace. The failing test's **name was never
+captured** — the grep used to extract it did not match, and the next four runs were green.
+
+Not reproduced since, over 26+ runs: 8 with the ambient `MULPEX_*` env the failures inherited
+(0/8), 6 under deliberate `$TMPDIR` churn plus concurrent cargo activity (0/6), and the rest
+incidental. The tree state it occurred in no longer exists — the plugin monitor was re-landed, so
+the suite is 121 tests.
+
+Recorded rather than fixed: no test can be named, so any "fix" would be a guess. If it recurs,
+capture the name first — `cargo test … 2>&1 | tee` the whole output rather than grepping for a
+pattern that may not match, which is what lost it the first two times.
