@@ -140,6 +140,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let save = MenuItemBuilder::with_id("save_session", "Save Session…")
         .accelerator("Cmd+S")
         .build(app)?;
+    // ⌘L: the list of saves in this project's repo; Enter starts a claude on one.
+    let load = MenuItemBuilder::with_id("load_session", "Load Session…")
+        .accelerator("Cmd+L")
+        .build(app)?;
     // A check item so the menu reports the *active* session's state; the
     // frontend keeps the tick in sync via `set_mute_menu_checked` whenever the
     // focus or the flag changes.
@@ -177,6 +181,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&rename)
         .item(&restart)
         .item(&save)
+        .item(&load)
         .item(&mute)
         .item(&messages)
         .item(&explainer)

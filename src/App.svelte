@@ -85,6 +85,7 @@
   import MessageReader from "./lib/components/MessageReader.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
+  import LoadDialog from "./lib/components/LoadDialog.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
   import type { CtxItem } from "./lib/components/ContextMenu.svelte";
 
@@ -170,6 +171,8 @@
   // beside an item aimed at a different one would advertise a key that does
   // something else.
 
+  /** ⌘L: the project whose saves the Load list is showing, or null when closed. */
+  let loadFor = $state<ProjectHandle | null>(null);
   let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
 
   /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
@@ -716,6 +719,9 @@
         if (h != null && cur != null) await restartInstance(h, cur);
         break;
       }
+      case "load_session":
+        if (h != null) loadFor = h;
+        break;
       case "save_session": {
         const cur = get(activeId);
         if (h != null && cur != null) await saveInstance(h, cur);
@@ -1024,6 +1030,25 @@
   {/if}
   {#if $rename}
     <RenameDialog />
+  {/if}
+  {#if loadFor != null}
+    <LoadDialog
+      handle={loadFor}
+      onclose={() => {
+        loadFor = null;
+        terminals.refocus();
+      }}
+      onloaded={async (info) => {
+        const h = loadFor;
+        loadFor = null;
+        if (h == null) return;
+        // Same as ⌘T's tail: add the row, then focus it once it has mounted.
+        const p = get(projects).get(h);
+        setSessionsFor(h, [...(p?.sessions ?? []), info]);
+        await tick();
+        selectSession(info.id);
+      }}
+    />
   {/if}
   {#if ctx}
     <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onclose={closeContextMenu} />

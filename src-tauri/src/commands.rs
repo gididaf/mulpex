@@ -340,3 +340,38 @@ pub fn save_session(
     };
     crate::saves::start(app, project_handle, id, dir, uuid)
 }
+
+fn project_dir(state: &State<AppState>, h: ProjectHandle) -> Result<std::path::PathBuf, String> {
+    let ws = state.ws.lock().unwrap();
+    Ok(ws.project(h).ok_or("no such project")?.project_dir.clone())
+}
+
+/// The saves of the project's repo, newest first (the ⌘L list).
+#[tauri::command]
+pub fn list_saves(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> Result<Vec<crate::saves::SaveEntry>, String> {
+    Ok(crate::saves::list(&project_dir(&state, project_handle)?))
+}
+
+/// Delete one save file (the ⌘L list's trash icon, after its confirm).
+#[tauri::command]
+pub fn delete_save(state: State<AppState>, project_handle: ProjectHandle, file: String) -> Result<(), String> {
+    crate::saves::delete(&project_dir(&state, project_handle)?, &file)
+}
+
+/// Start a fresh claude on a save (⌘L ▸ Enter): it reads the doc, checks the
+/// repo, reports and waits. Named after the save's title, and focused.
+#[tauri::command]
+pub fn load_save(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    file: String,
+) -> Result<SessionInfo, String> {
+    let path = crate::saves::resolve(&project_dir(&state, project_handle)?, &file)?;
+    let mut ws = state.ws.lock().unwrap();
+    let core = ws.project_mut(project_handle).ok_or("no such project")?;
+    core.spawn_instance_with_prompt(crate::saves::load_prompt(&path), crate::saves::title_of(&path))
+        .map_err(|e| e.to_string())
+}

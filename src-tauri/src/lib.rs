@@ -47,6 +47,7 @@ fn is_forwarded(id: &str) -> bool {
             | "rename"
             | "restart"
             | "save_session"
+            | "load_session"
             | "mute"
             | "messages"
             | "explainer"
@@ -107,6 +108,9 @@ pub fn run() {
             commands::get_explains,
             commands::retry_explain,
             commands::save_session,
+            commands::list_saves,
+            commands::delete_save,
+            commands::load_save,
             commands::restart_app,
         ])
         .setup(|app| {

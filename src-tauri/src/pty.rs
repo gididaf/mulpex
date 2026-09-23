@@ -56,6 +56,10 @@ pub enum SpawnSpec<'a> {
         /// Reopen an existing session id rather than creating it.
         resume: bool,
         initial_task: Option<SpawnTask>,
+        /// A prompt handed over exactly as written — no `[mulpex:hub]` wrapper,
+        /// no whitespace collapsing — as if the user had typed it (⌘L Load).
+        /// Still argv, never typed into the TUI. Ignored when `initial_task` is set.
+        plain_prompt: Option<String>,
     },
     Shell {
         state_dir: &'a Path,
@@ -274,6 +278,7 @@ impl Session {
                 session_id,
                 resume,
                 initial_task,
+                plain_prompt,
             } => {
                 let mut cmd = claude_command()?;
                 cmd.arg("--dangerously-skip-permissions");
@@ -306,6 +311,10 @@ impl Session {
                 // text (verified against a real `claude` at 12,000 characters).
                 if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
                     publish_expected_prompt(state_dir, id, &prompt);
+                    cmd.arg(prompt);
+                } else if let Some(prompt) = plain_prompt {
+                    // No delivery verdict or watchdog: this is an ordinary first
+                    // turn, captured by `UserPromptSubmit` like a typed one.
                     cmd.arg(prompt);
                 }
                 // Each mulpex-spawned `claude` is a genuine TOP-LEVEL session

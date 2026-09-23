@@ -35,7 +35,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::claude_bin;
@@ -275,6 +275,123 @@ fn render(d: &Draft, author: &str, date: &str) -> String {
     )
 }
 
+// ---- ⌘L Load: the list, delete, and the prompt a loaded claude starts on ----
+
+/// One save as the ⌘L list shows it. `file` is the bare file name inside
+/// `mulpex/saves/` — the only handle the frontend ever passes back.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SaveEntry {
+    pub file: String,
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    pub created: String,
+    pub updated: String,
+}
+
+/// Every save of the repo `dir` belongs to, most recently updated first. A file
+/// without a readable header still appears, titled by its file name: it is in
+/// the folder, so hiding it would be the list lying about what's there.
+pub fn list(dir: &Path) -> Vec<SaveEntry> {
+    let saves_dir = repo_root(dir).join(SAVES_DIR);
+    let Ok(rd) = std::fs::read_dir(&saves_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SaveEntry> = rd
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_str()?.to_string();
+            if !file.ends_with(".md") || !e.path().is_file() {
+                return None;
+            }
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            Some(entry_from(file, &text))
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (&b.updated, &b.created).cmp(&(&a.updated, &a.created)).then_with(|| a.file.cmp(&b.file))
+    });
+    out
+}
+
+fn entry_from(file: String, text: &str) -> SaveEntry {
+    let h = parse_header(text);
+    let get = |k: &str| h.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let title = get("title");
+    SaveEntry {
+        title: if title.is_empty() { file.trim_end_matches(".md").to_string() } else { title },
+        description: get("description"),
+        author: get("author"),
+        created: get("created"),
+        updated: get("updated"),
+        file,
+    }
+}
+
+/// The `---` front-matter block as `(key, value)` pairs. Values `render` wrote
+/// are JSON strings; a hand-edited plain value is taken as-is.
+fn parse_header(text: &str) -> Vec<(String, String)> {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let v = v.trim();
+        let v = if v.starts_with('"') {
+            serde_json::from_str::<String>(v).unwrap_or_else(|_| v.trim_matches('"').to_string())
+        } else {
+            v.to_string()
+        };
+        out.push((k.trim().to_string(), v));
+    }
+    out
+}
+
+/// The absolute path of save `file`, refusing anything that is not a plain
+/// `.md` name inside the saves dir — `file` comes from the webview.
+pub fn resolve(dir: &Path, file: &str) -> Result<PathBuf, String> {
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.starts_with('.') || !file.ends_with(".md") {
+        return Err(format!("not a save: {file}"));
+    }
+    let path = repo_root(dir).join(SAVES_DIR).join(file);
+    if !path.is_file() {
+        return Err(format!("{file} is gone — someone may have deleted it"));
+    }
+    Ok(path)
+}
+
+pub fn delete(dir: &Path, file: &str) -> Result<(), String> {
+    let path = resolve(dir, file)?;
+    std::fs::remove_file(&path).map_err(|e| format!("delete {file}: {e}"))
+}
+
+/// The save's title, for naming the loaded row.
+pub fn title_of(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let e = entry_from(String::new(), &text);
+    (!e.title.is_empty()).then_some(e.title)
+}
+
+/// What a loaded claude starts on: read the doc, check the repo, report, and
+/// wait for the user's go. The path is absolute because the instance's cwd is
+/// the project dir, which may be a subfolder of the repo the save lives in.
+pub fn load_prompt(path: &Path) -> String {
+    format!(
+        "Continue the work saved in {}. It is a handoff doc that Mulpex saved from an \
+         earlier session; that conversation is not available. Read the whole doc first, \
+         then check the repo's current state against it (git status, git log, the files it \
+         names). Then reply briefly: where things stand, anything that changed since the \
+         doc was written, and the next step you propose. Do not start the work yet — wait \
+         for my go.",
+        path.display()
+    )
+}
+
 /// Lowercase kebab-case, `[a-z0-9-]` only, ≤ 60 chars; `session` if nothing
 /// survives. The slug is a file name a model chose, so it is never trusted as a
 /// path (no `/`, no `..`).
@@ -397,6 +514,39 @@ mod tests {
         let uuid = std::env::var("SAVE_TEST_UUID").unwrap();
         let path = save(&dir, &uuid, |s| eprintln!("stage: {s}")).unwrap();
         eprintln!("wrote {}", path.display());
+    }
+
+    #[test]
+    fn header_round_trips_and_list_sorts_newest_first() {
+        let dir = std::env::temp_dir().join(format!("mulpex-saves-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saves = dir.join(SAVES_DIR);
+        write_save(&saves, &draft("old"), "a", "2026-09-01").unwrap();
+        write_save(&saves, &draft("new"), "b", "2026-09-20").unwrap();
+        std::fs::write(saves.join("bare.md"), "no header here").unwrap();
+        std::fs::write(saves.join("notes.txt"), "ignored").unwrap();
+        let l = list(&dir);
+        let files: Vec<_> = l.iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(files, ["new.md", "old.md", "bare.md"]);
+        assert_eq!(l[0].title, "האצת דף היומן");
+        assert_eq!(l[0].description, "כמעט גמור: \"בדיקה\" נשארה");
+        assert_eq!(l[0].author, "b");
+        assert_eq!(l[2].title, "bare");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_refuses_paths() {
+        let dir = std::env::temp_dir().join(format!("mulpex-saves-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_save(&dir.join(SAVES_DIR), &draft("x"), "a", "d").unwrap();
+        assert!(resolve(&dir, "x.md").is_ok());
+        for bad in ["../x.md", "a/x.md", ".x.md", "x.txt", "", "missing.md"] {
+            assert!(resolve(&dir, bad).is_err(), "{bad}");
+        }
+        delete(&dir, "x.md").unwrap();
+        assert!(resolve(&dir, "x.md").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

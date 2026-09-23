@@ -285,6 +285,30 @@ export const retryExplain = (
 export const saveSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("save_session", { projectHandle, id });
 
+/** One save in the repo's `mulpex/saves/`, as the ⌘L list shows it. `file` is
+ *  the bare file name — the only handle passed back to the backend. */
+export interface SaveEntry {
+  file: string;
+  title: string;
+  description: string;
+  author: string;
+  created: string;
+  updated: string;
+}
+
+/** The saves of the project's repo, most recently updated first. */
+export const listSaves = (projectHandle: ProjectHandle) =>
+  invoke<SaveEntry[]>("list_saves", { projectHandle });
+
+/** Delete one save file. */
+export const deleteSave = (projectHandle: ProjectHandle, file: string) =>
+  invoke<void>("delete_save", { projectHandle, file });
+
+/** Start a fresh claude on a save: it reads the doc, checks the repo, reports and
+ *  waits. Named after the save's title; the backend focuses it. */
+export const loadSave = (projectHandle: ProjectHandle, file: string) =>
+  invoke<SessionInfo>("load_save", { projectHandle, file });
+
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the
  * scratch root) before re-execing. Used to apply a downloaded update. */

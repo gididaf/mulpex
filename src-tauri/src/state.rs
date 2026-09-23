@@ -446,6 +446,7 @@ impl Core {
                     session_id: &saved.session_id,
                     resume: true,
                     initial_task: None,
+                    plain_prompt: None,
                 },
             ) {
                 worked.insert(id);
@@ -554,7 +555,28 @@ impl Core {
     /// Spawn a fresh Claude in the project dir and focus it (⌘T / the frontend
     /// `create_session` command). Ports `App::spawn_instance`.
     pub fn spawn_instance(&mut self) -> anyhow::Result<SessionInfo> {
-        self.spawn_with(None, true)
+        self.spawn_with(None, None, true)
+    }
+
+    /// Spawn a fresh Claude that starts on `prompt` exactly as written, as if the
+    /// user had typed it (⌘L Load: "read this save, report, wait"), and focus it.
+    /// `name` labels the row and is owned by the user like a ⌘R name — the save's
+    /// title is what identifies this work, so the instance's own `hub_set_name`
+    /// must not replace it.
+    pub fn spawn_instance_with_prompt(
+        &mut self,
+        prompt: String,
+        name: Option<String>,
+    ) -> anyhow::Result<SessionInfo> {
+        let info = self.spawn_with(None, Some(prompt), true)?;
+        match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+            Some(name) => {
+                self.names.insert(info.id, name.clone());
+                self.manual_names.insert(info.id);
+                Ok(SessionInfo { name: Some(name), ..info })
+            }
+            None => Ok(info),
+        }
     }
 
     /// Spawn a fresh Claude that starts immediately on `task`, assigned by
@@ -580,7 +602,7 @@ impl Core {
         let _ = std::fs::create_dir_all(&tasks_dir);
         let _ = std::fs::write(tasks_dir.join(id.to_string()), task.trim());
         pty::mark_delivery_pending(&self.state_dir, id);
-        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), false) {
+        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), None, false) {
             Ok(info) => info,
             Err(e) => {
                 // Nothing to deliver to; don't leave the markers behind for a
@@ -617,6 +639,7 @@ impl Core {
     fn spawn_with(
         &mut self,
         initial_task: Option<SpawnTask>,
+        plain_prompt: Option<String>,
         focus: bool,
     ) -> anyhow::Result<SessionInfo> {
         // Refuse before spawning if the project directory itself is off limits.
@@ -642,6 +665,7 @@ impl Core {
                 session_id: &session_id,
                 resume: false,
                 initial_task,
+                plain_prompt,
             },
         )?;
         self.next_id += 1;
@@ -1424,6 +1448,7 @@ impl Core {
                 session_id: &session_id,
                 resume: true,
                 initial_task: None,
+                plain_prompt: None,
             },
         )?;
         // Dropping the old `Session` here `kill`s it a second time, which is

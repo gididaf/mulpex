@@ -5,7 +5,7 @@ and only a claude could read them. Save/Load makes this a Mulpex feature:
 
 - **⌘S** saves one claude's work as a handoff doc in the repo, at `mulpex/saves/<slug>.md`. The doc
   gets a short, simple Hebrew title and description.
-- **⌘L** lists the saves and starts a claude from one. Not built yet; Phase 2.
+- **⌘L** lists the saves and starts a claude from one.
 
 The files are ordinary repo files, and Mulpex never commits them. You commit them like any other
 work, and that is how coworkers get them.
@@ -59,6 +59,26 @@ written, never transliterated.
   `saved ✓`, which fades after 10 s.
 - **A failure** shows the reason on the row, with **Retry** (no second confirm) and **✕**.
 - **A second ⌘S on the same instance** is refused while a save is running.
+
+## Load (Phase 2)
+
+- **⌘L / the palette** opens `LoadDialog.svelte`, which lists `saves.rs::list`: every `*.md` in the
+  repo's `mulpex/saves/`, newest `updated` first.
+  - A file with no readable header still shows up, titled by its file name. It is in the folder, so
+    hiding it would be the list lying.
+  - The list is hard `dir="rtl"`, never `auto`: that is the Explainer's rule, because a title that
+    starts with an English term would flip `auto` to LTR.
+- **Controls:** typing filters, ↑↓ chooses, Enter loads, 🗑 deletes after a native confirm.
+- **Enter** runs `load_save`, which spawns a claude through `Core::spawn_instance_with_prompt`:
+  - The prompt goes on **argv** (`SpawnSpec::Claude::plain_prompt`) exactly as written. There is no
+    `[mulpex:hub]` wrapper, no whitespace collapsing, and no delivery watchdog: it is an ordinary
+    first turn, which `UserPromptSubmit` captures like a typed one.
+  - The prompt says: read the doc (by absolute path, since the cwd may be a subfolder), check the
+    repo, report where things stand and the next step, and **wait for the user's go**.
+  - The row is named after the save's title as a **user-owned** name (`manual_names`), so the
+    instance's own `hub_set_name` can't replace it.
+- **`file` comes from the webview**, so `saves::resolve` accepts only a plain `.md` name inside the
+  saves dir: no `/`, no `\`, no leading `.`.
 
 ## Measured (2026-09-23)
 
