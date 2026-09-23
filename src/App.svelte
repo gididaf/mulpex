@@ -1038,14 +1038,17 @@
         loadFor = null;
         terminals.refocus();
       }}
-      onloaded={async (info) => {
+      onloaded={async ({ info, existing }) => {
         const h = loadFor;
         loadFor = null;
         if (h == null) return;
-        // Same as ⌘T's tail: add the row, then focus it once it has mounted.
-        const p = get(projects).get(h);
-        setSessionsFor(h, [...(p?.sessions ?? []), info]);
-        await tick();
+        // A new row: same as ⌘T's tail — add it, then focus once it has mounted.
+        // An already-open conversation: just focus its row.
+        if (!existing) {
+          const p = get(projects).get(h);
+          setSessionsFor(h, [...(p?.sessions ?? []), info]);
+          await tick();
+        }
         selectSession(info.id);
       }}
     />

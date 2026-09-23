@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { listSaves, deleteSave, loadSave } from "../ipc";
-  import type { ProjectHandle, SaveEntry, SessionInfo } from "../ipc";
+  import type { LoadResult, ProjectHandle, SaveEntry } from "../ipc";
 
   // ⌘L: the saves of the active project's repo (`saves.rs::list`). Enter starts
   // a claude on the selected one. The saves' own text is Hebrew, so the list is
@@ -16,8 +16,9 @@
   }: {
     handle: ProjectHandle;
     onclose: () => void;
-    /** A claude was started on a save; the caller adds and focuses its row. */
-    onloaded: (info: SessionInfo) => void;
+    /** A claude was started on a save (or, `existing`, found already open); the
+     *  caller adds the row if new and focuses it. */
+    onloaded: (r: LoadResult) => void;
   } = $props();
 
   let entries = $state<SaveEntry[] | null>(null);
@@ -25,6 +26,10 @@
   let query = $state("");
   let sel = $state(0);
   let busy = $state(false);
+  /** The row whose "continue or fresh?" choice is open, and which of the two
+   *  buttons (0 = continue, 1 = fresh) the keyboard is on. */
+  let choosing = $state<string | null>(null);
+  let pick = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
 
   const shown = $derived.by(() => {
@@ -55,14 +60,28 @@
     void refresh();
   });
 
-  async function load(e: SaveEntry | undefined) {
+  /** Enter / click on a row: a save whose conversation still exists here asks
+   *  first; any other loads fresh straight away. */
+  function choose(e: SaveEntry | undefined) {
     if (!e || busy) return;
+    if (e.continuable) {
+      choosing = e.file;
+      pick = 0;
+    } else {
+      void load(e, "fresh");
+    }
+  }
+
+  async function load(e: SaveEntry, mode: "fresh" | "continue") {
+    if (busy) return;
     busy = true;
     try {
-      onloaded(await loadSave(handle, e.file));
+      onloaded(await loadSave(handle, e.file, mode));
     } catch (err) {
       error = String(err);
       busy = false;
+      choosing = null;
+      inputEl?.focus();
     }
   }
 
@@ -84,12 +103,28 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    if (choosing != null) {
+      const entry = shown.find((x) => x.file === choosing);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        choosing = null;
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Tab") {
+        e.preventDefault();
+        pick = 1 - pick;
+      } else if (e.key === "Enter" && entry) {
+        e.preventDefault();
+        void load(entry, pick === 0 ? "continue" : "fresh");
+      } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+      }
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
       onclose();
     } else if (e.key === "Enter") {
       e.preventDefault();
-      void load(shown[sel]);
+      choose(shown[sel]);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       if (shown.length) sel = (sel + 1) % shown.length;
@@ -113,6 +148,7 @@
     <input
       bind:this={inputEl}
       bind:value={query}
+      oninput={() => (choosing = null)}
       onkeydown={onKey}
       dir="rtl"
       placeholder="חיפוש…"
@@ -133,10 +169,15 @@
             <button
               class="main"
               onmouseenter={() => (sel = i)}
-              onclick={() => void load(e)}
+              onclick={() => choose(e)}
               disabled={busy}
             >
-              <div class="title">{e.title}</div>
+              <div class="title">
+                {e.title}
+                {#if e.continuable}
+                  <span class="resumable" title="The original conversation is on this machine">↺</span>
+                {/if}
+              </div>
               {#if e.description}
                 <div class="desc">{e.description}</div>
               {/if}
@@ -146,6 +187,18 @@
             </button>
             <button class="trash" title="Delete" onclick={() => void remove(e)}>🗑</button>
           </div>
+          {#if choosing === e.file}
+            <!-- LTR: the buttons are app chrome, in English like the hints. -->
+            <div class="choice" dir="ltr">
+              <button class:on={pick === 0} onclick={() => void load(e, "continue")} disabled={busy}>
+                {e.open_as != null ? `Go to claude #${e.open_as}` : "Continue conversation"}
+              </button>
+              <button class:on={pick === 1} onclick={() => void load(e, "fresh")} disabled={busy}>
+                Start fresh from doc
+              </button>
+              <span class="choice-hint">←→ · Enter · Esc</span>
+            </div>
+          {/if}
         {/each}
       {/if}
     </div>
@@ -245,6 +298,36 @@
     margin-top: 3px;
     color: var(--text-faint);
     font-size: 0.74rem;
+  }
+  .resumable {
+    margin-inline-start: 0.3rem;
+    color: var(--text-faint);
+    font-weight: 400;
+  }
+  .choice {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0.6rem 0.55rem;
+  }
+  .choice button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.6rem;
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .choice button.on {
+    border-color: var(--border-focus);
+    background: var(--bg-elev);
+  }
+  .choice-hint {
+    margin-left: auto;
+    color: var(--text-faint);
+    font-size: 0.72rem;
   }
   .trash {
     flex: none;

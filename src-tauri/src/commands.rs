@@ -346,13 +346,31 @@ fn project_dir(state: &State<AppState>, h: ProjectHandle) -> Result<std::path::P
     Ok(ws.project(h).ok_or("no such project")?.project_dir.clone())
 }
 
-/// The saves of the project's repo, newest first (the ⌘L list).
+/// The saves of the project's repo, newest first (the ⌘L list), each marked
+/// with whether its conversation can still be continued here — and whether it
+/// is already open, in which case "continue" means "go to that row".
 #[tauri::command]
 pub fn list_saves(
     state: State<AppState>,
     project_handle: ProjectHandle,
 ) -> Result<Vec<crate::saves::SaveEntry>, String> {
-    Ok(crate::saves::list(&project_dir(&state, project_handle)?))
+    let dir = project_dir(&state, project_handle)?;
+    let mut entries = crate::saves::list(&dir);
+    for e in &mut entries {
+        let Ok(path) = crate::saves::resolve(&dir, &e.file) else { continue };
+        if let Some(uuid) = crate::saves::resumable_uuid(&path, &dir) {
+            e.continuable = true;
+            e.open_as = open_row_for(&state, project_handle, &uuid);
+        }
+    }
+    Ok(entries)
+}
+
+/// The open claude row already running conversation `uuid`, if any.
+fn open_row_for(state: &State<AppState>, h: ProjectHandle, uuid: &str) -> Option<usize> {
+    let ws = state.ws.lock().unwrap();
+    let core = ws.project(h)?;
+    core.sessions.iter().find(|s| !s.is_shell() && s.session_id == uuid).map(|s| s.id)
 }
 
 /// Delete one save file (the ⌘L list's trash icon, after its confirm).
@@ -361,17 +379,53 @@ pub fn delete_save(state: State<AppState>, project_handle: ProjectHandle, file: 
     crate::saves::delete(&project_dir(&state, project_handle)?, &file)
 }
 
-/// Start a fresh claude on a save (⌘L ▸ Enter): it reads the doc, checks the
-/// repo, reports and waits. Named after the save's title, and focused.
+/// What `load_save` did: started a new row, or (`existing`) found the
+/// conversation already open and is handing back that row to focus.
+#[derive(serde::Serialize)]
+pub struct LoadResult {
+    pub info: SessionInfo,
+    pub existing: bool,
+}
+
+/// Start a claude on a save (⌘L ▸ Enter). `mode`:
+/// - `"fresh"`: a new claude reads the doc, checks the repo, reports and waits;
+/// - `"continue"`: resume the conversation that last saved it — or, if that
+///   conversation is already open, return its row (two claudes on one
+///   transcript would corrupt it).
+///
+/// A new row is named after the save's title, and focused.
 #[tauri::command]
 pub fn load_save(
     state: State<AppState>,
     project_handle: ProjectHandle,
     file: String,
-) -> Result<SessionInfo, String> {
-    let path = crate::saves::resolve(&project_dir(&state, project_handle)?, &file)?;
+    mode: String,
+) -> Result<LoadResult, String> {
+    let dir = project_dir(&state, project_handle)?;
+    let path = crate::saves::resolve(&dir, &file)?;
+    let title = crate::saves::title_of(&path);
+    if mode == "continue" {
+        let uuid = crate::saves::resumable_uuid(&path, &dir)
+            .ok_or("that conversation is no longer on this machine — start fresh from the doc")?;
+        let mut ws = state.ws.lock().unwrap();
+        let core = ws.project_mut(project_handle).ok_or("no such project")?;
+        if let Some(open) = core.sessions.iter().find(|s| !s.is_shell() && s.session_id == uuid) {
+            let id = open.id;
+            let info = core.session_infos().into_iter().find(|i| i.id == id).ok_or("row vanished")?;
+            core.set_active(id);
+            return Ok(LoadResult { info, existing: true });
+        }
+        let info = core.spawn_instance_resuming(uuid, title).map_err(|e| e.to_string())?;
+        return Ok(LoadResult { info, existing: false });
+    }
     let mut ws = state.ws.lock().unwrap();
     let core = ws.project_mut(project_handle).ok_or("no such project")?;
-    core.spawn_instance_with_prompt(crate::saves::load_prompt(&path), crate::saves::title_of(&path))
-        .map_err(|e| e.to_string())
+    let info = core
+        .spawn_instance_with_prompt(crate::saves::load_prompt(&path), title)
+        .map_err(|e| e.to_string())?;
+    // Link the new conversation to the save, so its ⌘S updates this file.
+    if let Some(s) = core.sessions.iter().find(|s| s.id == info.id) {
+        crate::saves::link("loaded", &s.session_id, &dir, &path);
+    }
+    Ok(LoadResult { info, existing: false })
 }

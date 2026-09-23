@@ -555,7 +555,7 @@ impl Core {
     /// Spawn a fresh Claude in the project dir and focus it (⌘T / the frontend
     /// `create_session` command). Ports `App::spawn_instance`.
     pub fn spawn_instance(&mut self) -> anyhow::Result<SessionInfo> {
-        self.spawn_with(None, None, true)
+        self.spawn_with(None, None, None, true)
     }
 
     /// Spawn a fresh Claude that starts on `prompt` exactly as written, as if the
@@ -568,14 +568,36 @@ impl Core {
         prompt: String,
         name: Option<String>,
     ) -> anyhow::Result<SessionInfo> {
-        let info = self.spawn_with(None, Some(prompt), true)?;
+        let info = self.spawn_with(None, Some(prompt), None, true)?;
+        Ok(self.name_as_user(info, name))
+    }
+
+    /// Spawn a new row that resumes conversation `uuid` (⌘L ▸ Continue
+    /// conversation), focused and named like a load. The caller must have checked
+    /// that no open row already holds `uuid`: two claudes on one transcript
+    /// corrupt it. Marked `worked` + `restored` exactly like a startup restore, so
+    /// a resume that dies at once is kept as a failed row with its reason rather
+    /// than vanishing.
+    pub fn spawn_instance_resuming(
+        &mut self,
+        uuid: String,
+        name: Option<String>,
+    ) -> anyhow::Result<SessionInfo> {
+        let info = self.spawn_with(None, None, Some(uuid), true)?;
+        self.worked.insert(info.id);
+        self.restored.insert(info.id, Instant::now());
+        Ok(self.name_as_user(info, name))
+    }
+
+    /// Give a just-spawned row a user-owned name (see `spawn_instance_with_prompt`).
+    fn name_as_user(&mut self, info: SessionInfo, name: Option<String>) -> SessionInfo {
         match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
             Some(name) => {
                 self.names.insert(info.id, name.clone());
                 self.manual_names.insert(info.id);
-                Ok(SessionInfo { name: Some(name), ..info })
+                SessionInfo { name: Some(name), ..info }
             }
-            None => Ok(info),
+            None => info,
         }
     }
 
@@ -602,7 +624,7 @@ impl Core {
         let _ = std::fs::create_dir_all(&tasks_dir);
         let _ = std::fs::write(tasks_dir.join(id.to_string()), task.trim());
         pty::mark_delivery_pending(&self.state_dir, id);
-        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), None, false) {
+        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), None, None, false) {
             Ok(info) => info,
             Err(e) => {
                 // Nothing to deliver to; don't leave the markers behind for a
@@ -640,6 +662,7 @@ impl Core {
         &mut self,
         initial_task: Option<SpawnTask>,
         plain_prompt: Option<String>,
+        resume_uuid: Option<String>,
         focus: bool,
     ) -> anyhow::Result<SessionInfo> {
         // Refuse before spawning if the project directory itself is off limits.
@@ -652,7 +675,8 @@ impl Core {
         }
         self.ensure_state_dir()?;
         let id = self.next_id;
-        let session_id = persist::new_uuid();
+        let resume = resume_uuid.is_some();
+        let session_id = resume_uuid.unwrap_or_else(persist::new_uuid);
         let session = Session::spawn(
             id,
             &self.project_dir,
@@ -663,7 +687,7 @@ impl Core {
                 state_dir: &self.state_dir,
                 helper_path: &self.helper_path,
                 session_id: &session_id,
-                resume: false,
+                resume,
                 initial_task,
                 plain_prompt,
             },

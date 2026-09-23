@@ -45,6 +45,14 @@ const WRITE_PROMPT: &str = include_str!("save_prompts/write.md");
 const CHECK_PROMPT: &str = include_str!("save_prompts/check.md");
 const FIX_PROMPT: &str = include_str!("save_prompts/fix.md");
 
+/// Appended to the write prompt when ⌘S lands on an instance that already has a
+/// save (it was loaded from one, or saved before): one current doc replaces the
+/// old one, so nothing still true is lost to a conversation that never saw it.
+const UPDATE_NOTE: &str = "This work was saved before, and that doc is below. It may have \
+been written from an earlier conversation, so it can hold things this conversation never saw. \
+Produce ONE current doc that replaces it: keep everything from it that is still relevant, \
+update what changed, and drop what is no longer true. Keep its `slug`.";
+
 /// Per step. A fork re-reads the whole conversation and then explores the repo;
 /// the measured steps took 30–70 s, so this only catches a hung child.
 const STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -89,7 +97,13 @@ pub fn start(
                 SaveProgress { handle, id, state: state.into(), detail },
             );
         };
-        let result = save(&dir, &uuid, |stage| emit(stage, None));
+        // An instance that was loaded from a save, or saved before, updates
+        // that file in place instead of starting a second one.
+        let existing = save_for_uuid(&read_links(&links_file()), &uuid);
+        let result = save(&dir, &uuid, existing.as_deref(), |stage| emit(stage, None));
+        if let Ok(path) = &result {
+            link("saved", &uuid, &dir, path);
+        }
         if let Some(running) = RUNNING.lock().unwrap().as_mut() {
             running.remove(&(handle, id));
         }
@@ -105,9 +119,18 @@ pub fn start(
 }
 
 /// The three steps, then the file. Returns the path written.
-fn save(dir: &Path, uuid: &str, stage: impl Fn(&str)) -> Result<PathBuf, String> {
+fn save(
+    dir: &Path,
+    uuid: &str,
+    existing: Option<&Path>,
+    stage: impl Fn(&str),
+) -> Result<PathBuf, String> {
     stage("writing");
-    let draft = parse_draft(&run_step(dir, Some(uuid), WRITE_PROMPT)?)?;
+    let write = match existing.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(doc) => format!("{WRITE_PROMPT}\n\n{UPDATE_NOTE}\n\n<current_doc>\n{doc}\n</current_doc>\n"),
+        None => WRITE_PROMPT.to_string(),
+    };
+    let draft = parse_draft(&run_step(dir, Some(uuid), &write)?)?;
 
     stage("checking");
     let check = format!("{CHECK_PROMPT}\n\n<handoff>\n{}\n</handoff>\n", draft.body);
@@ -131,8 +154,12 @@ fn save(dir: &Path, uuid: &str, stage: impl Fn(&str)) -> Result<PathBuf, String>
     };
 
     let root = repo_root(dir);
+    // The latest saver is the author: the list shows who touched it last.
     let author = git_user_name(&root);
-    write_save(&root.join(SAVES_DIR), &draft, &author, &today())
+    match existing {
+        Some(path) => update_save(path, &draft, &author, &today()),
+        None => write_save(&root.join(SAVES_DIR), &draft, &author, &today()),
+    }
 }
 
 /// One headless step. `fork` = `Some(uuid)` resumes that conversation as a
@@ -257,17 +284,31 @@ fn write_save(saves_dir: &Path, d: &Draft, author: &str, date: &str) -> Result<P
         }
         n += 1;
     };
-    std::fs::write(&path, render(d, author, date)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(&path, render(d, author, date, date)).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Rewrite an existing save in place: same file, its `created` kept, `updated`
+/// bumped. If the file vanished meanwhile (someone deleted it), it is recreated
+/// at the same path rather than failing a three-minute save at the last step.
+fn update_save(path: &Path, d: &Draft, author: &str, date: &str) -> Result<PathBuf, String> {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let created = entry_from(String::new(), &old).created;
+    let created = if created.is_empty() { date.to_string() } else { created };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, render(d, author, &created, date)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.to_path_buf())
 }
 
 /// The file: a front-matter header, then the body. Header values are JSON
 /// strings — valid YAML, and unambiguous for any text a model can produce
 /// (colons, quotes, newlines).
-fn render(d: &Draft, author: &str, date: &str) -> String {
+fn render(d: &Draft, author: &str, created: &str, updated: &str) -> String {
     let q = |s: &str| serde_json::to_string(s.trim()).unwrap_or_default();
     format!(
-        "---\ntitle: {}\ndescription: {}\nauthor: {}\ncreated: {date}\nupdated: {date}\n---\n\n{}\n",
+        "---\ntitle: {}\ndescription: {}\nauthor: {}\ncreated: {created}\nupdated: {updated}\n---\n\n{}\n",
         q(&d.title_he),
         q(&d.description_he),
         q(author),
@@ -287,6 +328,12 @@ pub struct SaveEntry {
     pub author: String,
     pub created: String,
     pub updated: String,
+    /// The conversation that last saved it still exists on THIS machine, in
+    /// this project, so ⌘L can offer to continue it. Filled by `list_saves`.
+    pub continuable: bool,
+    /// That conversation is already open as this instance: "continue" focuses
+    /// it instead of spawning a second claude on the same transcript.
+    pub open_as: Option<usize>,
 }
 
 /// Every save of the repo `dir` belongs to, most recently updated first. A file
@@ -325,6 +372,8 @@ fn entry_from(file: String, text: &str) -> SaveEntry {
         created: get("created"),
         updated: get("updated"),
         file,
+        continuable: false,
+        open_as: None,
     }
 }
 
@@ -390,6 +439,111 @@ pub fn load_prompt(path: &Path) -> String {
          for my go.",
         path.display()
     )
+}
+
+// ---- local links: save file <-> conversation, never in the repo ----
+//
+// `<mulpex home>/save-links.tsv` (so a debug build uses `~/.mulpex-dev`), one
+// line per event: `kind \t uuid \t project dir \t save path`, all paths
+// canonical. `saved` = that conversation wrote the save; `loaded` = a fresh
+// claude was started on it. A conversation id means nothing on a coworker's
+// machine, which is why this is not in the doc's header. Append-only and read
+// newest-last; a line whose save file is gone is simply skipped.
+
+#[derive(Clone, Debug, PartialEq)]
+struct Link {
+    kind: String,
+    uuid: String,
+    dir: PathBuf,
+    save: PathBuf,
+}
+
+fn links_file() -> PathBuf {
+    mulpex_core::mulpex_home().join("save-links.tsv")
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Record that conversation `uuid` (running in `dir`) saved or loaded `save`.
+pub fn link(kind: &str, uuid: &str, dir: &Path, save: &Path) {
+    append_link(&links_file(), kind, uuid, dir, save);
+}
+
+fn append_link(file: &Path, kind: &str, uuid: &str, dir: &Path, save: &Path) {
+    if uuid.is_empty() {
+        return;
+    }
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let line = format!("{kind}\t{uuid}\t{}\t{}\n", canon(dir).display(), canon(save).display());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn read_links(file: &Path) -> Vec<Link> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            Some(Link {
+                kind: f.next()?.to_string(),
+                uuid: f.next()?.to_string(),
+                dir: PathBuf::from(f.next()?),
+                save: PathBuf::from(f.next()?),
+            })
+        })
+        .collect()
+}
+
+/// The save conversation `uuid` last saved or was loaded from, if that file
+/// still exists — what a ⌘S on it updates.
+fn save_for_uuid(links: &[Link], uuid: &str) -> Option<PathBuf> {
+    links.iter().rev().find(|l| l.uuid == uuid && l.save.is_file()).map(|l| l.save.clone())
+}
+
+/// The conversation that most recently SAVED `save` from project `dir` and
+/// still has its transcript here — the one "Continue conversation" resumes. A
+/// merely `loaded` conversation doesn't count: it may never have saved, so the
+/// doc can be newer than anything it holds.
+fn resumable(links: &[Link], save: &Path, dir: &Path, exists: impl Fn(&str, &Path) -> bool) -> Option<String> {
+    let (save, dir) = (canon(save), canon(dir));
+    links
+        .iter()
+        .rev()
+        .find(|l| l.kind == "saved" && l.save == save && l.dir == dir && exists(&l.uuid, &l.dir))
+        .map(|l| l.uuid.clone())
+}
+
+/// Public face of [`resumable`] against the real links file and transcripts.
+pub fn resumable_uuid(save: &Path, dir: &Path) -> Option<String> {
+    resumable(&read_links(&links_file()), save, dir, |uuid, dir| transcript_path(dir, uuid).is_file())
+}
+
+/// Where Claude Code keeps conversation `uuid` of project `dir`: the canonical
+/// dir with every non-alphanumeric byte turned into `-` (checked against the
+/// real `~/.claude/projects/` names, e.g. `/private/tmp/...` → `-private-tmp-...`).
+fn transcript_path(dir: &Path, uuid: &str) -> PathBuf {
+    let slug: String = canon(dir)
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    claude_config_dir().join("projects").join(slug).join(format!("{uuid}.jsonl"))
+}
+
+fn claude_config_dir() -> PathBuf {
+    claude_bin::forwarded_env()
+        .into_iter()
+        .find(|(k, v)| k == "CLAUDE_CONFIG_DIR" && !v.is_empty())
+        .map(|(_, v)| PathBuf::from(v))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
+        })
 }
 
 /// Lowercase kebab-case, `[a-z0-9-]` only, ≤ 60 chars; `session` if nothing
@@ -498,7 +652,7 @@ mod tests {
 
     #[test]
     fn header_quotes_hebrew_and_quotes() {
-        let text = render(&draft("x"), "Gidi", "2026-09-23");
+        let text = render(&draft("x"), "Gidi", "2026-09-23", "2026-09-23");
         assert!(text.starts_with("---\ntitle: \"האצת דף היומן\"\n"));
         assert!(text.contains("description: \"כמעט גמור: \\\"בדיקה\\\" נשארה\"\n"));
         assert!(text.contains("author: \"Gidi\"\ncreated: 2026-09-23\nupdated: 2026-09-23\n---\n\n## Goal\nx\n"));
@@ -512,7 +666,7 @@ mod tests {
     fn live_save() {
         let dir = PathBuf::from(std::env::var("SAVE_TEST_DIR").unwrap());
         let uuid = std::env::var("SAVE_TEST_UUID").unwrap();
-        let path = save(&dir, &uuid, |s| eprintln!("stage: {s}")).unwrap();
+        let path = save(&dir, &uuid, None, |s| eprintln!("stage: {s}")).unwrap();
         eprintln!("wrote {}", path.display());
     }
 
@@ -547,6 +701,64 @@ mod tests {
         delete(&dir, "x.md").unwrap();
         assert!(resolve(&dir, "x.md").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn links_pick_the_latest_live_saver() {
+        let dir = std::env::temp_dir().join(format!("mulpex-saves-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saves = dir.join(SAVES_DIR);
+        let a = write_save(&saves, &draft("a"), "x", "d").unwrap();
+        let b = write_save(&saves, &draft("b"), "x", "d").unwrap();
+        let file = dir.join("links.tsv");
+        append_link(&file, "saved", "u1", &dir, &a);
+        append_link(&file, "loaded", "u2", &dir, &a);
+        append_link(&file, "saved", "u3", &dir, &a);
+        append_link(&file, "saved", "u4", &dir, &b);
+        append_link(&file, "saved", "", &dir, &b); // ignored
+        let links = read_links(&file);
+        assert_eq!(links.len(), 4);
+
+        // ⌘S target: whatever the conversation last saved or loaded.
+        assert_eq!(save_for_uuid(&links, "u2"), Some(canon(&a)));
+        assert_eq!(save_for_uuid(&links, "u4"), Some(canon(&b)));
+        assert_eq!(save_for_uuid(&links, "nope"), None);
+
+        // Continue: the latest SAVER with a transcript; a loader never counts.
+        let all = |_: &str, _: &Path| true;
+        assert_eq!(resumable(&links, &a, &dir, all).as_deref(), Some("u3"));
+        let only_u1 = |u: &str, _: &Path| u == "u1";
+        assert_eq!(resumable(&links, &a, &dir, only_u1).as_deref(), Some("u1"));
+        let only_u2 = |u: &str, _: &Path| u == "u2";
+        assert_eq!(resumable(&links, &a, &dir, only_u2), None);
+        // Another project's conversation can't be resumed from here.
+        assert_eq!(resumable(&links, &a, &saves, all), None);
+
+        // A deleted save is no longer anyone's ⌘S target.
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(save_for_uuid(&links, "u4"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_keeps_created_and_the_file() {
+        let dir = std::env::temp_dir().join(format!("mulpex-saves-upd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = write_save(&dir, &draft("x"), "first", "2026-09-01").unwrap();
+        let mut d = draft("renamed-by-model");
+        d.body = "## Goal\nnew\n".into();
+        let q = update_save(&p, &d, "second", "2026-09-23").unwrap();
+        assert_eq!(p, q);
+        let e = entry_from(String::new(), &std::fs::read_to_string(&p).unwrap());
+        assert_eq!((e.created.as_str(), e.updated.as_str(), e.author.as_str()), ("2026-09-01", "2026-09-23", "second"));
+        assert!(std::fs::read_to_string(&p).unwrap().ends_with("## Goal\nnew\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_path_matches_claude_codes_layout() {
+        let p = transcript_path(Path::new("/nonexistent/a b/c.d"), "u");
+        assert!(p.ends_with("projects/-nonexistent-a-b-c-d/u.jsonl"), "{}", p.display());
     }
 
     #[test]

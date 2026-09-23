@@ -80,6 +80,36 @@ written, never transliterated.
 - **`file` comes from the webview**, so `saves::resolve` accepts only a plain `.md` name inside the
   saves dir: no `/`, no `\`, no leading `.`.
 
+## Links, Continue, and re-save (Phase 3)
+
+`<mulpex home>/save-links.tsv` stores the link between a save file and a conversation. It is
+**never in the repo**, because a conversation id means nothing on a coworker's machine, and a debug
+build keeps its own copy in `~/.mulpex-dev`.
+
+- **The file:** append-only, one line per event: `kind \t uuid \t project dir \t save path`,
+  with canonical paths.
+  - `saved`: that conversation wrote the save.
+  - `loaded`: a fresh claude was started on it, keyed by the uuid Mulpex minted.
+- **⌘S on a linked conversation** updates that same file, found through its latest link of either
+  kind whose file still exists.
+  - The write step also gets the old doc (`UPDATE_NOTE`) and writes **one** current doc that keeps
+    whatever is still true.
+  - `created` is kept, `updated` is bumped, and `author` becomes the latest saver.
+- **⌘L marks a save ↺** when the conversation that last **saved** it still has its `.jsonl` here, in
+  this project. `resumable` ignores `loaded` links, because a loader may never have saved, so the
+  doc can be newer than anything that conversation holds.
+  - Enter then shows **Continue conversation / Start fresh from doc** in place (←→, Enter, Esc).
+  - Continue spawns a new row with `--resume <uuid>` (`Core::spawn_instance_resuming`, marked
+    `worked` + `restored` like a startup restore).
+  - If that conversation is **already open**, the button reads "Go to claude #N" and focuses that
+    row instead. Two claudes on one transcript would corrupt it.
+- **Where the transcript is:** `transcript_path` builds Claude Code's own path:
+  `$CLAUDE_CONFIG_DIR` (or `~/.claude`), then `/projects/`, then the canonical dir with every
+  non-alphanumeric character turned into `-`, then `/<uuid>.jsonl`.
+- **Known gap:** a loaded instance whose transcript later diverges from its minted uuid (see
+  `reconcile_session_ids`) loses its link, and its next ⌘S writes a new file.
+- **Saves from before Phase 3** have no links. They get one on their next ⌘S.
+
 ## Measured (2026-09-23)
 
 The full chain was run on real conversations with a Python probe, then through `saves.rs` itself

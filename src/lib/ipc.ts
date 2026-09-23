@@ -294,6 +294,18 @@ export interface SaveEntry {
   author: string;
   created: string;
   updated: string;
+  /** The conversation that last saved it still exists on this machine, in this
+   *  project — ⌘L offers "Continue conversation". */
+  continuable: boolean;
+  /** That conversation is already open as this claude; continuing focuses it. */
+  open_as: number | null;
+}
+
+/** What `loadSave` did: started `info`, or (`existing`) found that conversation
+ *  already open as `info` and the caller should just focus it. */
+export interface LoadResult {
+  info: SessionInfo;
+  existing: boolean;
 }
 
 /** The saves of the project's repo, most recently updated first. */
@@ -304,10 +316,14 @@ export const listSaves = (projectHandle: ProjectHandle) =>
 export const deleteSave = (projectHandle: ProjectHandle, file: string) =>
   invoke<void>("delete_save", { projectHandle, file });
 
-/** Start a fresh claude on a save: it reads the doc, checks the repo, reports and
- *  waits. Named after the save's title; the backend focuses it. */
-export const loadSave = (projectHandle: ProjectHandle, file: string) =>
-  invoke<SessionInfo>("load_save", { projectHandle, file });
+/** Start a claude on a save. `fresh`: it reads the doc, checks the repo, reports
+ *  and waits. `continue`: resume the conversation that last saved it (or hand
+ *  back its row if it is already open). Named after the save's title. */
+export const loadSave = (
+  projectHandle: ProjectHandle,
+  file: string,
+  mode: "fresh" | "continue",
+) => invoke<LoadResult>("load_save", { projectHandle, file, mode });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the
