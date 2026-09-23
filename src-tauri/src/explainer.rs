@@ -722,7 +722,7 @@ fn run_summarizer(prompt: &str, turn: &str, cwd: &Path) -> Result<String, String
 /// ignorance in the same breath as a diagnosis. So: prefer stderr, which
 /// carries the more specific message when there is one, and fall back to
 /// stdout.
-fn failure_reason(code: Option<i32>, out: &str, err: &str) -> String {
+pub(crate) fn failure_reason(code: Option<i32>, out: &str, err: &str) -> String {
     let code = code.map_or("killed".to_string(), |c| format!("exit {c}"));
     match first_line(err).or_else(|| first_line(out)) {
         Some(reason) => format!("{code}: {reason}"),

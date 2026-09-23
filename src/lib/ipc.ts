@@ -153,6 +153,15 @@ export interface ExplainPendingEvent {
   id: number;
   active: boolean;
 }
+/** `save-progress`: one step of a ⌘S save. `detail` is the path on `done` and
+ *  the reason on `error`. */
+export type SaveState = "writing" | "checking" | "fixing" | "done" | "error";
+export interface SaveProgressEvent {
+  handle: ProjectHandle;
+  id: number;
+  state: SaveState;
+  detail: string | null;
+}
 export interface SessionsChangedEvent {
   handle: ProjectHandle;
   sessions: SessionInfo[];
@@ -268,6 +277,13 @@ export const retryExplain = (
   id: number,
   seq: number,
 ) => invoke<boolean>("retry_explain", { projectHandle, id, seq });
+
+/** Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry).
+ *  Resolves once the save is under way — progress arrives as `save-progress` —
+ *  and rejects with the reason when there is nothing to save or one is already
+ *  running for that instance. */
+export const saveSession = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("save_session", { projectHandle, id });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the

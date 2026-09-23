@@ -261,6 +261,17 @@ pub struct ExplainPending {
     pub active: bool,
 }
 
+/// `save-progress` event payload (⌘S, `saves.rs`). `state` is one of
+/// `writing` / `checking` / `fixing` (in flight), `done` (`detail` = the path
+/// written) or `error` (`detail` = the reason).
+#[derive(Clone, Serialize)]
+pub struct SaveProgress {
+    pub handle: ProjectHandle,
+    pub id: usize,
+    pub state: String,
+    pub detail: Option<String>,
+}
+
 /// `explain-update` event payload: one new entry for one instance's feed.
 /// Deliberately NOT part of `HubSnapshot` — a growing feed would inflate the
 /// 200 ms PartialEq compare and re-emit its whole history on every new entry,

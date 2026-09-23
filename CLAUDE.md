@@ -28,6 +28,7 @@ reasoning in `docs/`.
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explainer.md](docs/explainer.md) | Hebrew Explainer panel: automatic after every turn / pending question / pending plan (`Stop`/`askq`/`plan` write `explainreq/<id>`, the poll drains it), the `dialog` marker and the flush race, a feed of 10 (dimmed history, sticky scroll, bottom-pinned), three fixed parts with app-drawn headings, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs`'s `write_explain_request`, `hub.rs`'s drain, `ExplainerPanel.svelte`, `stores.ts`'s cap |
+| [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion) | `saves.rs`, `save_prompts/*`, the save row status in `InstanceList.svelte` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
@@ -213,7 +214,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project

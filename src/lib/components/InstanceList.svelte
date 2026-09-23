@@ -7,6 +7,7 @@
     hub,
     clampToGroup,
     dragOrder,
+    saves,
   } from "../stores";
   import type { SessionInfo, Status } from "../ipc";
 
@@ -16,6 +17,8 @@
     onreorder,
     oncontext,
     oncontextempty,
+    onsaveretry,
+    onsavedismiss,
   }: {
     onselect: (id: number) => void;
     /** Toggle mute for any row, without selecting it first. */
@@ -27,7 +30,19 @@
     oncontext: (e: MouseEvent, s: SessionInfo) => void;
     /** Right-click on the empty space below the rows. */
     oncontextempty: (e: MouseEvent) => void;
+    /** Re-run a failed ⌘S save for this row. */
+    onsaveretry: (id: number) => void;
+    /** Hide a failed save's message. */
+    onsavedismiss: (id: number) => void;
   } = $props();
+
+  const SAVE_LABEL = {
+    writing: "saving… writing",
+    checking: "saving… checking",
+    fixing: "saving… fixing",
+    done: "saved ✓",
+    error: "save failed",
+  } as const;
 
   const DOT: Record<Status, string> = {
     working: "var(--dot-working)",
@@ -142,6 +157,7 @@
 >
   {#each $sessions as s, i (s.id)}
     {@const st = statusOf(s.id)}
+    {@const sv = $saves.get(s.id)}
     <!-- The rule between the two blocks. Drawn from the first terminal rather
          than emitted once after the loop, so it lands in the right place no
          matter how the list is ordered, and only when there is actually a claude
@@ -227,6 +243,19 @@
           {s.muted ? "🔇" : "🔊"}
         </button>
       {/if}
+      <!-- ⌘S progress. Full-width under the row (the row wraps), and outside the
+           select button so Retry / ✕ can be real buttons. -->
+      {#if sv}
+        <div class="save" class:err={sv.state === "error"} class:ok={sv.state === "done"}>
+          <span class="save-text" title={sv.detail ?? ""}>
+            {SAVE_LABEL[sv.state]}{sv.state === "error" && sv.detail ? `: ${sv.detail}` : ""}
+          </span>
+          {#if sv.state === "error"}
+            <button class="save-btn" onclick={() => onsaveretry(s.id)}>Retry</button>
+            <button class="save-btn" title="Dismiss" onclick={() => onsavedismiss(s.id)}>✕</button>
+          {/if}
+        </div>
+      {/if}
     </div>
   {/each}
 </div>
@@ -239,6 +268,7 @@
   }
   .row {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
     gap: 0.15rem;
     width: 100%;
@@ -366,6 +396,41 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  .save {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 3px;
+    padding-left: calc(8px + 0.4rem);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+  }
+  .save.ok {
+    color: var(--dot-ready);
+  }
+  .save.err {
+    color: var(--warn, #e0a34a);
+  }
+  .save-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .save-btn {
+    flex: none;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 0.35rem;
+    font-size: 0.7rem;
+    color: var(--text);
+  }
+  .save-btn:hover {
+    background: var(--border);
   }
   .task {
     margin-top: 2px;

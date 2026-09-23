@@ -314,3 +314,29 @@ pub fn get_explains(project_handle: ProjectHandle) -> Vec<crate::snapshot::Expla
 pub fn retry_explain(project_handle: ProjectHandle, id: usize, seq: u64) -> bool {
     crate::explainer::retry(project_handle, id, seq)
 }
+
+/// Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry
+/// after a failed save). Returns once the save is under way; progress arrives as
+/// `save-progress`. Refuses — for the same reason ⌘⇧R does — an instance with no
+/// transcript yet: there is no conversation to fork.
+#[tauri::command]
+pub fn save_session(
+    app: AppHandle,
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+) -> Result<(), String> {
+    let (dir, uuid) = {
+        let ws = state.ws.lock().unwrap();
+        let core = ws.project(project_handle).ok_or("no such project")?;
+        let s = core.sessions.iter().find(|s| s.id == id).ok_or(format!("claude#{id} is not open"))?;
+        if s.is_shell() {
+            return Err(format!("term#{id} is a terminal — only a claude can be saved"));
+        }
+        if s.session_id.is_empty() || !core.worked.contains(&id) {
+            return Err(format!("claude#{id} has nothing to save yet — send it a prompt first"));
+        }
+        (core.project_dir.clone(), s.session_id.clone())
+    };
+    crate::saves::start(app, project_handle, id, dir, uuid)
+}

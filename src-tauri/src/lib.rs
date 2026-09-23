@@ -8,6 +8,7 @@ mod hub;
 mod menu;
 mod project;
 mod pty;
+mod saves;
 mod snapshot;
 mod state;
 mod vtgrid;
@@ -45,6 +46,7 @@ fn is_forwarded(id: &str) -> bool {
             | "close_session"
             | "rename"
             | "restart"
+            | "save_session"
             | "mute"
             | "messages"
             | "explainer"
@@ -104,6 +106,7 @@ pub fn run() {
             commands::get_hub_snapshot,
             commands::get_explains,
             commands::retry_explain,
+            commands::save_session,
             commands::restart_app,
         ])
         .setup(|app| {

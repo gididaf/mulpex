@@ -9,6 +9,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
 | `explainer.rs` (the `explainreq/<id>` drain via `submit`, turn extraction, pending questions + plans, the headless Sonnet child, the worker queue, the 10-entry feed, failure reason + retry) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race and the `dialog` marker, why not `--bare`, the three-part shape, no-silent-skip rule, and why a retry re-runs the *stashed* input rather than the transcript |
+| `saves.rs`, `save_prompts/*` (⌘S: fork → memoryless check → fork fix, read-only tools, writes `mulpex/saves/` at the git root) | [../docs/saves.md](../docs/saves.md) — why the doc must stand alone, why the forks run in the project dir, why `total_cost_usd` over-reports |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 

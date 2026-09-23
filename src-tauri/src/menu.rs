@@ -135,6 +135,11 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let restart = MenuItemBuilder::with_id("restart", "Restart Session…")
         .accelerator("Cmd+Shift+R")
         .build(app)?;
+    // ⌘S: write the focused claude's work to a handoff doc in the repo
+    // (`saves.rs`). Confirmed in the frontend, like Restart.
+    let save = MenuItemBuilder::with_id("save_session", "Save Session…")
+        .accelerator("Cmd+S")
+        .build(app)?;
     // A check item so the menu reports the *active* session's state; the
     // frontend keeps the tick in sync via `set_mute_menu_checked` whenever the
     // focus or the flag changes.
@@ -171,6 +176,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&rename)
         .item(&restart)
+        .item(&save)
         .item(&mute)
         .item(&messages)
         .item(&explainer)

@@ -13,6 +13,8 @@ import type {
   ExplainEntry,
   HubSnapshot,
   ProjectHandle,
+  SaveProgressEvent,
+  SaveState,
   SessionInfo,
   Status,
 } from "./ipc";
@@ -432,6 +434,60 @@ export function removeExplainsFor(handle: ProjectHandle, id: number): void {
   explainPending.delete(id);
   patchProject(handle, { explains, explainPending });
 }
+
+// ---- ⌘S save progress (saves.rs) ----
+
+export interface SaveStatus {
+  state: SaveState;
+  /** The path on `done`, the reason on `error`. */
+  detail: string | null;
+}
+
+/** Every instance's save status, keyed `handle:id`. Kept outside `ProjectState`
+ *  because it is transient: a `done` fades by itself, an `error` stays until
+ *  retried or dismissed, and nothing about it survives a reload. */
+const saveStates = writable<Map<string, SaveStatus>>(new Map());
+const saveKey = (handle: ProjectHandle, id: number) => `${handle}:${id}`;
+/** How long "saved ✓" stays on the row. */
+const SAVED_FADE_MS = 10_000;
+
+/** Mirror one `save-progress` event. */
+export function applySaveProgress(ev: SaveProgressEvent): void {
+  const key = saveKey(ev.handle, ev.id);
+  const status: SaveStatus = { state: ev.state, detail: ev.detail };
+  saveStates.update((m) => new Map(m).set(key, status));
+  if (ev.state === "done") {
+    // Only clears the status it was set for: a new save started within the ten
+    // seconds must not have its progress wiped by the old one's timer.
+    setTimeout(() => {
+      saveStates.update((m) => {
+        if (m.get(key) !== status) return m;
+        const next = new Map(m);
+        next.delete(key);
+        return next;
+      });
+    }, SAVED_FADE_MS);
+  }
+}
+
+/** Drop an instance's save status (a dismissed error, or the row exited). */
+export function clearSaveState(handle: ProjectHandle, id: number): void {
+  saveStates.update((m) => {
+    if (!m.has(saveKey(handle, id))) return m;
+    const next = new Map(m);
+    next.delete(saveKey(handle, id));
+    return next;
+  });
+}
+
+/** The active project's save statuses, by instance id. */
+export const saves = derived([saveStates, activeProjectHandle], ([$m, $h]) => {
+  const out = new Map<number, SaveStatus>();
+  if ($h == null) return out;
+  const prefix = `${$h}:`;
+  for (const [k, v] of $m) if (k.startsWith(prefix)) out.set(Number(k.slice(prefix.length)), v);
+  return out;
+});
 
 /** An already-open project whose dir matches `dir` (best-effort exact match; the
  * backend still dedups canonically). */

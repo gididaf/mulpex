@@ -19,6 +19,7 @@
     createTerminal,
     closeSession,
     restartSession,
+    saveSession,
     focusSession,
     getHubSnapshot,
     getExplains,
@@ -30,6 +31,7 @@
     type HubUpdateEvent,
     type ExplainUpdateEvent,
     type ExplainPendingEvent,
+    type SaveProgressEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
     type ProjectHandle,
@@ -56,6 +58,8 @@
     setExplainsFor,
     setExplainPendingFor,
     removeExplainsFor,
+    applySaveProgress,
+    clearSaveState,
     displayOrder,
     clampToGroup,
     dragOrder,
@@ -259,6 +263,11 @@
               label: "Restart…",
               hint: key("⌘⇧R"),
               run: () => void restartInstance(h, s.id),
+            },
+            {
+              label: "Save…",
+              hint: key("⌘S"),
+              run: () => void saveInstance(h, s.id),
             },
           ]),
       { label: "Close", hint: key("⌘W"), danger: true, run: () => closeSession(h, s.id) },
@@ -542,6 +551,49 @@
     terminals.refocus();
   }
 
+  /** The row's retry after a failed save: no second confirm — the user already
+   *  said yes to this save. */
+  async function retrySave(id: number) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    try {
+      await saveSession(h, id);
+    } catch (e) {
+      flashNotice(`Could not save claude #${id}: ${e}`, 8000);
+    }
+  }
+
+  /**
+   * ⌘S: save one claude's work as a handoff doc in the repo (`saves.rs`). Asked
+   * first, because it runs three Opus steps; allowed mid-turn, with a warning,
+   * since the save captures whatever the conversation holds right now. The
+   * instance stays usable throughout — progress shows on its sidebar row.
+   */
+  async function saveInstance(handle: ProjectHandle, id: number) {
+    const s = get(projects)
+      .get(handle)
+      ?.sessions.find((x) => x.id === id);
+    if (!s) return;
+    if (s.kind === "shell") {
+      flashNotice(`term #${id} can't be saved — only a claude has a conversation.`, 4000);
+      return;
+    }
+    const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
+    const busy = get(projects).get(handle)?.statuses.get(id) === "working";
+    const ok = await confirm(
+      `Save ${who} so you can continue it later?` +
+        (busy ? `\n\nIt's still working. The last step may be missed.` : ""),
+      { title: "Save Session", kind: "info", okLabel: "Save", cancelLabel: "Cancel" },
+    );
+    terminals.refocus();
+    if (!ok) return;
+    try {
+      await saveSession(handle, id);
+    } catch (e) {
+      flashNotice(`Could not save claude #${id}: ${e}`, 8000);
+    }
+  }
+
   /**
    * Cycle sessions within the active project, in the order the sidebar shows
    * them — claudes, then terminals. What you see is what you cycle.
@@ -662,6 +714,11 @@
       case "restart": {
         const cur = get(activeId);
         if (h != null && cur != null) await restartInstance(h, cur);
+        break;
+      }
+      case "save_session": {
+        const cur = get(activeId);
+        if (h != null && cur != null) await saveInstance(h, cur);
         break;
       }
       case "rename": {
@@ -829,8 +886,10 @@
       listen<ExplainPendingEvent>("explain-pending", (e) =>
         setExplainPendingFor(e.payload.handle, e.payload.id, e.payload.active),
       ),
+      listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
+        clearSaveState(e.payload.handle, e.payload.id);
         // The backend forgets the feed on reap; mirror it so a reused id can't
         // resurrect a dead instance's explanations.
         removeExplainsFor(e.payload.handle, e.payload.id);
@@ -930,6 +989,11 @@
         onreorder={applySessionOrder}
         oncontext={openRowMenu}
         oncontextempty={openEmptyMenu}
+        onsaveretry={retrySave}
+        onsavedismiss={(id) => {
+          const h = get(activeProjectHandle);
+          if (h != null) clearSaveState(h, id);
+        }}
       />
       <HubPanel />
     </aside>
