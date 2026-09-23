@@ -404,10 +404,14 @@ fn parse_header(text: &str) -> Vec<(String, String)> {
 /// The absolute path of save `file`, refusing anything that is not a plain
 /// `.md` name inside the saves dir — `file` comes from the webview.
 pub fn resolve(dir: &Path, file: &str) -> Result<PathBuf, String> {
+    resolve_in(dir, SAVES_DIR, file)
+}
+
+fn resolve_in(dir: &Path, sub: &str, file: &str) -> Result<PathBuf, String> {
     if file.is_empty() || file.contains('/') || file.contains('\\') || file.starts_with('.') || !file.ends_with(".md") {
         return Err(format!("not a save: {file}"));
     }
-    let path = repo_root(dir).join(SAVES_DIR).join(file);
+    let path = repo_root(dir).join(sub).join(file);
     if !path.is_file() {
         return Err(format!("{file} is gone — someone may have deleted it"));
     }
@@ -438,6 +442,111 @@ pub fn load_prompt(path: &Path) -> String {
          doc was written, and the next step you propose. Do not start the work yet — wait \
          for my go.",
         path.display()
+    )
+}
+
+// ---- playbooks: pointers to recurring-incident runbooks ----
+//
+// A playbook is a runbook that is used again and again ("attach this when a
+// client reports X"), so it is never "finished" and never moves. Mulpex knows
+// it through a small committed pointer, `mulpex/playbooks/<slug>.md`, whose
+// header carries the Hebrew `title` / `description` and `source` — the
+// runbook's path relative to the repo root. The runbook itself stays where
+// code and CLAUDE.md files already link to it.
+
+pub const PLAYBOOKS_DIR: &str = "mulpex/playbooks";
+
+/// One playbook as the ⌘L Playbooks tab shows it.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct PlaybookEntry {
+    pub file: String,
+    pub title: String,
+    pub description: String,
+    /// The runbook, relative to the repo root.
+    pub source: String,
+    /// `source` is not on disk (moved or deleted without its pointer).
+    pub missing: bool,
+}
+
+/// Every playbook pointer of the repo `dir` belongs to, by title.
+pub fn list_playbooks(dir: &Path) -> Vec<PlaybookEntry> {
+    let root = repo_root(dir);
+    let Ok(rd) = std::fs::read_dir(root.join(PLAYBOOKS_DIR)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PlaybookEntry> = rd
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_str()?.to_string();
+            if !file.ends_with(".md") || !e.path().is_file() {
+                return None;
+            }
+            let h = parse_header(&std::fs::read_to_string(e.path()).unwrap_or_default());
+            let get = |k: &str| h.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let source = get("source");
+            let title = get("title");
+            Some(PlaybookEntry {
+                missing: source_path(&root, &source).is_none_or(|p| !p.is_file()),
+                title: if title.is_empty() { file.trim_end_matches(".md").to_string() } else { title },
+                description: get("description"),
+                source,
+                file,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.file.cmp(&b.file)));
+    out
+}
+
+/// `source` resolved under `root`, refusing absolute paths and `..` — it is
+/// text in a committed file, so it is not trusted as a path.
+fn source_path(root: &Path, source: &str) -> Option<PathBuf> {
+    let rel = Path::new(source.trim());
+    if source.trim().is_empty()
+        || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+/// Pointer path, runbook path and title of playbook `file`.
+pub fn playbook(dir: &Path, file: &str) -> Result<(PathBuf, PathBuf, String), String> {
+    let pointer = resolve_in(dir, PLAYBOOKS_DIR, file)?;
+    let e = list_playbooks(dir).into_iter().find(|e| e.file == file).ok_or("playbook is gone")?;
+    let source = source_path(&repo_root(dir), &e.source)
+        .filter(|p| p.is_file())
+        .ok_or_else(|| format!("its runbook {} is missing", e.source))?;
+    Ok((pointer, source, e.title))
+}
+
+/// Retire a playbook for good: the runbook and its pointer. Git keeps the
+/// history; Mulpex never commits the deletion.
+pub fn delete_playbook(dir: &Path, file: &str) -> Result<(), String> {
+    let pointer = resolve_in(dir, PLAYBOOKS_DIR, file)?;
+    let h = parse_header(&std::fs::read_to_string(&pointer).unwrap_or_default());
+    let source = h.iter().find(|(k, _)| k == "source").map(|(_, v)| v.clone()).unwrap_or_default();
+    if let Some(src) = source_path(&repo_root(dir), &source).filter(|p| p.is_file()) {
+        std::fs::remove_file(&src).map_err(|e| format!("delete {source}: {e}"))?;
+    }
+    std::fs::remove_file(&pointer).map_err(|e| format!("delete {file}: {e}"))
+}
+
+/// What a claude started from a playbook begins on: read the runbook, say in a
+/// line or two what it is for, and ask what the user needs — then work it
+/// read-only first, and at the end suggest (never make) an edit, or the
+/// playbook's deletion if it describes something that is gone.
+pub fn playbook_prompt(pointer: &Path, source: &Path) -> String {
+    format!(
+        "Read the playbook at {src} fully. Then tell me in one or two short lines what it is \
+         for, and ask me what I need it for this time.\n\n\
+         Once I tell you, stay read-only until you know what is going on, and ask me before \
+         changing anything (data, production, code). When we are done: if you learned something the playbook lacks or has wrong, \
+         suggest a concrete edit to it and ask before writing it. If the playbook describes \
+         something that no longer exists, say so and suggest deleting it — both {src} and its \
+         Mulpex pointer {ptr} — and ask before deleting.",
+        src = source.display(),
+        ptr = pointer.display(),
     )
 }
 
@@ -759,6 +868,36 @@ mod tests {
     fn transcript_path_matches_claude_codes_layout() {
         let p = transcript_path(Path::new("/nonexistent/a b/c.d"), "u");
         assert!(p.ends_with("projects/-nonexistent-a-b-c-d/u.jsonl"), "{}", p.display());
+    }
+
+    #[test]
+    fn playbooks_list_resolve_and_retire() {
+        let dir = std::env::temp_dir().join(format!("mulpex-playbooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs/runbooks")).unwrap();
+        std::fs::create_dir_all(dir.join(PLAYBOOKS_DIR)).unwrap();
+        std::fs::write(dir.join("docs/runbooks/mfa.md"), "# MFA").unwrap();
+        let ptr = |title: &str, src: &str| format!("---\ntitle: \"{title}\"\ndescription: \"d\"\nsource: \"{src}\"\n---\n");
+        std::fs::write(dir.join(PLAYBOOKS_DIR).join("mfa.md"), ptr("ביטול MFA", "docs/runbooks/mfa.md")).unwrap();
+        std::fs::write(dir.join(PLAYBOOKS_DIR).join("gone.md"), ptr("אבד", "docs/runbooks/gone.md")).unwrap();
+        std::fs::write(dir.join(PLAYBOOKS_DIR).join("evil.md"), ptr("רע", "../../etc/passwd")).unwrap();
+
+        let l = list_playbooks(&dir);
+        let by = |f: &str| l.iter().find(|e| e.file == f).unwrap().clone();
+        assert!(!by("mfa.md").missing);
+        assert!(by("gone.md").missing);
+        assert!(by("evil.md").missing, "a `..` source must never resolve");
+
+        let (p, s, t) = playbook(&dir, "mfa.md").unwrap();
+        assert!(p.ends_with("mulpex/playbooks/mfa.md") && s.ends_with("docs/runbooks/mfa.md"));
+        assert_eq!(t, "ביטול MFA");
+        assert!(playbook(&dir, "gone.md").is_err());
+        assert!(playbook(&dir, "evil.md").is_err());
+
+        delete_playbook(&dir, "mfa.md").unwrap();
+        assert!(!dir.join("docs/runbooks/mfa.md").exists());
+        assert!(!dir.join(PLAYBOOKS_DIR).join("mfa.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

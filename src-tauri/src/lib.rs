@@ -111,6 +111,9 @@ pub fn run() {
             commands::list_saves,
             commands::delete_save,
             commands::load_save,
+            commands::list_playbooks,
+            commands::delete_playbook,
+            commands::load_playbook,
             commands::restart_app,
         ])
         .setup(|app| {

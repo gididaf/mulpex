@@ -110,6 +110,31 @@ build keeps its own copy in `~/.mulpex-dev`.
   `reconcile_session_ids`) loses its link, and its next ⌘S writes a new file.
 - **Saves from before Phase 3** have no links. They get one on their next ⌘S.
 
+## Playbooks (Phase 4a)
+
+Most old "runbooks" are not unfinished work. They are **recurring-incident playbooks** ("attach this
+when a client reports X"): used again and again, never finished, and linked from code comments and
+CLAUDE.md files. So a playbook **never moves**:
+
+- **The pointer:** Mulpex knows a playbook through a committed pointer,
+  `mulpex/playbooks/<slug>.md`. It is only a header: Hebrew `title` / `description`, and `source`,
+  the runbook's path relative to the repo root. `source` is text in a committed file, so
+  `source_path` accepts only normal components: nothing absolute and no `..`.
+- **The ⌘L window** has two tabs, **Saves | Playbooks**. Tab switches between them.
+  - A missing runbook still lists, marked "missing", and can't be loaded.
+- **Loading one:** Enter runs `load_playbook`, which spawns a claude on `playbook_prompt`:
+  - It reads the runbook, says in a line or two what it is for, and **asks what the user needs this
+    time**. There is deliberately no "what happened?" box in the dialog: one was built and dropped
+    as an extra step nobody used.
+  - It then works read-only first, and asks before changing anything.
+  - At the end it **suggests** an edit to the playbook, or **suggests deleting** it (runbook +
+    pointer) if it describes something that no longer exists. It never writes or deletes without
+    asking.
+  - The row starts named after the playbook, **not** user-owned, so the instance may rename it after
+    the specific incident.
+- **🗑 on a playbook retires it for good:** it deletes the runbook **and** the pointer. Git keeps the
+  history, and Mulpex does not commit.
+
 ## Measured (2026-09-23)
 
 The full chain was run on real conversations with a Python probe, then through `saves.rs` itself

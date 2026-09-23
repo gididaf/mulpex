@@ -559,17 +559,19 @@ impl Core {
     }
 
     /// Spawn a fresh Claude that starts on `prompt` exactly as written, as if the
-    /// user had typed it (⌘L Load: "read this save, report, wait"), and focus it.
-    /// `name` labels the row and is owned by the user like a ⌘R name — the save's
-    /// title is what identifies this work, so the instance's own `hub_set_name`
-    /// must not replace it.
+    /// user had typed it (⌘L Load), and focus it. `name` labels the row. With
+    /// `user_owned` it is kept like a ⌘R name — a save's title is what identifies
+    /// that work, so the instance's own `hub_set_name` must not replace it; a
+    /// playbook's title is only a starting label, and the instance may rename the
+    /// row after the specific incident.
     pub fn spawn_instance_with_prompt(
         &mut self,
         prompt: String,
         name: Option<String>,
+        user_owned: bool,
     ) -> anyhow::Result<SessionInfo> {
         let info = self.spawn_with(None, Some(prompt), None, true)?;
-        Ok(self.name_as_user(info, name))
+        Ok(self.name_row(info, name, user_owned))
     }
 
     /// Spawn a new row that resumes conversation `uuid` (⌘L ▸ Continue
@@ -586,15 +588,17 @@ impl Core {
         let info = self.spawn_with(None, None, Some(uuid), true)?;
         self.worked.insert(info.id);
         self.restored.insert(info.id, Instant::now());
-        Ok(self.name_as_user(info, name))
+        Ok(self.name_row(info, name, true))
     }
 
-    /// Give a just-spawned row a user-owned name (see `spawn_instance_with_prompt`).
-    fn name_as_user(&mut self, info: SessionInfo, name: Option<String>) -> SessionInfo {
+    /// Name a just-spawned row (see `spawn_instance_with_prompt` for `user_owned`).
+    fn name_row(&mut self, info: SessionInfo, name: Option<String>, user_owned: bool) -> SessionInfo {
         match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
             Some(name) => {
                 self.names.insert(info.id, name.clone());
-                self.manual_names.insert(info.id);
+                if user_owned {
+                    self.manual_names.insert(info.id);
+                }
                 SessionInfo { name: Some(name), ..info }
             }
             None => info,

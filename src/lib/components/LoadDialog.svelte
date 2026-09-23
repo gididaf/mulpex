@@ -1,13 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { confirm } from "@tauri-apps/plugin-dialog";
-  import { listSaves, deleteSave, loadSave } from "../ipc";
-  import type { LoadResult, ProjectHandle, SaveEntry } from "../ipc";
+  import {
+    listSaves,
+    deleteSave,
+    loadSave,
+    listPlaybooks,
+    deletePlaybook,
+    loadPlaybook,
+  } from "../ipc";
+  import type { LoadResult, PlaybookEntry, ProjectHandle, SaveEntry } from "../ipc";
 
-  // ⌘L: the saves of the active project's repo (`saves.rs::list`). Enter starts
-  // a claude on the selected one. The saves' own text is Hebrew, so the list is
-  // hard `dir="rtl"` — never `auto`, which a title starting with an English term
-  // would flip to LTR (the Explainer's rule, docs/explainer.md).
+  // ⌘L: two tabs over the active project's repo.
+  // - Saves (`mulpex/saves/`): unfinished work. Enter starts a claude on one.
+  // - Playbooks (`mulpex/playbooks/`): pointers to recurring-incident runbooks.
+  //   Enter starts a claude that reads it and asks what the user needs.
+  // Both lists are hard `dir="rtl"` — never `auto`, which a title starting with
+  // an English term would flip to LTR (the Explainer's rule, docs/explainer.md).
 
   let {
     handle,
@@ -16,39 +25,60 @@
   }: {
     handle: ProjectHandle;
     onclose: () => void;
-    /** A claude was started on a save (or, `existing`, found already open); the
-     *  caller adds the row if new and focuses it. */
+    /** A claude was started (or, `existing`, found already open); the caller
+     *  adds the row if new and focuses it. */
     onloaded: (r: LoadResult) => void;
   } = $props();
 
-  let entries = $state<SaveEntry[] | null>(null);
+  type Tab = "saves" | "playbooks";
+  let tab = $state<Tab>("saves");
+  let saves = $state<SaveEntry[] | null>(null);
+  let playbooks = $state<PlaybookEntry[] | null>(null);
   let error = $state<string | null>(null);
   let query = $state("");
   let sel = $state(0);
   let busy = $state(false);
-  /** The row whose "continue or fresh?" choice is open, and which of the two
-   *  buttons (0 = continue, 1 = fresh) the keyboard is on. */
+  /** Saves: the row whose "continue or fresh?" choice is open, and which button
+   *  (0 = continue, 1 = fresh) the keyboard is on. */
   let choosing = $state<string | null>(null);
   let pick = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
 
-  const shown = $derived.by(() => {
+  type Row = { file: string; title: string; description: string; meta: string; mark: string };
+
+  const rows = $derived.by((): Row[] => {
+    const all: Row[] =
+      tab === "saves"
+        ? (saves ?? []).map((e) => ({
+            file: e.file,
+            title: e.title,
+            description: e.description,
+            meta: `${e.updated || e.created}${e.author ? ` · ${e.author}` : ""}`,
+            mark: e.continuable ? "↺" : "",
+          }))
+        : (playbooks ?? []).map((e) => ({
+            file: e.file,
+            title: e.title,
+            description: e.description,
+            meta: e.missing ? `${e.source} — missing` : e.source,
+            mark: "",
+          }));
     const q = query.trim().toLowerCase();
-    const all = entries ?? [];
     if (!q) return all;
-    return all.filter((e) =>
-      [e.title, e.description, e.author, e.file].some((f) => f.toLowerCase().includes(q)),
+    return all.filter((r) =>
+      [r.title, r.description, r.meta, r.file].some((f) => f.toLowerCase().includes(q)),
     );
   });
+  const loaded = $derived(tab === "saves" ? saves : playbooks);
 
   $effect(() => {
     // Keep the selection on a real row as the filter narrows.
-    if (sel >= shown.length) sel = Math.max(0, shown.length - 1);
+    if (sel >= rows.length) sel = Math.max(0, rows.length - 1);
   });
 
   async function refresh() {
     try {
-      entries = await listSaves(handle);
+      [saves, playbooks] = await Promise.all([listSaves(handle), listPlaybooks(handle)]);
       error = null;
     } catch (e) {
       error = String(e);
@@ -60,23 +90,36 @@
     void refresh();
   });
 
-  /** Enter / click on a row: a save whose conversation still exists here asks
-   *  first; any other loads fresh straight away. */
-  function choose(e: SaveEntry | undefined) {
-    if (!e || busy) return;
-    if (e.continuable) {
-      choosing = e.file;
+  function switchTab(t: Tab) {
+    if (tab === t) return;
+    tab = t;
+    sel = 0;
+    choosing = null;
+    inputEl?.focus();
+  }
+
+  /** Enter / click on a row. */
+  async function choose(r: Row | undefined) {
+    if (!r || busy) return;
+    if (tab === "playbooks") {
+      void runPlaybook(r.file);
+      return;
+    }
+    // A save whose conversation still exists here asks first; any other loads
+    // fresh straight away.
+    if (saves?.find((e) => e.file === r.file)?.continuable) {
+      choosing = r.file;
       pick = 0;
     } else {
-      void load(e, "fresh");
+      void loadSaveAs(r.file, "fresh");
     }
   }
 
-  async function load(e: SaveEntry, mode: "fresh" | "continue") {
+  async function run(f: () => Promise<LoadResult>) {
     if (busy) return;
     busy = true;
     try {
-      onloaded(await loadSave(handle, e.file, mode));
+      onloaded(await f());
     } catch (err) {
       error = String(err);
       busy = false;
@@ -84,18 +127,29 @@
       inputEl?.focus();
     }
   }
+  const loadSaveAs = (file: string, mode: "fresh" | "continue") =>
+    run(() => loadSave(handle, file, mode));
+  const runPlaybook = (file: string) =>
+    run(async () => ({ info: await loadPlaybook(handle, file), existing: false }));
 
-  async function remove(e: SaveEntry) {
-    const ok = await confirm(`Delete "${e.title}"?`, {
-      title: "Delete Save",
-      kind: "warning",
-      okLabel: "Delete",
-      cancelLabel: "Cancel",
-    });
+  async function remove(r: Row) {
+    const pb = playbooks?.find((e) => e.file === r.file);
+    const ok = await confirm(
+      tab === "saves"
+        ? `Delete "${r.title}"?`
+        : `Retire "${r.title}"?\n\nThis deletes the runbook (${pb?.source}) and its playbook ` +
+            `entry. Git keeps the history.`,
+      {
+        title: tab === "saves" ? "Delete Save" : "Retire Playbook",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel",
+      },
+    );
     inputEl?.focus();
     if (!ok) return;
     try {
-      await deleteSave(handle, e.file);
+      await (tab === "saves" ? deleteSave(handle, r.file) : deletePlaybook(handle, r.file));
     } catch (err) {
       error = String(err);
     }
@@ -104,16 +158,15 @@
 
   function onKey(e: KeyboardEvent) {
     if (choosing != null) {
-      const entry = shown.find((x) => x.file === choosing);
       if (e.key === "Escape") {
         e.preventDefault();
         choosing = null;
       } else if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Tab") {
         e.preventDefault();
         pick = 1 - pick;
-      } else if (e.key === "Enter" && entry) {
+      } else if (e.key === "Enter") {
         e.preventDefault();
-        void load(entry, pick === 0 ? "continue" : "fresh");
+        void loadSaveAs(choosing, pick === 0 ? "continue" : "fresh");
       } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         e.preventDefault();
       }
@@ -122,15 +175,18 @@
     if (e.key === "Escape") {
       e.preventDefault();
       onclose();
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      switchTab(tab === "saves" ? "playbooks" : "saves");
     } else if (e.key === "Enter") {
       e.preventDefault();
-      choose(shown[sel]);
+      void choose(rows[sel]);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (shown.length) sel = (sel + 1) % shown.length;
+      if (rows.length) sel = (sel + 1) % rows.length;
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      if (shown.length) sel = (sel - 1 + shown.length) % shown.length;
+      if (rows.length) sel = (sel - 1 + rows.length) % rows.length;
     }
   }
 </script>
@@ -144,7 +200,14 @@
     onclick={(e) => e.stopPropagation()}
     onkeydown={() => {}}
   >
-    <div class="label">Load Session</div>
+    <div class="tabs">
+      <button class:on={tab === "saves"} onclick={() => switchTab("saves")}>
+        Saves{saves ? ` (${saves.length})` : ""}
+      </button>
+      <button class:on={tab === "playbooks"} onclick={() => switchTab("playbooks")}>
+        Playbooks{playbooks ? ` (${playbooks.length})` : ""}
+      </button>
+    </div>
     <input
       bind:this={inputEl}
       bind:value={query}
@@ -157,43 +220,57 @@
       <div class="error">{error}</div>
     {/if}
     <div class="list" dir="rtl">
-      {#if entries == null}
+      {#if loaded == null}
         <div class="empty">…</div>
-      {:else if entries.length === 0}
-        <div class="empty" dir="ltr">No saves yet. Press ⌘S on a claude to save one.</div>
-      {:else if shown.length === 0}
+      {:else if loaded.length === 0}
+        <div class="empty" dir="ltr">
+          {tab === "saves"
+            ? "No saves yet. Press ⌘S on a claude to save one."
+            : "No playbooks yet."}
+        </div>
+      {:else if rows.length === 0}
         <div class="empty">אין תוצאות</div>
       {:else}
-        {#each shown as e, i (e.file)}
+        {#each rows as r, i (r.file)}
           <div class="item" class:sel={i === sel}>
             <button
               class="main"
               onmouseenter={() => (sel = i)}
-              onclick={() => choose(e)}
+              onclick={() => void choose(r)}
               disabled={busy}
             >
               <div class="title">
-                {e.title}
-                {#if e.continuable}
-                  <span class="resumable" title="The original conversation is on this machine">↺</span>
+                {r.title}
+                {#if r.mark}
+                  <span class="resumable" title="The original conversation is on this machine"
+                    >{r.mark}</span
+                  >
                 {/if}
               </div>
-              {#if e.description}
-                <div class="desc">{e.description}</div>
+              {#if r.description}
+                <div class="desc">{r.description}</div>
               {/if}
-              <div class="meta">
-                {e.updated || e.created}{e.author ? ` · ${e.author}` : ""}
-              </div>
+              <div class="meta" dir="auto">{r.meta}</div>
             </button>
-            <button class="trash" title="Delete" onclick={() => void remove(e)}>🗑</button>
+            <button class="trash" title="Delete" onclick={() => void remove(r)}>🗑</button>
           </div>
-          {#if choosing === e.file}
+          {#if choosing === r.file}
             <!-- LTR: the buttons are app chrome, in English like the hints. -->
             <div class="choice" dir="ltr">
-              <button class:on={pick === 0} onclick={() => void load(e, "continue")} disabled={busy}>
-                {e.open_as != null ? `Go to claude #${e.open_as}` : "Continue conversation"}
+              <button
+                class:on={pick === 0}
+                onclick={() => void loadSaveAs(r.file, "continue")}
+                disabled={busy}
+              >
+                {saves?.find((e) => e.file === r.file)?.open_as != null
+                  ? `Go to claude #${saves?.find((e) => e.file === r.file)?.open_as}`
+                  : "Continue conversation"}
               </button>
-              <button class:on={pick === 1} onclick={() => void load(e, "fresh")} disabled={busy}>
+              <button
+                class:on={pick === 1}
+                onclick={() => void loadSaveAs(r.file, "fresh")}
+                disabled={busy}
+              >
                 Start fresh from doc
               </button>
               <span class="choice-hint">←→ · Enter · Esc</span>
@@ -202,7 +279,7 @@
         {/each}
       {/if}
     </div>
-    <div class="hint">Enter to load · ↑↓ to choose · Esc to close</div>
+    <div class="hint">Enter to load · ↑↓ to choose · Tab switches tabs · Esc to close</div>
   </div>
 </div>
 
@@ -224,12 +301,25 @@
     border: 1px solid var(--border-focus);
     border-radius: 8px;
   }
-  .label {
+  .tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 0.5rem;
+  }
+  .tabs button {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 0.2rem 0.5rem;
     color: var(--label);
     font-size: 0.78rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    margin-bottom: 0.5rem;
+    cursor: pointer;
+  }
+  .tabs button.on {
+    color: var(--text);
+    border-bottom-color: var(--border-focus);
   }
   input {
     width: 100%;

@@ -325,6 +325,28 @@ export const loadSave = (
   mode: "fresh" | "continue",
 ) => invoke<LoadResult>("load_save", { projectHandle, file, mode });
 
+/** One playbook pointer in the repo's `mulpex/playbooks/` — a recurring-incident
+ *  runbook that stays where it is (`source`, relative to the repo root). */
+export interface PlaybookEntry {
+  file: string;
+  title: string;
+  description: string;
+  source: string;
+  /** The runbook is not on disk any more. */
+  missing: boolean;
+}
+
+export const listPlaybooks = (projectHandle: ProjectHandle) =>
+  invoke<PlaybookEntry[]>("list_playbooks", { projectHandle });
+
+/** Retire a playbook: deletes its runbook AND its pointer. */
+export const deletePlaybook = (projectHandle: ProjectHandle, file: string) =>
+  invoke<void>("delete_playbook", { projectHandle, file });
+
+/** Start a claude on a playbook: it reads it and asks what the user needs. */
+export const loadPlaybook = (projectHandle: ProjectHandle, file: string) =>
+  invoke<SessionInfo>("load_playbook", { projectHandle, file });
+
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the
  * scratch root) before re-execing. Used to apply a downloaded update. */

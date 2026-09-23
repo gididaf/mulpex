@@ -379,6 +379,37 @@ pub fn delete_save(state: State<AppState>, project_handle: ProjectHandle, file: 
     crate::saves::delete(&project_dir(&state, project_handle)?, &file)
 }
 
+/// The playbooks of the project's repo, by title (the ⌘L Playbooks tab).
+#[tauri::command]
+pub fn list_playbooks(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> Result<Vec<crate::saves::PlaybookEntry>, String> {
+    Ok(crate::saves::list_playbooks(&project_dir(&state, project_handle)?))
+}
+
+/// Retire a playbook: its runbook and its pointer (after the list's confirm).
+#[tauri::command]
+pub fn delete_playbook(state: State<AppState>, project_handle: ProjectHandle, file: String) -> Result<(), String> {
+    crate::saves::delete_playbook(&project_dir(&state, project_handle)?, &file)
+}
+
+/// Start a claude on a playbook: it reads it and asks what the user needs. The
+/// row starts named after the playbook; the instance may rename it after the
+/// specific incident.
+#[tauri::command]
+pub fn load_playbook(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    file: String,
+) -> Result<SessionInfo, String> {
+    let (pointer, source, title) = crate::saves::playbook(&project_dir(&state, project_handle)?, &file)?;
+    let mut ws = state.ws.lock().unwrap();
+    let core = ws.project_mut(project_handle).ok_or("no such project")?;
+    core.spawn_instance_with_prompt(crate::saves::playbook_prompt(&pointer, &source), Some(title), false)
+        .map_err(|e| e.to_string())
+}
+
 /// What `load_save` did: started a new row, or (`existing`) found the
 /// conversation already open and is handing back that row to focus.
 #[derive(serde::Serialize)]
@@ -421,7 +452,7 @@ pub fn load_save(
     let mut ws = state.ws.lock().unwrap();
     let core = ws.project_mut(project_handle).ok_or("no such project")?;
     let info = core
-        .spawn_instance_with_prompt(crate::saves::load_prompt(&path), title)
+        .spawn_instance_with_prompt(crate::saves::load_prompt(&path), title, true)
         .map_err(|e| e.to_string())?;
     // Link the new conversation to the save, so its ⌘S updates this file.
     if let Some(s) = core.sessions.iter().find(|s| s.id == info.id) {
