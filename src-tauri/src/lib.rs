@@ -8,6 +8,7 @@ mod hub;
 mod menu;
 mod project;
 mod pty;
+mod docs_import;
 mod saves;
 mod snapshot;
 mod state;
@@ -48,6 +49,7 @@ fn is_forwarded(id: &str) -> bool {
             | "restart"
             | "save_session"
             | "load_session"
+            | "import_docs"
             | "mute"
             | "messages"
             | "explainer"
@@ -111,9 +113,13 @@ pub fn run() {
             commands::list_saves,
             commands::delete_save,
             commands::load_save,
-            commands::list_playbooks,
-            commands::delete_playbook,
-            commands::load_playbook,
+            commands::list_guides,
+            commands::delete_guide,
+            commands::load_guide,
+            commands::import_start,
+            commands::import_state,
+            commands::import_discard,
+            commands::import_apply,
             commands::restart_app,
         ])
         .setup(|app| {

@@ -86,6 +86,7 @@
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
   import LoadDialog from "./lib/components/LoadDialog.svelte";
+  import ImportDialog from "./lib/components/ImportDialog.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
   import type { CtxItem } from "./lib/components/ContextMenu.svelte";
 
@@ -173,6 +174,8 @@
 
   /** ⌘L: the project whose saves the Load list is showing, or null when closed. */
   let loadFor = $state<ProjectHandle | null>(null);
+  /** File ▸ Import Docs…: the project whose import window is open. */
+  let importFor = $state<ProjectHandle | null>(null);
   let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
 
   /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
@@ -722,6 +725,9 @@
       case "load_session":
         if (h != null) loadFor = h;
         break;
+      case "import_docs":
+        if (h != null) importFor = h;
+        break;
       case "save_session": {
         const cur = get(activeId);
         if (h != null && cur != null) await saveInstance(h, cur);
@@ -1030,6 +1036,36 @@
   {/if}
   {#if $rename}
     <RenameDialog />
+  {/if}
+  {#if importFor != null}
+    <ImportDialog
+      handle={importFor}
+      onclose={() => {
+        importFor = null;
+        terminals.refocus();
+      }}
+      onapplied={(r) => {
+        importFor = null;
+        terminals.refocus();
+        const parts = [
+          r.saves && `${r.saves} save(s)`,
+          r.guides && `${r.guides} guide(s)`,
+          r.deleted && `${r.deleted} deleted`,
+          r.skipped && `${r.skipped} skipped`,
+        ].filter(Boolean);
+        const bad = r.errors.length > 0 || r.commit_error != null || r.leftovers.length > 0;
+        flashNotice(
+          `Imported: ${parts.join(", ") || "nothing"}.` +
+            (r.errors.length ? ` ${r.errors.length} failed: ${r.errors.join("; ")}.` : "") +
+            (r.commit ? ` Committed ${r.commit}.` : "") +
+            (r.commit_error ? ` NOT committed (files are changed): ${r.commit_error}` : "") +
+            (r.leftovers.length
+              ? ` Still pointing at a deleted doc: ${r.leftovers.join("; ")}`
+              : ""),
+          bad ? 15000 : 8000,
+        );
+      }}
+    />
   {/if}
   {#if loadFor != null}
     <LoadDialog

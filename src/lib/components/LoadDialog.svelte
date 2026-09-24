@@ -5,15 +5,15 @@
     listSaves,
     deleteSave,
     loadSave,
-    listPlaybooks,
-    deletePlaybook,
-    loadPlaybook,
+    listGuides,
+    deleteGuide,
+    loadGuide,
   } from "../ipc";
-  import type { LoadResult, PlaybookEntry, ProjectHandle, SaveEntry } from "../ipc";
+  import type { LoadResult, GuideEntry, ProjectHandle, SaveEntry } from "../ipc";
 
   // ⌘L: two tabs over the active project's repo.
   // - Saves (`mulpex/saves/`): unfinished work. Enter starts a claude on one.
-  // - Playbooks (`mulpex/playbooks/`): pointers to recurring-incident runbooks.
+  // - Guides (`mulpex/guides/`): pointers to recurring-incident runbooks.
   //   Enter starts a claude that reads it and asks what the user needs.
   // Both lists are hard `dir="rtl"` — never `auto`, which a title starting with
   // an English term would flip to LTR (the Explainer's rule, docs/explainer.md).
@@ -30,10 +30,10 @@
     onloaded: (r: LoadResult) => void;
   } = $props();
 
-  type Tab = "saves" | "playbooks";
+  type Tab = "saves" | "guides";
   let tab = $state<Tab>("saves");
   let saves = $state<SaveEntry[] | null>(null);
-  let playbooks = $state<PlaybookEntry[] | null>(null);
+  let guides = $state<GuideEntry[] | null>(null);
   let error = $state<string | null>(null);
   let query = $state("");
   let sel = $state(0);
@@ -56,7 +56,7 @@
             meta: `${e.updated || e.created}${e.author ? ` · ${e.author}` : ""}`,
             mark: e.continuable ? "↺" : "",
           }))
-        : (playbooks ?? []).map((e) => ({
+        : (guides ?? []).map((e) => ({
             file: e.file,
             title: e.title,
             description: e.description,
@@ -69,7 +69,7 @@
       [r.title, r.description, r.meta, r.file].some((f) => f.toLowerCase().includes(q)),
     );
   });
-  const loaded = $derived(tab === "saves" ? saves : playbooks);
+  const loaded = $derived(tab === "saves" ? saves : guides);
 
   $effect(() => {
     // Keep the selection on a real row as the filter narrows.
@@ -78,7 +78,7 @@
 
   async function refresh() {
     try {
-      [saves, playbooks] = await Promise.all([listSaves(handle), listPlaybooks(handle)]);
+      [saves, guides] = await Promise.all([listSaves(handle), listGuides(handle)]);
       error = null;
     } catch (e) {
       error = String(e);
@@ -101,8 +101,8 @@
   /** Enter / click on a row. */
   async function choose(r: Row | undefined) {
     if (!r || busy) return;
-    if (tab === "playbooks") {
-      void runPlaybook(r.file);
+    if (tab === "guides") {
+      void runGuide(r.file);
       return;
     }
     // A save whose conversation still exists here asks first; any other loads
@@ -129,18 +129,18 @@
   }
   const loadSaveAs = (file: string, mode: "fresh" | "continue") =>
     run(() => loadSave(handle, file, mode));
-  const runPlaybook = (file: string) =>
-    run(async () => ({ info: await loadPlaybook(handle, file), existing: false }));
+  const runGuide = (file: string) =>
+    run(async () => ({ info: await loadGuide(handle, file), existing: false }));
 
   async function remove(r: Row) {
-    const pb = playbooks?.find((e) => e.file === r.file);
+    const pb = guides?.find((e) => e.file === r.file);
     const ok = await confirm(
       tab === "saves"
         ? `Delete "${r.title}"?`
-        : `Retire "${r.title}"?\n\nThis deletes the runbook (${pb?.source}) and its playbook ` +
+        : `Retire "${r.title}"?\n\nThis deletes the doc (${pb?.source}) and its guide ` +
             `entry. Git keeps the history.`,
       {
-        title: tab === "saves" ? "Delete Save" : "Retire Playbook",
+        title: tab === "saves" ? "Delete Save" : "Retire Guide",
         kind: "warning",
         okLabel: "Delete",
         cancelLabel: "Cancel",
@@ -149,7 +149,7 @@
     inputEl?.focus();
     if (!ok) return;
     try {
-      await (tab === "saves" ? deleteSave(handle, r.file) : deletePlaybook(handle, r.file));
+      await (tab === "saves" ? deleteSave(handle, r.file) : deleteGuide(handle, r.file));
     } catch (err) {
       error = String(err);
     }
@@ -177,7 +177,7 @@
       onclose();
     } else if (e.key === "Tab") {
       e.preventDefault();
-      switchTab(tab === "saves" ? "playbooks" : "saves");
+      switchTab(tab === "saves" ? "guides" : "saves");
     } else if (e.key === "Enter") {
       e.preventDefault();
       void choose(rows[sel]);
@@ -204,8 +204,8 @@
       <button class:on={tab === "saves"} onclick={() => switchTab("saves")}>
         Saves{saves ? ` (${saves.length})` : ""}
       </button>
-      <button class:on={tab === "playbooks"} onclick={() => switchTab("playbooks")}>
-        Playbooks{playbooks ? ` (${playbooks.length})` : ""}
+      <button class:on={tab === "guides"} onclick={() => switchTab("guides")}>
+        Guides{guides ? ` (${guides.length})` : ""}
       </button>
     </div>
     <input
@@ -226,7 +226,7 @@
         <div class="empty" dir="ltr">
           {tab === "saves"
             ? "No saves yet. Press ⌘S on a claude to save one."
-            : "No playbooks yet."}
+            : "No guides yet."}
         </div>
       {:else if rows.length === 0}
         <div class="empty">אין תוצאות</div>

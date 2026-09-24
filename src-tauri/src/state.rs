@@ -562,7 +562,7 @@ impl Core {
     /// user had typed it (⌘L Load), and focus it. `name` labels the row. With
     /// `user_owned` it is kept like a ⌘R name — a save's title is what identifies
     /// that work, so the instance's own `hub_set_name` must not replace it; a
-    /// playbook's title is only a starting label, and the instance may rename the
+    /// guide's title is only a starting label, and the instance may rename the
     /// row after the specific incident.
     pub fn spawn_instance_with_prompt(
         &mut self,

@@ -66,11 +66,11 @@ static RUNNING: Mutex<Option<HashSet<(ProjectHandle, usize)>>> = Mutex::new(None
 
 /// What the fork returns. `body` is the English doc; the rest is the header.
 #[derive(Debug, Deserialize, PartialEq)]
-struct Draft {
-    slug: String,
-    title_he: String,
-    description_he: String,
-    body: String,
+pub(crate) struct Draft {
+    pub slug: String,
+    pub title_he: String,
+    pub description_he: String,
+    pub body: String,
 }
 
 /// Start saving `claude#id`. `dir` is the project dir the instance runs in —
@@ -169,11 +169,23 @@ fn save(
 /// `CLAUDE_CODE_CHILD_SESSION`), and like it, no `--bare`: that can't see the
 /// OAuth token.
 fn run_step(dir: &Path, fork: Option<&str>, prompt: &str) -> Result<String, String> {
+    run_claude(dir, "opus", fork, prompt, STEP_TIMEOUT)
+}
+
+/// One read-only headless `claude -p` (see [`run_step`]); `model` and
+/// `timeout` are the caller's — the runbook sorter uses Sonnet.
+pub(crate) fn run_claude(
+    dir: &Path,
+    model: &str,
+    fork: Option<&str>,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let claude = claude_bin::resolve_claude().ok_or("claude not found")?;
     let mut args: Vec<&str> = vec![
         "-p",
         "--model",
-        "opus",
+        model,
         "--setting-sources",
         "",
         "--strict-mcp-config",
@@ -219,14 +231,14 @@ fn run_step(dir: &Path, fork: Option<&str>, prompt: &str) -> Result<String, Stri
     let out_reader = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let err_reader = drain(child.stderr.take().map(|p| Box::new(p) as _));
 
-    let deadline = std::time::Instant::now() + STEP_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("timeout after {} min", STEP_TIMEOUT.as_secs() / 60));
+                return Err(format!("timeout after {} min", timeout.as_secs() / 60));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(250)),
             Err(e) => return Err(format!("wait: {e}")),
@@ -242,7 +254,7 @@ fn run_step(dir: &Path, fork: Option<&str>, prompt: &str) -> Result<String, Stri
 
 /// The `result` of `--output-format json`. A JSON body with `is_error` is a
 /// failure the CLI itself reported (exit 0 is not proof of success).
-fn result_text(out: &str) -> Result<String, String> {
+pub(crate) fn result_text(out: &str) -> Result<String, String> {
     let v: serde_json::Value = serde_json::from_str(out.trim())
         .map_err(|_| format!("unreadable output: {}", first_chars(out, 200)))?;
     let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
@@ -273,6 +285,18 @@ fn parse_draft(text: &str) -> Result<Draft, String> {
 /// Write the doc under `saves_dir`, never overwriting: a taken slug gets `-2`,
 /// `-3`… (updating an existing save is Phase 3's link, not a name collision).
 fn write_save(saves_dir: &Path, d: &Draft, author: &str, date: &str) -> Result<PathBuf, String> {
+    write_save_dated(saves_dir, d, author, date, date)
+}
+
+/// [`write_save`] with its own `created` / `updated` (an imported runbook keeps
+/// the dates git knows for it).
+pub(crate) fn write_save_dated(
+    saves_dir: &Path,
+    d: &Draft,
+    author: &str,
+    created: &str,
+    updated: &str,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(saves_dir).map_err(|e| format!("create {}: {e}", saves_dir.display()))?;
     let slug = clean_slug(&d.slug);
     let mut n = 1;
@@ -284,7 +308,7 @@ fn write_save(saves_dir: &Path, d: &Draft, author: &str, date: &str) -> Result<P
         }
         n += 1;
     };
-    std::fs::write(&path, render(d, author, date, date)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(&path, render(d, author, created, updated)).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -379,7 +403,7 @@ fn entry_from(file: String, text: &str) -> SaveEntry {
 
 /// The `---` front-matter block as `(key, value)` pairs. Values `render` wrote
 /// are JSON strings; a hand-edited plain value is taken as-is.
-fn parse_header(text: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_header(text: &str) -> Vec<(String, String)> {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return Vec::new();
@@ -445,20 +469,20 @@ pub fn load_prompt(path: &Path) -> String {
     )
 }
 
-// ---- playbooks: pointers to recurring-incident runbooks ----
+// ---- guides: pointers to recurring-incident runbooks ----
 //
-// A playbook is a runbook that is used again and again ("attach this when a
+// A guide is a runbook that is used again and again ("attach this when a
 // client reports X"), so it is never "finished" and never moves. Mulpex knows
-// it through a small committed pointer, `mulpex/playbooks/<slug>.md`, whose
+// it through a small committed pointer, `mulpex/guides/<slug>.md`, whose
 // header carries the Hebrew `title` / `description` and `source` — the
 // runbook's path relative to the repo root. The runbook itself stays where
 // code and CLAUDE.md files already link to it.
 
-pub const PLAYBOOKS_DIR: &str = "mulpex/playbooks";
+pub const GUIDES_DIR: &str = "mulpex/guides";
 
-/// One playbook as the ⌘L Playbooks tab shows it.
+/// One guide as the ⌘L Guides tab shows it.
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct PlaybookEntry {
+pub struct GuideEntry {
     pub file: String,
     pub title: String,
     pub description: String,
@@ -468,13 +492,13 @@ pub struct PlaybookEntry {
     pub missing: bool,
 }
 
-/// Every playbook pointer of the repo `dir` belongs to, by title.
-pub fn list_playbooks(dir: &Path) -> Vec<PlaybookEntry> {
+/// Every guide pointer of the repo `dir` belongs to, by title.
+pub fn list_guides(dir: &Path) -> Vec<GuideEntry> {
     let root = repo_root(dir);
-    let Ok(rd) = std::fs::read_dir(root.join(PLAYBOOKS_DIR)) else {
+    let Ok(rd) = std::fs::read_dir(root.join(GUIDES_DIR)) else {
         return Vec::new();
     };
-    let mut out: Vec<PlaybookEntry> = rd
+    let mut out: Vec<GuideEntry> = rd
         .flatten()
         .filter_map(|e| {
             let file = e.file_name().to_str()?.to_string();
@@ -485,7 +509,7 @@ pub fn list_playbooks(dir: &Path) -> Vec<PlaybookEntry> {
             let get = |k: &str| h.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default();
             let source = get("source");
             let title = get("title");
-            Some(PlaybookEntry {
+            Some(GuideEntry {
                 missing: source_path(&root, &source).is_none_or(|p| !p.is_file()),
                 title: if title.is_empty() { file.trim_end_matches(".md").to_string() } else { title },
                 description: get("description"),
@@ -510,20 +534,20 @@ fn source_path(root: &Path, source: &str) -> Option<PathBuf> {
     Some(root.join(rel))
 }
 
-/// Pointer path, runbook path and title of playbook `file`.
-pub fn playbook(dir: &Path, file: &str) -> Result<(PathBuf, PathBuf, String), String> {
-    let pointer = resolve_in(dir, PLAYBOOKS_DIR, file)?;
-    let e = list_playbooks(dir).into_iter().find(|e| e.file == file).ok_or("playbook is gone")?;
+/// Pointer path, runbook path and title of guide `file`.
+pub fn guide(dir: &Path, file: &str) -> Result<(PathBuf, PathBuf, String), String> {
+    let pointer = resolve_in(dir, GUIDES_DIR, file)?;
+    let e = list_guides(dir).into_iter().find(|e| e.file == file).ok_or("guide is gone")?;
     let source = source_path(&repo_root(dir), &e.source)
         .filter(|p| p.is_file())
         .ok_or_else(|| format!("its runbook {} is missing", e.source))?;
     Ok((pointer, source, e.title))
 }
 
-/// Retire a playbook for good: the runbook and its pointer. Git keeps the
+/// Retire a guide for good: the runbook and its pointer. Git keeps the
 /// history; Mulpex never commits the deletion.
-pub fn delete_playbook(dir: &Path, file: &str) -> Result<(), String> {
-    let pointer = resolve_in(dir, PLAYBOOKS_DIR, file)?;
+pub fn delete_guide(dir: &Path, file: &str) -> Result<(), String> {
+    let pointer = resolve_in(dir, GUIDES_DIR, file)?;
     let h = parse_header(&std::fs::read_to_string(&pointer).unwrap_or_default());
     let source = h.iter().find(|(k, _)| k == "source").map(|(_, v)| v.clone()).unwrap_or_default();
     if let Some(src) = source_path(&repo_root(dir), &source).filter(|p| p.is_file()) {
@@ -532,17 +556,17 @@ pub fn delete_playbook(dir: &Path, file: &str) -> Result<(), String> {
     std::fs::remove_file(&pointer).map_err(|e| format!("delete {file}: {e}"))
 }
 
-/// What a claude started from a playbook begins on: read the runbook, say in a
+/// What a claude started from a guide begins on: read the runbook, say in a
 /// line or two what it is for, and ask what the user needs — then work it
 /// read-only first, and at the end suggest (never make) an edit, or the
-/// playbook's deletion if it describes something that is gone.
-pub fn playbook_prompt(pointer: &Path, source: &Path) -> String {
+/// guide's deletion if it describes something that is gone.
+pub fn guide_prompt(pointer: &Path, source: &Path) -> String {
     format!(
-        "Read the playbook at {src} fully. Then tell me in one or two short lines what it is \
+        "Read the guide at {src} fully. Then tell me in one or two short lines what it is \
          for, and ask me what I need it for this time.\n\n\
          Once I tell you, stay read-only until you know what is going on, and ask me before \
-         changing anything (data, production, code). When we are done: if you learned something the playbook lacks or has wrong, \
-         suggest a concrete edit to it and ask before writing it. If the playbook describes \
+         changing anything (data, production, code). When we are done: if you learned something the guide lacks or has wrong, \
+         suggest a concrete edit to it and ask before writing it. If the guide describes \
          something that no longer exists, say so and suggest deleting it — both {src} and its \
          Mulpex pointer {ptr} — and ask before deleting.",
         src = source.display(),
@@ -658,7 +682,7 @@ fn claude_config_dir() -> PathBuf {
 /// Lowercase kebab-case, `[a-z0-9-]` only, ≤ 60 chars; `session` if nothing
 /// survives. The slug is a file name a model chose, so it is never trusted as a
 /// path (no `/`, no `..`).
-fn clean_slug(raw: &str) -> String {
+pub(crate) fn clean_slug(raw: &str) -> String {
     let mut s = String::new();
     for c in raw.trim().to_lowercase().chars() {
         if c.is_ascii_alphanumeric() {
@@ -674,7 +698,7 @@ fn clean_slug(raw: &str) -> String {
 
 /// The git top-level of `dir`, so a project tab opened on a subfolder still
 /// saves into the one `mulpex/saves/` of its repo. Not a repo → `dir` itself.
-fn repo_root(dir: &Path) -> PathBuf {
+pub(crate) fn repo_root(dir: &Path) -> PathBuf {
     git(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf())
 }
 
@@ -682,7 +706,7 @@ fn git_user_name(dir: &Path) -> String {
     git(dir, &["config", "user.name"]).unwrap_or_default()
 }
 
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -706,7 +730,7 @@ fn today() -> String {
         .unwrap_or_default()
 }
 
-fn first_chars(s: &str, n: usize) -> String {
+pub(crate) fn first_chars(s: &str, n: usize) -> String {
     let s = s.trim();
     match s.char_indices().nth(n) {
         Some((cut, _)) => format!("{}…", &s[..cut]),
@@ -871,32 +895,32 @@ mod tests {
     }
 
     #[test]
-    fn playbooks_list_resolve_and_retire() {
-        let dir = std::env::temp_dir().join(format!("mulpex-playbooks-{}", std::process::id()));
+    fn guides_list_resolve_and_retire() {
+        let dir = std::env::temp_dir().join(format!("mulpex-guides-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("docs/runbooks")).unwrap();
-        std::fs::create_dir_all(dir.join(PLAYBOOKS_DIR)).unwrap();
+        std::fs::create_dir_all(dir.join(GUIDES_DIR)).unwrap();
         std::fs::write(dir.join("docs/runbooks/mfa.md"), "# MFA").unwrap();
         let ptr = |title: &str, src: &str| format!("---\ntitle: \"{title}\"\ndescription: \"d\"\nsource: \"{src}\"\n---\n");
-        std::fs::write(dir.join(PLAYBOOKS_DIR).join("mfa.md"), ptr("ביטול MFA", "docs/runbooks/mfa.md")).unwrap();
-        std::fs::write(dir.join(PLAYBOOKS_DIR).join("gone.md"), ptr("אבד", "docs/runbooks/gone.md")).unwrap();
-        std::fs::write(dir.join(PLAYBOOKS_DIR).join("evil.md"), ptr("רע", "../../etc/passwd")).unwrap();
+        std::fs::write(dir.join(GUIDES_DIR).join("mfa.md"), ptr("ביטול MFA", "docs/runbooks/mfa.md")).unwrap();
+        std::fs::write(dir.join(GUIDES_DIR).join("gone.md"), ptr("אבד", "docs/runbooks/gone.md")).unwrap();
+        std::fs::write(dir.join(GUIDES_DIR).join("evil.md"), ptr("רע", "../../etc/passwd")).unwrap();
 
-        let l = list_playbooks(&dir);
+        let l = list_guides(&dir);
         let by = |f: &str| l.iter().find(|e| e.file == f).unwrap().clone();
         assert!(!by("mfa.md").missing);
         assert!(by("gone.md").missing);
         assert!(by("evil.md").missing, "a `..` source must never resolve");
 
-        let (p, s, t) = playbook(&dir, "mfa.md").unwrap();
-        assert!(p.ends_with("mulpex/playbooks/mfa.md") && s.ends_with("docs/runbooks/mfa.md"));
+        let (p, s, t) = guide(&dir, "mfa.md").unwrap();
+        assert!(p.ends_with("mulpex/guides/mfa.md") && s.ends_with("docs/runbooks/mfa.md"));
         assert_eq!(t, "ביטול MFA");
-        assert!(playbook(&dir, "gone.md").is_err());
-        assert!(playbook(&dir, "evil.md").is_err());
+        assert!(guide(&dir, "gone.md").is_err());
+        assert!(guide(&dir, "evil.md").is_err());
 
-        delete_playbook(&dir, "mfa.md").unwrap();
+        delete_guide(&dir, "mfa.md").unwrap();
         assert!(!dir.join("docs/runbooks/mfa.md").exists());
-        assert!(!dir.join(PLAYBOOKS_DIR).join("mfa.md").exists());
+        assert!(!dir.join(GUIDES_DIR).join("mfa.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

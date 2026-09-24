@@ -89,6 +89,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let close_session = MenuItemBuilder::with_id("close_session", "Close Session")
         .accelerator("Cmd+W")
         .build(app)?;
+    // Turn the repo's old markdown runbooks into ⌘L saves / guides
+    // (`docs_import.rs`). Rare, so no accelerator; the palette reaches it too.
+    let import_docs =
+        MenuItemBuilder::with_id("import_docs", "Import Docs…").build(app)?;
     let mut file_builder = SubmenuBuilder::new(app, "File")
         .item(&open_project)
         .item(&close_project)
@@ -111,6 +115,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&new_session)
         .item(&new_terminal)
         .item(&close_session)
+        .separator()
+        .item(&import_docs)
         .build()?;
 
     // Edit: the predefined items macOS routes to the focused xterm textarea.

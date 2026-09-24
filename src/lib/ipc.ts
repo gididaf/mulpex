@@ -325,9 +325,9 @@ export const loadSave = (
   mode: "fresh" | "continue",
 ) => invoke<LoadResult>("load_save", { projectHandle, file, mode });
 
-/** One playbook pointer in the repo's `mulpex/playbooks/` — a recurring-incident
+/** One guide pointer in the repo's `mulpex/guides/` — a recurring-incident
  *  runbook that stays where it is (`source`, relative to the repo root). */
-export interface PlaybookEntry {
+export interface GuideEntry {
   file: string;
   title: string;
   description: string;
@@ -336,16 +336,67 @@ export interface PlaybookEntry {
   missing: boolean;
 }
 
-export const listPlaybooks = (projectHandle: ProjectHandle) =>
-  invoke<PlaybookEntry[]>("list_playbooks", { projectHandle });
+export const listGuides = (projectHandle: ProjectHandle) =>
+  invoke<GuideEntry[]>("list_guides", { projectHandle });
 
-/** Retire a playbook: deletes its runbook AND its pointer. */
-export const deletePlaybook = (projectHandle: ProjectHandle, file: string) =>
-  invoke<void>("delete_playbook", { projectHandle, file });
+/** Retire a guide: deletes its runbook AND its pointer. */
+export const deleteGuide = (projectHandle: ProjectHandle, file: string) =>
+  invoke<void>("delete_guide", { projectHandle, file });
 
-/** Start a claude on a playbook: it reads it and asks what the user needs. */
-export const loadPlaybook = (projectHandle: ProjectHandle, file: string) =>
-  invoke<SessionInfo>("load_playbook", { projectHandle, file });
+/** Start a claude on a guide: it reads it and asks what the user needs. */
+export const loadGuide = (projectHandle: ProjectHandle, file: string) =>
+  invoke<SessionInfo>("load_guide", { projectHandle, file });
+
+// ---- Import Docs (docs_import.rs) ----
+
+export type ImportKind = "save" | "guide" | "stale" | "skip";
+
+/** One markdown file of an import. `status` is `pending` while Sonnet sorts it. */
+export interface ImportItem {
+  file: string;
+  status: "pending" | "done" | "error";
+  kind: ImportKind | "";
+  slug: string;
+  title: string;
+  description: string;
+  reason: string;
+  error: string | null;
+}
+export interface ImportState {
+  running: boolean;
+  items: ImportItem[];
+}
+export interface ImportDecision {
+  file: string;
+  kind: ImportKind;
+  slug: string;
+  title: string;
+  description: string;
+}
+export interface ApplyReport {
+  saves: number;
+  guides: number;
+  deleted: number;
+  skipped: number;
+  errors: string[];
+  /** `<short hash> <subject>` of the one commit Apply made. */
+  commit: string | null;
+  /** Why no commit was made (a hook failed…); the files are changed anyway. */
+  commit_error: string | null;
+  /** Places still naming a deleted doc that were not safe to edit. */
+  leftovers: string[];
+}
+
+/** Start the project's import, or get the one already running / in review.
+ *  Progress arrives as `import-update` (payload: the project handle). */
+export const importStart = (projectHandle: ProjectHandle) =>
+  invoke<ImportState>("import_start", { projectHandle });
+export const importState = (projectHandle: ProjectHandle) =>
+  invoke<ImportState | null>("import_state", { projectHandle });
+export const importDiscard = (projectHandle: ProjectHandle) =>
+  invoke<void>("import_discard", { projectHandle });
+export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecision[]) =>
+  invoke<ApplyReport>("import_apply", { projectHandle, decisions });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the

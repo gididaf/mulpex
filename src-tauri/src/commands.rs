@@ -379,35 +379,70 @@ pub fn delete_save(state: State<AppState>, project_handle: ProjectHandle, file: 
     crate::saves::delete(&project_dir(&state, project_handle)?, &file)
 }
 
-/// The playbooks of the project's repo, by title (the ⌘L Playbooks tab).
+/// The guides of the project's repo, by title (the ⌘L Guides tab).
 #[tauri::command]
-pub fn list_playbooks(
+pub fn list_guides(
     state: State<AppState>,
     project_handle: ProjectHandle,
-) -> Result<Vec<crate::saves::PlaybookEntry>, String> {
-    Ok(crate::saves::list_playbooks(&project_dir(&state, project_handle)?))
+) -> Result<Vec<crate::saves::GuideEntry>, String> {
+    Ok(crate::saves::list_guides(&project_dir(&state, project_handle)?))
 }
 
-/// Retire a playbook: its runbook and its pointer (after the list's confirm).
+/// Retire a guide: its runbook and its pointer (after the list's confirm).
 #[tauri::command]
-pub fn delete_playbook(state: State<AppState>, project_handle: ProjectHandle, file: String) -> Result<(), String> {
-    crate::saves::delete_playbook(&project_dir(&state, project_handle)?, &file)
+pub fn delete_guide(state: State<AppState>, project_handle: ProjectHandle, file: String) -> Result<(), String> {
+    crate::saves::delete_guide(&project_dir(&state, project_handle)?, &file)
 }
 
-/// Start a claude on a playbook: it reads it and asks what the user needs. The
-/// row starts named after the playbook; the instance may rename it after the
+/// Start a claude on a guide: it reads it and asks what the user needs. The
+/// row starts named after the guide; the instance may rename it after the
 /// specific incident.
 #[tauri::command]
-pub fn load_playbook(
+pub fn load_guide(
     state: State<AppState>,
     project_handle: ProjectHandle,
     file: String,
 ) -> Result<SessionInfo, String> {
-    let (pointer, source, title) = crate::saves::playbook(&project_dir(&state, project_handle)?, &file)?;
+    let (pointer, source, title) = crate::saves::guide(&project_dir(&state, project_handle)?, &file)?;
     let mut ws = state.ws.lock().unwrap();
     let core = ws.project_mut(project_handle).ok_or("no such project")?;
-    core.spawn_instance_with_prompt(crate::saves::playbook_prompt(&pointer, &source), Some(title), false)
+    core.spawn_instance_with_prompt(crate::saves::guide_prompt(&pointer, &source), Some(title), false)
         .map_err(|e| e.to_string())
+}
+
+/// Start (or return the running) Import Docs job for the project's repo.
+/// Progress arrives as `import-update {handle}`; re-read with `import_state`.
+#[tauri::command]
+pub fn import_start(
+    app: AppHandle,
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> Result<crate::docs_import::ImportState, String> {
+    let dir = project_dir(&state, project_handle)?;
+    Ok(crate::docs_import::start(app, project_handle, &dir))
+}
+
+/// The project's import, if one is running or waiting for review.
+#[tauri::command]
+pub fn import_state(project_handle: ProjectHandle) -> Option<crate::docs_import::ImportState> {
+    crate::docs_import::state(project_handle)
+}
+
+/// Throw the project's import away.
+#[tauri::command]
+pub fn import_discard(project_handle: ProjectHandle) {
+    crate::docs_import::discard(project_handle);
+}
+
+/// Carry out the reviewed decisions (ticked rows only) and end the import.
+#[tauri::command]
+pub fn import_apply(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    decisions: Vec<crate::docs_import::Decision>,
+) -> Result<crate::docs_import::ApplyReport, String> {
+    let dir = project_dir(&state, project_handle)?;
+    Ok(crate::docs_import::apply(project_handle, &dir, &decisions))
 }
 
 /// What `load_save` did: started a new row, or (`existing`) found the

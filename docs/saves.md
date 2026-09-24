@@ -110,30 +110,103 @@ build keeps its own copy in `~/.mulpex-dev`.
   `reconcile_session_ids`) loses its link, and its next ⌘S writes a new file.
 - **Saves from before Phase 3** have no links. They get one on their next ⌘S.
 
-## Playbooks (Phase 4a)
+## Guides (Phase 4a)
 
-Most old "runbooks" are not unfinished work. They are **recurring-incident playbooks** ("attach this
+These were called **playbooks** until 2026-09-24. They were renamed because the word needed
+explaining, and the menu item became **Import Docs…** because it scans every `.md`, not only
+runbooks.
+
+Most old "runbooks" are not unfinished work. They are **recurring-incident guides** ("attach this
 when a client reports X"): used again and again, never finished, and linked from code comments and
-CLAUDE.md files. So a playbook **never moves**:
+CLAUDE.md files. So a guide **never moves**:
 
-- **The pointer:** Mulpex knows a playbook through a committed pointer,
-  `mulpex/playbooks/<slug>.md`. It is only a header: Hebrew `title` / `description`, and `source`,
+- **The pointer:** Mulpex knows a guide through a committed pointer,
+  `mulpex/guides/<slug>.md`. It is only a header: Hebrew `title` / `description`, and `source`,
   the runbook's path relative to the repo root. `source` is text in a committed file, so
   `source_path` accepts only normal components: nothing absolute and no `..`.
-- **The ⌘L window** has two tabs, **Saves | Playbooks**. Tab switches between them.
+- **The ⌘L window** has two tabs, **Saves | Guides**. Tab switches between them.
   - A missing runbook still lists, marked "missing", and can't be loaded.
-- **Loading one:** Enter runs `load_playbook`, which spawns a claude on `playbook_prompt`:
+- **Loading one:** Enter runs `load_guide`, which spawns a claude on `guide_prompt`:
   - It reads the runbook, says in a line or two what it is for, and **asks what the user needs this
     time**. There is deliberately no "what happened?" box in the dialog: one was built and dropped
     as an extra step nobody used.
   - It then works read-only first, and asks before changing anything.
-  - At the end it **suggests** an edit to the playbook, or **suggests deleting** it (runbook +
+  - At the end it **suggests** an edit to the guide, or **suggests deleting** it (runbook +
     pointer) if it describes something that no longer exists. It never writes or deletes without
     asking.
-  - The row starts named after the playbook, **not** user-owned, so the instance may rename it after
+  - The row starts named after the guide, **not** user-owned, so the instance may rename it after
     the specific incident.
-- **🗑 on a playbook retires it for good:** it deletes the runbook **and** the pointer. Git keeps the
+- **🗑 on a guide retires it for good:** it deletes the runbook **and** the pointer. Git keeps the
   history, and Mulpex does not commit.
+
+## Import Docs (Phase 4b)
+
+**File ▸ Import Docs…** (also in the palette; no accelerator) converts a repo's existing
+markdown into what ⌘L shows. The code is `src-tauri/src/docs_import.rs` and
+`save_prompts/sort.md`. It runs in four steps:
+
+1. **Scan:** every committed `.md` (`git ls-files -z`), minus:
+   - README / CHANGELOG / CLAUDE / AGENTS / LICENSE / CONTRIBUTING;
+   - any dot-folder (`.claude/`, `.github/`) and `node_modules/`;
+   - Mulpex's own `mulpex/`;
+   - runbooks that already have a guide pointer;
+   - whatever the committed `mulpex/import-skip.txt` lists.
+2. **Sort:** a headless **Sonnet**, 6 at a time and read-only, puts each file into one of four
+   kinds: `save` (unfinished work), `guide` (a reusable guide), `stale` (describes something
+   gone) or `skip`. It also writes the Hebrew title and description. It may check the repo, and
+   that is what lets it call a runbook stale with evidence.
+3. **Review:** the job lives in the backend per project, so the window can be closed mid-sort and
+   reopened (`import-update {handle}` → `import_state`). Each row has a tick, a kind picker and
+   editable Hebrew. **Apply** is enabled once sorting ends.
+4. **Apply:** only ticked rows are applied. Each kind does something different:
+   - **save:** the original body plus a Hebrew header goes to `mulpex/saves/`, and the original is
+     deleted. Its dates and author come from git: first commit, last commit, last committer.
+   - **guide:** a pointer is written, and the runbook stays where code links to it.
+   - **stale:** the file is deleted.
+   - **skip:** the path is appended to `mulpex/import-skip.txt`, so no later import asks again,
+     yours or a coworker's.
+
+**Apply makes one commit** in the target repo, `docs: import into Mulpex (N saves, N guides, N
+deleted)`, whose body lists each file and what happened to it. That way the whole conversion can be
+reviewed or reverted as one commit. It is the one place in the saves feature where Mulpex commits
+(⌘S never does), on the user's request (2026-09-24):
+
+- **Only the import's files:** new files are `git add`ed, then `git commit --only -- <paths>`. So
+  anything else staged in that tree, the user's or another instance's, stays staged and out of the
+  commit. The test proves this with a real temp repo.
+- **Hooks run** like any commit. If one fails, the files are still changed, the commit isn't made,
+  and the notice says why.
+
+**Apply keeps links whole** (`fix_references`, added after the first real import left two dead
+links in `cloud`). After the moves and deletes, every tracked file that names one of those docs is
+checked, and the edits go into the same commit:
+
+- **A link to a moved save** is re-pointed relative to the linking file, and a plain repo-relative
+  mention of it (a code comment, say) is rewritten.
+- **A link to a deleted stale doc:** if it sits in a table row or list item, that line is dropped,
+  since it was an index entry for a doc that no longer exists. Inside a sentence the link becomes
+  plain text.
+- **Any other mention of a deleted doc** is left alone and listed in the notice (`leftovers`).
+  Guessing in code or prose does more harm than a note.
+
+This was replayed on `cloud`'s `production-debugging.md` as it stood right after that import. It
+produced the same result as the hand fix: the row re-pointed, the row dropped, and nothing reported.
+
+The sorter is also told never to open a title with a document-kind word (`מדריך`, `תיעוד`…). 18 of
+`cloud`'s first 20 guide titles did, which only repeated the tab's name.
+
+`apply_one` refuses any `file` that isn't a plain repo-relative path.
+
+Measured on 6 real `cloud` files (2026-09-23), in about 2.5 min in parallel:
+
+| File | Sorted as | Why |
+| --- | --- | --- |
+| `sophos-xg-auto-provisioning` | guide | the feature shipped |
+| `disable-mfa-for-user` | **stale** | it checked the code: the bypass list the runbook relies on was replaced by an `mfa_exempt` field |
+| `TODO.md` | save | it checked that both items are still open |
+| `ai-chat-audit-rubric` | skip | |
+| `pricing-api` | skip | |
+| `rdns-coverage` | guide | |
 
 ## Measured (2026-09-23)
 
