@@ -68,6 +68,9 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
+  src/saves.rs        ⌘S Save / ⌘L Load: headless read-only `claude -p` steps write a
+                      handoff doc to `mulpex/saves/`; guides; the links file
+  src/docs_import.rs  File ▸ Import Docs: Sonnet sorts a repo's `.md`, Apply commits once
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -211,7 +214,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘E** explain/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
@@ -451,4 +454,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`f278704485bc4a13ba692ec35cf3b7a899b0bafa` — 2026-09-21
+`29b6acc0a71d934a1db09d25baca6e97b156b8d7` — 2026-09-28
