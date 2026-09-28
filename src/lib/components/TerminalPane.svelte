@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { projects, activeProject } from "../stores";
+  import { projects, activeProject, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
 
@@ -39,6 +39,9 @@
       Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
     </div>
   {/if}
+  {#if $toast}
+    <div class="toast" role="status">{$toast}</div>
+  {/if}
 </div>
 
 <style>
@@ -54,5 +57,21 @@
     height: 100%;
     color: var(--text-faint);
     font-size: 0.9rem;
+  }
+  .toast {
+    position: absolute;
+    top: 0.75rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    max-width: calc(100% - 2rem);
+    padding: 0.45rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-elev);
+    color: var(--text);
+    font-size: 0.85rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
   }
 </style>

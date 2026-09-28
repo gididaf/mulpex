@@ -25,7 +25,7 @@ Traps that live in this crate specifically:
 
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `watching/`, `compacting/`,
-  `armed/`, `relisten/`, `pids/`, `listeners/`, `explainreq/`,
+  `armed/`, `relisten/`, `pids/`, `listeners/`,
   `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, like `peers/`
   already does.
 - **A re-arm-only wake must leave no trace, and proving it *is* re-arm-only is the whole job.**
@@ -33,7 +33,7 @@ Traps that live in this crate specifically:
   tool call that is not `is_listener_rearm` — so surviving to `Stop` is evidence, not a guess.
   Three handlers share it (`userpromptsubmit`, `posttooluse`, `stop`, plus `write_needs` for an
   escaped dialog, which fires no `PostToolUse` at all); change one and check the other three,
-  because the failure mode is an explanation that silently never appears.
+  because the failure mode is a status dot that silently never moves.
   → [../../docs/hub.md](../../docs/hub.md)
 - **A `<task-notification>` turn is the runtime talking, not the user.** It is a real turn that
   fires `UserPromptSubmit` like any other, so anything the hook *asks the model to do* has to be

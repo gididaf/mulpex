@@ -3,7 +3,6 @@
 
 mod claude_bin;
 mod commands;
-mod explainer;
 mod hub;
 mod menu;
 mod project;
@@ -52,7 +51,7 @@ fn is_forwarded(id: &str) -> bool {
             | "import_docs"
             | "mute"
             | "messages"
-            | "explainer"
+            | "explain"
             | "minimize"
             | "next"
             | "prev"
@@ -107,8 +106,6 @@ pub fn run() {
             commands::resize_terminals,
             commands::focus_session,
             commands::get_hub_snapshot,
-            commands::get_explains,
-            commands::retry_explain,
             commands::save_session,
             commands::list_saves,
             commands::delete_save,

@@ -82,7 +82,6 @@ pub fn close_project(
     let mut ws = state.ws.lock().unwrap();
     ws.close_project(project_handle);
     ws.persist_open();
-    crate::explainer::forget_project(project_handle);
     let wsinfo = ws.workspace_info();
     drop(ws);
     let _ = app.emit("projects-changed", wsinfo.clone());
@@ -293,26 +292,6 @@ pub fn get_hub_snapshot(
         .unwrap()
         .project(project_handle)
         .map(Core::hub_snapshot)
-}
-
-/// A project's whole Explainer feed for the initial paint (bootstrap / dev
-/// hot-reload); thereafter pushed via `explain-update`. Per instance newest
-/// first, instances in arbitrary order — the frontend groups by `entry.id`.
-#[tauri::command]
-pub fn get_explains(project_handle: ProjectHandle) -> Vec<crate::snapshot::ExplainEntry> {
-    crate::explainer::feed(project_handle)
-}
-
-/// Re-run the summarizer for one **failed** Explainer entry (the panel's
-/// "נסה שוב" button), addressed by the `seq` that entry carries. The result
-/// replaces the failed row in place, arriving as an ordinary `explain-update`.
-///
-/// Returns false when nothing is stashed under that seq — the row aged out of
-/// its 10-entry feed, or its instance is gone — so the panel can put the button
-/// back rather than wait for an update that will never come.
-#[tauri::command]
-pub fn retry_explain(project_handle: ProjectHandle, id: usize, seq: u64) -> bool {
-    crate::explainer::retry(project_handle, id, seq)
 }
 
 /// Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry

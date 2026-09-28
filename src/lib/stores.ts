@@ -10,7 +10,6 @@
 
 import { writable, derived, get } from "svelte/store";
 import type {
-  ExplainEntry,
   HubSnapshot,
   ProjectHandle,
   SaveProgressEvent,
@@ -33,11 +32,6 @@ export interface ProjectState {
    *  are idle (`waiting`) and must look it. */
   watching: Set<number>;
   tasks: Map<number, string>;
-  /** id → that instance's Explainer feed, newest first, capped at
-   *  `MAX_EXPLAIN_ENTRIES` (the panel renders it oldest first). */
-  explains: Map<number, ExplainEntry[]>;
-  /** Instances the Explainer is currently working on (the panel's busy dot). */
-  explainPending: Set<number>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
 }
@@ -215,20 +209,6 @@ export const tasks = derived(
 );
 /** The active project's hub snapshot (locks / waiting / messages / pending). */
 export const hub = derived(activeProject, (p) => p?.hub ?? null);
-/** The active project's *focused* instance's Explainer feed, newest first. */
-export const activeExplains = derived(activeProject, (p) =>
-  p && p.activeSessionId != null
-    ? (p.explains.get(p.activeSessionId) ?? [])
-    : [],
-);
-/** Whether the Explainer is working on the focused instance right now. */
-export const activeExplainBusy = derived(
-  activeProject,
-  (p) =>
-    p != null &&
-    p.activeSessionId != null &&
-    p.explainPending.has(p.activeSessionId),
-);
 /** Focused session id within the active project (null when none). */
 export const activeId = derived(activeProject, (p) => p?.activeSessionId ?? null);
 /** Non-null while any project is open — App.svelte's shell gate. */
@@ -367,74 +347,6 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   });
 }
 
-/** Feed cap per instance — mirrors `explainer.rs::MAX_ENTRIES`. The backend
- *  truncates its store; this is what keeps the webview's copy from growing
- *  past it between reloads. The oldest entry is dropped completely. */
-const MAX_EXPLAIN_ENTRIES = 10;
-
-/** Replace a project's whole Explainer feed from the initial-paint fetch
- *  (`get_explains`): a flat, per-instance-newest-first array grouped by
- *  `entry.id`, keeping the arrival order. */
-export function setExplainsFor(
-  handle: ProjectHandle,
-  entries: ExplainEntry[],
-): void {
-  const explains = new Map<number, ExplainEntry[]>();
-  for (const e of entries) {
-    explains.set(e.id, [...(explains.get(e.id) ?? []), e].slice(0, MAX_EXPLAIN_ENTRIES));
-  }
-  patchProject(handle, { explains });
-}
-
-/** Apply one `explain-update`: an entry whose `seq` is already in the feed
- *  **replaces** it where it sits (a retry of a failed row lands in place, not as
- *  a second row at the top); anything else is prepended and the feed is
- *  re-capped, so the oldest row is dropped here exactly as the backend drops it. */
-export function applyExplainFor(
-  handle: ProjectHandle,
-  id: number,
-  entry: ExplainEntry,
-): void {
-  const p = get(projects).get(handle);
-  if (!p) return;
-  const explains = new Map(p.explains);
-  const feed = explains.get(id) ?? [];
-  const at = feed.findIndex((e) => e.seq === entry.seq);
-  explains.set(
-    id,
-    at === -1
-      ? [entry, ...feed].slice(0, MAX_EXPLAIN_ENTRIES)
-      : [...feed.slice(0, at), entry, ...feed.slice(at + 1)],
-  );
-  patchProject(handle, { explains });
-}
-
-/** Mirror an `explain-pending` transition (the panel's busy dot). */
-export function setExplainPendingFor(
-  handle: ProjectHandle,
-  id: number,
-  active: boolean,
-): void {
-  const p = get(projects).get(handle);
-  if (!p || p.explainPending.has(id) === active) return;
-  const explainPending = new Set(p.explainPending);
-  if (active) explainPending.add(id);
-  else explainPending.delete(id);
-  patchProject(handle, { explainPending });
-}
-
-/** Drop one instance's feed and its busy dot: its row exited, so the feed is
- *  unreachable. */
-export function removeExplainsFor(handle: ProjectHandle, id: number): void {
-  const p = get(projects).get(handle);
-  if (!p || (!p.explains.has(id) && !p.explainPending.has(id))) return;
-  const explains = new Map(p.explains);
-  explains.delete(id);
-  const explainPending = new Set(p.explainPending);
-  explainPending.delete(id);
-  patchProject(handle, { explains, explainPending });
-}
-
 // ---- ⌘S save progress (saves.rs) ----
 
 export interface SaveStatus {
@@ -501,11 +413,6 @@ export function findByDir(dir: string): ProjectState | undefined {
 /** Whether the ⌘⇧M message reader panel is open. */
 export const showMessages = writable(false);
 
-/** Whether the ⌘⇧E Explainer column is visible. On by default — the panel's
- *  whole point is being there after every turn; ⌘⇧E hides it for the current
- *  run and never throws anything away. */
-export const showExplainer = writable(true);
-
 /** Whether the ⌘P project quick-switcher overlay is open. */
 export const showPalette = writable(false);
 
@@ -524,4 +431,15 @@ export function flashNotice(text: string, ms = 2000) {
   notice.set(text);
   clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => notice.set(null), ms) as unknown as number;
+}
+
+/** A short toast over the terminal — for "that key did nothing, here's why",
+ *  where the bottom strip is too far from where the user is looking. */
+export const toast = writable<string | null>(null);
+
+let toastTimer: number | undefined;
+export function flashToast(text: string, ms = 2000) {
+  toast.set(text);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.set(null), ms) as unknown as number;
 }

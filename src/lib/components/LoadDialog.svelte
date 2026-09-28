@@ -16,7 +16,7 @@
   // - Guides (`mulpex/guides/`): pointers to recurring-incident runbooks.
   //   Enter starts a claude that reads it and asks what the user needs.
   // Both lists are hard `dir="rtl"` — never `auto`, which a title starting with
-  // an English term would flip to LTR (the Explainer's rule, docs/explainer.md).
+  // an English term would flip to LTR.
 
   let {
     handle,

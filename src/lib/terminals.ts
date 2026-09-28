@@ -22,6 +22,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
 import type { SessionKind } from "./ipc";
+import { readPromptBox } from "./promptbox";
+import type { PromptBox } from "./promptbox";
 
 const THEME: ITheme = {
   background: "#0d0d0f",
@@ -290,6 +292,14 @@ class TerminalManager {
     // including background projects. All PTYs share this one geometry; resize each
     // open project's sessions (one backend call per distinct project handle).
     if (resized) resizeTerminals(this.cols, this.rows);
+  }
+
+  /** Whether (handle, id)'s claude input box is empty, holds a draft, or can't
+   *  be found on screen. See `promptbox.ts`. */
+  promptBox(handle: number, id: number): PromptBox {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return "none";
+    return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols);
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

@@ -164,10 +164,9 @@ fn save(
 
 /// One headless step. `fork` = `Some(uuid)` resumes that conversation as a
 /// throwaway fork; `None` is a blank claude. The prompt goes on stdin (closed
-/// after, or `-p` waits for EOF forever). Env is scrubbed exactly like the
-/// Explainer's child (`forwarded_env` drops `MULPEX_*` and
-/// `CLAUDE_CODE_CHILD_SESSION`), and like it, no `--bare`: that can't see the
-/// OAuth token.
+/// after, or `-p` waits for EOF forever). Env is scrubbed (`forwarded_env`
+/// drops `MULPEX_*` and `CLAUDE_CODE_CHILD_SESSION`), and no `--bare`: that
+/// can't see the OAuth token.
 fn run_step(dir: &Path, fork: Option<&str>, prompt: &str) -> Result<String, String> {
     run_claude(dir, "opus", fork, prompt, STEP_TIMEOUT)
 }
@@ -218,7 +217,8 @@ pub(crate) fn run_claude(
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
-    // Both pipes drained on their own threads — see explainer::run_summarizer.
+    // Both pipes drained on their own threads: a child that fills one pipe while
+    // we block reading the other deadlocks until the timeout.
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
             let mut s = String::new();
@@ -247,9 +247,35 @@ pub(crate) fn run_claude(
     let out = out_reader.join().unwrap_or_default();
     let err = err_reader.join().unwrap_or_default();
     if !status.success() {
-        return Err(crate::explainer::failure_reason(status.code(), &out, &err));
+        return Err(failure_reason(status.code(), &out, &err));
     }
     result_text(&out)
+}
+
+/// Why a headless `claude -p` step died, for the error the user sees.
+///
+/// **`claude -p` reports its own failures on stdout, not stderr** — measured
+/// 2026-09-03: a bad OAuth token exits 1 with "Failed to authenticate. API
+/// Error: 401 OAuth access token is invalid." on stdout and an *empty* stderr.
+/// Reading stderr alone is what once left a failure saying only "exit 1" — the
+/// exit code with the reason thrown away. So: prefer stderr, which carries the
+/// more specific message when there is one, and fall back to stdout.
+pub(crate) fn failure_reason(code: Option<i32>, out: &str, err: &str) -> String {
+    let code = code.map_or("killed".to_string(), |c| format!("exit {c}"));
+    match first_line(err).or_else(|| first_line(out)) {
+        Some(reason) => format!("{code}: {reason}"),
+        None => code,
+    }
+}
+
+/// First non-blank line of a child's output, trimmed and length-capped — an
+/// API error can be a paragraph.
+fn first_line(s: &str) -> Option<String> {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(match line.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
 }
 
 /// The `result` of `--output-format json`. A JSON body with `is_error` is a
@@ -741,6 +767,35 @@ pub(crate) fn first_chars(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure text is only useful if it says why: `claude -p` reports its
+    /// own errors on stdout, so a bare "exit 1" is a reason thrown away.
+    #[test]
+    fn a_failure_reason_is_a_capped_first_nonblank_line() {
+        assert_eq!(first_line("\n\n  boom  \nsecond\n").as_deref(), Some("boom"));
+        assert_eq!(first_line("   \n\t\n"), None, "no reason is None, not an empty line");
+        let long = first_line(&"x".repeat(400)).unwrap();
+        assert_eq!(long.chars().count(), 201, "capped, with the ellipsis");
+        assert!(long.ends_with('…'));
+    }
+
+    /// Strings measured 2026-09-03 from a real `claude -p` with a bad token.
+    #[test]
+    fn a_dead_step_reports_the_reason_not_just_the_code() {
+        let real = "Failed to authenticate. API Error: 401 OAuth access token is invalid.";
+        assert_eq!(
+            failure_reason(Some(1), &format!("{real}\n"), ""),
+            format!("exit 1: {real}"),
+            "stdout carries the reason when stderr is empty"
+        );
+        assert_eq!(
+            failure_reason(Some(1), "some output", "boom\n"),
+            "exit 1: boom",
+            "stderr wins when it has something to say"
+        );
+        assert_eq!(failure_reason(Some(1), "  \n", " \n"), "exit 1", "nothing to add, nothing said");
+        assert_eq!(failure_reason(None, "", ""), "killed");
+    }
 
     fn draft(slug: &str) -> Draft {
         Draft {

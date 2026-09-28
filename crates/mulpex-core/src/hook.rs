@@ -492,20 +492,8 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // The turn is really ending; reset the nudge high-water mark to the current
     // (now-read, usually 0) count so the next message re-nudges cleanly.
     let _ = std::fs::write(notified_marker(ctx), unread.to_string());
-    // Hand the finished turn to the Explainer. Placed after the mail block above
-    // on purpose: a blocked stop is a continuing turn, and writing here twice
-    // would explain the same turn twice. The summarizer itself must never run in
-    // this hook — a Stop hook blocks the claude's turn end.
-    //
-    // ...unless the marker survived every tool call, which means this turn was a
-    // `<task-notification>` the instance answered by re-arming its hub listener
-    // and nothing more. There is no explanation to write: a Monitor expired and a
-    // Monitor was started. → `QUIETTURN_DIR`
-    let rearm_only = quiet_turn(ctx);
+    // The turn is over, so it is no longer a re-arm-only candidate. → `QUIETTURN_DIR`
     clear_quiet_turn(ctx);
-    if !rearm_only {
-        write_explain_request(ctx, payload.as_ref(), false);
-    }
     // Preserve the sidebar status the old `printf waiting` Stop hook produced —
     // unless work this instance started is still running, in which case the turn
     // ended but the instance did not, and `waiting` (a green "ready" dot, and 60 s
@@ -516,28 +504,19 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
 }
 
 /// `PreToolUse[AskUserQuestion]`: the instance stopped to ask the user
-/// something. Two jobs: the `needs` status word (this handler replaced the
-/// inline `printf needs` matcher and must keep doing that), and handing the
-/// turn to the Explainer so the question is explained *while it sits on
-/// screen* — `Stop` does not fire while a dialog waits, so without this the
-/// question would only be explained after it was answered.
-///
-/// The questions payload itself is not forwarded: it is already in the
-/// transcript by the time the dialog is on screen, and `explainer::read_turn`
-/// reads it from there. What is forwarded is the transcript path plus the
-/// `dialog` marker, which tells the reader to wait for that entry to land.
+/// something, so the status word is `needs` (this handler replaced the inline
+/// `printf needs` matcher and must keep doing that). Stdin is drained first so
+/// Claude Code never blocks writing the payload.
 fn askq(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let payload = serde_json::from_str::<serde_json::Value>(&input).ok();
     write_needs(ctx);
-    write_explain_request(ctx, payload.as_ref(), true);
     Ok(())
 }
 
 /// `PreToolUse[ExitPlanMode]`: the instance finished a plan and is about to ask
-/// the user whether to execute it. Writes the `needs` status word and hands the
-/// turn to the Explainer, exactly as `askq` does.
+/// the user whether to execute it. Writes the `needs` status word, exactly as
+/// `askq` does.
 ///
 /// The status write is deliberately redundant: measured 2026-09-01, the
 /// approval dialog also fires `Notification{permission_prompt}` ~6 s later,
@@ -547,9 +526,7 @@ fn askq(ctx: &Ctx) -> anyhow::Result<()> {
 fn plan(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let payload = serde_json::from_str::<serde_json::Value>(&input).ok();
     write_needs(ctx);
-    write_explain_request(ctx, payload.as_ref(), true);
     Ok(())
 }
 
@@ -566,56 +543,8 @@ fn write_needs(ctx: &Ctx) {
     // A turn that stops to ask the user something is not a silent re-arm,
     // whatever it did first. Cleared here rather than left to `posttooluse`
     // because an *escaped* dialog fires no `PostToolUse` at all — the marker
-    // would survive to `Stop` and swallow the explanation of a real turn.
+    // would survive into the rest of the turn and keep hiding its status.
     clear_quiet_turn(ctx);
-}
-
-/// Record where this turn's transcript lives, for the Explainer. Every hook
-/// payload carries `transcript_path` (measured on `Stop`, 2026-08-30; a common
-/// field of every event per Claude Code's hook contract). The app's poll loop
-/// consumes `explainreq/<id>` and summarizes the turn off-process. A payload
-/// without the field writes nothing — that turn simply gets no explanation,
-/// which is better than guessing at the transcript's location.
-///
-/// `dialog` is set by `askq`/`plan`: the transcript may not yet hold the
-/// `tool_use` entry the hook is firing for, and a reader that summarized it as
-/// a plain turn would never get a second chance (`Stop` does not fire while the
-/// dialog waits). The marker is what tells `explainer::read_turn_settled` to
-/// wait for the dialog rather than for prose.
-///
-/// A finished turn (`Stop`) forwards the payload's **`last_assistant_message`**
-/// after a `final` marker line — the text of the message the turn ended on, as
-/// Claude Code reports it (present since v2.1.27x; measured 2026-09-17 on
-/// 2.1.274). The same flush race one entry earlier: the transcript gets that
-/// final entry a beat *after* `Stop` fires, and a turn that said something
-/// mid-way ("let me check the tree first") reads as complete without it — the
-/// reader then explained the first line of a turn as the whole turn, with
-/// `NEED: nothing` under two decisions the user had to make. With the text in
-/// hand the reader waits for exactly it, and if it never lands, appends it.
-/// A payload without the field writes the path alone, as before.
-fn write_explain_request(ctx: &Ctx, payload: Option<&serde_json::Value>, dialog: bool) {
-    let Some(path) = payload
-        .and_then(|j| j.get("transcript_path"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    else {
-        return;
-    };
-    let file = crate::explain_request_path(&ctx.state_dir, ctx.instance);
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let last_said = payload
-        .and_then(|j| j.get("last_assistant_message"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let body = match (dialog, last_said) {
-        (true, _) => format!("{path}\ndialog"),
-        (false, Some(text)) => format!("{path}\nfinal\n{text}"),
-        (false, None) => path.to_string(),
-    };
-    let _ = std::fs::write(file, body);
 }
 
 /// Report which transcript this instance is actually writing to, so the app can
@@ -1163,7 +1092,7 @@ fn write_working_unless_a_dialog_waits(ctx: &Ctx, payload: &str) {
 /// work and must not be hidden.
 ///
 /// An unparseable payload reads as **not** the re-arm, which is the safe
-/// direction: the cost of being wrong that way is one explanation the user did
+/// direction: the cost of being wrong that way is one yellow flicker the user did
 /// not need, against silently hiding a turn that did something real.
 fn is_listener_rearm(payload: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
@@ -1187,8 +1116,8 @@ fn mark_quiet_turn(ctx: &Ctx) {
     let _ = std::fs::write(path, "");
 }
 
-/// This turn did something other than re-arm, or has ended: it is explained and
-/// shown like any other.
+/// This turn did something other than re-arm, or has ended: it is shown like
+/// any other.
 fn clear_quiet_turn(ctx: &Ctx) {
     let _ = std::fs::remove_file(crate::quiet_turn_path(&ctx.state_dir, ctx.instance));
 }
@@ -2037,8 +1966,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one job the two `PreToolUse` matchers must never lose, whatever else
-    /// they do for the Explainer: the `needs` status word — `needs` is the
+    /// The one job the two `PreToolUse` matchers must never lose: the `needs`
+    /// status word — `needs` is the
     /// sidebar's "this instance is holding something up for YOU".
     #[test]
     fn a_waiting_dialog_still_writes_the_needs_status_word() {
@@ -2059,21 +1988,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `Stop` payload as measured 2026-08-30 (probe0): `transcript_path` is
-    /// present alongside the fields the mail/background logic already uses.
-    const STOP_WITH_TRANSCRIPT: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
-        "session_id":"3562192c-a1ad-48c3-a94c-94b6e742499c",
-        "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
-        "background_tasks":[],"session_crons":[]}"#;
-
     /// A re-arm-only wake leaves no trace; anything else in the same turn ends
     /// that immediately.
     ///
     /// This is the whole contract of `QUIETTURN_DIR`, and both halves matter. The
     /// instance is woken twice an hour by a Monitor expiry it cannot prevent, and
     /// hiding that is the point — but hiding a turn that *did* something would be
-    /// the far worse bug, and it is invisible by construction: the symptom is an
-    /// explanation that never appears, which looks exactly like a quiet instance.
+    /// the far worse bug, and it is invisible by construction: the symptom is a
+    /// status dot that never turns yellow, which looks exactly like a quiet instance.
     #[test]
     fn a_rearm_only_wake_is_silent_and_anything_else_cancels_it() {
         let dir = std::env::temp_dir().join(format!("mulpex-quiet-{}", crate::persist::new_uuid()));
@@ -2085,7 +2007,7 @@ mod tests {
         assert!(is_listener_rearm(rearm));
 
         // A Monitor is not automatically ours. Watching a log is real work and
-        // must be explained like any other.
+        // must show like any other.
         let other_monitor = r#"{"tool_name":"Monitor","tool_input":{
             "command":"tail -f deploy.log | grep --line-buffered ERROR",
             "timeout_ms":1800000,"description":"deploy errors"}}"#;
@@ -2180,131 +2102,6 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    /// The Explainer request must mirror exactly what the payload says — and say
-    /// nothing when the payload doesn't. A missing or empty `transcript_path`
-    /// writes no file (that turn gets no explanation; better than a guessed path).
-    /// A finished turn carries no `dialog` line: the reader waits for prose.
-    #[test]
-    fn a_finished_turn_hands_its_transcript_to_the_explainer() {
-        let dir = std::env::temp_dir().join(format!("mulpex-explain-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 3);
-
-        write_explain_request(&ctx, payload(STOP_WITH_TRANSCRIPT).as_ref(), false);
-        let req = crate::explain_request_path(&ctx.state_dir, 3);
-        assert_eq!(
-            std::fs::read_to_string(&req).unwrap(),
-            "/Users/x/.claude/projects/-p/3562192c.jsonl"
-        );
-
-        // A second turn overwrites — latest-wins is the coalescing contract.
-        let redone = STOP_WITH_TRANSCRIPT.replace("3562192c.jsonl", "later.jsonl");
-        write_explain_request(&ctx, payload(&redone).as_ref(), false);
-        assert!(std::fs::read_to_string(&req).unwrap().ends_with("later.jsonl"));
-
-        let _ = std::fs::remove_file(&req);
-        write_explain_request(&ctx, payload(STOP_IDLE).as_ref(), false);
-        assert!(!req.exists(), "no transcript_path in the payload → no request file");
-        write_explain_request(&ctx, payload(r#"{"transcript_path":""}"#).as_ref(), false);
-        assert!(!req.exists(), "an empty transcript_path is not a path");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The text a turn ended on rides along with the path, so the reader can
-    /// wait for that exact entry instead of accepting whatever the transcript
-    /// holds the instant `Stop` fires. Measured 2026-09-17 on `claude` 2.1.274:
-    /// `Stop` carries `last_assistant_message` ("Text content of the last
-    /// assistant message before stopping"), and a real turn whose first line was
-    /// "let me check the tree first" was explained from that line alone because
-    /// the final answer had not been flushed yet. Multi-line text survives
-    /// verbatim — everything after the `final` line is the message.
-    #[test]
-    fn a_finished_turn_forwards_the_message_it_ended_on() {
-        let dir = std::env::temp_dir().join(format!("mulpex-final-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 5);
-        let req = crate::explain_request_path(&ctx.state_dir, 5);
-
-        let stop = r#"{"hook_event_name":"Stop","stop_hook_active":false,
-            "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
-            "last_assistant_message":"Two decisions.\n\n1. Armor\n- check it\n\n2. Commit\n",
-            "background_tasks":[],"session_crons":[]}"#;
-        write_explain_request(&ctx, payload(stop).as_ref(), false);
-        assert_eq!(
-            std::fs::read_to_string(&req).unwrap(),
-            "/Users/x/.claude/projects/-p/3562192c.jsonl\nfinal\nTwo decisions.\n\n1. Armor\n- check it\n\n2. Commit"
-        );
-
-        // Blank text is no text: the path alone, exactly as an older payload.
-        let blank = stop.replace("Two decisions.\\n\\n1. Armor\\n- check it\\n\\n2. Commit\\n", "  \\n ");
-        write_explain_request(&ctx, payload(&blank).as_ref(), false);
-        assert_eq!(
-            std::fs::read_to_string(&req).unwrap(),
-            "/Users/x/.claude/projects/-p/3562192c.jsonl"
-        );
-
-        // A dialog request never carries it: the reader waits for the dialog
-        // entry there, and the text before a question is read from the file.
-        write_explain_request(&ctx, payload(stop).as_ref(), true);
-        assert_eq!(
-            std::fs::read_to_string(&req).unwrap(),
-            "/Users/x/.claude/projects/-p/3562192c.jsonl\ndialog"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A pending AskUserQuestion reaches the Explainer as the transcript path
-    /// plus the `dialog` marker — not as the questions payload, which the app
-    /// reads out of the transcript itself. The marker is what stops the reader
-    /// summarizing the turn's prose before the question entry has landed.
-    #[test]
-    fn a_pending_question_reaches_the_explainer() {
-        let dir = std::env::temp_dir().join(format!("mulpex-askq-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 4);
-        let req = crate::explain_request_path(&ctx.state_dir, 4);
-
-        let pretool = r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
-            "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
-            "tool_input":{"questions":[{"question":"Which way?","header":"Way",
-            "options":[{"label":"A","description":"first"}],"multiSelect":false}]}}"#;
-        write_explain_request(&ctx, payload(pretool).as_ref(), true);
-        assert_eq!(
-            std::fs::read_to_string(&req).unwrap(),
-            "/Users/x/.claude/projects/-p/3562192c.jsonl\ndialog"
-        );
-
-        let _ = std::fs::remove_file(&req);
-        write_explain_request(&ctx, payload(r#"{"tool_input":{"questions":[]}}"#).as_ref(), true);
-        assert!(!req.exists(), "no transcript_path → no request file, dialog or not");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A pending plan reaches the Explainer the same way. The payload is the
-    /// shape measured on a real `claude` v2.1.252 driven on a PTY, 2026-09-01
-    /// (`scratchpad/probe`): `PreToolUse[ExitPlanMode]` with `plan` +
-    /// `planFilePath` — neither of which is forwarded.
-    #[test]
-    fn a_pending_plan_reaches_the_explainer() {
-        let dir = std::env::temp_dir().join(format!("mulpex-plan-{}", crate::persist::new_uuid()));
-        let ctx = test_ctx(&dir, 6);
-        let req = crate::explain_request_path(&ctx.state_dir, 6);
-
-        // `r##`: the plan is markdown, so the payload contains `"#` (a quote then a
-        // heading), which would close a plain `r#""#` literal mid-string.
-        let pretool = r##"{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode",
-            "transcript_path":"/Users/x/.claude/projects/-p/3562192c.jsonl",
-            "permission_mode":"plan","tool_input":{"plan":"# Add a comment\n\nInsert one line.",
-            "planFilePath":"/Users/x/.claude/plans/plan-abc.md"}}"##;
-        write_explain_request(&ctx, payload(pretool).as_ref(), true);
-        let written = std::fs::read_to_string(&req).unwrap();
-        assert!(written.starts_with("/Users/x/.claude/projects/-p/3562192c.jsonl\n"));
-        assert!(written.ends_with("dialog"));
-        assert!(!written.contains("Insert one line."), "the plan is read from the transcript, not forwarded");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real hub-listener command, exactly as `HUB_RULES` dictates it and

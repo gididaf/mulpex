@@ -12,12 +12,14 @@
 use std::path::Path;
 
 use crate::config::{
-    HOOK_SETTINGS_JSON, MCP_CONFIG_JSON, PLUGIN_MANIFEST_JSON, PLUGIN_MONITORS_JSON,
+    EXPLAIN_SKILL_MD, HOOK_SETTINGS_JSON, MCP_CONFIG_JSON, PLUGIN_MANIFEST_JSON,
+    PLUGIN_MONITORS_JSON,
 };
 
 /// The generated plugin `claude` is launched with (`--plugin-dir`), relative to
-/// the state dir. Carries one background monitor: the hub inbox listener, armed
-/// by the host rather than by the model. See `config::PLUGIN_MONITORS_JSON`.
+/// the state dir. Carries one background monitor — the hub inbox listener, armed
+/// by the host rather than by the model (`config::PLUGIN_MONITORS_JSON`) — and
+/// the `/explain` skill (`config::EXPLAIN_SKILL_MD`).
 pub const PLUGIN_DIR: &str = "plugin";
 
 /// Lay out (or repair) a project's scratch dir: the `--settings` / `--mcp-config`
@@ -58,6 +60,8 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
         plugin.join("monitors/monitors.json"),
         PLUGIN_MONITORS_JSON.replace("__MULPEX_BIN__", &helper),
     )?;
+    std::fs::create_dir_all(plugin.join("skills/explain"))?;
+    std::fs::write(plugin.join("skills/explain/SKILL.md"), EXPLAIN_SKILL_MD)?;
     // Every name here contains no bare integer at the top level, which is what
     // keeps `mcp::live_ids`' integer-filename scan from mistaking one for an
     // instance status file.
@@ -78,7 +82,6 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
         crate::RELISTEN_DIR,
         crate::PIDS_DIR,
         crate::LISTENERS_DIR,
-        crate::EXPLAINREQ_DIR,
         crate::WATCHING_DIR,
         "terminals",
         "terminals/cursors",
@@ -158,7 +161,11 @@ mod tests {
         let manifest = std::fs::read_to_string(dir.join("plugin/.claude-plugin/plugin.json"))
             .expect("manifest written");
         let manifest: serde_json::Value = serde_json::from_str(&manifest).expect("valid JSON");
-        assert_eq!(manifest["name"], "mulpex-hub");
+        assert_eq!(manifest["name"], "mulpex");
+
+        let skill = std::fs::read_to_string(dir.join("plugin/skills/explain/SKILL.md"))
+            .expect("explain skill written");
+        assert!(skill.starts_with("---\nname: explain\n"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

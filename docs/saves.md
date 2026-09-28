@@ -35,8 +35,8 @@ else. Mulpex writes the file itself. Other details:
 - **Where they run:** every step runs with cwd = the project dir, because `--resume` finds a
   conversation by its cwd. The file goes to the **git top-level**, so a tab opened on a subfolder
   still uses its repo's single `mulpex/saves/`.
-- **Environment:** scrubbed exactly like the Explainer's child (`claude_bin::forwarded_env`), and
-  like it, no `--bare`.
+- **Environment:** scrubbed (`claude_bin::forwarded_env`), and no `--bare` — that can't see the
+  OAuth token.
 - **`--no-session-persistence`:** so no fork leaves a transcript behind.
 - **`--output-format json`:** the answer is read from `result`, and `is_error: true` counts as a
   failure even on exit 0.
@@ -47,7 +47,7 @@ taken slug gets `-2`, `-3`…; a save never overwrites. The body is English and 
 with these sections: Goal / Status / Context / Done / Left / Decisions / Traps / How to verify /
 Open questions. It says "the user", never a name, because coworkers read it too.
 
-The Hebrew follows the Explainer's rules: simple everyday Hebrew, a title of at most 6 words and a
+The Hebrew is simple everyday Hebrew, a title of at most 6 words and a
 description of one sentence of at most 15 words. An English term stays in English exactly as
 written, never transliterated.
 
@@ -66,7 +66,7 @@ written, never transliterated.
   repo's `mulpex/saves/`, newest `updated` first.
   - A file with no readable header still shows up, titled by its file name. It is in the folder, so
     hiding it would be the list lying.
-  - The list is hard `dir="rtl"`, never `auto`: that is the Explainer's rule, because a title that
+  - The list is hard `dir="rtl"`, never `auto`, because a title that
     starts with an English term would flip `auto` to LTR.
 - **Controls:** typing filters, ↑↓ chooses, Enter loads, 🗑 deletes after a native confirm.
 - **Enter** runs `load_save`, which spawns a claude through `Core::spawn_instance_with_prompt`:

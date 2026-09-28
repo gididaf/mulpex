@@ -24,12 +24,7 @@ them without asking.
 Hidden terminals use `visibility: hidden`, **never** `display: none` — the latter zeroes their size
 and breaks `fit()`.
 
-The Explainer column (`ExplainerPanel.svelte`, the `explains` map in `stores.ts`) is documented in
-[../docs/explainer.md](../docs/explainer.md) — including why its text is hard `dir="rtl"` and never
-`dir="auto"` (entries often *start* with an English identifier, which flips auto to LTR). It is
-**open by default** and fills itself after every turn; ⌘⇧E is a plain show/hide and nothing in the
-frontend ever discards an entry except a row exiting. The feed is capped at 10 per instance in
-`stores.ts` (`MAX_EXPLAIN_ENTRIES`, mirroring the backend) — keep the two caps equal, or a reload
-shows a different history than the live feed did. The panel's feed rules (render-time reversal,
-sticky scroll, `opacity: 0.18` history, `:last-of-type` not `:last-child`) only make sense together;
-don't remove one piecemeal.
+⌘E (`App.svelte::explainInstance`) types `/explain` into the focused claude, but only after
+`promptbox.ts` reads its input box as empty off the xterm buffer — a guess at someone else's TUI,
+measured and documented in [../docs/explain.md](../docs/explain.md). Keep it refusing (with a toast)
+on anything it does not recognize; typing onto a draft or into an open dialog is the failure.

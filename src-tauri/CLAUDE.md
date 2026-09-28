@@ -8,7 +8,6 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
 | `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
-| `explainer.rs` (the `explainreq/<id>` drain via `submit`, turn extraction, pending questions + plans, the headless Sonnet child, the worker queue, the 10-entry feed, failure reason + retry) | [../docs/explainer.md](../docs/explainer.md) — the transcript-flush race and the `dialog` marker, why not `--bare`, the three-part shape, no-silent-skip rule, and why a retry re-runs the *stashed* input rather than the transcript |
 | `saves.rs`, `docs_import.rs`, `save_prompts/*` (⌘S: fork → memoryless check → fork fix, read-only tools, writes `mulpex/saves/` at the git root; guides; the links file; Import Docs' sort / apply / one commit / link fixing) | [../docs/saves.md](../docs/saves.md) — why the doc must stand alone, why the forks run in the project dir, why `total_cost_usd` over-reports |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
@@ -31,7 +30,8 @@ Traps that live in this directory specifically:
   hand instead. → [../docs/verification-log.md](../docs/verification-log.md)
 - **A child process's failure reason may be on stdout.** `claude -p` exits 1 and prints
   `API Error: 401 …` on **stdout** with an empty stderr (measured). Reading stderr alone is how the
-  Explainer shipped a failure entry that said only `exit 1`. → [../docs/explainer.md](../docs/explainer.md)
+  (since removed) Explainer shipped a failure entry that said only `exit 1`. `saves.rs::failure_reason`
+  is the one reader now.
 - **Never `wait()` a terminal's child to learn it exited.** Liveness is reader-thread EOF; a zombie
   keeps the pid unrecyclable, which is what makes the `killpg` in teardown safe.
 - **`Session::kill` cannot reach a `claude`'s background commands.** Claude Code runs each in its

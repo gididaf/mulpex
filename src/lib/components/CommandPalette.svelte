@@ -164,7 +164,7 @@
       ["mute", cur?.muted ? "Unmute Session" : "Mute Session", "⌘M", isClaude],
       ["close_session", "Close Session", "⌘W", cur != null],
       ["messages", "Messages", "⌘⇧M", true],
-      ["explainer", "Explainer", "⌘⇧E", true],
+      ["explain", "Explain", "⌘E", isClaude],
       ["next", "Next Session", "⌘]", $sessions.length > 1],
       ["prev", "Previous Session", "⌘[", $sessions.length > 1],
       ["move_instance_up", "Move Instance Up", "⌘⇧↑", $sessions.length > 1],

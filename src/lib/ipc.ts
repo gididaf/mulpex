@@ -97,61 +97,10 @@ export interface ClaudeStatus {
   searched_path: string;
 }
 
-/** A turn explanation's three fixed parts. The summarizer answers exactly these
- *  three questions; the PANEL draws the Hebrew headings, so their wording and
- *  typography are ours and never Sonnet's. Absent when the output didn't parse
- *  into three parts, or on a question/plan entry — the panel then shows `text`
- *  as-is rather than faking a structure. Mirrors `snapshot.rs::ExplainSections`. */
-export interface ExplainSections {
-  /** "על מה אנחנו עובדים" — the goal, from the user's own recent prompts. */
-  work: string;
-  /** "מה עשיתי בסבב זה" — what this turn did. */
-  did: string;
-  /** "מה אני צריך ממך" — always answered, explicitly "nothing" when nothing. */
-  need: string;
-}
-
-/** One item of an instance's Explainer feed: the short Hebrew explanation of
- *  one turn, question or plan. Up to 10 per instance, newest first in the
- *  store. `ok: false` marks a summarizer failure (the text says so — rendered
- *  dim, with a retry button). Mirrors `snapshot.rs::ExplainEntry` (no codegen;
- *  keep in sync). */
-export interface ExplainEntry {
-  id: number;
-  /** Unix epoch milliseconds. A retry that replaced a failed entry carries the
-   *  retry's time, which is also how the panel notices its row came back. */
-  ts: number;
-  /** The summarizer's raw output: what the panel shows when `sections` is
-   *  null, and where a failure's reason lives. */
-  text: string;
-  sections: ExplainSections | null;
-  ok: boolean;
-  /** "turn" explains a finished turn; "question" explains a pending
-   *  AskUserQuestion (what's being asked + what each option means); "plan"
-   *  explains a pending ExitPlanMode plan in one line, before you approve it. */
-  kind: "turn" | "question" | "plan";
-  /** Unique, stable id of this feed item: the retry address of a failed entry,
-   *  and what an incoming `explain-update` matches to replace a row in place
-   *  instead of prepending a new one. */
-  seq: number;
-}
-
 // Scoped event payloads (mirror snapshot.rs).
 export interface HubUpdateEvent {
   handle: ProjectHandle;
   snapshot: HubSnapshot;
-}
-export interface ExplainUpdateEvent {
-  handle: ProjectHandle;
-  id: number;
-  entry: ExplainEntry;
-}
-/** Fires on transitions only: the Explainer started (active) or finished
- *  (summary, failure, or skip — all end it) working on instance `id`. */
-export interface ExplainPendingEvent {
-  handle: ProjectHandle;
-  id: number;
-  active: boolean;
 }
 /** `save-progress`: one step of a ⌘S save. `detail` is the path on `done` and
  *  the reason on `error`. */
@@ -262,21 +211,6 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
-
-/** A project's whole Explainer feed, for the initial paint (thereafter pushed
- *  via `explain-update`). Flat; per instance newest first. */
-export const getExplains = (projectHandle: ProjectHandle) =>
-  invoke<ExplainEntry[]>("get_explains", { projectHandle });
-
-/** Re-run the summarizer for one failed entry; its result replaces that row in
- *  place (an ordinary `explain-update` carrying the same `seq`). False means the
- *  backend has nothing stashed under that seq any more — the entry aged out of
- *  the 10-entry feed, or its instance is gone — and the button should come back. */
-export const retryExplain = (
-  projectHandle: ProjectHandle,
-  id: number,
-  seq: number,
-) => invoke<boolean>("retry_explain", { projectHandle, id, seq });
 
 /** Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry).
  *  Resolves once the save is under way — progress arrives as `save-progress` —

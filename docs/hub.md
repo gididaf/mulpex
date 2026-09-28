@@ -25,7 +25,8 @@ against the *local* hub:
   see [the command is a binary now](#the-command-is-a-binary-now-and-the-old-one-is-why) for why
   that had to stop.
 - **Arming (a plugin monitor — the host does it, not the model):** every `claude` is spawned with
-  `--plugin-dir <state_dir>/plugin`, a one-purpose plugin Mulpex *generates* beside `settings.json`
+  `--plugin-dir <state_dir>/plugin`, a plugin (named `mulpex`; it also carries the `/explain` skill,
+  [explain.md](explain.md)) Mulpex *generates* beside `settings.json`
   and `mcp.json` (`config::PLUGIN_MANIFEST_JSON` + `PLUGIN_MONITORS_JSON`, written by
   `state_dir::write_state_dir`). Its `monitors/monitors.json` declares the listener, and **Claude
   Code arms it itself at session start** — including on `--resume`. No turn is spent arming it,
@@ -96,7 +97,7 @@ fallback. What the 30-minute cap did to the sidebar's yellow dot is in
 
 **Mostly history since the plugin monitor landed** — a routine re-arm no longer happens at all, so
 this machinery now only covers the crash-only fallback. It is kept because the fallback is real,
-and because what it protects (an Explainer call and a dot flip for a turn that said nothing) comes
+and because what it protects (a dot flip for a turn that said nothing) comes
 straight back the moment any wake becomes routine again. Read the rest as the reasoning behind a
 guard, not as the daily path.
 
@@ -112,8 +113,9 @@ Each of those wakes used to cost two visible things, neither of them Anthropic's
 
 - the sidebar dot flipped to `working` and back, because `userpromptsubmit` writes `working` before
   it knows what kind of turn this is;
-- `Stop` handed the turn to the Explainer, which spent a Sonnet call writing a Hebrew paragraph
-  explaining that a watchdog had been restarted.
+- `Stop` handed the turn to the Explainer (removed 2026-09-28, replaced by `/explain` —
+  [explain.md](explain.md)), which spent a Sonnet call writing a Hebrew paragraph explaining that
+  a watchdog had been restarted.
 
 At five instances that is ~480 model calls a day, none of which say anything. `quietturn/<id>` is
 the fix, and its whole design is about *earning* the right to hide a turn:

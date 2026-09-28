@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/explainer.md](docs/explainer.md) | Hebrew Explainer panel: automatic after every turn / pending question / pending plan (`Stop`/`askq`/`plan` write `explainreq/<id>`, the poll drains it), the `dialog` marker and the flush race, a feed of 10 (dimmed history, sticky scroll, bottom-pinned), three fixed parts with app-drawn headings, pending questions + plans read out of the transcript (and why plan mode needs shift+tab), first person (אני = the claude, אתה = the user), the headless Sonnet child (why not `--bare`), a failed explanation's reason + auto-retry + `נסה שוב` (and `seq`, the retry address), event-not-snapshot, hard `dir="rtl"` | `explainer.rs`, `hook.rs`'s `write_explain_request`, `hub.rs`'s drain, `ExplainerPanel.svelte`, `stores.ts`'s cap |
+| [docs/explain.md](docs/explain.md) | `/explain` (a skill in the generated plugin: the claude itself explains in simple Hebrew, four fixed parts, no English, why plain `/explain` works) and ⌘E (types it; refused with a toast on an open dialog, a draft, or no input box; reading claude's input box off the xterm buffer — U+00A0 after `❯`, dim = claude's own text). Replaced the Explainer panel on 2026-09-28 | `config.rs`'s `EXPLAIN_SKILL_MD`, `promptbox.ts`, `App.svelte`'s `explainInstance` |
 | [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion). ⌘L Load (Saves / Guides tabs, continue-the-conversation links in `~/.mulpex/save-links.tsv`). File ▸ Import Docs (Sonnet sorts a repo's `.md` into save / guide / stale / skip; Apply commits once and fixes links) | `saves.rs`, `docs_import.rs`, `save_prompts/*`, `LoadDialog`/`ImportDialog.svelte`, the save row status in `InstanceList.svelte` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
@@ -68,10 +68,6 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
-  src/explainer.rs    the Explainer: worker queue fed by the poll loop from the hooks'
-                      `explainreq/<id>`, summarizing each turn / pending dialog into three
-                      short Hebrew parts via headless `claude -p --model sonnet`; a feed
-                      of 10 per instance; emits explain-update / explain-pending
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -82,7 +78,7 @@ src/                  Svelte/Vite frontend
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
   lib/updater.ts      update check/download/apply + the cross-project busy-session count
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, ExplainerPanel, MessageReader, Rename,
+                      TerminalPane/View, MessageReader, Rename,
                       ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 docs/                 the deferred half of these notes — see the table above
@@ -104,8 +100,9 @@ is kept deliberately even though its second caller is gone (see the invariants b
 `hub_send` writes `inbox/<id>/<uuid>.json` and nothing else, so something has to be *watching* that
 directory on the instance's behalf. That something is `mulpex-helper listen` — and since
 2026-09-20 **Claude Code arms it, not the model**. Every `claude` is spawned with
-`--plugin-dir <state_dir>/plugin`, a one-purpose plugin Mulpex *generates* beside `settings.json`
-and `mcp.json`, whose `monitors/monitors.json` declares the listener. It starts at session start
+`--plugin-dir <state_dir>/plugin`, a plugin named `mulpex` that Mulpex *generates* beside
+`settings.json` and `mcp.json`, whose `monitors/monitors.json` declares the listener (it also carries
+the `/explain` skill — [docs/explain.md](docs/explain.md)). It starts at session start
 and on `--resume`, costs no turn, and does not expire.
 
 **What it replaced.** A model-armed `Monitor` is capped at 30 minutes and has no `persistent`
@@ -214,7 +211,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/⌘M/⌘⇧M/**⌘⇧E** Explainer/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘E** explain/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
@@ -422,9 +419,10 @@ new work more than any individual fix is.
   dispatcher, find its allowlist.**
 - **A default that reads as an assertion.** `status: waiting` is `mcp::status_of`'s default for a
   *missing* file — it reports ignorance in the same word it reports idleness. `ok: true` used to
-  mean the process existed, not that its task arrived. The Explainer's `ההסבר נכשל (exit 1)` was
-  the same shape from the other end: it read only the child's **stderr**, and `claude -p` prints
-  its own failure on **stdout**, so the panel showed a code with the diagnosis thrown away.
+  mean the process existed, not that its task arrived. The (since removed) Explainer's
+  `ההסבר נכשל (exit 1)` was the same shape from the other end: it read only the child's
+  **stderr**, and `claude -p` prints its own failure on **stdout**, so the panel showed a code with
+  the diagnosis thrown away.
   **Say what you know; don't round it up — and check which stream the reason is actually on.**
 - **It reproduces only in the shipped `.app`.** `tauri dev` inherits your terminal's environment, so
   the whole `PATH` / `TERM` / login-token class is invisible there. Finder gives LaunchServices'

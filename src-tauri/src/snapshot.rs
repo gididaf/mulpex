@@ -194,73 +194,6 @@ pub struct ClaudeStatus {
     pub searched_path: String,
 }
 
-/// What an Explainer entry explains: the turn's text, a pending
-/// `AskUserQuestion` (what the claude is asking right now and what each option
-/// means), or a pending `ExitPlanMode` plan (what it is proposing to do, before
-/// you approve it). All three are read out of the same transcript by
-/// `explainer::read_turn`; the panel styles each kind distinctly.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExplainKind {
-    Turn,
-    Question,
-    Plan,
-}
-
-/// A turn explanation's three fixed parts. The summarizer is required to answer
-/// exactly these three questions and nothing else, and **the panel draws the
-/// headings itself** — so the wording and the typography are the app's, not
-/// whatever Sonnet felt like writing that time, and a part it left empty is
-/// visibly empty rather than silently missing.
-///
-/// `None` on an entry means the output did not parse into three parts (or the
-/// entry is a question/plan, which have their own shapes); the panel then shows
-/// `text` as-is rather than faking a structure that isn't there.
-#[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct ExplainSections {
-    /// "על מה אנחנו עובדים" — the goal, from the user's own recent prompts.
-    pub work: String,
-    /// "מה עשיתי בסבב זה" — what this turn actually did.
-    pub did: String,
-    /// "מה אני צריך ממך" — always answered, explicitly "nothing" when nothing.
-    pub need: String,
-}
-
-/// One item of an instance's Explainer feed: the short Hebrew explanation of
-/// one turn, pending question or pending plan. Up to `explainer::MAX_ENTRIES`
-/// per instance, the oldest dropped completely. `ok: false` marks a summarizer
-/// failure — the text then says so instead of pretending (never round ignorance
-/// up to an explanation), and the panel offers a retry on it.
-#[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct ExplainEntry {
-    pub id: usize,
-    /// Unix epoch milliseconds of when the explanation was produced. A retry
-    /// that replaces a failed entry carries the retry's time, not the failure's.
-    pub ts: u64,
-    /// The summarizer's raw output. Always present; it is what the panel shows
-    /// when `sections` is `None`, and what a failure's reason lives in.
-    pub text: String,
-    /// The three parts, when this is a turn explanation that parsed.
-    pub sections: Option<ExplainSections>,
-    pub ok: bool,
-    pub kind: ExplainKind,
-    /// Process-wide unique id of this entry. It is the retry address (a failed
-    /// entry's summarizer input is stashed under it) and it is what a retry's
-    /// `explain-update` matches to *rewrite* the failed entry rather than
-    /// arrive as a new one. Stable across a retry.
-    pub seq: u64,
-}
-
-/// `explain-pending` event payload: whether the Explainer is currently working
-/// on `id` (a job queued or running). Emitted only on transitions (idle→busy,
-/// busy→idle), so the frontend just mirrors a boolean per instance.
-#[derive(Clone, Serialize)]
-pub struct ExplainPending {
-    pub handle: ProjectHandle,
-    pub id: usize,
-    pub active: bool,
-}
-
 /// `save-progress` event payload (⌘S, `saves.rs`). `state` is one of
 /// `writing` / `checking` / `fixing` (in flight), `done` (`detail` = the path
 /// written) or `error` (`detail` = the reason).
@@ -270,17 +203,6 @@ pub struct SaveProgress {
     pub id: usize,
     pub state: String,
     pub detail: Option<String>,
-}
-
-/// `explain-update` event payload: one new entry for one instance's feed.
-/// Deliberately NOT part of `HubSnapshot` — a growing feed would inflate the
-/// 200 ms PartialEq compare and re-emit its whole history on every new entry,
-/// and the worker that produced the entry already knows exactly what changed.
-#[derive(Clone, Serialize)]
-pub struct ExplainUpdate {
-    pub handle: ProjectHandle,
-    pub id: usize,
-    pub entry: ExplainEntry,
 }
 
 /// `hub-update` event payload, now scoped to the project it describes.

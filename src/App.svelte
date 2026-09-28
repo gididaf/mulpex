@@ -22,15 +22,12 @@
     saveSession,
     focusSession,
     getHubSnapshot,
-    getExplains,
     sendBytes,
     setSessionMuted,
     setMuteMenuChecked,
     type BootstrapInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
-    type ExplainUpdateEvent,
-    type ExplainPendingEvent,
     type SaveProgressEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
@@ -44,7 +41,6 @@
     sessions,
     activeId,
     showMessages,
-    showExplainer,
     showPalette,
     rename,
     addProject,
@@ -54,10 +50,6 @@
     setSessionsFor,
     setSessionMutedLocal,
     applyHubFor,
-    applyExplainFor,
-    setExplainsFor,
-    setExplainPendingFor,
-    removeExplainsFor,
     applySaveProgress,
     clearSaveState,
     displayOrder,
@@ -65,6 +57,7 @@
     dragOrder,
     claudeInAnotherProject,
     flashNotice,
+    flashToast,
     reorderProjects as reorderProjectsLocal,
     reorderSessions as reorderSessionsLocal,
   } from "./lib/stores";
@@ -81,7 +74,6 @@
   import InstanceList from "./lib/components/InstanceList.svelte";
   import HubPanel from "./lib/components/HubPanel.svelte";
   import TerminalPane from "./lib/components/TerminalPane.svelte";
-  import ExplainerPanel from "./lib/components/ExplainerPanel.svelte";
   import MessageReader from "./lib/components/MessageReader.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
@@ -105,17 +97,12 @@
       statuses: new Map(),
       watching: new Set(),
       tasks: new Map(),
-      explains: new Map(),
-      explainPending: new Set(),
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,
     });
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle);
     if (snap) applyHubFor(info.handle, snap);
-    // The Explainer feed is push-only after this; the fetch covers what the
-    // workers produced before this webview existed (dev hot-reload, mostly).
-    setExplainsFor(info.handle, await getExplains(info.handle));
     if (makeActive) selectProject(info.handle);
   }
 
@@ -570,6 +557,37 @@
   }
 
   /**
+   * ⌘E: type `/explain` + Enter into the focused claude, so it explains itself in
+   * simple Hebrew (the plugin skill, `config::EXPLAIN_SKILL_MD`). Mid-turn is
+   * fine — claude queues it. Refused with a toast when typing would land
+   * somewhere else: an open question/plan box (`needs`), or a draft in the input
+   * box (`promptbox.ts`), which the command would be glued onto.
+   *
+   * One write for the text and the Enter, like Shift+Enter's two bytes: typed
+   * into the TUI, not argv — fine for nine characters, see "A TUI is not an
+   * interface" for why nothing longer should ever go this way.
+   */
+  function explainInstance(handle: ProjectHandle, id: number) {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    if (!p || !s || s.kind === "shell" || s.exited) return;
+    if (p.statuses.get(id) === "needs") {
+      flashToast("Answer or close the open question first");
+      return;
+    }
+    const box = terminals.promptBox(handle, id);
+    if (box === "draft") {
+      flashToast("Clear the prompt first");
+      return;
+    }
+    if (box === "none") {
+      flashToast("No prompt to type into right now");
+      return;
+    }
+    sendBytes(handle, id, new TextEncoder().encode("/explain\r"));
+  }
+
+  /**
    * ⌘S: save one claude's work as a handoff doc in the repo (`saves.rs`). Asked
    * first, because it runs three Opus steps; allowed mid-turn, with a warning,
    * since the save captures whatever the conversation holds right now. The
@@ -753,13 +771,13 @@
         }
         break;
       }
+      case "explain": {
+        const cur = get(activeId);
+        if (h != null && cur != null) explainInstance(h, cur);
+        break;
+      }
       case "messages":
         showMessages.update((v) => !v);
-        break;
-      case "explainer":
-        // A plain show/hide: the feed fills itself after every turn, and
-        // hiding the column never throws anything away.
-        showExplainer.update((v) => !v);
         break;
       case "minimize":
         // Custom item (muda hard-binds the predefined one to ⌘M, which is Mute).
@@ -892,19 +910,10 @@
       listen<HubUpdateEvent>("hub-update", (e) =>
         applyHubFor(e.payload.handle, e.payload.snapshot),
       ),
-      listen<ExplainUpdateEvent>("explain-update", (e) =>
-        applyExplainFor(e.payload.handle, e.payload.id, e.payload.entry),
-      ),
-      listen<ExplainPendingEvent>("explain-pending", (e) =>
-        setExplainPendingFor(e.payload.handle, e.payload.id, e.payload.active),
-      ),
       listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
-        // The backend forgets the feed on reap; mirror it so a reused id can't
-        // resurrect a dead instance's explanations.
-        removeExplainsFor(e.payload.handle, e.payload.id);
       }),
       listen<SessionsChangedEvent>("sessions-changed", async (e) => {
         const { handle, sessions: list } = e.payload;
@@ -986,7 +995,7 @@
 <svelte:window onkeydown={onGlobalKey} />
 
 {#if ready && $project}
-  <div class="shell" class:with-explainer={$showExplainer}>
+  <div class="shell">
     <ProjectTabBar
       onselect={selectProject}
       onclose={closeProjectHandle}
@@ -1012,9 +1021,6 @@
     <main class="pane">
       <TerminalPane />
     </main>
-    {#if $showExplainer}
-      <ExplainerPanel />
-    {/if}
     <BottomBar />
   </div>
   {#if $showPalette}
@@ -1126,17 +1132,6 @@
       "side pane"
       "bottom bottom";
     height: 100%;
-  }
-  /* The Explainer is a real third column: the pane narrows, its ResizeObserver
-     refits, and every PTY workspace-wide follows (one geometry — the same class
-     of resize as dragging the window edge). */
-  .shell.with-explainer {
-    grid-template-columns: var(--sidebar-w) 1fr var(--explainer-w);
-    grid-template-areas:
-      "tabs tabs tabs"
-      "top top top"
-      "side pane explain"
-      "bottom bottom bottom";
   }
   .sidebar {
     grid-area: side;

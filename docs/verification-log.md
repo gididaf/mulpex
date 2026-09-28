@@ -2375,3 +2375,24 @@ the suite is 121 tests.
 Recorded rather than fixed: no test can be named, so any "fix" would be a guess. If it recurs,
 capture the name first — `cargo test … 2>&1 | tee` the whole output rather than grepping for a
 pattern that may not match, which is what lost it the first two times.
+
+## 2026-09-28 — the Explainer replaced by `/explain` + ⌘E
+
+Design in [explain.md](explain.md). Every Explainer entry above is history: `explainer.rs`,
+`ExplainerPanel.svelte`, ⌘⇧E and `explainreq/` were deleted.
+
+Measured:
+- **Plain `/explain` resolves to the plugin skill.** Real `claude` 2.1.283 in tmux with
+  `--plugin-dir` holding the generated plugin: autocomplete lists `/mulpex:explain (explain)`;
+  `/explain\r` sent as one write ran the skill and answered in the four Hebrew parts, with no
+  English. Also confirmed by the user inside a Mulpex dev build.
+- **A `/explain` sent mid-turn is queued** ("Press up to edit queued messages") and runs when the
+  turn ends.
+- **Input-box reading** (`promptbox.ts`): a real session recorded with `script -F` at 120x40, with
+  byte offsets marked at each state, replayed through `@xterm/headless` 5.5.0 (Mulpex's xterm
+  version). Correct at all ten checkpoints: empty (placeholder), draft, cleared, multi-line draft,
+  busy, busy with draft, busy cleared, after a turn, `AskUserQuestion` open (`none`), after the
+  dialog. The first run read `none` everywhere: the character after `❯` is U+00A0, not a space.
+
+Not measured: the next-prompt suggestion through the replay (seen dim, SGR 2, in `tmux capture-pane
+-e` only). ⌘E was QA'd by the user in a dev build, not driven by me.

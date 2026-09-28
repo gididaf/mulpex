@@ -194,7 +194,7 @@ The fix is that `Stop` is the only hook that can see the truth, so it records it
   the plan-approval dialog itself, ~6 s after `PreToolUse[ExitPlanMode]` (measured 2026-09-01).
   That dialog's red is already written by `hook plan`, so all the notification has to do is not
   undo it, which is the `needs`-preserving guard above. Both notification kinds now take the same
-  branch. → [explainer.md](explainer.md)
+  branch.
 - **`session_crons` is deliberately not counted.** A scheduled future run is not work in flight;
   between firings the instance really is idle and a prompt really is what it wants.
 - A task entry with **no** `status` counts as running. The failure that matters is calling a busy
@@ -621,7 +621,7 @@ restores `--resume <uuid>`, and `persist_sessions` writes `Session::session_id` 
 for*, at every step. Nothing ever compared it to what Claude Code did.
 
 The fix moves the answer onto the declared contract. Every hook payload carries `transcript_path`
-(the Explainer has relied on it since 2026-08-30), so `hook::write_session_uuid` writes its file
+(measured on `Stop` 2026-08-30), so `hook::write_session_uuid` writes its file
 stem to `sessionid/<id>` from **`SessionStart` and `Stop`**, and `Core::reconcile_session_ids`
 (poll loop, next to `refresh_worked`) adopts it into `Session::session_id` and re-persists.
 `SessionStart` alone is not enough — it fires at launch, and the divergence observed happened

@@ -62,23 +62,6 @@ pub fn named_flag_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(NAMED_DIR).join(id.to_string())
 }
 
-/// Where a hook hands a turn to the Explainer: one file per instance under
-/// `<state_dir>/explainreq/`. Line 1 is the session's transcript path (from the
-/// payload's `transcript_path` — measured present on `Stop`, 2026-08-30, and a
-/// common field of every hook event per Claude Code's hook contract); an optional
-/// line 2 is a marker: `dialog` says the writer was `askq`/`plan`, so the reader
-/// should wait for the pending `AskUserQuestion`/`ExitPlanMode` entry to land in
-/// that transcript before summarizing; `final` says the writer was `Stop` and
-/// **everything after that line** is the payload's `last_assistant_message` — the
-/// text the turn ended on, which the reader waits for in the transcript (it lands
-/// a beat after `Stop` fires) and falls back to appending. Written by the helper
-/// (`Stop`, `askq`, `plan`), consumed-and-deleted by the app's poll loop
-/// (`Core::take_explain_requests`); overwriting between polls is the latest-wins
-/// coalescing.
-pub fn explain_request_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
-    state_dir.join(EXPLAINREQ_DIR).join(id.to_string())
-}
-
 /// A spawned child's task-delivery verdict: `<state_dir>/spawning/<id>`, holding
 /// `pending` (created, not started yet), `failed` (never began a turn) or
 /// `partial` (began a turn, but on text that is not what Mulpex sent). Absent
@@ -196,9 +179,6 @@ pub const PIDS_DIR: &str = "pids";
 /// `listeners/<id>` = the pid of the hub listener currently serving that
 /// instance, so a second one stands down instead of doubling every wake-up.
 pub const LISTENERS_DIR: &str = "listeners";
-/// `explainreq/<id>` = a turn (or a pending dialog) the hooks handed to the
-/// Explainer. See `explain_request_path`.
-pub const EXPLAINREQ_DIR: &str = "explainreq";
 /// `watching/<id>` = that instance ended its turn holding a **watcher** — its
 /// hub listener, an agentalk poll loop, anything in `watchers.txt`.
 ///
@@ -245,17 +225,17 @@ pub fn session_id_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
 /// (v2.1.271, 2026-09-14; the schema still advertises `maximum: 3600000` and
 /// silently clamps to `1800000`, measured 2026-09-19). So every instance is woken
 /// twice an hour by an expiry it can do nothing about, re-arms, and stops. That
-/// wake is a real turn: it flips the sidebar dot to `working` and it ends in a
-/// `Stop`, which hands the turn to the Explainer — a Sonnet call and a Hebrew
-/// paragraph explaining that a watchdog was restarted. Five instances is ~480 of
-/// those a day, and not one of them says anything.
+/// wake is a real turn: it flips the sidebar dot to `working` for a few seconds.
+/// Five instances is ~480 of those a day, and not one of them means anything.
+/// (It also used to hand each one to the Explainer, a Sonnet call apiece; the
+/// Explainer is gone — `/explain` replaced it — and the dot is what is left.)
 ///
 /// The expiry is Anthropic's; the *noise* was ours. This marker is what makes a
 /// re-arm-only turn silent: written when a `<task-notification>` turn starts,
-/// **cleared by the first tool call that is not the re-arm**, and read at `Stop`.
-/// Surviving to `Stop` is therefore proof the turn did nothing else, which is the
-/// only honest basis for hiding it — a wake that reads its inbox and acts on mail
-/// clears the marker on that very first call and is explained as normal.
+/// **cleared by the first tool call that is not the re-arm**, and cleared at
+/// `Stop`. While it stands, `posttooluse` leaves the dot alone for the re-arm —
+/// a wake that reads its inbox and acts on mail clears the marker on that very
+/// first call and shows as normal.
 pub const QUIETTURN_DIR: &str = "quietturn";
 
 /// `quietturn/<id>` for one instance.
