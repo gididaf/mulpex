@@ -780,6 +780,8 @@ const WATCHERS_TEMPLATE: &str = "\
 #   /tmp/agentalk-session-        agentalk's poll loop
 #   /tmp/agentalk-events-         agentalk's events tail
 #   agentalk-loop.sh              agentalk's loop script
+#   (a published claude.ai Artifact's live-updates watch — matched by Claude
+#    Code's own label, since it has no command)
 #
 # Your own, one per line:
 ";
@@ -819,9 +821,42 @@ pub fn command_is_watcher(command: &str, user_patterns: &[String]) -> bool {
 /// Is this `background_tasks` entry a watcher? A `subagent` entry carries no
 /// `command` at all, so it can never be mistaken for one.
 fn is_watcher(task: &serde_json::Value, user_patterns: &[String]) -> bool {
-    task.get("command")
-        .and_then(|v| v.as_str())
-        .is_some_and(|c| command_is_watcher(c, user_patterns))
+    is_artifact_watch(task)
+        || task
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| command_is_watcher(c, user_patterns))
+}
+
+/// The description Claude Code gives the live-updates monitor it arms on a
+/// published claude.ai Artifact. Measured verbatim off `monorepo#4`'s `Stop`
+/// payload, 2026-09-28:
+///
+/// ```text
+/// {"id":"svihg37wu","type":"monitor","status":"running",
+///  "description":"live updates for artifact https://claude.ai/artifact/DHgi…Vt (auto-armed on publish)"}
+/// {"id":"szykhb2s4","type":"monitor","status":"running",
+///  "description":"live updates for artifact https://claude.ai/artifact/PBUy…p3 (watch requested)"}
+/// ```
+const ARTIFACT_WATCH_PREFIX: &str = "live updates for artifact ";
+
+/// Is this the watch Claude Code keeps on a published Artifact? It never ends
+/// by itself, so left counted it pinned the row on `working` until the user
+/// cancelled it by hand.
+///
+/// This is the one watcher matched on `description`, which the command rule
+/// otherwise forbids — because here **Claude Code writes it, not the model**,
+/// and the entry has **no `command`** to match. Requiring both `type: monitor`
+/// and a missing `command` keeps a model-armed `Monitor` (which always has a
+/// command and a free-text description) from ever qualifying. The URL and the
+/// trailing reason vary, so only the prefix is matched.
+fn is_artifact_watch(task: &serde_json::Value) -> bool {
+    task.get("type").and_then(|v| v.as_str()) == Some("monitor")
+        && task.get("command").is_none()
+        && task
+            .get("description")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| d.starts_with(ARTIFACT_WATCH_PREFIX))
 }
 
 /// The ids of every hub listener this payload reports as running.
@@ -2303,6 +2338,51 @@ mod tests {
             background_work_running(&ctx, Some(&building_agentalk), NO_WATCHERS),
             "a build inside the agentalk repo is real work, not a watcher"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A published Artifact leaves a live-updates monitor running that never
+    /// ends by itself; counted as work, the row stayed yellow until the user
+    /// cancelled the watch. The payload is `monorepo#4`'s real `Stop`, verbatim.
+    #[test]
+    fn an_artifact_watch_is_a_watcher() {
+        let dir = std::env::temp_dir().join(format!("mulpex-artifact-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let ctx = test_ctx(&dir, 4);
+
+        let artifact = |id: &str, desc: &str| {
+            serde_json::json!({"id": id, "type": "monitor", "status": "running", "description": desc})
+        };
+        let published = stop_with(vec![
+            shell_task(
+                "b5ofok1gd",
+                "Mulpex hub inbox listener",
+                r#""/Applications/Mulpex.app/Contents/MacOS/mulpex-helper" listen"#,
+            ),
+            artifact(
+                "svihg37wu",
+                "live updates for artifact https://claude.ai/artifact/DHgi3jKxqzMxb8To5vjeVT (auto-armed on publish)",
+            ),
+            artifact(
+                "szykhb2s4",
+                "live updates for artifact https://claude.ai/artifact/PBUyUJLrbM8cE9iKTtwE3p (watch requested)",
+            ),
+        ]);
+        assert!(
+            !background_work_running(&ctx, Some(&published), NO_WATCHERS),
+            "an instance idle after publishing an artifact is waiting, not working"
+        );
+        assert!(watcher_running(Some(&published), NO_WATCHERS), "but not safe to restart");
+
+        // A model-armed Monitor always carries a command, so borrowing the
+        // wording cannot exempt real work.
+        let lookalike = stop_with(vec![serde_json::json!({
+            "id": "m1", "type": "monitor", "status": "running",
+            "description": "live updates for artifact build",
+            "command": "npm run build -- --watch",
+        })]);
+        assert!(background_work_running(&ctx, Some(&lookalike), NO_WATCHERS));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

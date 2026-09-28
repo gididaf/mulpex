@@ -317,6 +317,18 @@ adds:
   only `command_is_hub_listener`. Widening those would have Mulpex offering to replace agentalk's
   poll loop.
 
+#### The third watcher: a published Artifact's live-updates monitor
+
+Publishing a claude.ai Artifact makes Claude Code arm a watch on it that never ends by itself, and
+`monorepo#4` sat on yellow until the user cancelled it by hand (2026-09-28). Captured off its real
+`Stop` payload, the entry has **no `command`** —
+`{"type":"monitor","status":"running","description":"live updates for artifact <url> (auto-armed on publish)"}`
+(or `(watch requested)`). So `is_artifact_watch` is the one watcher matched on `description`:
+allowed only because Claude Code, not the model, writes it; gated on `type: monitor` **and** a
+missing `command`, so a model-armed `Monitor` (always has a command) can never borrow the wording.
+Prefix only — the URL and the reason vary. Pinned by `an_artifact_watch_is_a_watcher`; replayed
+through the real helper: shipped → `working`, fixed → `waiting` + `watching`.
+
 #### `watching/<id>`: idle to the sidebar, busy to the updater
 
 Going green cost the updater's busy guard, which reads the status word — and a watcher *is* a
