@@ -33,7 +33,12 @@
 /// `<helper> hook pretooluse`, a per-file semaphore that waits then proceeds
 /// (never a hard deny). `Stop` runs `<helper> hook stop` to release per-turn
 /// locks + write `waiting`. See `hook.rs`.
+///
+/// **Context %** — `statusLine` runs `<helper> statusline`, which saves Claude
+/// Code's own `context_window.used_percentage` for the sidebar and then runs the
+/// person's own statusline, since this one replaces it. See `statusline.rs`.
 pub const HOOK_SETTINGS_JSON: &str = r#"{
+  "statusLine": { "type": "command", "command": "\"__MULPEX_BIN__\" statusline", "padding": 0 },
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "\"__MULPEX_BIN__\" hook userpromptsubmit" } ] }

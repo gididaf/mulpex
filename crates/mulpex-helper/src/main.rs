@@ -20,9 +20,12 @@ fn main() -> anyhow::Result<()> {
         // the `Monitor` tool — see `listen.rs` for why the loop is here rather
         // than in the prompt that asks for it.
         Some("listen") => mulpex_core::listen::run(&args[2..]),
+        // The `statusLine` command from `settings.json`: saves the context-window
+        // % for the sidebar, then runs the person's own statusline.
+        Some("statusline") => mulpex_core::statusline::run(&args[2..]),
         other => {
             eprintln!(
-                "mulpex-helper: expected `hook <event>`, `mcp` or `listen`, got {:?}",
+                "mulpex-helper: expected `hook <event>`, `mcp`, `listen` or `statusline`, got {:?}",
                 other
             );
             std::process::exit(2);

@@ -31,6 +31,8 @@ export interface ProjectState {
    *  `StatusEntry.watching`. Read only by `updater.ts`'s busy guard: these rows
    *  are idle (`waiting`) and must look it. */
   watching: Set<number>;
+  /** id → context window used, whole percent. Claudes that have replied only. */
+  ctx: Map<number, number>;
   tasks: Map<number, string>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
@@ -202,6 +204,8 @@ export const statuses = derived(
   activeProject,
   (p) => p?.statuses ?? new Map<number, Status>(),
 );
+/** id → context window used (whole %), active project. */
+export const ctx = derived(activeProject, (p) => p?.ctx ?? new Map<number, number>());
 /** id → current task line, active project. */
 export const tasks = derived(
   activeProject,
@@ -343,6 +347,9 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
     hub: snap,
     statuses: new Map(snap.statuses.map((e) => [e.id, e.status])),
     watching: new Set(snap.statuses.filter((e) => e.watching).map((e) => e.id)),
+    ctx: new Map(
+      snap.statuses.filter((e) => e.ctx_pct != null).map((e) => [e.id, e.ctx_pct!]),
+    ),
     tasks: new Map(snap.tasks.map((e) => [e.id, e.task])),
   });
 }

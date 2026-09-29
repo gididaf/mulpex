@@ -96,6 +96,7 @@
       sessions: info.sessions,
       statuses: new Map(),
       watching: new Set(),
+      ctx: new Map(),
       tasks: new Map(),
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,

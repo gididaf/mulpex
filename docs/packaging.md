@@ -7,7 +7,11 @@ Back to [CLAUDE.md](../CLAUDE.md).
 
 ## Bundling the helper (signed sidecar)
 
-The dev flow needs nothing (helper sits beside the app in `target/`). For `tauri build`,
+**The dev flow stages the sidecar too.** `externalBin` applies in `tauri dev` as well: building the
+app copies `src-tauri/binaries/mulpex-helper-<triple>` over `target/debug/mulpex-helper`, so a
+freshly built debug helper is overwritten by whatever the last release build staged. Until
+2026-09-29 `beforeDevCommand` ran only `cargo build -p mulpex-helper`, and a dev build silently ran
+a day-old helper that lacked the new `statusline` subcommand. It now runs `bundle-helper.sh`. For `tauri build`,
 `mulpex-helper` ships as a **signed sidecar** so it lands in `Contents/MacOS/` *and is signed with
 the bundle* — otherwise Gatekeeper SIGKILLs it and **every hook fails-open silently** (no
 coordination, no error). This is **wired**: `bundle.externalBin` is `["binaries/mulpex-helper"]`

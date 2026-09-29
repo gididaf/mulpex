@@ -37,6 +37,9 @@ export interface StatusEntry {
    *  `status` says `waiting`. Only the updater's busy guard reads it — a restart
    *  would kill the claude and drop whatever the watcher is attached to. */
   watching: boolean;
+  /** Context window used, whole percent (Claude Code's own number, via the
+   *  statusline). Null until the first reply. */
+  ctx_pct: number | null;
 }
 export interface TaskEntry {
   id: number;

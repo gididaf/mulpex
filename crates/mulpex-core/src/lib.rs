@@ -20,6 +20,7 @@ pub mod registry;
 pub mod remote;
 pub mod rules;
 pub mod state_dir;
+pub mod statusline;
 pub mod termlog;
 
 /// Mulpex's persistent home: recents/open-project lists and the per-project
@@ -189,6 +190,16 @@ pub const LISTENERS_DIR: &str = "listeners";
 /// agentalk channel — so the updater's busy guard must keep counting it.
 /// Written by `hook::stop`, read by `state::hub_snapshot`.
 pub const WATCHING_DIR: &str = "watching";
+
+/// `ctx/<id>` = how full that instance's context window is, in percent, as
+/// Claude Code itself reports it to a statusline command
+/// (`context_window.used_percentage`). Written by `statusline::run`.
+pub const CTX_DIR: &str = "ctx";
+
+/// `ctx/<id>` for one instance.
+pub fn ctx_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(CTX_DIR).join(id.to_string())
+}
 
 /// `watching/<id>` for one instance.
 pub fn watching_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {

@@ -2,6 +2,7 @@
   import {
     sessions,
     statuses,
+    ctx,
     tasks,
     activeId,
     hub,
@@ -54,6 +55,13 @@
     waiting: "ready",
     needs: "needs you",
   };
+
+  // Context window used: gray, then yellow at 50%, red at 75%. A muted row
+  // stays gray — mute drops every attention signal.
+  function ctxLevel(pct: number, muted: boolean): string {
+    if (muted) return "";
+    return pct >= 75 ? "crit" : pct >= 50 ? "warn" : "";
+  }
 
   function statusOf(id: number): Status {
     return $statuses.get(id) ?? "waiting";
@@ -170,6 +178,7 @@
          "this one died". The mute toggle is a sibling of the select button, not
          nested inside it (a button inside a button is invalid HTML). -->
     {@const shell = s.kind === "shell"}
+    {@const pct = shell || s.failed ? undefined : $ctx.get(s.id)}
     <div
       class="row"
       role="presentation"
@@ -222,10 +231,18 @@
             <span class="st">{LABEL[st]}</span>
           {/if}
         </div>
-        {#if s.name}
-          <div class="name">{s.name}</div>
-        {:else if !shell && $tasks.get(s.id)}
-          <div class="task">{$tasks.get(s.id)}</div>
+        {#if s.name || (!shell && $tasks.get(s.id)) || pct != null}
+          <!-- Name/task on the left, context % under the status word. -->
+          <div class="sub">
+            {#if s.name}
+              <div class="name">{s.name}</div>
+            {:else if !shell && $tasks.get(s.id)}
+              <div class="task">{$tasks.get(s.id)}</div>
+            {/if}
+            {#if pct != null}
+              <span class="ctx {ctxLevel(pct, s.muted)}" title="context window used">{pct}%</span>
+            {/if}
+          </div>
         {/if}
       </button>
       <!-- Mute is meaningless for a terminal: it produces none of the signals
@@ -431,6 +448,30 @@
   }
   .save-btn:hover {
     background: var(--border);
+  }
+  .sub {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.4rem;
+  }
+  .sub > .name,
+  .sub > .task {
+    flex: 1;
+    min-width: 0;
+  }
+  .ctx {
+    margin-left: auto;
+    margin-top: 3px;
+    flex: none;
+    color: var(--text-faint);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .ctx.warn {
+    color: var(--dot-working);
+  }
+  .ctx.crit {
+    color: var(--dot-needs);
   }
   .task {
     margin-top: 2px;

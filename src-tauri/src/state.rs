@@ -1414,6 +1414,9 @@ impl Core {
         // the flag, skips the arm nudge for good, and the resumed instance is
         // never woken by hub mail again — with nothing anywhere to say so.
         let _ = std::fs::remove_file(self.state_dir.join("armed").join(id.to_string()));
+        // The context % belongs to the old process; the new one reports its own
+        // on its first statusline draw.
+        let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         // ...and because it was cleared, the resumed child has to re-arm — which,
         // with no task on its command line, only happens if it takes a turn. The
         // one thing that makes it take one is the "orphaned background task" wake
@@ -1657,6 +1660,7 @@ impl Core {
         // The transcript this id was writing to. Left behind, a recycled number
         // would adopt the dead instance's conversation on its first tick.
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         crate::pty::clear_delivery(&self.state_dir, id);
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
@@ -1904,10 +1908,15 @@ impl Core {
                 // only thing that can tell the updater not to restart the app out
                 // from under a live agentalk channel.
                 let watching = mulpex_core::watching_path(&self.state_dir, s.id).exists();
+                let ctx_pct = std::fs::read_to_string(mulpex_core::ctx_path(&self.state_dir, s.id))
+                    .ok()
+                    .and_then(|t| t.trim().parse::<f64>().ok())
+                    .map(|p| p.round().clamp(0.0, 100.0) as u8);
                 StatusEntry {
                     id: s.id,
                     status,
                     watching,
+                    ctx_pct,
                 }
             })
             .collect();

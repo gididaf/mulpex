@@ -150,6 +150,10 @@ pub struct StatusEntry {
     /// watcher is attached to, which is the updater's business and nobody
     /// else's. → `mulpex_core::WATCHING_DIR`.
     pub watching: bool,
+    /// How full the context window is, whole percent, as Claude Code reports
+    /// it to the statusline (`mulpex_core::CTX_DIR`). `None` until the first
+    /// reply. Rounded so the snapshot only changes when the number shown does.
+    pub ctx_pct: Option<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
