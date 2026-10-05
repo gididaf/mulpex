@@ -195,8 +195,13 @@ Two halves close it, and both are needed:
 
 - **`listen.rs` exits by itself** when `$MULPEX_STATE_DIR` disappears (app quit removes the whole
   scratch root; project close removes the project's) or when the `claude` in `pids/<id>` — written
-  by `pty.rs` right after spawn — is gone. It also takes a `listeners/<id>` pid lock, so a second
-  listener for the same instance stands down instead of doubling every wake-up.
+  by `pty.rs` right after spawn — is gone. The owner pid is **pinned at start**, and `pids/<id>`
+  naming a *different* `claude` also counts as gone: re-reading the file each tick let an old
+  listener adopt a restarted instance's new pid as its own (monorepo#4, 2026-10-05). It also takes a
+  `listeners/<id>` pid lock; a second listener **waits silently** behind it and takes over within a
+  second when it dies. It used to print `standing down` and exit, which for the plugin monitor is
+  permanent (Claude Code never restarts one) — so when the incumbent later died (reaped orphan, or a
+  30-minute model-armed Monitor expiring) the instance went deaf with nothing to say so.
 - **`pty::reap_orphaned_listeners`** SIGKILLs the ones that predate that, at launch (next to
   `sweep_stale_state_roots`) and at teardown. It keys on **`ppid == 1` plus the listener mark**,
   *not* on a dead scratch root: a legacy listener's argv spells its state dir as the literal
