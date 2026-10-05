@@ -19,6 +19,7 @@ pub mod persist;
 pub mod registry;
 pub mod remote;
 pub mod rules;
+pub mod secrets;
 pub mod state_dir;
 pub mod statusline;
 pub mod termlog;

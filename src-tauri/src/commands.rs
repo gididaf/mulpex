@@ -320,6 +320,104 @@ pub fn save_session(
     crate::saves::start(app, project_handle, id, dir, uuid)
 }
 
+/// ⌘K: write a one-off secrets file for claude#`id` and return its path. The
+/// frontend types the reference line itself (`App.svelte::sendSecretsRef`).
+#[tauri::command]
+pub fn secrets_create_ephemeral(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    rows: Vec<crate::secrets::SecretRow>,
+) -> Result<String, String> {
+    let (state_dir, _) = secrets_target(&state, project_handle, id)?;
+    crate::secrets::create_ephemeral(&state_dir, id, &rows).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// The scratch dir and project dir behind claude#`id`, refusing a terminal.
+fn secrets_target(
+    state: &State<AppState>,
+    h: ProjectHandle,
+    id: usize,
+) -> Result<(std::path::PathBuf, String), String> {
+    let ws = state.ws.lock().unwrap();
+    let core = ws.project(h).ok_or("no such project")?;
+    let s = core.sessions.iter().find(|s| s.id == id).ok_or(format!("claude#{id} is not open"))?;
+    if s.is_shell() {
+        return Err(format!("term#{id} is a terminal — secrets go to a claude"));
+    }
+    Ok((core.state_dir.clone(), core.project_dir.to_string_lossy().into_owned()))
+}
+
+/// ⌘K: the saved sets usable in this project — names and keys, never values.
+#[tauri::command]
+pub fn secrets_list(state: State<AppState>, project_handle: ProjectHandle) -> Vec<crate::secrets::SavedSet> {
+    match project_dir(&state, project_handle) {
+        Ok(dir) => crate::secrets::list_saved(&mulpex_core::mulpex_home(), &dir.to_string_lossy()),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// ⌘K with "Save for reuse": save a new set and, if `send`, hand it to
+/// claude#`id`. `project_only` limits it to this project. Returns the keys, for
+/// the tag.
+#[tauri::command]
+pub fn secrets_save(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    name: String,
+    project_only: bool,
+    rows: Vec<crate::secrets::SecretRow>,
+    send: bool,
+) -> Result<Vec<String>, String> {
+    let (state_dir, project) = secrets_target(&state, project_handle, id)?;
+    let home = mulpex_core::mulpex_home();
+    let tag = project_only.then_some(project.as_str());
+    crate::secrets::save(&home, &name, tag, &rows)?;
+    if !send {
+        return Ok(Vec::new());
+    }
+    crate::secrets::attach(&home, &project, &state_dir, id, name.trim())
+}
+
+/// ⌘K ✎: a saved set's rows, values included, for the edit form.
+#[tauri::command]
+pub fn secrets_get(name: String) -> Result<crate::secrets::SavedDetail, String> {
+    crate::secrets::get_saved(&mulpex_core::mulpex_home(), &name)
+}
+
+/// ⌘K ✎ Save: replace a saved set's rows; `project_only` re-tags it to this project.
+#[tauri::command]
+pub fn secrets_update(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    name: String,
+    project_only: bool,
+    rows: Vec<crate::secrets::SecretRow>,
+) -> Result<(), String> {
+    let project = project_dir(&state, project_handle)?.to_string_lossy().into_owned();
+    let tag = project_only.then_some(project.as_str());
+    crate::secrets::update(&mulpex_core::mulpex_home(), &name, tag, &rows)
+}
+
+/// ⌘K 🗑: delete a saved set.
+#[tauri::command]
+pub fn secrets_delete(name: String) -> Result<(), String> {
+    crate::secrets::delete(&mulpex_core::mulpex_home(), &name)
+}
+
+/// ⌘K: hand saved set `name` to claude#`id`. Returns its keys, for the tag.
+#[tauri::command]
+pub fn secrets_attach(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    name: String,
+) -> Result<Vec<String>, String> {
+    let (state_dir, project) = secrets_target(&state, project_handle, id)?;
+    crate::secrets::attach(&mulpex_core::mulpex_home(), &project, &state_dir, id, &name)
+}
+
 fn project_dir(state: &State<AppState>, h: ProjectHandle) -> Result<std::path::PathBuf, String> {
     let ws = state.ws.lock().unwrap();
     Ok(ws.project(h).ok_or("no such project")?.project_dir.clone())

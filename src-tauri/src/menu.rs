@@ -166,6 +166,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let explain = MenuItemBuilder::with_id("explain", "Explain")
         .accelerator("Cmd+E")
         .build(app)?;
+    // Hands the focused claude a 0600 .env and types its path (`secrets.rs`).
+    let secrets = MenuItemBuilder::with_id("secrets", "Secrets…")
+        .accelerator("Cmd+K")
+        .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
         .build(app)?;
@@ -192,6 +196,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&mute)
         .item(&messages)
         .item(&explain)
+        .item(&secrets)
         .separator()
         .item(&next)
         .item(&prev)

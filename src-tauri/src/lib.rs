@@ -9,6 +9,7 @@ mod project;
 mod pty;
 mod docs_import;
 mod saves;
+mod secrets;
 mod snapshot;
 mod state;
 mod vtgrid;
@@ -52,6 +53,7 @@ fn is_forwarded(id: &str) -> bool {
             | "mute"
             | "messages"
             | "explain"
+            | "secrets"
             | "minimize"
             | "next"
             | "prev"
@@ -110,6 +112,13 @@ pub fn run() {
             commands::list_saves,
             commands::delete_save,
             commands::load_save,
+            commands::secrets_create_ephemeral,
+            commands::secrets_list,
+            commands::secrets_save,
+            commands::secrets_attach,
+            commands::secrets_get,
+            commands::secrets_update,
+            commands::secrets_delete,
             commands::list_guides,
             commands::delete_guide,
             commands::load_guide,

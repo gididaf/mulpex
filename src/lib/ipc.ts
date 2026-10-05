@@ -204,6 +204,57 @@ export const sendBytes = (
   data: Uint8Array,
 ) => invoke<void>("send_bytes", { projectHandle, id, data });
 
+export interface SecretRow {
+  key: string;
+  value: string;
+}
+
+/** ⌘K: write a one-off 0600 secrets file for claude#id; resolves to its path. */
+export const secretsCreateEphemeral = (
+  projectHandle: ProjectHandle,
+  id: number,
+  rows: SecretRow[],
+) => invoke<string>("secrets_create_ephemeral", { projectHandle, id, rows });
+
+/** A saved set as listed: never its values. */
+export interface SavedSet {
+  name: string;
+  keys: string[];
+  project_only: boolean;
+}
+
+/** Saved sets usable in this project (untagged ones + this project's). */
+export const secretsList = (projectHandle: ProjectHandle) =>
+  invoke<SavedSet[]>("secrets_list", { projectHandle });
+
+/** Save a new set and, if `send`, hand it to claude#id; resolves to its keys. */
+export const secretsSave = (
+  projectHandle: ProjectHandle,
+  id: number,
+  name: string,
+  projectOnly: boolean,
+  rows: SecretRow[],
+  send: boolean,
+) => invoke<string[]>("secrets_save", { projectHandle, id, name, projectOnly, rows, send });
+
+/** A saved set's rows, values included — only for the edit form. */
+export const secretsGet = (name: string) =>
+  invoke<{ rows: SecretRow[]; project_only: boolean }>("secrets_get", { name });
+
+/** Replace a saved set's rows; `projectOnly` re-tags it to this project. */
+export const secretsUpdate = (
+  projectHandle: ProjectHandle,
+  name: string,
+  projectOnly: boolean,
+  rows: SecretRow[],
+) => invoke<void>("secrets_update", { projectHandle, name, projectOnly, rows });
+
+export const secretsDelete = (name: string) => invoke<void>("secrets_delete", { name });
+
+/** Hand saved set `name` to claude#id; resolves to its keys. */
+export const secretsAttach = (projectHandle: ProjectHandle, id: number, name: string) =>
+  invoke<string[]>("secrets_attach", { projectHandle, id, name });
+
 /** Bring every PTY in every open project to the center pane's geometry. One call
  *  for the whole workspace — see `resize_terminals` in commands.rs. */
 export const resizeTerminals = (cols: number, rows: number) =>

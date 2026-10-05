@@ -29,6 +29,7 @@ reasoning in `docs/`.
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explain.md](docs/explain.md) | `/explain` (a skill in the generated plugin: the claude itself explains in simple Hebrew, four fixed parts, no English, why plain `/explain` works) and ⌘E (types it; refused with a toast on an open dialog, a draft, or no input box; reading claude's input box off the xterm buffer — U+00A0 after `❯`, dim = claude's own text). Replaced the Explainer panel on 2026-09-28 | `config.rs`'s `EXPLAIN_SKILL_MD`, `promptbox.ts`, `App.svelte`'s `explainInstance` |
 | [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion). ⌘L Load (Saves / Guides tabs, continue-the-conversation links in `~/.mulpex/save-links.tsv`). File ▸ Import Docs (Sonnet sorts a repo's `.md` into save / guide / stale / skip; Apply commits once and fixes links) | `saves.rs`, `docs_import.rs`, `save_prompts/*`, `LoadDialog`/`ImportDialog.svelte`, the save row status in `InstanceList.svelte` |
+| [docs/secrets.md](docs/secrets.md) | ⌘K Secrets: KEY=VALUE rows → a 0600 `.env`; only `🔑 KEY` is typed, and the path + rules ride every turn as hidden hook context; one-off (scratch dir, gone when the claude closes) vs saved (`<mulpex home>/secrets/`, global or project-only, refs); the shared file format | `secrets.rs` (both crates), `SecretsDialog.svelte`, `commands.rs` `secrets_*`, the `userpromptsubmit` note |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
@@ -214,7 +215,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/**⌘K** secrets/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project

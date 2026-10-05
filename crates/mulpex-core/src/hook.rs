@@ -1489,6 +1489,11 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     if let Some(context) = crate::mcp::peers_context(ctx) {
         parts.push(context);
     }
+    // Information rather than a request, so like the peer snapshot it rides every
+    // turn: a hub wake may be the turn that needs the password.
+    if let Some(context) = crate::secrets::context(&ctx.state_dir, ctx.instance) {
+        parts.push(context);
+    }
     if !parts.is_empty() {
         let out = serde_json::json!({
             "hookSpecificOutput": {

@@ -78,6 +78,7 @@
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import RenameDialog from "./lib/components/RenameDialog.svelte";
   import LoadDialog from "./lib/components/LoadDialog.svelte";
+  import SecretsDialog from "./lib/components/SecretsDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
   import type { CtxItem } from "./lib/components/ContextMenu.svelte";
@@ -164,6 +165,8 @@
   let loadFor = $state<ProjectHandle | null>(null);
   /** File ▸ Import Docs…: the project whose import window is open. */
   let importFor = $state<ProjectHandle | null>(null);
+  /** ⌘K: the claude the Secrets dialog is for, or null when closed. */
+  let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
   let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
 
   /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
@@ -262,6 +265,11 @@
               label: "Save…",
               hint: key("⌘S"),
               run: () => void saveInstance(h, s.id),
+            },
+            {
+              label: "Secrets…",
+              hint: key("⌘K"),
+              run: () => openSecrets(h, s.id),
             },
           ]),
       { label: "Close", hint: key("⌘W"), danger: true, run: () => closeSession(h, s.id) },
@@ -568,6 +576,44 @@
    * into the TUI, not argv — fine for nine characters, see "A TUI is not an
    * interface" for why nothing longer should ever go this way.
    */
+  /** The prompt state that rules out typing into claude#id, as a toast; null when
+   *  typing is fine. A draft is fine here: the line is appended to it. */
+  function secretsBlocked(handle: ProjectHandle, id: number): string | null {
+    const p = get(projects).get(handle);
+    if (p?.statuses.get(id) === "needs") return "Answer or close the open question first";
+    if (terminals.promptBox(handle, id) === "none") return "No prompt to type into right now";
+    return null;
+  }
+
+  /** ⌘K: open the Secrets dialog for a claude (`secrets.rs`). Checked up front
+   *  too, so you don't type a password only to be refused at Send. */
+  function openSecrets(handle: ProjectHandle, id: number) {
+    const s = get(projects)
+      .get(handle)
+      ?.sessions.find((x) => x.id === id);
+    if (!s || s.kind === "shell" || s.exited) return;
+    const why = secretsBlocked(handle, id);
+    if (why) {
+      flashToast(why);
+      return;
+    }
+    secretsFor = { handle, id };
+  }
+
+  /** Type a `🔑 KEY` tag into claude#id's prompt, and no Enter: the user adds the
+   *  request. The path and the rules reach the claude through the hook on every
+   *  turn (`mulpex_core::secrets::context`); the tag only says which request
+   *  they're for. */
+  function sendSecretsTag(handle: ProjectHandle, id: number, keys: string[]) {
+    const why = secretsBlocked(handle, id);
+    if (why) {
+      flashToast(why);
+      return;
+    }
+    const lead = terminals.promptBox(handle, id) === "draft" ? " " : "";
+    sendBytes(handle, id, new TextEncoder().encode(`${lead}🔑 ${keys.join(", ")} `));
+  }
+
   function explainInstance(handle: ProjectHandle, id: number) {
     const p = get(projects).get(handle);
     const s = p?.sessions.find((x) => x.id === id);
@@ -770,6 +816,11 @@
           // put it back rather than leaving a tick with nothing behind it.
           syncMuteMenu(true);
         }
+        break;
+      }
+      case "secrets": {
+        const cur = get(activeId);
+        if (h != null && cur != null) openSecrets(h, cur);
         break;
       }
       case "explain": {
@@ -1071,6 +1122,22 @@
               : ""),
           bad ? 15000 : 8000,
         );
+      }}
+    />
+  {/if}
+  {#if secretsFor}
+    <SecretsDialog
+      handle={secretsFor.handle}
+      id={secretsFor.id}
+      onclose={() => {
+        secretsFor = null;
+        terminals.refocus();
+      }}
+      onsent={(keys) => {
+        const t = secretsFor;
+        secretsFor = null;
+        if (t) sendSecretsTag(t.handle, t.id, keys);
+        terminals.refocus();
       }}
     />
   {/if}

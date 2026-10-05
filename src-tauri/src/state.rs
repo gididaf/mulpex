@@ -1669,6 +1669,8 @@ impl Core {
         // A remote terminal's token and seen-markers go with it: a recycled id
         // must never inherit another terminal's identity.
         mulpex_core::remote::forget_all(&self.state_dir, id);
+        // Its one-off ⌘K secrets: they were handed to this instance only.
+        let _ = std::fs::remove_dir_all(crate::secrets::instance_dir(&self.state_dir, id));
         // Every reader's cursor into that terminal.
         let cursors = self.state_dir.join("terminals").join("cursors");
         if let Ok(entries) = std::fs::read_dir(&cursors) {
@@ -3294,6 +3296,25 @@ mod tests {
             "an instance that exited long after starting was not reaped"
         );
         assert!(core.sessions.is_empty(), "the session outlived its reap");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A ⌘K one-off secrets file belongs to the instance it was handed to, so it
+    /// must not outlive that instance's reap.
+    #[test]
+    fn reaping_an_instance_deletes_its_secrets() {
+        let (_env, root, mut core) = core_with_dead_instance("secrets-reap");
+        let rows = [crate::secrets::SecretRow { key: "PASS".into(), value: "x".into() }];
+        let file = crate::secrets::create_ephemeral(&core.state_dir, 1, &rows).unwrap();
+        core.started
+            .insert(1, Instant::now() - EARLY_DEATH_GRACE * 2);
+        assert!(
+            wait_until(|| !core.reap_dead().is_empty()),
+            "the instance was not reaped"
+        );
+        assert!(!file.exists(), "the secrets file outlived its instance");
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
