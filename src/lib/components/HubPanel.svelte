@@ -1,5 +1,15 @@
 <script lang="ts">
   import { hub, showMessages, unread } from "../stores";
+
+  // Unread messages are always listed, however old — they are what the user
+  // needs to see to nag a claude whose listener died. Read ones fill the rest of
+  // the 8 slots. Order stays newest first.
+  const FEED = 8;
+  const feed = $derived.by(() => {
+    const all = $hub?.messages ?? [];
+    let room = Math.max(0, FEED - all.filter((m) => m.unread).length);
+    return all.filter((m) => m.unread || room-- > 0);
+  });
 </script>
 
 <!-- Messages is the whole panel. Locks and Waiting used to render above it,
@@ -22,8 +32,9 @@
          (ts, from, to) is not unique: two messages on the same route inside one
          second are possible, and Svelte 5 throws on a duplicate key. -->
     {#if $hub && $hub.messages.length}
-      {#each $hub.messages.slice(0, 8) as m, i (m.ts + "-" + m.from + "-" + m.to + "-" + i)}
-        <div class="msg">
+      {#each feed as m, i (m.ts + "-" + m.from + "-" + m.to + "-" + i)}
+        <div class="msg" class:is-unread={m.unread} title={m.unread ? "not read yet" : undefined}>
+          {#if m.unread}<span class="dot"></span>{/if}
           <span class="route">{m.from}→{m.to}</span>
           <span class="snippet">{m.body.replace(/\s+/g, " ").slice(0, 60)}</span>
         </div>
@@ -83,6 +94,17 @@
   .route {
     color: var(--accent);
     flex: none;
+  }
+  .dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--dot-needs);
+    align-self: center;
+  }
+  .is-unread .snippet {
+    color: var(--text);
   }
   .empty {
     color: var(--text-faint);

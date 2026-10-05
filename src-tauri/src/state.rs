@@ -1971,6 +1971,7 @@ impl Core {
         // subtract a muted instance's mail out of the unread badges.
         let mut pending = 0usize;
         let mut pending_by_id: Vec<PendingEntry> = Vec::new();
+        let mut queued: Vec<(u64, String)> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("inbox")) {
             for entry in entries.flatten() {
                 let Some(id) = entry.file_name().to_str().and_then(|n| n.parse::<usize>().ok())
@@ -1988,9 +1989,15 @@ impl Core {
                     );
                     continue;
                 }
-                let count = std::fs::read_dir(entry.path())
-                    .map(|d| d.flatten().count())
-                    .unwrap_or(0);
+                let files: Vec<PathBuf> = std::fs::read_dir(entry.path())
+                    .map(|d| d.flatten().map(|f| f.path()).collect())
+                    .unwrap_or_default();
+                let count = files.len();
+                for f in &files {
+                    if let Some(m) = read_queued(f) {
+                        queued.push(m);
+                    }
+                }
                 pending += count;
                 if count > 0 {
                     pending_by_id.push(PendingEntry { id, count });
@@ -2027,7 +2034,8 @@ impl Core {
         }
         waiting.sort_by_key(|e| e.id);
 
-        let messages = read_messages(&self.state_dir.join("messages.log"), MSG_FEED_MAX);
+        let mut messages = read_messages(&self.state_dir.join("messages.log"), MSG_FEED_MAX);
+        mark_unread(&mut messages, queued);
 
         HubSnapshot {
             statuses,
@@ -2329,9 +2337,46 @@ fn read_messages(path: &Path, max: usize) -> Vec<MsgEntry> {
             to: to.to_string(),
             body: unescape_msg(body),
             ts,
+            unread: false,
         });
     }
     out
+}
+
+/// One queued inbox file as `(ts, body)`, the two fields it shares with its log
+/// line. `None` for a file mid-write or not ours.
+fn read_queued(path: &Path) -> Option<(u64, String)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    Some((v.get("ts")?.as_u64()?, v.get("body")?.as_str()?.to_string()))
+}
+
+/// How far apart a log line's `ts` and its inbox file's may be. `hub_send` stamps
+/// each with its own `now()`, inbox first, so they can straddle a second.
+const UNREAD_TS_SLACK: u64 = 5;
+
+/// Mark which log records are still waiting in some live inbox, so the user can
+/// see *which* message an instance is sitting on and nag it.
+///
+/// The log line and the inbox file carry no shared id, so this matches on body
+/// and a timestamp within `UNREAD_TS_SLACK`. Each inbox file accounts for one
+/// directed message; a broadcast (`to: all`) is one log line but a file per
+/// recipient, so it takes every matching file and stays unread while any
+/// recipient still holds it.
+fn mark_unread(messages: &mut [MsgEntry], mut queued: Vec<(u64, String)>) {
+    if queued.is_empty() {
+        return;
+    }
+    let near = |m: &MsgEntry, q: &(u64, String)| q.1 == m.body && q.0.abs_diff(m.ts) <= UNREAD_TS_SLACK;
+    for m in messages.iter_mut() {
+        if m.to == "all" {
+            let before = queued.len();
+            queued.retain(|q| !near(m, q));
+            m.unread = queued.len() < before;
+        } else if let Some(i) = queued.iter().position(|q| near(m, q)) {
+            queued.swap_remove(i);
+            m.unread = true;
+        }
+    }
 }
 
 fn unescape_msg(s: &str) -> String {
@@ -2566,6 +2611,36 @@ mod tests {
 
     /// The log carries addresses now, not ids, so an entry can name the project a
     /// message came from. A bare-number `from` would have nowhere to put it.
+    /// The panel marks the messages still sitting in an inbox. Same body twice
+    /// with one read must mark one; a broadcast stays unread while any recipient
+    /// holds it; a body match far off in time is a different message.
+    #[test]
+    fn unread_is_matched_by_body_and_time() {
+        let msg = |to: &str, body: &str, ts: u64| MsgEntry {
+            from: "claude#1".into(),
+            to: to.into(),
+            body: body.into(),
+            ts,
+            unread: false,
+        };
+        // Newest first, as `read_messages` returns them.
+        let mut log = vec![
+            msg("all", "ship it", 300),
+            msg("claude#4", "status?", 200),
+            msg("claude#4", "status?", 100),
+            msg("claude#5", "old", 50),
+        ];
+        let queued = vec![
+            (299, "ship it".to_string()),
+            (300, "ship it".to_string()),
+            (199, "status?".to_string()),
+            (900, "old".to_string()),
+        ];
+        mark_unread(&mut log, queued);
+        let marks: Vec<bool> = log.iter().map(|m| m.unread).collect();
+        assert_eq!(marks, vec![true, true, false, false]);
+    }
+
     #[test]
     fn the_message_log_carries_addresses_on_both_ends() {
         let dir = std::env::temp_dir().join(format!("mulpex-msglog-{}", persist::new_uuid()));

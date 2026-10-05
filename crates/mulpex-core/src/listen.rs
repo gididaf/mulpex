@@ -102,20 +102,31 @@ fn read_pid(path: &Path) -> Option<libc::pid_t> {
 /// reparented to launchd still spinning. Six such orphans were found alive on one
 /// machine, the oldest more than a day old.
 ///
+/// `owner` is the pid `pids/<id>` held when this listener started, and it is
+/// pinned on purpose. Reading the file afresh every tick is what went wrong on
+/// `monorepo#4` (2026-10-05): the instance was restarted, `pids/4` was rewritten
+/// with the *new* `claude`'s pid, and the old listener — whose `claude` was dead —
+/// read that live pid as its own owner and carried on. It held the lock, so the new
+/// plugin monitor stood down; the orphan was reaped later, and the instance sat
+/// deaf to its mail. So: the pinned pid dying is death, and so is `pids/<id>` now
+/// naming someone else — this slot belongs to a different `claude` now.
+///
 /// A missing `pids/<id>` is deliberately *not* treated as death: `mpx` does not
 /// write one, and neither did any Mulpex before this shipped.
-fn owner_is_gone(w: &Watch) -> bool {
-    match read_pid(&w.owner_pid) {
-        Some(pid) => !alive(pid),
-        None => false,
+fn owner_is_gone(w: &Watch, owner: Option<libc::pid_t>) -> bool {
+    let current = read_pid(&w.owner_pid);
+    match owner {
+        Some(pinned) => !alive(pinned) || current.is_some_and(|now| now != pinned),
+        None => current.is_some_and(|pid| !alive(pid)),
     }
 }
 
-/// Stand down if another listener is already serving this instance.
+/// Take the lock unless another live listener already serves this instance.
 ///
-/// Returns false when this process should exit. First one wins: the incumbent is
+/// Returns false while an incumbent holds it. First one wins: the incumbent is
 /// already watching the same inbox, so the newcomer would only double every
-/// wake-up — which is precisely what the user reported seeing.
+/// wake-up — which is precisely what the user reported seeing. The loser does
+/// not exit, though; see `run`.
 fn claim(w: &Watch) -> bool {
     if let Some(pid) = read_pid(&w.lock) {
         if pid != std::process::id() as libc::pid_t && alive(pid) {
@@ -133,23 +144,38 @@ pub fn run(_args: &[String]) -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&w.inbox);
     let _ = std::fs::create_dir_all(w.armed.parent().unwrap_or(&w.state_dir));
 
-    if !claim(&w) {
-        // Not an error: the instance is watched, which is all that was being
-        // asked for. Said out loud because a Monitor that ends instantly with no
-        // explanation reads as a failure.
-        println!("mulpex: a hub listener is already running for this instance — standing down");
-        return Ok(());
+    let owner = read_pid(&w.owner_pid);
+
+    // Another listener already serves this instance: wait behind it, silently,
+    // and take over the moment it dies. This used to print "standing down" and
+    // exit, and for the plugin monitor that is permanent — Claude Code never
+    // restarts one. The incumbent was then the only listener left, and whenever it
+    // went (a 30-minute model-armed Monitor expiring, an orphan being reaped) the
+    // instance stopped hearing its mail with nothing anywhere to say so. Silent,
+    // because every line printed here wakes the instance.
+    let mut prev = unread(&w.inbox);
+    while !claim(&w) {
+        if !w.state_dir.is_dir() || owner_is_gone(&w, owner) {
+            return Ok(());
+        }
+        // Tracked while waiting so a message landing in the second between the
+        // incumbent's death and the takeover is still news.
+        prev = unread(&w.inbox);
+        std::thread::sleep(TICK);
     }
 
-    let mut prev = unread(&w.inbox);
     loop {
         // Mulpex is gone (teardown removes the whole scratch root) or this
         // project was closed. Either way nobody is left to wake.
         if !w.state_dir.is_dir() {
             return Ok(());
         }
-        if owner_is_gone(&w) {
-            let _ = std::fs::remove_file(&w.lock);
+        if owner_is_gone(&w, owner) {
+            // Only our own lock: after a restart the slot may already belong to
+            // the new `claude`'s listener.
+            if read_pid(&w.lock) == Some(std::process::id() as libc::pid_t) {
+                let _ = std::fs::remove_file(&w.lock);
+            }
             return Ok(());
         }
 
@@ -221,18 +247,45 @@ mod tests {
 
         // No `pids/<id>` at all: an older Mulpex, or `mpx`. Keep running — a
         // listener that quits early is worse than one that lingers.
-        assert!(!owner_is_gone(&w), "an unknown owner is not a dead owner");
+        assert!(!owner_is_gone(&w, None), "an unknown owner is not a dead owner");
 
         // Our own pid is alive by definition.
         std::fs::write(&w.owner_pid, std::process::id().to_string()).unwrap();
-        assert!(!owner_is_gone(&w));
+        assert!(!owner_is_gone(&w, None));
 
         // pid 1 is launchd; a pid that cannot exist is gone. (`i32::MAX` is above
         // any real pid on macOS.)
         std::fs::write(&w.owner_pid, "1").unwrap();
-        assert!(!owner_is_gone(&w), "launchd is alive");
+        assert!(!owner_is_gone(&w, None), "launchd is alive");
         std::fs::write(&w.owner_pid, i32::MAX.to_string()).unwrap();
-        assert!(owner_is_gone(&w), "a pid that does not exist means the claude is gone");
+        assert!(owner_is_gone(&w, None), "a pid that does not exist means the claude is gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `monorepo#4` case: the instance restarts, `pids/<id>` is rewritten with
+    /// the new `claude`'s (live) pid, and the old listener must not adopt it as its
+    /// own owner — it would hold the lock against the new `claude`'s listener.
+    #[test]
+    fn a_restarted_instance_retires_the_old_listener() {
+        let dir = scratch("restart");
+        let w = watch(&dir);
+        let me = std::process::id() as libc::pid_t;
+
+        std::fs::write(&w.owner_pid, me.to_string()).unwrap();
+        assert!(!owner_is_gone(&w, Some(me)), "pinned owner alive, slot still ours");
+
+        // Restart: a different live `claude` now holds the slot.
+        std::fs::write(&w.owner_pid, "1").unwrap();
+        assert!(owner_is_gone(&w, Some(me)), "the slot belongs to another claude now");
+
+        // The pinned owner died, whatever the file says.
+        std::fs::write(&w.owner_pid, i32::MAX.to_string()).unwrap();
+        assert!(owner_is_gone(&w, Some(i32::MAX)));
+
+        // The file vanishing is not news (pinned owner alive).
+        std::fs::remove_file(&w.owner_pid).unwrap();
+        assert!(!owner_is_gone(&w, Some(me)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -110,6 +110,10 @@ pub struct MsgEntry {
     pub to: String,
     pub body: String,
     pub ts: u64,
+    /// Still sitting in a live recipient's inbox — not yet `hub_inbox`ed. The log
+    /// and the inbox files share no id, so this is a body + time match; see
+    /// `state.rs::mark_unread`.
+    pub unread: bool,
 }
 
 /// The live coordination state the backend poll loop emits to the frontend on

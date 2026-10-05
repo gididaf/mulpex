@@ -63,6 +63,8 @@ export interface MsgEntry {
   to: string;
   body: string;
   ts: number;
+  /** Still in a live recipient's inbox (not yet `hub_inbox`ed). */
+  unread: boolean;
 }
 export interface PendingEntry {
   id: number;
