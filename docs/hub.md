@@ -447,7 +447,10 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
   `[mulpex:hub]`-sentinel-prefixed (skips the sidebar task-capture) and a single line (task
   whitespace collapsed). The child is **auto-named** `name_from_task(task)` so the sidebar labels
   it, and is **not** focused — the user stays on their pane while children appear. Recursion is
-  inherent (children also have `hub_spawn`); only the per-call cap bounds a single call.
+  inherent (children also have `hub_spawn`); only the per-call cap bounds a single call. The
+  sidebar nests the child under its spawner (`Core::parents`, persisted) — see **Spawned claudes
+  nest under their spawner** in `frontend.md`. Closing a spawner does not close its children; they
+  move up one level.
 - **The task goes on the child's COMMAND LINE, and must never be typed into its TUI again**
   (`pty.rs`). `claude` takes an initial prompt as a positional argv argument, so `spawn_prompt`'s
   text is handed over at `exec` time: no readiness detection, no retries, no submit key, and

@@ -40,7 +40,7 @@ Traps that live in this crate specifically:
   gated on it (`nudges_welcome`) — an arm nudge injected there made the instance start the very
   Monitor whose death causes the next one. The peer snapshot is the deliberate exception: a hub
   wake *is* a task-notification. → [../../docs/hub.md](../../docs/hub.md)
-- **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>]]]`). Only
+- **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`). Only
   *trailing* empties may be dropped, or the id is read back as the name.
 - **`SessionStore::new` picks the home from the ambient `MULPEX_HOME`, so anything that is not the
   desktop app must not use it.** Leave that variable unset and the first write lands in the app's

@@ -9,12 +9,16 @@
     clampToGroup,
     dragOrder,
     saves,
+    treeDepths,
+    hiddenIds,
+    descendantsOf,
   } from "../stores";
   import type { SessionInfo, Status } from "../ipc";
 
   let {
     onselect,
     onmute,
+    oncollapse,
     onreorder,
     oncontext,
     oncontextempty,
@@ -24,6 +28,8 @@
     onselect: (id: number) => void;
     /** Toggle mute for any row, without selecting it first. */
     onmute: (id: number, muted: boolean) => void;
+    /** Fold or unfold a row's `hub_spawn` family. */
+    oncollapse: (id: number, collapsed: boolean) => void;
     /** Commit a new top-to-bottom order (session ids) after a drag. */
     onreorder: (ids: number[]) => void;
     /** Right-click on a row. Carries the row itself, not its id: the menu acts
@@ -74,6 +80,34 @@
    *  the number alone is unambiguous — the word says which kind it is. */
   const label = (s: { id: number; kind: string }) =>
     s.kind === "shell" ? `term #${s.id}` : `claude #${s.id}`;
+
+  /** How far each row is indented: a `hub_spawn` child sits one step under its
+   *  spawner, at any depth. */
+  const depths = $derived(treeDepths($sessions));
+  /** Rows folded away under a collapsed parent: not drawn at all. */
+  const hidden = $derived(hiddenIds($sessions));
+
+  /** What a parent row shows about its family: how many rows it has, and —
+   *  when folded — whether any of them is waiting on you, since that row is
+   *  out of sight. Muted rows are silent here as everywhere. */
+  function familyOf(id: number): { count: number; needs: boolean } {
+    const kids = descendantsOf($sessions, id);
+    return {
+      count: kids.length,
+      needs: kids.some((k) => !k.muted && !k.failed && $statuses.get(k.id) === "needs"),
+    };
+  }
+
+  /** Indexes that move with the dragged row: it and its whole family, which
+   *  `displayOrder` keeps right under it. */
+  function inDrag(i: number): boolean {
+    if (!dragging || dragIdx == null || i < dragIdx) return false;
+    const d0 = depths.get($sessions[dragIdx].id) ?? 0;
+    for (let j = dragIdx + 1; j <= i; j++) {
+      if ((depths.get($sessions[j].id) ?? 0) <= d0) return false;
+    }
+    return true;
+  }
 
   // ---- drag to reorder ----
   //
@@ -179,13 +213,18 @@
          nested inside it (a button inside a button is invalid HTML). -->
     {@const shell = s.kind === "shell"}
     {@const pct = shell || s.failed ? undefined : $ctx.get(s.id)}
+    {@const depth = depths.get(s.id) ?? 0}
+    {@const fam = shell ? { count: 0, needs: false } : familyOf(s.id)}
+    {#if !hidden.has(s.id)}
     <div
       class="row"
       role="presentation"
+      class:child={depth > 0}
+      style:margin-left="{depth * 0.9}rem"
       class:active={s.id === $activeId}
       class:muted={s.muted}
       class:shell
-      class:dragging={dragging && dragIdx === i}
+      class:dragging={inDrag(i)}
       class:drop-target={dragging && overIdx === i && dragIdx !== i}
       bind:this={rowEls[i]}
       oncontextmenu={(e) => {
@@ -204,6 +243,26 @@
         onclick={() => selectUnlessDragged(s.id)}
       >
         <div class="head">
+          {#if depth > 0}
+            <span class="branch" aria-hidden="true">└</span>
+          {/if}
+          {#if fam.count > 0}
+            <!-- A span, not a button: it sits inside the row's select button.
+                 Stopping pointerdown keeps it from starting a drag, stopping
+                 click from also selecting the row. -->
+            <span
+              class="fold"
+              role="button"
+              tabindex="-1"
+              title="{s.collapsed ? 'Show' : 'Hide'} the {fam.count} claude{fam.count === 1 ? '' : 's'} it spawned"
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={(e) => {
+                e.stopPropagation();
+                oncollapse(s.id, !s.collapsed);
+              }}
+              onkeydown={() => {}}
+            >{s.collapsed ? "▸" : "▾"}</span>
+          {/if}
           <!-- A terminal has no hub status to report, so it gets a $ marker
                where an instance gets its status dot. Leaving the dot out
                entirely would read as "this row is broken"; a green "ready" dot
@@ -220,6 +279,11 @@
             <span class="dot" style:background={DOT[st]}></span>
           {/if}
           <span class="id">{label(s)}</span>
+          {#if s.collapsed && fam.count > 0}
+            <span class="folded" class:needs={fam.needs} title={fam.needs ? "one of them needs you" : ""}>
+              +{fam.count}
+            </span>
+          {/if}
           {#if !shell && !s.failed && !s.muted && waitOn(s.id) != null}
             <span class="wait" title="waiting on #{waitOn(s.id)}">⏳</span>
           {/if}
@@ -274,6 +338,7 @@
         </div>
       {/if}
     </div>
+    {/if}
   {/each}
 </div>
 
@@ -297,6 +362,46 @@
   }
   .row:hover {
     background: var(--bg-elev);
+  }
+  /* A `hub_spawn` child: indented under its spawner (margin-left, set inline
+     per depth) and narrower by the same amount, so the tree reads at a glance. */
+  .row.child {
+    width: auto;
+  }
+  .fold {
+    flex: none;
+    width: 0.8rem;
+    margin-left: -0.2rem;
+    text-align: center;
+    color: var(--text-faint);
+    font-size: 0.7rem;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .fold:hover {
+    color: var(--text);
+    background: var(--border);
+  }
+  /* "+N" on a folded parent; red when a hidden row is waiting on you. */
+  .folded {
+    flex: none;
+    padding: 0 0.3rem;
+    border-radius: 8px;
+    font-size: 0.68rem;
+    color: var(--text-dim);
+    background: var(--border);
+  }
+  .folded.needs {
+    color: #fff;
+    background: var(--dot-needs);
+  }
+  .branch {
+    flex: none;
+    margin-left: -0.15rem;
+    color: var(--text-faint);
+    font-size: 0.8rem;
+    line-height: 1;
   }
   /* Claudes above, terminals below. The margins carry as much of the separation
      as the rule does — the gap is what you read first. */

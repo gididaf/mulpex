@@ -283,6 +283,14 @@ pub struct Core {
     /// only — a muted instance runs and coordinates exactly like any other; the
     /// frontend just dims it, sorts it last, and leaves it out of the badges.
     pub muted: HashSet<usize>,
+    /// child id → the instance that `hub_spawn`ed it. Only `hub_spawn` creates a
+    /// link (a ⌘T claude is always top-level), and a terminal is never a child.
+    /// The sidebar draws its tree from this; when a parent goes away its
+    /// children move up one level (`reap_dead`), so a value always names a row
+    /// that still exists.
+    pub parents: HashMap<usize, usize>,
+    /// Rows whose `hub_spawn` family is folded away in the sidebar. Persisted.
+    pub collapsed: HashSet<usize>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -403,6 +411,8 @@ impl Core {
         let mut worked: HashSet<usize> = HashSet::new();
         let mut names: HashMap<usize, String> = HashMap::new();
         let mut muted: HashSet<usize> = HashSet::new();
+        let mut parents: HashMap<usize, usize> = HashMap::new();
+        let mut collapsed: HashSet<usize> = HashSet::new();
         let mut restored: HashMap<usize, Instant> = HashMap::new();
         let mut started: HashMap<usize, Instant> = HashMap::new();
         // Records whose session could not even be spawned. Nothing will be in
@@ -458,6 +468,12 @@ impl Core {
                 if saved.muted {
                     muted.insert(id);
                 }
+                if let Some(p) = saved.parent {
+                    parents.insert(id, p);
+                }
+                if saved.collapsed {
+                    collapsed.insert(id);
+                }
                 sessions.push(session);
             } else {
                 // Keep the record AND where it sat: appending it would move that
@@ -475,6 +491,9 @@ impl Core {
         // the last session with ⌘W produces it): `active` stays 0 and indexes
         // nothing, `bootstrap_info` yields `activeSessionId: null`, the frontend
         // hides every terminal and `TerminalPane` shows its ⌘T empty state.
+        // A parent that did not come back (failed restore, hand-edited store)
+        // leaves its children top-level rather than linked to nothing.
+        parents.retain(|_, p| sessions.iter().any(|s| s.id == *p));
         // Continue past the highest number ever handed out, so a new ⌘T can never
         // collide with a restored instance (or with the gap a failed one left).
         let next_id = used.iter().copied().max().unwrap_or(0) + 1;
@@ -500,6 +519,8 @@ impl Core {
             names,
             fallback_names: HashMap::new(),
             muted,
+            parents,
+            collapsed,
             worked,
             closing: HashSet::new(),
             remote_awaiting: HashSet::new(),
@@ -545,6 +566,8 @@ impl Core {
                 id: s.id,
                 name: self.display_name(s.id),
                 muted: self.muted.contains(&s.id),
+                parent: self.parents.get(&s.id).copied(),
+                collapsed: self.collapsed.contains(&s.id),
                 kind: kind_of(s),
                 exited: s.is_shell() && !s.is_alive(),
                 failed: self.failed.get(&s.id).cloned(),
@@ -638,6 +661,23 @@ impl Core {
                 return Err(e);
             }
         };
+        // The row hangs under its spawner in the sidebar — only while that
+        // spawner is a live claude here, so a stale or odd `from` makes a
+        // top-level row rather than a link to nothing.
+        let parent = self
+            .sessions
+            .iter()
+            .any(|s| s.id == parent_id && !s.is_shell())
+            .then_some(parent_id);
+        if let Some(p) = parent {
+            self.parents.insert(info.id, p);
+        }
+        // Born into a muted family, it starts muted like the rest of it.
+        let muted = parent.is_some_and(|p| self.muted.contains(&p));
+        if muted {
+            self.muted.insert(info.id);
+        }
+        let info = SessionInfo { parent, muted, ..info };
         if let Some(name) = name {
             self.names.insert(info.id, name.clone());
             return Ok(SessionInfo {
@@ -707,6 +747,8 @@ impl Core {
             id,
             name: None,
             muted: false,
+            parent: None,
+            collapsed: false,
             kind: SessionKind::Claude,
             exited: false,
             failed: None,
@@ -755,6 +797,8 @@ impl Core {
             id,
             name,
             muted: false,
+            parent: None,
+            collapsed: false,
             kind: SessionKind::Shell,
             exited: false,
             failed: None,
@@ -1253,12 +1297,41 @@ impl Core {
         if self.sessions.iter().any(|s| s.id == id && s.is_shell()) {
             return;
         }
-        if muted {
-            self.muted.insert(id);
-        } else {
-            self.muted.remove(&id);
+        // A parent's mute carries its whole `hub_spawn` family with it, both
+        // ways. A child can still be (un)muted on its own afterwards.
+        for id in self.family_of(id) {
+            if muted {
+                self.muted.insert(id);
+            } else {
+                self.muted.remove(&id);
+            }
         }
         self.persist_sessions();
+    }
+
+    /// Fold or unfold `id`'s `hub_spawn` family in the sidebar. Presentation
+    /// only, like mute; persisted so the sidebar comes back the way it was.
+    pub fn set_collapsed(&mut self, id: usize, collapsed: bool) {
+        let changed = if collapsed {
+            self.collapsed.insert(id)
+        } else {
+            self.collapsed.remove(&id)
+        };
+        if changed {
+            self.persist_sessions();
+        }
+    }
+
+    /// `id` and every row under it in the sidebar tree.
+    fn family_of(&self, id: usize) -> Vec<usize> {
+        let mut family = vec![id];
+        let mut i = 0;
+        while i < family.len() {
+            let parent = family[i];
+            family.extend(self.parents.iter().filter(|(_, p)| **p == parent).map(|(c, _)| *c));
+            i += 1;
+        }
+        family
     }
 
     /// Unmute any instance the user has just spoken to: one `userprompt/<id>`
@@ -1537,13 +1610,29 @@ impl Core {
                     && self
                         .restored
                         .get(&session.id)
-                        .is_some_and(|t| t.elapsed() < RESTORE_GRACE);
+                        .is_some_and(|t| t.elapsed() < RESTORE_GRACE)
+                    // …and never came up. A resume that worked fires
+                    // `SessionStart` (the hook writes `sessionid/<id>`) about a
+                    // second in; one `claude` cannot open fires nothing and
+                    // exits ("No conversation found") — both measured on
+                    // v2.1.291. Without this, a restored claude the user quit
+                    // with Ctrl+C inside the grace came back at the next launch.
+                    && !mulpex_core::session_id_path(&self.state_dir, session.id).exists();
                 if lost_restore && !session.session_id.is_empty() {
+                    // Said out loud: a row the user believes closed coming back
+                    // at the next launch was reported once and never reproduced.
+                    eprintln!(
+                        "[restore] claude#{} died unasked {:?} after its restore — kept for the next launch",
+                        session.id,
+                        self.restored.get(&session.id).map(|t| t.elapsed()),
+                    );
                     let record = persist::SavedSession {
                         session_id: session.session_id.clone(),
                         name: self.names.get(&session.id).cloned(),
                         muted: self.muted.contains(&session.id),
                         id: Some(session.id),
+                        parent: self.parents.get(&session.id).copied(),
+                        collapsed: self.collapsed.contains(&session.id),
                     };
                     if !self
                         .sticky
@@ -1577,6 +1666,27 @@ impl Core {
         self.fallback_names
             .retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.muted.retain(|id| self.sessions.iter().any(|s| s.id == *id));
+        // A removed parent's children move up one level, to its own parent or
+        // to the top. Order-independent: a removed child of a removed parent
+        // hands its children up first or second, and both end at the nearest
+        // live ancestor.
+        for gone in &removed {
+            let up = self.parents.remove(gone);
+            let kids: Vec<usize> = self
+                .parents
+                .iter()
+                .filter(|(_, p)| **p == *gone)
+                .map(|(c, _)| *c)
+                .collect();
+            for kid in kids {
+                match up {
+                    Some(up) => self.parents.insert(kid, up),
+                    None => self.parents.remove(&kid),
+                };
+            }
+        }
+        self.parents.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
+        self.collapsed.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.failed.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
@@ -2116,6 +2226,8 @@ impl Core {
                 // The number the user knows this instance by, so the next launch
                 // brings it back as the same `claude#N`.
                 id: Some(s.id),
+                parent: self.parents.get(&s.id).copied(),
+                collapsed: self.collapsed.contains(&s.id),
             })
             .collect();
         // Records whose session is gone but must not be forgotten — a restore
@@ -3042,12 +3154,43 @@ mod tests {
         (guard, root, core)
     }
 
+    /// The sidebar tree survives a restart, and a link to a row that did not
+    /// come back is dropped rather than kept pointing at nothing.
+    #[test]
+    fn parent_links_are_restored_and_dangling_ones_dropped() {
+        let saved = [
+            persist::SavedSession { collapsed: true, ..record("root", Some(3)) },
+            persist::SavedSession { parent: Some(3), ..record("child", Some(7)) },
+            persist::SavedSession { parent: Some(7), ..record("grandchild", Some(9)) },
+            persist::SavedSession { parent: Some(42), ..record("orphan", Some(11)) },
+        ];
+        let (_env, root, mut core) = core_from_store("parents", &saved);
+        assert_eq!(core.parents.get(&7), Some(&3));
+        assert_eq!(core.parents.get(&9), Some(&7));
+        assert_eq!(core.parents.get(&11), None, "a parent that is not here was kept");
+        assert!(core.collapsed.contains(&3), "the folded family came back unfolded");
+
+        // …and it is written back the same way.
+        core.persist_sessions();
+        let back = core.store.load();
+        let parent_of = |id: usize| back.iter().find(|s| s.id == Some(id)).unwrap().parent;
+        assert_eq!(parent_of(7), Some(3));
+        assert_eq!(parent_of(9), Some(7));
+        assert_eq!(parent_of(11), None);
+        assert!(back.iter().find(|s| s.id == Some(3)).unwrap().collapsed);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn record(name: &str, id: Option<usize>) -> persist::SavedSession {
         persist::SavedSession {
             session_id: persist::new_uuid(),
             name: Some(name.into()),
             muted: false,
             id,
+            parent: None,
+            collapsed: false,
         }
     }
 
@@ -3103,6 +3246,8 @@ mod tests {
             name: Some("WC2 spells phase 2".into()),
             muted: false,
             id: Some(75),
+            parent: None,
+            collapsed: false,
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -3147,6 +3292,8 @@ mod tests {
                 name: Some("holder".into()),
                 muted: false,
                 id: Some(1),
+                parent: None,
+                collapsed: false,
             },
             record("copycat", Some(2)),
         ];
@@ -3318,6 +3465,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A restored claude that came up (its `SessionStart` reported a transcript)
+    /// and was then quit from inside — Ctrl+C, `/exit` — is not a failed restore,
+    /// however soon after launch it happened. It used to be kept as one, so the
+    /// row the user had just quit came back at the next launch.
+    #[test]
+    fn a_restore_that_came_up_and_was_quit_is_not_kept() {
+        let saved = [record("first", Some(1)), record("second", Some(2))];
+        let (_env, root, mut core) = core_from_store("quitrestore", &saved);
+        assert_eq!(core.sessions.len(), 2, "the restore did not spawn");
+        let victim_id = core.sessions[1].id;
+        let uuid = core.sessions[1].session_id.clone();
+        // What the hook writes on `SessionStart`.
+        let file = mulpex_core::session_id_path(&core.state_dir, victim_id);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, &uuid).unwrap();
+        core.started
+            .insert(victim_id, Instant::now() - EARLY_DEATH_GRACE - Duration::from_secs(1));
+        core.sessions[1].kill();
+        assert!(wait_until(|| !core.sessions[1].is_alive()), "it never died");
+        core.reap_dead();
+        assert_eq!(core.sessions.len(), 1, "the quit restore was not reaped");
+        assert!(core.sticky.is_empty(), "a restore that came up was kept as failed");
+        assert!(core.store.load().iter().all(|s| s.session_id != uuid));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Closing restored rows one by one, right after launch, must not bring
+    /// them back at the next launch.
+    #[test]
+    fn closing_every_restored_row_leaves_nothing_to_restore() {
+        let saved = [record("first", Some(1)), record("second", Some(2)), record("third", Some(3))];
+        let (_env, root, mut core) = core_from_store("closeall", &saved);
+        assert_eq!(core.sessions.len(), 3, "the restore did not spawn");
+        for id in [1, 2, 3] {
+            core.close(id);
+            assert!(wait_until(|| { core.reap_dead(); !core.sessions.iter().any(|s| s.id == id) }));
+        }
+        let left: Vec<_> = core.store.load().into_iter().map(|s| (s.id, s.name)).collect();
+        assert!(left.is_empty(), "closed rows were written back: {left:?}");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A `Core` holding one instance that spawned and then died — the shape of
     /// every failed start. Built by restoring a session id `claude` has never
     /// heard of, which is a real failure rather than a simulated one: it prints
@@ -3334,6 +3527,8 @@ mod tests {
             name: None,
             muted: false,
             id: None,
+            parent: None,
+            collapsed: false,
         }]);
         let mut core = Core::open(
             1,
@@ -3711,6 +3906,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A `hub_spawn` child is linked to its spawner — but only a live claude can
+    /// be one, so a terminal or an unknown id makes a top-level row.
+    #[test]
+    fn a_spawned_child_hangs_under_a_live_claude_only() {
+        let (_env, root, mut core) = scratch_core("parent-link");
+        let parent = core.spawn_instance().unwrap().id;
+        let term = core.spawn_terminal(None, None, false).unwrap().id;
+
+        let child = core.spawn_instance_with_task(parent, "do a thing".into()).unwrap();
+        assert_eq!(child.parent, Some(parent));
+        let by_term = core.spawn_instance_with_task(term, "do a thing".into()).unwrap();
+        assert_eq!(by_term.parent, None, "a terminal cannot be a parent");
+        let by_ghost = core.spawn_instance_with_task(999, "do a thing".into()).unwrap();
+        assert_eq!(by_ghost.parent, None, "an unknown spawner makes a root");
+
+        let infos = core.session_infos();
+        let of = |id: usize| infos.iter().find(|s| s.id == id).unwrap().parent;
+        assert_eq!(of(child.id), Some(parent));
+        assert_eq!(of(parent), None);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Muting a parent mutes its whole family and unmuting it unmutes it; a
+    /// child can still be flipped alone; a child born to a muted parent starts
+    /// muted.
+    #[test]
+    fn mute_follows_the_family() {
+        let (_env, root, mut core) = scratch_core("famute");
+        let a = core.spawn_instance().unwrap().id;
+        let b = core.spawn_instance_with_task(a, "x".into()).unwrap().id;
+        let c = core.spawn_instance_with_task(b, "x".into()).unwrap().id;
+        let other = core.spawn_instance().unwrap().id;
+
+        core.set_muted(a, true);
+        assert!([a, b, c].iter().all(|id| core.muted.contains(id)));
+        assert!(!core.muted.contains(&other));
+
+        let d = core.spawn_instance_with_task(a, "x".into()).unwrap();
+        assert!(d.muted && core.muted.contains(&d.id), "a child of a muted parent starts muted");
+
+        core.set_muted(c, false);
+        assert!(!core.muted.contains(&c) && core.muted.contains(&b), "a child flips alone");
+
+        core.set_muted(a, false);
+        assert!(core.muted.is_empty(), "unmuting the parent unmutes the family: {:?}", core.muted);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Closing a parent moves its children up one level — to the grandparent,
+    /// or to the top — never leaves them pointing at a row that is gone.
+    #[test]
+    fn closing_a_parent_moves_its_children_up_one_level() {
+        let (_env, root, mut core) = scratch_core("reparent");
+        // The link is kind-agnostic inside `reap_dead`, and terminals reap
+        // deterministically, so they stand in for claudes here.
+        let ids: Vec<usize> = (0..4)
+            .map(|_| core.spawn_terminal(None, None, false).unwrap().id)
+            .collect();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+        // a ─ b ─ c, and b ─ d
+        core.parents.insert(b, a);
+        core.parents.insert(c, b);
+        core.parents.insert(d, b);
+
+        core.close(b);
+        assert!(wait_until(|| core.reap_dead() == vec![b]));
+        assert_eq!(core.parents.get(&c), Some(&a));
+        assert_eq!(core.parents.get(&d), Some(&a));
+        assert!(!core.parents.contains_key(&b));
+
+        core.close(a);
+        assert!(wait_until(|| core.reap_dead() == vec![a]));
+        assert!(core.parents.is_empty(), "children of a root become roots: {:?}", core.parents);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `reap_dead` runs on every 200 ms tick and does real disk I/O, so it has to
     /// stay a no-op while an exited terminal is simply sitting in the list. This
     /// is what a plain `all(is_alive)` guard would get wrong — forever.
@@ -4017,6 +4294,8 @@ mod tests {
             name: Some("important work".into()),
             muted: false,
             id: None,
+            parent: None,
+            collapsed: false,
         }]);
 
         let mut core = Core::open(
@@ -4421,6 +4700,8 @@ mod tests {
             name: None,
             muted: false,
             id: None,
+            parent: None,
+            collapsed: false,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -4477,6 +4758,8 @@ mod tests {
             name: None,
             muted: false,
             id: None,
+            parent: None,
+            collapsed: false,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");

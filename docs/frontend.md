@@ -202,6 +202,32 @@ widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the it
 - Row right-clicks `stopPropagation()`, which is what keeps the container's empty-space menu from
   firing as well.
 
+## Spawned claudes nest under their spawner
+
+A claude started by `hub_spawn` is drawn **indented under the claude that spawned it** (`└`, any
+depth), keeping its real number — `claude #7` stays `claude#7` everywhere, because the number is a
+hub address. Only `hub_spawn` makes a child: ⌘T claudes are always top-level and terminals are
+never nested.
+
+- **The link is backend state.** `Core::parents` (child → spawner) is recorded in
+  `spawn_instance_with_task`, but only when the spawner is a live claude here — a terminal or an
+  unknown id makes a root. It reaches the frontend as `SessionInfo.parent`, and is saved as the
+  store's 5th column (see `docs/sessions.md`); on restore a parent that did not come back is dropped.
+  When a parent closes, `reap_dead` hands its children up one level (grandparent, or top), so a
+  link never names a row that is gone.
+- **The tree is drawn, not stored in order.** `displayOrder` lists each top-level row followed by
+  its family depth first, and sorts **every set of siblings** the way the top level is sorted — so
+  a muted child sinks to the bottom of its own siblings, taking its family along, and never leaves
+  its parent's family. A muted top-level row sinks its whole family.
+- **Mute follows the family.** `Core::set_muted` (and `setSessionMutedLocal`) mute/unmute a row and
+  every row under it; a child can still be flipped alone afterwards; a child born to a muted parent
+  starts muted.
+- **Folding** (▾/▸ on a row with children, `Core::collapsed`, saved as the store's 6th column) hides
+  the family. A folded parent shows `+N`, red when a hidden unmuted row `needs` you; ⌘[ / ⌘] skip
+  hidden rows (`stores.ts::hiddenIds`); folding away the focused row moves focus to the parent, and
+  focusing a hidden row any other way (a notification, the palette) unfolds what hides it
+  (`App.svelte::selectSession`).
+
 ## Sessions drag to reorder
 
 Sidebar rows drag vertically exactly as project tabs drag horizontally — same mechanism
@@ -238,6 +264,14 @@ list runs vertically). Terminals drag like instances: one list, one behavior.
   implementation of the reorder. It reuses `clampToGroup` + `dragOrder` for exactly the reason the
   drag does, and a clamped `to` that equals `from` is dropped rather than round-tripping an order
   that changes nothing — so the ends of a block are a silent no-op, matching ⌘⇧← / ⌘⇧→ on tabs.
+  It steps with `stepSlot`, one *sibling* at a time (see below).
+- **A row moves with its family, among its siblings only.** Since `hub_spawn` nesting, the unit a
+  drag or ⌘⇧↑/↓ moves is the row plus every row under it, and the slots it may land in are its
+  siblings' subtrees — same parent (or none) and same block (`stores.ts::siblingRanges`). A drop
+  anywhere else clamps to the nearest sibling slot: a child dropped into another family, or a
+  parent dropped between its own children, would snap back the moment `displayOrder` re-applied
+  the tree. Siblings are always one contiguous run of subtrees in display order, which is what lets
+  `dragOrder` reorder whole ranges and still emit an order `displayOrder` leaves unchanged.
   Like those, the keys are declared in the menu *and* claimed in `onGlobalKey`, because with the
   terminal focused ⌘⇧↑/↓ is AppKit's `moveUp/DownAndModifySelection:` on xterm's helper textarea
   and never reaches the menu (see **Keyboard** in `../CLAUDE.md`).

@@ -18,6 +18,11 @@ export interface SessionInfo {
   /** Muted (⌘M): dimmed, sorted last, and left out of every attention badge.
    *  Purely presentational — the instance runs and coordinates as normal. */
   muted: boolean;
+  /** The instance that `hub_spawn`ed this one, while it is open — the sidebar
+   *  nests the row under it. `null` for a top-level row. */
+  parent: number | null;
+  /** Its family is folded away in the sidebar. */
+  collapsed: boolean;
   kind: SessionKind;
   /** A terminal whose shell has exited. Kept in the list (unlike a dead
    *  instance, which is removed) so its output stays readable until closed. */
@@ -188,6 +193,13 @@ export const renameSession = (
   id: number,
   name: string,
 ) => invoke<void>("rename_session", { projectHandle, id, name });
+
+/** Fold/unfold a row's `hub_spawn` family in the sidebar; persists. */
+export const setSessionCollapsed = (
+  projectHandle: ProjectHandle,
+  id: number,
+  collapsed: boolean,
+) => invoke<void>("set_session_collapsed", { projectHandle, id, collapsed });
 
 /** Mute/unmute a session (⌘M or the sidebar 🔇); persists across restarts. */
 export const setSessionMuted = (

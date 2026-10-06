@@ -24,6 +24,7 @@
     getHubSnapshot,
     sendBytes,
     setSessionMuted,
+    setSessionCollapsed,
     setMuteMenuChecked,
     type BootstrapInfo,
     type ClaudeStatus,
@@ -49,11 +50,15 @@
     setActiveSession,
     setSessionsFor,
     setSessionMutedLocal,
+    setSessionCollapsedLocal,
+    hiddenIds,
+    collapsedAncestors,
+    descendantsOf,
     applyHubFor,
     applySaveProgress,
     clearSaveState,
     displayOrder,
-    clampToGroup,
+    stepSlot,
     dragOrder,
     claudeInAnotherProject,
     flashNotice,
@@ -299,9 +304,22 @@
     if (!get(rename)) terminals.refocus();
   }
 
+  /**
+   * Focus can land on a row folded away under its parent — from a
+   * notification, the palette, a reap picking the next row. Unfold whatever
+   * hides it, so the visible terminal always has its row on screen.
+   */
+  function unfoldTo(h: ProjectHandle, id: number) {
+    for (const up of collapsedAncestors(get(projects).get(h)?.sessions ?? [], id)) {
+      setSessionCollapsedLocal(h, up, false);
+      setSessionCollapsed(h, up, false);
+    }
+  }
+
   function selectSession(id: number) {
     const h = get(activeProjectHandle);
     if (h == null) return;
+    unfoldTo(h, id);
     setActiveSession(h, id);
     focusSession(h, id);
     terminals.focus(h, id);
@@ -321,6 +339,22 @@
     setSessionMutedLocal(h, id, muted);
     setSessionMuted(h, id, muted); // persists; fire-and-forget
     syncMuteMenu();
+  }
+
+  /**
+   * Fold or unfold a row's `hub_spawn` family. Folding away the focused row
+   * hands focus to the parent, so the visible terminal always has its row on
+   * screen.
+   */
+  function collapseSession(id: number, collapsed: boolean) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    const list = get(projects).get(h)?.sessions ?? [];
+    if (collapsed && descendantsOf(list, id).some((s) => s.id === get(activeId))) {
+      selectSession(id);
+    }
+    setSessionCollapsedLocal(h, id, collapsed);
+    setSessionCollapsed(h, id, collapsed); // persists; fire-and-forget
   }
 
   /** Push the focused session's muted state into the menu's check item — the
@@ -682,7 +716,10 @@
   function cycle(delta: number) {
     const h = get(activeProjectHandle);
     if (h == null) return;
-    const list = displayOrder(get(projects).get(h)?.sessions ?? []);
+    const all = displayOrder(get(projects).get(h)?.sessions ?? []);
+    // Rows folded under a collapsed parent are out of sight, so out of the walk.
+    const hidden = hiddenIds(all);
+    const list = all.filter((s) => !hidden.has(s.id));
     const n = list.length;
     if (n === 0) return;
     const cur = get(activeId);
@@ -733,9 +770,10 @@
    * the Y-axis twin of `moveProject`, committing through the same path a drag
    * does, so the arrangement is persisted and ⌘[ / ⌘] cycle it in the new order.
    *
-   * Clamped exactly like a drag: `dragOrder` runs `clampToGroup`, so a row can
-   * only move within its own block (unmuted claudes / muted claudes / terminals)
-   * and the ends are a no-op. Crossing a boundary could never stick anyway —
+   * Clamped exactly like a drag: a row only trades places with its siblings
+   * (same `hub_spawn` parent, or the other top-level rows of its block —
+   * unmuted claudes / muted claudes / terminals), steps over a sibling's whole
+   * family, carries its own along, and the ends are a no-op. Crossing a boundary could never stick anyway —
    * `displayOrder` re-applies on top of whatever order is committed — so a
    * clamped `to` that equals `from` is dropped here rather than round-tripping
    * an order that changes nothing.
@@ -745,7 +783,7 @@
     const cur = get(activeId);
     const from = list.findIndex((s) => s.id === cur);
     if (from < 0) return;
-    const to = clampToGroup(list, from, from + delta);
+    const to = stepSlot(list, from, delta);
     if (to === from) return;
     applySessionOrder(dragOrder(list, from, to));
   }
@@ -1007,6 +1045,7 @@
     let stopAttention: (() => void) | null = null;
     initAttention((handle, id) => {
       selectProject(handle);
+      unfoldTo(handle, id);
       setActiveSession(handle, id);
       focusSession(handle, id);
       terminals.focus(handle, id);
@@ -1059,6 +1098,7 @@
       <InstanceList
         onselect={selectSession}
         onmute={muteSession}
+        oncollapse={collapseSession}
         onreorder={applySessionOrder}
         oncontext={openRowMenu}
         oncontextempty={openEmptyMenu}

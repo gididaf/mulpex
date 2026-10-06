@@ -75,50 +75,200 @@ function groupOf(s: SessionInfo): number {
  *
  * This is the single source of the visible order: ⌘[ / ⌘] cycle through *this*
  * list, so what you see is what you cycle.
+ *
+ * Each top-level row is followed by its `hub_spawn` family, depth first, and
+ * every set of siblings is sorted the same way the top level is — so a muted
+ * child sinks to the bottom of its own siblings (taking its family along), and
+ * never out of its parent's family.
  */
 export function displayOrder(list: SessionInfo[]): SessionInfo[] {
-  return [...list].sort((a, b) => groupOf(a) - groupOf(b));
+  const kids = childrenOf(list);
+  const roots = list
+    .filter((s) => parentOf(list, s) == null)
+    .sort((a, b) => groupOf(a) - groupOf(b));
+  const out: SessionInfo[] = [];
+  const visit = (s: SessionInfo) => {
+    out.push(s);
+    // Muted children sink to the bottom of their siblings, like muted roots do.
+    const own = [...(kids.get(s.id) ?? [])].sort((a, b) => groupOf(a) - groupOf(b));
+    own.forEach(visit);
+  };
+  roots.forEach(visit);
+  return out;
 }
 
 /**
- * The slot a dragged sidebar row can actually land in: `to`, clamped to the
- * dragged row's own block (see `groupOf`).
+ * The row's parent, if it is a claude present in `list` — a `hub_spawn`
+ * child nests under its spawner (the "family"). Anything else is a root: the
+ * backend already re-parents children when a parent closes, so this is only a
+ * guard against a link that names nothing. Parents are always older than their
+ * children (a spawner exists before it spawns), so links never form a cycle.
+ */
+function parentOf(list: SessionInfo[], s: SessionInfo): SessionInfo | undefined {
+  if (s.kind === "shell" || s.parent == null) return undefined;
+  const p = list.find((x) => x.id === s.parent);
+  return p && p.kind !== "shell" ? p : undefined;
+}
+
+/** parent id → its children, in `list` order (which is their order on screen). */
+function childrenOf(list: SessionInfo[]): Map<number, SessionInfo[]> {
+  const kids = new Map<number, SessionInfo[]>();
+  for (const s of list) {
+    const p = parentOf(list, s);
+    if (p) kids.set(p.id, [...(kids.get(p.id) ?? []), s]);
+  }
+  return kids;
+}
+
+/** Rows folded away under a collapsed ancestor — the sidebar skips them, and
+ *  so do ⌘[ / ⌘]. */
+export function hiddenIds(list: SessionInfo[]): Set<number> {
+  const hidden = new Set<number>();
+  for (const s of list) {
+    for (let p = parentOf(list, s); p; p = parentOf(list, p)) {
+      if (p.collapsed) {
+        hidden.add(s.id);
+        break;
+      }
+    }
+  }
+  return hidden;
+}
+
+/** The folded rows above `id` — what has to unfold for it to be on screen. */
+export function collapsedAncestors(list: SessionInfo[], id: number): number[] {
+  const out: number[] = [];
+  const row = list.find((s) => s.id === id);
+  for (let p = row && parentOf(list, row); p; p = parentOf(list, p)) {
+    if (p.collapsed) out.push(p.id);
+  }
+  return out;
+}
+
+/** Every row under `id` in its `hub_spawn` family, at any depth. */
+export function descendantsOf(list: SessionInfo[], id: number): SessionInfo[] {
+  const out: SessionInfo[] = [];
+  const ids = new Set([id]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const s of list) {
+      const up = parentOf(list, s);
+      if (up && ids.has(up.id) && !ids.has(s.id)) {
+        ids.add(s.id);
+        out.push(s);
+        grew = true;
+      }
+    }
+  }
+  return out;
+}
+
+/** How deep each row sits in its family: 0 for a top-level row. */
+export function treeDepths(list: SessionInfo[]): Map<number, number> {
+  const depth = new Map<number, number>();
+  const of = (s: SessionInfo): number => {
+    const known = depth.get(s.id);
+    if (known != null) return known;
+    const p = parentOf(list, s);
+    const d = p ? of(p) + 1 : 0;
+    depth.set(s.id, d);
+    return d;
+  };
+  list.forEach(of);
+  return depth;
+}
+
+/**
+ * The rows a row can trade places with, as `[start, end)` index ranges of
+ * their whole subtrees in `list` (the *displayed* order, i.e. already through
+ * `displayOrder`), top to bottom — plus where the row's own range sits.
  *
- * `list` is the *displayed* order — i.e. already through `displayOrder`.
+ * Siblings are the other rows with the same parent (or none) in the same
+ * block (see `groupOf`) — so a muted child moves only among its muted siblings. A row only ever moves
+ * among them, and always together with its own `hub_spawn` family: dropping a
+ * child into another family, or a parent between its own children, would snap
+ * back the moment `displayOrder` re-applied the tree.
+ *
+ * Because `displayOrder` lists each family depth first, every subtree is one
+ * contiguous range, and a set of siblings is one contiguous run of them.
+ */
+function siblingRanges(
+  list: SessionInfo[],
+  from: number,
+): { ranges: [number, number][]; own: number } {
+  const row = list[from];
+  const depths = treeDepths(list);
+  const depth = (i: number) => depths.get(list[i].id) ?? 0;
+  const parent = parentOf(list, row)?.id;
+  const isSibling = (s: SessionInfo) =>
+    parentOf(list, s)?.id === parent && groupOf(s) === groupOf(row);
+  const ranges: [number, number][] = [];
+  for (let i = 0; i < list.length; i++) {
+    if (!isSibling(list[i])) continue;
+    let end = i + 1;
+    while (end < list.length && depth(end) > depth(i)) end++;
+    ranges.push([i, end]);
+  }
+  return { ranges, own: ranges.findIndex(([a]) => a === from) };
+}
+
+/** Which sibling slot index `to` falls in: the subtree holding it, or the
+ *  nearest end. */
+function slotAt(ranges: [number, number][], to: number): number {
+  if (to < ranges[0][0]) return 0;
+  const hit = ranges.findIndex(([a, b]) => to >= a && to < b);
+  return hit >= 0 ? hit : ranges.length - 1;
+}
+
+/**
+ * The slot a dragged sidebar row can actually land in: the first row of the
+ * sibling subtree `to` points into (see `siblingRanges`), so the drop indicator
+ * only ever appears where the row — and its family — can really go.
  *
  * This exists because manual order and the display grouping are composed, not
  * alternatives: `displayOrder` runs on top of the arrangement a drag commits, so
- * a drop across a block boundary could never stick — the row would visibly snap
- * back on release. Clamping keeps the drop indicator honest, and keeps the order
- * `dragOrder` emits already-grouped (so re-applying `displayOrder` to it is the
- * identity, and the frontend's optimistic repaint matches what the backend
- * echoes back).
+ * a drop across a block or family boundary could never stick — the row would
+ * visibly snap back on release. Clamping keeps the indicator honest, and keeps
+ * the order `dragOrder` emits already-grouped (so re-applying `displayOrder` to
+ * it is the identity, and the frontend's optimistic repaint matches what the
+ * backend echoes back).
  */
 export function clampToGroup(
   list: SessionInfo[],
   from: number,
   to: number,
 ): number {
-  const row = list[from];
-  if (!row) return to;
-  const g = groupOf(row);
-  let lo = 0;
-  while (lo < list.length && groupOf(list[lo]) !== g) lo++;
-  let hi = list.length - 1;
-  while (hi > lo && groupOf(list[hi]) !== g) hi--;
-  return Math.min(Math.max(to, lo), hi);
+  if (!list[from]) return to;
+  const { ranges } = siblingRanges(list, from);
+  return ranges[slotAt(ranges, to)][0];
 }
 
-/** The new top-to-bottom id order after dragging row `from` onto slot `to`. */
+/** The slot one sibling up (`delta` -1) or down (+1) from row `from`, clamped
+ *  at the ends — what ⌘⇧↑ / ⌘⇧↓ hand `dragOrder`. A row steps over a whole
+ *  sibling family, never into it. */
+export function stepSlot(list: SessionInfo[], from: number, delta: number): number {
+  if (!list[from]) return from;
+  const { ranges, own } = siblingRanges(list, from);
+  const t = Math.min(Math.max(own + delta, 0), ranges.length - 1);
+  return ranges[t][0];
+}
+
+/** The new top-to-bottom id order after dragging row `from` (with its whole
+ *  family) onto slot `to`. */
 export function dragOrder(
   list: SessionInfo[],
   from: number,
   to: number,
 ): number[] {
   const ids = list.map((s) => s.id);
-  const [id] = ids.splice(from, 1);
-  ids.splice(clampToGroup(list, from, to), 0, id);
-  return ids;
+  if (!list[from]) return ids;
+  const { ranges, own } = siblingRanges(list, from);
+  const units = ranges.map(([a, b]) => ids.slice(a, b));
+  const [moved] = units.splice(own, 1);
+  units.splice(slotAt(ranges, to), 0, moved);
+  const lo = ranges[0][0];
+  const hi = ranges[ranges.length - 1][1];
+  return [...ids.slice(0, lo), ...units.flat(), ...ids.slice(hi)];
 }
 
 /** Ids muted in this project — the set every badge count subtracts. */
@@ -327,8 +477,9 @@ export function reorderSessions(handle: ProjectHandle, ids: number[]): void {
   patchProject(handle, { sessions: next });
 }
 
-/** Flip one session's muted flag locally (the backend persists it separately;
- *  mute doesn't go through the `sessions-changed` event). */
+/** Flip a session's muted flag locally, along with its whole `hub_spawn`
+ *  family — the same cascade `Core::set_muted` applies (the backend persists
+ *  it separately; mute doesn't go through the `sessions-changed` event). */
 export function setSessionMutedLocal(
   handle: ProjectHandle,
   id: number,
@@ -336,8 +487,22 @@ export function setSessionMutedLocal(
 ): void {
   const p = get(projects).get(handle);
   if (!p) return;
+  const family = new Set([id, ...descendantsOf(p.sessions, id).map((s) => s.id)]);
   patchProject(handle, {
-    sessions: p.sessions.map((s) => (s.id === id ? { ...s, muted } : s)),
+    sessions: p.sessions.map((s) => (family.has(s.id) ? { ...s, muted } : s)),
+  });
+}
+
+/** Fold or unfold one row's family locally (the backend persists it). */
+export function setSessionCollapsedLocal(
+  handle: ProjectHandle,
+  id: number,
+  collapsed: boolean,
+): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  patchProject(handle, {
+    sessions: p.sessions.map((s) => (s.id === id ? { ...s, collapsed } : s)),
   });
 }
 

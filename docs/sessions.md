@@ -517,7 +517,9 @@ not a cosmetic relabel. The number is what the sidebar shows, what a person says
 `hub_send` addresses (`claude#15`, `central-one#3`) — so after a restart every number named a
 different conversation than it had the day before. The store now carries the id as a **fourth
 positional column**, `<uuid>[\t<name>[\tmuted[\t<id>]]]`, read with `splitn(4, '\t')`, and a restore
-reuses it. Gaps are kept (#2, #3, #15) because the gap is the truth; `next_id` continues from
+reuses it. (Two more columns followed: the `hub_spawn` parent's id and a `collapsed` flag, making
+the full line `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`. An older build reads
+the id column of such a line as garbage, so downgrading loses the number of any nested row.) Gaps are kept (#2, #3, #15) because the gap is the truth; `next_id` continues from
 `max + 1`, so a fresh ⌘T cannot collide with a restored instance or land in a hole.
 
 `sessions.len() + 1` was wrong for a second reason that the field report also hit: **it does not
@@ -587,6 +589,14 @@ sidebar for good (see **An instance number is an identity, not a position**). A 
 once may well succeed next launch; if it never does, the user still has the id. Guarded by
 `a_failed_restore_is_kept_visible_and_never_erases_the_record`, confirmed to fail with the `sticky` push
 disabled.
+
+**"Died inside the grace" is not enough on its own — the restore must also never have come up.**
+Until 2026-10-06 a restored claude the user quit from inside (Ctrl+C, `/exit`) within the 120 s was
+kept as a failed restore, and came back at the next launch, in reverse order, after the user had
+quit every row. The tell is now `sessionid/<id>`: measured on `claude` v2.1.291 on a real PTY, a
+`--resume` that works fires `SessionStart` about a second in (the hook writes that file), while one
+`claude` cannot open prints "No conversation found" and exits **without firing it**. Guarded by
+`a_restore_that_came_up_and_was_quit_is_not_kept`.
 
 **That test does not reach the `sticky` path, despite its name.** A session that dies within
 `EARLY_DEATH_GRACE` is deliberately *kept* rather than reaped, so nothing is removed and nothing

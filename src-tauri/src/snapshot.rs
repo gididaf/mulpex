@@ -64,6 +64,11 @@ pub struct SessionInfo {
     /// and drops it from every attention badge. Purely presentational — the
     /// instance keeps running and stays a full hub peer.
     pub muted: bool,
+    /// The instance that `hub_spawn`ed this one, while it is still open — the
+    /// sidebar nests the row under it. `None` for a top-level row.
+    pub parent: Option<usize>,
+    /// Its family is folded away in the sidebar (⌄/› on the row).
+    pub collapsed: bool,
     pub kind: SessionKind,
     /// A terminal whose shell has exited. Unlike a dead instance it is *kept*,
     /// so its output stays readable until it's explicitly closed — otherwise a

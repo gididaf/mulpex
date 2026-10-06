@@ -207,6 +207,19 @@ pub fn set_session_muted(
     }
 }
 
+/// Fold or unfold a row's `hub_spawn` family in the sidebar; persisted.
+#[tauri::command]
+pub fn set_session_collapsed(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    collapsed: bool,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
+        core.set_collapsed(id, collapsed);
+    }
+}
+
 /// Sync the "Mute Session" menu tick to the focused session's state. Called by
 /// the frontend whenever focus or the flag moves — the menu has no view of which
 /// session is active, so the tick has to be pushed to it.
