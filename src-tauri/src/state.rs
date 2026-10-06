@@ -2244,6 +2244,14 @@ impl Core {
             }
         }
         self.store.save(&sessions);
+        // A pin lives as long as its row in the store (`pins.rs`).
+        self.pin_store()
+            .retain(&sessions.iter().filter_map(|s| s.id).collect());
+    }
+
+    /// This project's ⌘⇧P pins, stored beside its session store.
+    pub fn pin_store(&self) -> crate::pins::PinStore {
+        crate::pins::PinStore::beside(self.store.path(), &self.project_dir)
     }
 
     /// Publish the live instance ids to `state_dir/instances` (the peer list the

@@ -215,12 +215,13 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/**⌘K** secrets/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/**⌘K** secrets/**⌘⇧P** pin selection/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
 quick-switcher) is *not* a menu accelerator — it's handled in the webview (`svelte:window` keydown,
-`preventDefault` stops the print dialog).
+`preventDefault` stops the print dialog). That arm excludes Shift, since ⌘⇧P is Pin Selection
+(declared in the menu and also claimed in `onGlobalKey`, like ⌘⇧[ / ⌘⇧]).
 
 **A menu accelerator is not reached while the terminal has focus.** Observed: ⌘⇧← / ⌘⇧→ move the
 project tab with the sidebar focused and do nothing with the terminal focused. Keys then land on

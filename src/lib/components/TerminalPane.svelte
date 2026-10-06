@@ -3,6 +3,7 @@
   import { projects, activeProject, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
+  import PinStack from "./PinStack.svelte";
 
   let paneEl: HTMLDivElement;
 
@@ -34,6 +35,7 @@
   {#each all as e (e.handle + " " + e.id)}
     <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
   {/each}
+  <PinStack />
   {#if activeEmpty}
     <div class="empty">
       Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal

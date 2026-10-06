@@ -193,6 +193,31 @@ pub fn rename_session(
     }
 }
 
+/// The project's saved ⌘⇧P pins, by instance id (`pins.rs`).
+#[tauri::command]
+pub fn get_pins(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> std::collections::BTreeMap<usize, serde_json::Value> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.pin_store().load(),
+        None => Default::default(),
+    }
+}
+
+/// Save (`Some`) or remove (`None`) one instance's pin.
+#[tauri::command]
+pub fn set_pin(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    pin: Option<serde_json::Value>,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project(project_handle) {
+        core.pin_store().set(id, pin);
+    }
+}
+
 /// Mute or unmute a session (⌘M / the sidebar's 🔇). Presentation only — the
 /// instance is untouched; only how the sidebar and tab badges treat it changes.
 #[tauri::command]

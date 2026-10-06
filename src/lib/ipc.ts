@@ -208,6 +208,14 @@ export const setSessionMuted = (
   muted: boolean,
 ) => invoke<void>("set_session_muted", { projectHandle, id, muted });
 
+/** The project's saved ⌘⇧P pins, by instance id (`pins.rs`). Pin data is the
+ *  frontend's own (`pins.ts`); the backend stores it opaque. */
+export const getPins = (projectHandle: ProjectHandle) =>
+  invoke<Record<string, unknown>>("get_pins", { projectHandle });
+
+export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | null) =>
+  invoke<void>("set_pin", { projectHandle, id, pin });
+
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>
   invoke<void>("set_mute_menu_checked", { checked });

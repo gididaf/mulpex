@@ -165,6 +165,7 @@
       ["close_session", "Close Session", "⌘W", cur != null],
       ["messages", "Messages", "⌘⇧M", true],
       ["explain", "Explain", "⌘E", isClaude],
+      ["pin_selection", "Pin Selection", "⌘⇧P", isClaude],
       ["next", "Next Session", "⌘]", $sessions.length > 1],
       ["prev", "Previous Session", "⌘[", $sessions.length > 1],
       ["move_instance_up", "Move Instance Up", "⌘⇧↑", $sessions.length > 1],

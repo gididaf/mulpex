@@ -6,6 +6,7 @@ mod commands;
 mod hub;
 mod menu;
 mod project;
+mod pins;
 mod pty;
 mod docs_import;
 mod saves;
@@ -54,6 +55,7 @@ fn is_forwarded(id: &str) -> bool {
             | "messages"
             | "explain"
             | "secrets"
+            | "pin_selection"
             | "minimize"
             | "next"
             | "prev"
@@ -103,6 +105,8 @@ pub fn run() {
             commands::reorder_sessions,
             commands::rename_session,
             commands::set_session_muted,
+            commands::get_pins,
+            commands::set_pin,
             commands::set_session_collapsed,
             commands::set_mute_menu_checked,
             commands::send_bytes,

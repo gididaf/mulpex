@@ -339,6 +339,25 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 > **with nothing of its own still running** — see **`needs` must mean "needs YOU"** in
 > [sessions.md](sessions.md).
 
+## Pins (⌘⇧P)
+
+Select text in a claude's pane and ⌘⇧P floats it over the top of that pane, so a QA list or a
+command stays in view while the conversation scrolls. One pin per instance: a new one replaces it,
+and ⌘⇧P with nothing selected removes it (the "Select some text first" toast only when there is no
+pin either). Claudes only — a shell's row is never restored, so its pin could not outlive the app.
+
+- **Captured cell by cell** off the xterm buffer (`pins.ts::captureSelection`), not
+  `getSelection()`, so claude's colors survive. Colors resolve to CSS at capture time (bold 0–7 →
+  bright, like xterm), so a pin is self-contained. `getSelectionPosition()` is **0-based with
+  `end.x` exclusive** in xterm 5.5, whatever its typings say — measured against `@xterm/headless`.
+- **Rendered** by `PinStack.svelte` in `.pane-inner`, beside the xterms (never inside one), with
+  the terminal's own font/size/theme and the same two RTL rules as `.xterm-rows`.
+- **Saved** to `<mulpex home>/pins/<session-store key>.json`, keyed by instance number
+  (`src-tauri/src/pins.rs`). A pin lives exactly as long as its row in the session store:
+  `persist_sessions` prunes the file to the ids it saved. So ⌘W loses the pin, a quit keeps it, and
+  a later claude given the same number can't inherit one. The frontend's `dropPins` on
+  `session-exited` is memory-only for that reason — teardown exits sessions too.
+
 ## Hub panel is Messages only
 
 `HubPanel.svelte` renders **Messages** and nothing else. It used to show **Waiting** and **Locks**

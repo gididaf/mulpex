@@ -170,6 +170,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let secrets = MenuItemBuilder::with_id("secrets", "Secrets…")
         .accelerator("Cmd+K")
         .build(app)?;
+    // ⌘⇧P: float the selection over the top of the focused claude's pane
+    // (`pins.ts`). Also claimed in the webview (`App.svelte::onGlobalKey`),
+    // whose ⌘P palette arm would otherwise take it.
+    let pin = MenuItemBuilder::with_id("pin_selection", "Pin Selection")
+        .accelerator("Cmd+Shift+P")
+        .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
         .build(app)?;
@@ -197,6 +203,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&messages)
         .item(&explain)
         .item(&secrets)
+        .item(&pin)
         .separator()
         .item(&next)
         .item(&prev)

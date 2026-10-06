@@ -24,8 +24,10 @@ import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
 import type { SessionKind } from "./ipc";
 import { readPromptBox } from "./promptbox";
 import type { PromptBox } from "./promptbox";
+import { captureSelection } from "./pins";
+import type { PinRun } from "./pins";
 
-const THEME: ITheme = {
+export const THEME: ITheme = {
   background: "#0d0d0f",
   foreground: "#e6e6e6",
   cursor: "#e6e6e6",
@@ -48,8 +50,11 @@ const THEME: ITheme = {
   brightWhite: "#ffffff",
 };
 
-const FONT_FAMILY =
+export const FONT_FAMILY =
   'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Monaco, "Cascadia Code", monospace';
+
+export const FONT_SIZE = 13;
+export const LINE_HEIGHT = 1.1;
 
 const encoder = new TextEncoder();
 
@@ -133,8 +138,8 @@ class TerminalManager {
       macOptionIsMeta: true,
       allowProposedApi: true,
       fontFamily: FONT_FAMILY,
-      fontSize: 13,
-      lineHeight: 1.1,
+      fontSize: FONT_SIZE,
+      lineHeight: LINE_HEIGHT,
       theme: THEME,
       cursorBlink: true,
     });
@@ -300,6 +305,16 @@ class TerminalManager {
     const e = this.entries.get(keyOf(handle, id));
     if (!e) return "none";
     return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols);
+  }
+
+  /** (handle, id)'s current selection, colors and all, for a pin (⌘⇧P). The
+   *  selection is cleared once taken, so the pane shows it went somewhere. */
+  pinSelection(handle: number, id: number): PinRun[][] | null {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return null;
+    const lines = captureSelection(e.term, THEME);
+    if (lines) e.term.clearSelection();
+    return lines;
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

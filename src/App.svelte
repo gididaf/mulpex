@@ -68,6 +68,7 @@
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
+  import { addPin, clearPin, dropPins, loadPins, pins, pinKey } from "./lib/pins";
   import { initAttention } from "./lib/attention";
 
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
@@ -107,6 +108,7 @@
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,
     });
+    void loadPins(info.handle);
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle);
     if (snap) applyHubFor(info.handle, snap);
@@ -476,6 +478,7 @@
   async function closeProjectHandle(handle: ProjectHandle) {
     await closeProject(handle);
     terminals.disposeProject(handle);
+    dropPins(handle);
     removeProject(handle); // re-picks the active handle (neighbor / null)
     const next = get(activeProjectHandle);
     if (next != null) selectProject(next);
@@ -666,6 +669,28 @@
       return;
     }
     sendBytes(handle, id, new TextEncoder().encode("/explain\r"));
+  }
+
+  /** ⌘⇧P: float the focused claude's selection over the top of its pane
+   *  (`pins.ts`), replacing its pin; with nothing selected, remove the pin.
+   *  Claudes only — a shell's rows are never restored, so a pin there could
+   *  not outlive the app. */
+  function pinSelection(handle: ProjectHandle, id: number) {
+    const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
+    if (!s) return;
+    if (s.kind === "shell") {
+      flashToast("Pins work on claudes only");
+      return;
+    }
+    const lines = terminals.pinSelection(handle, id);
+    if (!lines) {
+      // No selection: the same key unpins.
+      if (get(pins).has(pinKey(handle, id))) clearPin(handle, id);
+      else flashToast("Select some text first");
+      return;
+    }
+    addPin(handle, id, lines);
+    terminals.refocus();
   }
 
   /**
@@ -866,6 +891,11 @@
         if (h != null && cur != null) explainInstance(h, cur);
         break;
       }
+      case "pin_selection": {
+        const cur = get(activeId);
+        if (h != null && cur != null) pinSelection(h, cur);
+        break;
+      }
       case "messages":
         showMessages.update((v) => !v);
         break;
@@ -923,7 +953,7 @@
     // ⌘P / Ctrl+P toggles the command palette (projects, sessions, commands). Not a
     // menu accelerator, so it reaches the webview; preventDefault stops the print
     // dialog.
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
       if (get(projects).size > 0) showPalette.update((v) => !v);
       return;
@@ -942,6 +972,13 @@
     // *does* match is consumed by the menu and never reaches the webview, so this
     // arm cannot double-fire — it simply stops seeing the key.
     if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
+      // ⌘⇧P — Pin Selection. Declared in the menu too; if the menu takes the
+      // key it never reaches here, so this cannot double-fire (see below).
+      if (e.code === "KeyP") {
+        e.preventDefault();
+        void handleMenu("pin_selection");
+        return;
+      }
       // `code` is the physical key — `key` is "}"/"{" here, and layout-dependent.
       const back = e.code === "BracketLeft";
       if (back || e.code === "BracketRight") {
@@ -1004,6 +1041,7 @@
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
+        dropPins(e.payload.handle, e.payload.id);
       }),
       listen<SessionsChangedEvent>("sessions-changed", async (e) => {
         const { handle, sessions: list } = e.payload;
