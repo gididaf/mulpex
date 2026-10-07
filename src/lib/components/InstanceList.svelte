@@ -8,6 +8,7 @@
     hub,
     clampToGroup,
     dragOrder,
+    canNest,
     saves,
     treeDepths,
     hiddenIds,
@@ -20,6 +21,8 @@
     onmute,
     oncollapse,
     onreorder,
+    onnest,
+    onunnest,
     oncontext,
     oncontextempty,
     onsaveretry,
@@ -32,6 +35,11 @@
     oncollapse: (id: number, collapsed: boolean) => void;
     /** Commit a new top-to-bottom order (session ids) after a drag. */
     onreorder: (ids: number[]) => void;
+    /** Drop row `from` INTO row `target` (indexes into the displayed list). */
+    onnest: (from: number, target: number) => void;
+    /** Pull nested row `from` out to the top level, before row `at` (or at the
+     *  end when `at` is the list length). */
+    onunnest: (from: number, at: number) => void;
     /** Right-click on a row. Carries the row itself, not its id: the menu acts
      *  on the row you clicked, which is deliberately NOT the focused one. */
     oncontext: (e: MouseEvent, s: SessionInfo) => void;
@@ -126,6 +134,12 @@
   let dragIdx = $state<number | null>(null);
   /** Index it would land on — also drives the drop indicator. */
   let overIdx = $state<number | null>(null);
+  /** Row the dragged one would be dropped INTO (drag-to-nest), or null. Set
+   *  instead of `overIdx`, never together with it. */
+  let nestIdx = $state<number | null>(null);
+  /** Where a NESTED dragged row would be pulled out to the top level: before
+   *  this row index, or `$sessions.length` for the end. Null when not. */
+  let unnestAt = $state<number | null>(null);
   /** True only once the pointer has moved past the threshold. */
   let dragging = $state(false);
   let startY = 0;
@@ -141,6 +155,60 @@
     return $sessions.length - 1;
   }
 
+  /** The row whose MIDDLE half the pointer is over — a drop there nests into
+   *  it. The top and bottom quarters stay reorder slots, as before. */
+  function nestTargetAt(y: number): number | null {
+    for (let i = 0; i < $sessions.length; i++) {
+      const r = rowEls[i]?.getBoundingClientRect();
+      if (!r || y < r.top || y >= r.bottom) continue;
+      const inMiddle = y >= r.top + r.height / 4 && y < r.bottom - r.height / 4;
+      return inMiddle && dragIdx != null && canNest($sessions, dragIdx, i) ? i : null;
+    }
+    return null;
+  }
+
+  /** Un-nest spots, only for a dragged row that is nested: the top quarter of
+   *  a top-level claude row (lands above it), or anywhere below the last row
+   *  (lands at the end). The bottom edge of a child row stays a reorder within
+   *  its family, so the two never claim the same spot. */
+  function unnestTargetAt(y: number): number | null {
+    if (dragIdx == null || (depths.get($sessions[dragIdx].id) ?? 0) === 0) return null;
+    let lastBottom = -Infinity;
+    for (let i = 0; i < $sessions.length; i++) {
+      const r = rowEls[i]?.getBoundingClientRect();
+      if (!r) continue;
+      lastBottom = Math.max(lastBottom, r.bottom);
+      if (y < r.top || y >= r.bottom) continue;
+      const s = $sessions[i];
+      const root = s.kind !== "shell" && (depths.get(s.id) ?? 0) === 0;
+      return root && y < r.top + r.height / 4 ? i : null;
+    }
+    return y >= lastBottom ? $sessions.length : null;
+  }
+
+  /** Where a plain reorder's line goes. Dragging UP lands the row before the
+   *  target slot, so the line sits on the target's top edge; dragging DOWN lands
+   *  it AFTER the target's whole family (`dragOrder`), so the line sits under
+   *  the last visible row of that family. Always drawing the top edge put the
+   *  line above a row the drop would land below. */
+  const reorderLine = $derived.by((): { idx: number; below: boolean } | null => {
+    if (!dragging || dragIdx == null || overIdx == null || overIdx === dragIdx) return null;
+    if (overIdx < dragIdx) return { idx: overIdx, below: false };
+    const d0 = depths.get($sessions[overIdx].id) ?? 0;
+    let last = overIdx;
+    for (let j = overIdx + 1; j < $sessions.length; j++) {
+      if ((depths.get($sessions[j].id) ?? 0) <= d0) break;
+      if (!hidden.has($sessions[j].id)) last = j;
+    }
+    return { idx: last, below: true };
+  });
+
+  /** The last row on screen — where the "lands at the end" line is drawn. */
+  const lastVisible = $derived.by(() => {
+    for (let i = $sessions.length - 1; i >= 0; i--) if (!hidden.has($sessions[i].id)) return i;
+    return -1;
+  });
+
   function onPointerDown(e: PointerEvent, i: number) {
     if (e.button !== 0) return; // left button only — right-click may open a menu
     dragIdx = i;
@@ -155,20 +223,37 @@
     // as a drag would make rows impossible to simply select.
     if (!dragging && Math.abs(e.clientY - startY) < 4) return;
     dragging = true;
+    nestIdx = nestTargetAt(e.clientY);
+    unnestAt = nestIdx == null ? unnestTargetAt(e.clientY) : null;
     // Clamped, not raw: the indicator must only ever appear where the row can
     // actually land (see stores.ts::clampToGroup).
-    overIdx = clampToGroup($sessions, dragIdx, indexAt(e.clientY));
+    overIdx =
+      nestIdx != null || unnestAt != null
+        ? null
+        : clampToGroup($sessions, dragIdx, indexAt(e.clientY));
   }
 
   function onPointerUp() {
     const from = dragIdx;
     const to = overIdx;
+    const into = nestIdx;
+    const out = unnestAt;
     const moved = dragging;
     dragIdx = null;
     overIdx = null;
+    nestIdx = null;
+    unnestAt = null;
     dragging = false;
     if (!moved) return;
     suppressClick = true;
+    if (from != null && into != null) {
+      onnest(from, into);
+      return;
+    }
+    if (from != null && out != null) {
+      onunnest(from, out);
+      return;
+    }
     if (from == null || to == null || from === to) return;
     onreorder(dragOrder($sessions, from, to));
   }
@@ -225,7 +310,11 @@
       class:muted={s.muted}
       class:shell
       class:dragging={inDrag(i)}
-      class:drop-target={dragging && overIdx === i && dragIdx !== i}
+      class:drop-target={reorderLine?.idx === i && !reorderLine.below}
+      class:drop-after-row={reorderLine?.idx === i && reorderLine.below}
+      class:nest-target={dragging && nestIdx === i}
+      class:drop-target-out={dragging && unnestAt === i}
+      class:drop-after={dragging && unnestAt === $sessions.length && i === lastVisible}
       bind:this={rowEls[i]}
       oncontextmenu={(e) => {
         e.preventDefault();
@@ -421,8 +510,19 @@
   .row.dragging {
     opacity: 0.45;
   }
-  .row.drop-target {
+  .row.drop-target,
+  .row.drop-target-out {
     box-shadow: inset 0 2px 0 var(--border-focus);
+  }
+  /* Un-nest to the end: the line under the last row. */
+  .row.drop-after,
+  .row.drop-after-row {
+    box-shadow: inset 0 -2px 0 var(--border-focus);
+  }
+  /* Drag-to-nest: the whole row lights up, unlike the edge line of a reorder. */
+  .row.nest-target {
+    border-color: var(--border-focus);
+    background: var(--bg-elev);
   }
   .body {
     cursor: grab;

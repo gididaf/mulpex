@@ -180,6 +180,23 @@ pub fn reorder_sessions(state: State<AppState>, project_handle: ProjectHandle, i
     }
 }
 
+/// Drag-to-nest: move a claude (with its family) under another claude, or to the
+/// top level with `parent: None`, committing the sidebar order `ids` with it
+/// (`Core::reparent`). Refused for terminals and for cycles.
+#[tauri::command]
+pub fn reparent_session(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    parent: Option<usize>,
+    ids: Vec<usize>,
+) -> bool {
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.reparent(id, parent, &ids),
+        None => false,
+    }
+}
+
 /// Rename an instance (⌘R). Empty name clears it (auto task line returns).
 #[tauri::command]
 pub fn rename_session(

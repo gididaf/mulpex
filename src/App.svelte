@@ -25,6 +25,7 @@
     sendBytes,
     setSessionMuted,
     setSessionCollapsed,
+    reparentSession,
     setMuteMenuChecked,
     type BootstrapInfo,
     type ClaudeStatus,
@@ -60,6 +61,9 @@
     displayOrder,
     stepSlot,
     dragOrder,
+    nestOrder,
+    unnestOrder,
+    setSessionParentLocal,
     claudeInAnotherProject,
     flashNotice,
     flashToast,
@@ -157,6 +161,39 @@
     if (h == null) return;
     reorderSessionsLocal(h, ids);
     reorderSessions(h, ids);
+  }
+
+  /**
+   * Drag-to-nest: row `from` (with its family) becomes the last child of row
+   * `target` — indexes into the displayed list. Applied locally only once the
+   * backend accepts: a refusal changes nothing there, so it would echo nothing
+   * back to undo an optimistic repaint.
+   */
+  async function nestSession(from: number, target: number) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    const list = get(sessions);
+    const row = list[from];
+    const parent = list[target];
+    if (!row || !parent) return;
+    const ids = nestOrder(list, from, target);
+    if (!(await reparentSession(h, row.id, parent.id, ids))) return;
+    setSessionParentLocal(h, row.id, parent.id);
+    reorderSessionsLocal(h, ids);
+  }
+
+  /** Drag-to-nest's inverse: nested row `from` (with its family) becomes
+   *  top-level, before row `at` or at the end. Same accept-then-apply rule. */
+  async function unnestSession(from: number, at: number) {
+    const h = get(activeProjectHandle);
+    if (h == null) return;
+    const list = get(sessions);
+    const row = list[from];
+    if (!row) return;
+    const ids = unnestOrder(list, from, at);
+    if (!(await reparentSession(h, row.id, null, ids))) return;
+    setSessionParentLocal(h, row.id, null);
+    reorderSessionsLocal(h, ids);
   }
 
   // ---- sidebar context menu (right-click) ----
@@ -1138,6 +1175,8 @@
         onmute={muteSession}
         oncollapse={collapseSession}
         onreorder={applySessionOrder}
+        onnest={(from, target) => void nestSession(from, target)}
+        onunnest={(from, at) => void unnestSession(from, at)}
         oncontext={openRowMenu}
         oncontextempty={openEmptyMenu}
         onsaveretry={retrySave}

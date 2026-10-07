@@ -188,6 +188,16 @@ export const restartSession = (projectHandle: ProjectHandle, id: number) =>
 export const reorderSessions = (projectHandle: ProjectHandle, ids: number[]) =>
   invoke<void>("reorder_sessions", { projectHandle, ids });
 
+/** Drag-to-nest: move a claude (with its family) under `parent`, or to the top
+ *  level with `null`, committing the sidebar order `ids` with it. Resolves
+ *  false when the backend refused (a terminal, or a cycle). */
+export const reparentSession = (
+  projectHandle: ProjectHandle,
+  id: number,
+  parent: number | null,
+  ids: number[],
+) => invoke<boolean>("reparent_session", { projectHandle, id, parent, ids });
+
 export const renameSession = (
   projectHandle: ProjectHandle,
   id: number,

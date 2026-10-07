@@ -101,8 +101,9 @@ export function displayOrder(list: SessionInfo[]): SessionInfo[] {
  * The row's parent, if it is a claude present in `list` — a `hub_spawn`
  * child nests under its spawner (the "family"). Anything else is a root: the
  * backend already re-parents children when a parent closes, so this is only a
- * guard against a link that names nothing. Parents are always older than their
- * children (a spawner exists before it spawns), so links never form a cycle.
+ * guard against a link that names nothing. Links never form a cycle: a spawner
+ * exists before it spawns, and drag-to-nest (`Core::reparent`, and `canNest`
+ * here) refuses a parent from inside the row's own family.
  */
 function parentOf(list: SessionInfo[], s: SessionInfo): SessionInfo | undefined {
   if (s.kind === "shell" || s.parent == null) return undefined;
@@ -269,6 +270,77 @@ export function dragOrder(
   const lo = ranges[0][0];
   const hi = ranges[ranges.length - 1][1];
   return [...ids.slice(0, lo), ...units.flat(), ...ids.slice(hi)];
+}
+
+/** Whether row `from` may be dropped INTO row `target` (drag-to-nest): both
+ *  claudes, the target outside `from`'s own family (a cycle), and not already
+ *  its parent (a drop that would only shuffle it among its siblings). */
+export function canNest(list: SessionInfo[], from: number, target: number): boolean {
+  const row = list[from];
+  const t = list[target];
+  if (!row || !t || row.kind === "shell" || t.kind === "shell") return false;
+  if (t.id === row.id || parentOf(list, row)?.id === t.id) return false;
+  return !descendantsOf(list, row.id).some((s) => s.id === t.id);
+}
+
+/** The new top-to-bottom id order after nesting row `from` (with its whole
+ *  family) under row `target` as its LAST child: the family is lifted out and
+ *  set down right after the end of the target's own subtree. `list` is the
+ *  displayed order, where every subtree is one contiguous run. */
+export function nestOrder(list: SessionInfo[], from: number, target: number): number[] {
+  const ids = list.map((s) => s.id);
+  if (!list[from] || !list[target]) return ids;
+  const depths = treeDepths(list);
+  const depth = (i: number) => depths.get(list[i].id) ?? 0;
+  const end = (i: number) => {
+    let e = i + 1;
+    while (e < list.length && depth(e) > depth(i)) e++;
+    return e;
+  };
+  const moved = ids.slice(from, end(from));
+  const tEnd = end(target);
+  const rest = [...ids.slice(0, from), ...ids.slice(end(from))];
+  // Where the target's subtree ends once the moved run is gone from above it.
+  const at = tEnd > from ? tEnd - moved.length : tEnd;
+  rest.splice(at, 0, ...moved);
+  return rest;
+}
+
+/** The new top-to-bottom id order after pulling nested row `from` (with its
+ *  family) out to the top level, set down before row `at` — or after the last
+ *  claude when `at` is `list.length`, since claudes always draw above
+ *  terminals. */
+export function unnestOrder(list: SessionInfo[], from: number, at: number): number[] {
+  const ids = list.map((s) => s.id);
+  if (!list[from]) return ids;
+  const depths = treeDepths(list);
+  const d0 = depths.get(list[from].id) ?? 0;
+  let end = from + 1;
+  while (end < list.length && (depths.get(list[end].id) ?? 0) > d0) end++;
+  if (at >= list.length) {
+    const firstShell = list.findIndex((s) => s.kind === "shell");
+    at = firstShell >= 0 ? firstShell : list.length;
+  }
+  const moved = ids.slice(from, end);
+  const rest = [...ids.slice(0, from), ...ids.slice(end)];
+  rest.splice(at > from ? at - moved.length : at, 0, ...moved);
+  return rest;
+}
+
+/** Set one row's parent locally (the backend persists it via `reparent_session`
+ *  and echoes it back); unfolds the new parent like the backend does. */
+export function setSessionParentLocal(
+  handle: ProjectHandle,
+  id: number,
+  parent: number | null,
+): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  patchProject(handle, {
+    sessions: p.sessions.map((s) =>
+      s.id === id ? { ...s, parent } : s.id === parent ? { ...s, collapsed: false } : s,
+    ),
+  });
 }
 
 /** Ids muted in this project — the set every badge count subtracts. */

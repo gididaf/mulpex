@@ -103,6 +103,7 @@ pub fn run() {
             commands::close_session,
             commands::restart_session,
             commands::reorder_sessions,
+            commands::reparent_session,
             commands::rename_session,
             commands::set_session_muted,
             commands::get_pins,

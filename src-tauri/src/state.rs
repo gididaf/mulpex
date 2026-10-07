@@ -1322,6 +1322,36 @@ impl Core {
         }
     }
 
+    /// Move `id` (with its whole family) under `parent`, or to the top level
+    /// with `None` — the sidebar's drag-to-nest. Presentation only, like
+    /// folding: the hub never reads `parents`. `ids` is the sidebar order to
+    /// commit with it, so the row lands where the drop put it in one step.
+    ///
+    /// Refused (nothing changes) for a terminal on either end, an unknown id, or
+    /// a `parent` inside `id`'s own family — that would be a cycle, which the
+    /// frontend's tree walks assume can never exist. Returns whether it applied.
+    pub fn reparent(&mut self, id: usize, parent: Option<usize>, ids: &[usize]) -> bool {
+        let is_claude = |id: usize| self.sessions.iter().any(|s| s.id == id && !s.is_shell());
+        if !is_claude(id) {
+            return false;
+        }
+        match parent {
+            Some(p) => {
+                if !is_claude(p) || self.family_of(id).contains(&p) {
+                    return false;
+                }
+                self.parents.insert(id, p);
+                // Unfold the new parent so the moved row stays in sight.
+                self.collapsed.remove(&p);
+            }
+            None => {
+                self.parents.remove(&id);
+            }
+        }
+        self.reorder_sessions(ids); // persists
+        true
+    }
+
     /// `id` and every row under it in the sidebar tree.
     fn family_of(&self, id: usize) -> Vec<usize> {
         let mut family = vec![id];
@@ -3961,6 +3991,47 @@ mod tests {
 
         core.set_muted(a, false);
         assert!(core.muted.is_empty(), "unmuting the parent unmutes the family: {:?}", core.muted);
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Drag-to-nest moves a claude (family and all) under another claude or
+    /// back to the top, unfolds the new parent, keeps mute alone, and refuses
+    /// a cycle or a terminal on either end without touching anything.
+    #[test]
+    fn reparent_moves_a_family_and_refuses_cycles() {
+        let (_env, root, mut core) = scratch_core("renest");
+        let a = core.spawn_instance().unwrap().id;
+        let b = core.spawn_instance_with_task(a, "x".into()).unwrap().id;
+        let other = core.spawn_instance().unwrap().id;
+        let term = core.spawn_terminal(None, None, false).unwrap().id;
+        core.set_muted(other, true);
+        core.set_collapsed(other, true);
+
+        // a (with child b) goes under `other`, last in the order given.
+        assert!(core.reparent(a, Some(other), &[other, a, b, term]));
+        assert_eq!(core.parents.get(&a), Some(&other));
+        assert_eq!(core.parents.get(&b), Some(&a), "the family moves along");
+        assert!(!core.collapsed.contains(&other), "the new parent unfolds");
+        assert!(!core.muted.contains(&a), "moving never changes mute");
+        let order: Vec<usize> = core.sessions.iter().map(|s| s.id).collect();
+        assert_eq!(order, vec![other, a, b, term]);
+
+        // Cycles and terminals are refused, and change nothing.
+        let before = core.parents.clone();
+        assert!(!core.reparent(other, Some(b), &[b, other]), "a cycle");
+        assert!(!core.reparent(a, Some(a), &[a]), "onto itself");
+        assert!(!core.reparent(a, Some(term), &[term, a]), "under a terminal");
+        assert!(!core.reparent(term, Some(a), &[a, term]), "a terminal");
+        assert_eq!(core.parents, before);
+        let order: Vec<usize> = core.sessions.iter().map(|s| s.id).collect();
+        assert_eq!(order, vec![other, a, b, term], "a refusal must not reorder");
+
+        // Back to the top level.
+        assert!(core.reparent(a, None, &[a, b, other, term]));
+        assert!(!core.parents.contains_key(&a));
+        assert_eq!(core.parents.get(&b), Some(&a));
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

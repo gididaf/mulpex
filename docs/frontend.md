@@ -206,8 +206,25 @@ widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the it
 
 A claude started by `hub_spawn` is drawn **indented under the claude that spawned it** (`└`, any
 depth), keeping its real number — `claude #7` stays `claude#7` everywhere, because the number is a
-hub address. Only `hub_spawn` makes a child: ⌘T claudes are always top-level and terminals are
-never nested.
+hub address. `hub_spawn` makes a child, and so does a drag (below); a ⌘T claude starts top-level
+and terminals are never nested.
+
+- **Drag-to-nest.** Dropping a row on the **middle half** of a claude row (the whole row lights
+  up) makes it — family and all — that claude's **last child**; the top and bottom quarters stay
+  reorder slots. Any claude may be moved, ⌘T ones included; mute is left alone; a folded target
+  unfolds. `Core::reparent` sets the link and commits the order in one call and refuses a terminal
+  on either end or a parent from inside the row's own family — a cycle would hang `treeDepths`, so
+  the backend refuses it even though `stores.ts::canNest` already hides such targets. The frontend
+  applies the move only after the backend accepts, because a refusal changes nothing there and so
+  would echo nothing back to undo an optimistic repaint. `nestOrder` emits an order `displayOrder`
+  leaves unchanged, like `dragOrder`.
+- **Un-nesting** a nested row goes straight to the top level, family and all, from two spots:
+  the **top quarter of a top-level claude** (lands above it) or **anywhere below the last row**
+  (lands after the last claude, above the terminals) — `InstanceList::unnestTargetAt`,
+  `stores.ts::unnestOrder`, the same `Core::reparent` with `parent: None`. The bottom edge of a
+  child row deliberately stays a reorder within its family: with one top-level claude there is no
+  gap *between* top-level rows at all, and claiming that edge too would make "move below my last
+  sibling" impossible.
 
 - **The link is backend state.** `Core::parents` (child → spawner) is recorded in
   `spawn_instance_with_task`, but only when the spawner is a live claude here — a terminal or an
