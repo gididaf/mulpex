@@ -327,6 +327,14 @@ impl Session {
                 cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
                 cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
                 cmd.env("IS_SANDBOX", "1");
+                // Claude Code's "fullscreen" renderer (alt screen + mouse
+                // tracking) rolls out server-side and via an in-app trial. It
+                // takes every drag away from xterm, so ⌘⇧P (pins) never sees a
+                // selection, and the readers built on the classic screen
+                // (`promptbox.ts`) were never measured against it. The env var
+                // wins over `/tui fullscreen` and the rollout gate (measured,
+                // 2.1.292: `0` emits no ?1049h / ?100xh).
+                cmd.env("CLAUDE_CODE_NO_FLICKER", "0");
                 cmd.env("MULPEX_INSTANCE_ID", id.to_string());
                 cmd.env("MULPEX_STATE_DIR", state_dir);
                 cmd.env(

@@ -323,6 +323,10 @@ pub fn peer_rules(token: &str) -> String {
 /// very often entered as root. This deliberately bypasses a safety check Claude
 /// Code put there on purpose: a remote peer runs unattended and answers to
 /// another model, so it must not stop at a permission prompt no human will see.
+///
+/// **`CLAUDE_CODE_NO_FLICKER=0`** keeps the remote claude on the classic
+/// renderer, the same as a local one (`pty.rs`): fullscreen's alt screen is not
+/// what the screen-only reads in ../../docs/remote-peers.md were measured on.
 pub fn remote_launch_command(
     cwd: Option<&str>,
     rules_b64: &str,
@@ -359,7 +363,7 @@ pub fn remote_launch_command(
         None => String::new(),
     };
     format!(
-        "{cd}export IS_SANDBOX=1 && {exec}claude --dangerously-skip-permissions \
+        "{cd}export IS_SANDBOX=1 CLAUDE_CODE_NO_FLICKER=0 && {exec}claude --dangerously-skip-permissions \
          --append-system-prompt \"$(printf %s {rules_b64} | base64 -d)\"{task}"
     )
 }
@@ -777,6 +781,7 @@ mod tests {
         for cmd in [&mine, &theirs] {
             assert!(cmd.contains("cd '/opt/ticket-system' && "), "{cmd}");
             assert!(cmd.contains("IS_SANDBOX=1"), "{cmd}");
+            assert!(cmd.contains("CLAUDE_CODE_NO_FLICKER=0"), "{cmd}");
             assert!(cmd.contains("base64 -d"), "{cmd}");
         }
         // With no cwd there is no `cd`, so the launch inherits wherever the

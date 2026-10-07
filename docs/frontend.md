@@ -357,6 +357,15 @@ pin either). Claudes only — a shell's row is never restored, so its pin could 
   `persist_sessions` prunes the file to the ids it saved. So ⌘W loses the pin, a quit keeps it, and
   a later claude given the same number can't inherit one. The frontend's `dropPins` on
   `session-exited` is memory-only for that reason — teardown exits sessions too.
+- **Every claude is spawned with `CLAUDE_CODE_NO_FLICKER=0`** (`pty.rs`, and the remote launch in
+  `remote.rs`). Claude Code's "fullscreen" renderer turns on mouse tracking (`?1000h ?1002h ?1003h
+  ?1006h`) plus the alt screen, so xterm hands every drag to claude and never holds a selection —
+  ⌘⇧P then *always* says "Select some text first", while claude paints a highlight that looks
+  exactly like one. It arrived on its own, after pins shipped, through the `tengu_pewter_brook`
+  rollout gate or the `/tui fullscreen` trial upsell — no claude or Mulpex update involved. Measured
+  on 2.1.292 (2026-10-07): the env var is checked before the `tui` setting and the gate, and with it
+  claude emits none of those modes. Don't drop it to "let the user choose"; that brings back a pin
+  key that can never work, and leaves `promptbox.ts` reading a screen it was never measured on.
 
 ## Hub panel is Messages only
 
