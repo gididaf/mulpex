@@ -159,6 +159,7 @@
       ["save_session", "Save Session…", "⌘S", isClaude],
       ["load_session", "Load Session…", "⌘L", true],
       ["import_docs", "Import Docs…", "", true],
+      ["remote_control", "Remote Control…", "⌘⇧O", true],
       // Mute is meaningless for a terminal — it produces none of the signals mute
       // silences, and the backend refuses to record the flag (see InstanceList).
       ["mute", cur?.muted ? "Unmute Session" : "Mute Session", "⌘M", isClaude],

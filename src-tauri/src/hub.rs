@@ -48,6 +48,10 @@ pub fn start(app: AppHandle) {
             let mut reg = Registry::default();
             let state_root = ws.state_root.clone();
             let mut live: HashSet<ProjectHandle> = HashSet::new();
+            // Remote Control's picture of the workspace — only built while it's on.
+            let remote_on = crate::remote::is_enabled();
+            let mut remote_projects = Vec::new();
+            let active = ws.active;
             for core in &mut ws.projects {
                 live.insert(core.handle);
                 let removed = core.reap_dead();
@@ -90,9 +94,22 @@ pub fn start(app: AppHandle) {
                 // below, which are what publish the label.
                 core.apply_fallback_names(&snap);
                 reg.projects.push(core.registry_entry(&snap));
-                batch.push((core.handle, removed, snap, core.session_infos()));
+                let sessions = core.session_infos();
+                if remote_on {
+                    remote_projects.push(crate::remote::project_view(
+                        core.handle,
+                        &core.project_name,
+                        &core.state_dir,
+                        &sessions,
+                        &snap,
+                    ));
+                }
+                batch.push((core.handle, removed, snap, sessions));
             }
             drop(ws);
+            if remote_on {
+                crate::remote::publish(crate::remote::workspace_view(active, remote_projects));
+            }
 
             // Cross-project addressing rests on this file. Written outside the
             // lock and only when the bytes change, so a quiet tick costs one

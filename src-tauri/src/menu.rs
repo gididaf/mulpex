@@ -93,6 +93,11 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // (`docs_import.rs`). Rare, so no accelerator; the palette reaches it too.
     let import_docs =
         MenuItemBuilder::with_id("import_docs", "Import Docs…").build(app)?;
+    // ⌘⇧O: the Remote Control dialog — turn it on/off and pair a phone
+    // (`remote.rs`). O for "outside".
+    let remote_control = MenuItemBuilder::with_id("remote_control", "Remote Control…")
+        .accelerator("Cmd+Shift+O")
+        .build(app)?;
     let mut file_builder = SubmenuBuilder::new(app, "File")
         .item(&open_project)
         .item(&close_project)
@@ -117,6 +122,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&close_session)
         .separator()
         .item(&import_docs)
+        .item(&remote_control)
         .build()?;
 
     // Edit: the predefined items macOS routes to the focused xterm textarea.

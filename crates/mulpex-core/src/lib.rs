@@ -230,6 +230,20 @@ pub fn session_id_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(SESSIONID_DIR).join(id.to_string())
 }
 
+/// `dialog/<id>.json` = the dialog instance `id` last held up for the user:
+/// `{"tool": "AskUserQuestion" | "ExitPlanMode", "input": <tool input>}`,
+/// written by the `askq` / `plan` hooks. Remote Control draws it as buttons on
+/// the phone. Only meaningful while the instance's status is `needs` — those
+/// two hooks are the only writers of `needs` besides the plan dialog's own
+/// permission notification — so a stale file from an escaped dialog is
+/// harmless and is simply overwritten by the next one.
+pub const DIALOG_DIR: &str = "dialog";
+
+/// `dialog/<id>.json` for one instance.
+pub fn dialog_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(DIALOG_DIR).join(format!("{id}.json"))
+}
+
 /// `quietturn/<id>` = this turn is, so far, nothing but the instance re-arming
 /// its own hub listener — so it must leave no trace in the UI.
 ///

@@ -423,4 +423,38 @@ export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecis
  * scratch root) before re-execing. Used to apply a downloaded update. */
 export const restartApp = () => invoke<void>("restart_app");
 
+/** ⌘⇧O Remote Control (`remote.rs`). Also the `remote-changed` event payload. */
+export interface RemoteStatus {
+  enabled: boolean;
+  relay_url: string;
+  state: "off" | "connecting" | "connected" | "error";
+  error: string | null;
+  /** Phones connected right now. */
+  clients: number;
+  /** What a NEW phone opens to pair (one use, 10 minutes); the QR code
+   *  encodes exactly this. Empty while off. */
+  pair_url: string;
+  qr_svg: string;
+  devices: RemoteDevice[];
+}
+export interface RemoteDevice {
+  id: string;
+  name: string;
+  /** Unix seconds. */
+  added: number;
+  online: boolean;
+  /** Gets notifications. */
+  push: boolean;
+}
+/** Answer a phone's typing request (`remote-type`). */
+export const remoteReply = (rid: string, ok: boolean, why: string | null, id: number | null = null) =>
+  invoke<void>("remote_reply", { rid, ok, why, id });
+export const remoteRevokeDevice = (id: string) =>
+  invoke<RemoteStatus>("remote_revoke_device", { id });
+export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
+export const remoteSetEnabled = (on: boolean) =>
+  invoke<RemoteStatus>("remote_set_enabled", { on });
+export const remoteSetRelayUrl = (url: string) =>
+  invoke<RemoteStatus>("remote_set_relay_url", { url });
+
 export { Channel };

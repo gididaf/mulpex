@@ -686,7 +686,7 @@ pub fn resumable_uuid(save: &Path, dir: &Path) -> Option<String> {
 /// Where Claude Code keeps conversation `uuid` of project `dir`: the canonical
 /// dir with every non-alphanumeric byte turned into `-` (checked against the
 /// real `~/.claude/projects/` names, e.g. `/private/tmp/...` → `-private-tmp-...`).
-fn transcript_path(dir: &Path, uuid: &str) -> PathBuf {
+pub(crate) fn transcript_path(dir: &Path, uuid: &str) -> PathBuf {
     let slug: String = canon(dir)
         .to_string_lossy()
         .chars()

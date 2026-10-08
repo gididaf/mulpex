@@ -23,6 +23,7 @@
     focusSession,
     getHubSnapshot,
     sendBytes,
+    remoteReply,
     setSessionMuted,
     setSessionCollapsed,
     reparentSession,
@@ -90,6 +91,7 @@
   import LoadDialog from "./lib/components/LoadDialog.svelte";
   import SecretsDialog from "./lib/components/SecretsDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
+  import RemoteDialog from "./lib/components/RemoteDialog.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
   import type { CtxItem } from "./lib/components/ContextMenu.svelte";
 
@@ -211,6 +213,8 @@
   let importFor = $state<ProjectHandle | null>(null);
   /** ⌘K: the claude the Secrets dialog is for, or null when closed. */
   let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
+  /** ⌘⇧O: the Remote Control dialog is open. */
+  let showRemote = $state(false);
   let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
 
   /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
@@ -688,6 +692,106 @@
     sendBytes(handle, id, new TextEncoder().encode(`${lead}🔑 ${keys.join(", ")} `));
   }
 
+  /** Remote Control: a phone's message for claude#id (`remote/mod.rs::on_type`;
+   *  over 900 bytes it is already a one-line pointer to a file). Refused like
+   *  ⌘E — never onto a draft or into an open dialog — and the answer goes back to
+   *  the phone. One bracketed paste plus Enter, in one write: measured to arrive
+   *  exact, newlines and Hebrew included. */
+  type RemoteTypeEvent = { handle: ProjectHandle; id: number; text: string; rid: string };
+  function remoteType({ handle, id, text, rid }: RemoteTypeEvent) {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    let why: string | null = null;
+    if (!p || !s || s.kind === "shell" || s.exited || s.failed) why = "That claude isn't running";
+    else if (p.statuses.get(id) === "needs") why = "Answer the open question first";
+    else {
+      const box = terminals.promptBox(handle, id);
+      if (box === "draft") why = "There's unsent text in this claude's prompt on the Mac";
+      else if (box === "none") why = "No prompt to type into right now";
+    }
+    // Control characters out: an ESC inside could end the paste early (`ESC[201~`)
+    // and turn the rest of the message into keystrokes.
+    const clean = text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+    if (!why) sendBytes(handle, id, new TextEncoder().encode(`\x1b[200~${clean}\x1b[201~\r`));
+    remoteReply(rid, why == null, why);
+  }
+
+  /** Remote Control: a phone answering claude#id's open question or plan. The
+   *  keys were worked out in `remote/dialog.rs` (measured against a real
+   *  claude); here they are played one write at a time, with a gap so the
+   *  dialog keeps up — and only while the claude is still waiting on it. */
+  type RemoteKeysEvent = { handle: ProjectHandle; id: number; chunks: string[]; rid: string };
+  async function remoteKeys({ handle, id, chunks, rid }: RemoteKeysEvent) {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    if (!p || !s || s.kind === "shell" || s.exited) return remoteReply(rid, false, "That claude isn't running");
+    if (p.statuses.get(id) !== "needs") return remoteReply(rid, false, "That question was already answered");
+    for (const c of chunks) {
+      sendBytes(handle, id, new TextEncoder().encode(c));
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    remoteReply(rid, true, null);
+  }
+
+  /** Remote Control: start a claude or terminal in a project, or close an
+   *  instance. The same calls as ⌘T / ⌘⇧T / ⌘W, but aimed at the phone's
+   *  project and never moving the Mac's focus — the new row just appears, the
+   *  way an instance's `hub_spawn` does. The phone confirms a close itself. */
+  type RemoteActionEvent = {
+    action: "new" | "close";
+    handle: ProjectHandle;
+    id: number | null;
+    kind: "claude" | "shell" | null;
+    rid: string;
+  };
+  async function remoteAction({ action, handle, id, kind, rid }: RemoteActionEvent) {
+    const p = get(projects).get(handle);
+    if (!p) return remoteReply(rid, false, "That project isn't open");
+    if (action === "close") {
+      if (id == null || !p.sessions.some((s) => s.id === id)) return remoteReply(rid, false, "Already closed");
+      try {
+        await closeSession(handle, id);
+        remoteReply(rid, true, null);
+      } catch (e) {
+        remoteReply(rid, false, String(e));
+      }
+      return;
+    }
+    try {
+      const info = kind === "shell" ? await createTerminal(handle) : await createSession(handle);
+      const cur = get(projects).get(handle);
+      if (cur && !cur.sessions.some((s) => s.id === info.id)) setSessionsFor(handle, [...cur.sessions, info]);
+      remoteReply(rid, true, null, info.id);
+    } catch (e) {
+      remoteReply(rid, false, String(e));
+    }
+  }
+
+  /** Remote Control's key bar. Arrows follow the claude's cursor-key mode, as
+   *  xterm itself would send them. */
+  type RemoteKeyEvent = { handle: ProjectHandle; id: number; key: string };
+  function remoteKey({ handle, id, key }: RemoteKeyEvent) {
+    const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
+    if (!s || s.exited) return;
+    const app = terminals.appCursorKeys(handle, id);
+    const bytes: Record<string, string> = {
+      esc: "\x1b",
+      "ctrl-c": "\x03",
+      enter: "\r",
+      tab: "\t",
+      "shift-tab": "\x1b[Z",
+      up: app ? "\x1bOA" : "\x1b[A",
+      down: app ? "\x1bOB" : "\x1b[B",
+      right: app ? "\x1bOC" : "\x1b[C",
+      left: app ? "\x1bOD" : "\x1b[D",
+      "ctrl-d": "\x04",
+      "ctrl-l": "\x0c",
+      "ctrl-z": "\x1a",
+    };
+    const b = bytes[key];
+    if (b) sendBytes(handle, id, new TextEncoder().encode(b));
+  }
+
   function explainInstance(handle: ProjectHandle, id: number) {
     const p = get(projects).get(handle);
     const s = p?.sessions.find((x) => x.id === id);
@@ -893,6 +997,9 @@
       case "import_docs":
         if (h != null) importFor = h;
         break;
+      case "remote_control":
+        showRemote = true;
+        break;
       case "save_session": {
         const cur = get(activeId);
         if (h != null && cur != null) await saveInstance(h, cur);
@@ -979,7 +1086,7 @@
    * `messages` open their own focus-taking UI, and `open_project` opens a native
    * folder dialog. Refocusing the terminal after those would fight them.
    */
-  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project"]);
+  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project", "remote_control"]);
   async function runPaletteAction(id: string) {
     showPalette.set(false);
     await handleMenu(id);
@@ -1071,6 +1178,10 @@
 
     unlisteners.push(
       listen<string>("menu", (e) => handleMenu(e.payload)),
+      listen<RemoteTypeEvent>("remote-type", (e) => remoteType(e.payload)),
+      listen<RemoteKeyEvent>("remote-key", (e) => remoteKey(e.payload)),
+      listen<RemoteKeysEvent>("remote-keys", (e) => remoteKeys(e.payload)),
+      listen<RemoteActionEvent>("remote-action", (e) => remoteAction(e.payload)),
       listen<HubUpdateEvent>("hub-update", (e) =>
         applyHubFor(e.payload.handle, e.payload.snapshot),
       ),
@@ -1168,7 +1279,7 @@
       onadd={pickAndOpen}
       onreorder={applyProjectOrder}
     />
-    <TopBar />
+    <TopBar onremote={() => (showRemote = true)} />
     <aside class="sidebar">
       <InstanceList
         onselect={selectSession}
@@ -1239,6 +1350,14 @@
               : ""),
           bad ? 15000 : 8000,
         );
+      }}
+    />
+  {/if}
+  {#if showRemote}
+    <RemoteDialog
+      onclose={() => {
+        showRemote = false;
+        terminals.refocus();
       }}
     />
   {/if}

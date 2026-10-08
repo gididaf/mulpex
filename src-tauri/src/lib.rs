@@ -8,6 +8,7 @@ mod menu;
 mod project;
 mod pins;
 mod pty;
+mod remote;
 mod docs_import;
 mod saves;
 mod secrets;
@@ -62,6 +63,7 @@ fn is_forwarded(id: &str) -> bool {
             | "move_instance_up"
             | "move_instance_down"
             | "check_updates"
+            | "remote_control"
     ) || id.starts_with("project_")
 }
 
@@ -133,6 +135,11 @@ pub fn run() {
             commands::import_discard,
             commands::import_apply,
             commands::restart_app,
+            remote::remote_status,
+            remote::remote_set_enabled,
+            remote::remote_set_relay_url,
+            remote::remote_revoke_device,
+            remote::remote_reply,
         ])
         .setup(|app| {
             // Warm the `claude` lookup off-thread: it shells out to the user's
@@ -180,6 +187,7 @@ pub fn run() {
                 // Drop any dirs that no longer exist / failed to open from the set.
                 ws.persist_open();
             }
+            remote::init(app.handle().clone());
             hub::start(app.handle().clone());
             Ok(())
         })

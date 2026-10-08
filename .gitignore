@@ -15,3 +15,6 @@
 
 # Local measurement harnesses and build/install logs (see CLAUDE.md)
 /scratchpad
+
+# Remote Control phone app build output (served by mulpex-relay)
+/remote/dist

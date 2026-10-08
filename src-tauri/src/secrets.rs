@@ -64,7 +64,7 @@ fn render(rows: &[SecretRow], project: Option<&str>) -> Result<String, String> {
 }
 
 /// Create `dir` (and its parents) as owner-only.
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -75,7 +75,7 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 /// Write `body` to `path` as 0600. Atomic: the temp file is 0600 from its first
 /// byte and is renamed over the target, so no reader ever sees a half-written
 /// file or a moment of wider permissions.
-fn write_private(path: &Path, body: &str) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, body: &str) -> Result<(), String> {
     let tmp = path.with_extension("env.tmp");
     let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new()

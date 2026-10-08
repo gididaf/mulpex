@@ -510,8 +510,29 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
 fn askq(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    write_dialog(ctx, &input);
     write_needs(ctx);
     Ok(())
+}
+
+/// Keep what the dialog asks (`dialog/<id>.json`), so Remote Control can offer
+/// it as buttons. Written before `needs`, so a reader that sees `needs` finds
+/// the dialog it belongs to. Best-effort: a payload that won't parse leaves the
+/// old file, which the status gate makes harmless.
+fn write_dialog(ctx: &Ctx, payload: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+    let body = serde_json::json!({
+        "tool": v.get("tool_name").cloned().unwrap_or_default(),
+        "input": v.get("tool_input").cloned().unwrap_or_default(),
+    });
+    let path = crate::dialog_path(&ctx.state_dir, ctx.instance);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// `PreToolUse[ExitPlanMode]`: the instance finished a plan and is about to ask
@@ -526,6 +547,7 @@ fn askq(ctx: &Ctx) -> anyhow::Result<()> {
 fn plan(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    write_dialog(ctx, &input);
     write_needs(ctx);
     Ok(())
 }
@@ -2025,6 +2047,31 @@ mod tests {
         write_needs(&ctx);
         assert_eq!(std::fs::read_to_string(&status).unwrap(), "needs");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dialog's questions are kept for Remote Control, from the real
+    /// `PreToolUse` payload shape, and a payload that won't parse leaves the
+    /// previous file alone.
+    #[test]
+    fn a_dialog_payload_is_kept_for_remote_control() {
+        let dir = std::env::temp_dir().join(format!("mulpex-dialog-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Pick?", "header": "P", "multiSelect": false,
+                "options": [{"label": "A", "description": "a"}]}]},
+        });
+        write_dialog(&ctx, &payload.to_string());
+        let path = crate::dialog_path(&ctx.state_dir, 3);
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(got["tool"], "AskUserQuestion");
+        assert_eq!(got["input"]["questions"][0]["options"][0]["label"], "A");
+
+        write_dialog(&ctx, "not json");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), got.to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

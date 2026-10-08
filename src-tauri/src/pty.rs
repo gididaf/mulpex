@@ -181,6 +181,20 @@ fn delivery_settled(state_dir: &Path, id: usize) -> bool {
 /// `Serialize` payload that survives Tauri IPC without ArrayBuffer plumbing).
 pub struct OutputSink {
     state: Mutex<SinkState>,
+    /// Shell terminals only: the last `TAIL_BYTES` of output and the Remote
+    /// Control phones watching it. A phone opening a terminal gets the tail to
+    /// paint from, then every byte after it — the same bytes, at the same one
+    /// geometry, the desktop xterm got.
+    tail: Option<Mutex<Tail>>,
+}
+
+/// How much of a terminal's recent output a phone repaints from.
+const TAIL_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct Tail {
+    ring: std::collections::VecDeque<u8>,
+    taps: Vec<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 enum SinkState {
@@ -189,9 +203,10 @@ enum SinkState {
 }
 
 impl OutputSink {
-    fn new() -> Self {
+    fn new(keep_tail: bool) -> Self {
         Self {
             state: Mutex::new(SinkState::Buffering(Vec::new())),
+            tail: keep_tail.then(|| Mutex::new(Tail::default())),
         }
     }
 
@@ -204,6 +219,24 @@ impl OutputSink {
             }
             SinkState::Buffering(buf) => buf.extend_from_slice(bytes),
         }
+        drop(st);
+        if let Some(tail) = &self.tail {
+            let mut t = tail.lock().unwrap();
+            t.ring.extend(bytes);
+            let over = t.ring.len().saturating_sub(TAIL_BYTES);
+            t.ring.drain(..over);
+            // A phone that went away dropped its receiver; forget it.
+            t.taps.retain(|tx| tx.send(bytes.to_vec()).is_ok());
+        }
+    }
+
+    /// Watch this terminal: its recent output now, every new byte after. Under
+    /// the one lock, so nothing falls between the two. `None` for a claude.
+    pub fn tap(&self) -> Option<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
+        let mut t = self.tail.as_ref()?.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        t.taps.push(tx);
+        Some((t.ring.iter().copied().collect(), rx))
     }
 
     /// Bind the frontend channel: flush anything buffered, then stream live.
@@ -396,7 +429,7 @@ impl Session {
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let master = pair.master;
 
-        let sink = Arc::new(OutputSink::new());
+        let sink = Arc::new(OutputSink::new(kind == SessionKind::Shell));
         let alive = Arc::new(AtomicBool::new(true));
         // Latched by the reader thread on first output. It can't be read here:
         // `spawn_command` has returned from the fork, but the child sets its
@@ -570,6 +603,11 @@ impl Session {
 
     /// Forward raw bytes to Claude's stdin (from xterm `onData`). Shares the PTY
     /// writer (behind a mutex) with the one-shot hub-listener bootstrap thread.
+    /// Remote Control: watch this terminal's output (`OutputSink::tap`).
+    pub fn tap(&self) -> Option<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
+        self.sink.tap()
+    }
+
     pub fn send(&mut self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(bytes);
@@ -1167,6 +1205,29 @@ fn b64encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Remote Control tap gets the recent output, then every byte after it;
+    /// the tail is bounded; a phone that went away is forgotten; and a claude
+    /// keeps no tail at all.
+    #[test]
+    fn a_terminal_tap_gets_the_tail_then_the_stream() {
+        let sink = OutputSink::new(true);
+        sink.push(b"before ");
+        let (tail, rx) = sink.tap().unwrap();
+        assert_eq!(tail, b"before ");
+        sink.push(b"after");
+        assert_eq!(rx.recv().unwrap(), b"after");
+
+        sink.push(&vec![b'x'; TAIL_BYTES + 10]);
+        let (tail, _kept) = sink.tap().unwrap();
+        assert_eq!(tail.len(), TAIL_BYTES);
+
+        drop(rx);
+        sink.push(b"!");
+        assert_eq!(sink.tail.as_ref().unwrap().lock().unwrap().taps.len(), 1, "the dropped tap is gone");
+
+        assert!(OutputSink::new(false).tap().is_none());
+    }
 
     /// The selection behind the one cleanup nothing else in this file can do —
     /// and the one that has to be *narrow*, because it reaches into the process

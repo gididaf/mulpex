@@ -307,6 +307,13 @@ class TerminalManager {
     return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols);
   }
 
+  /** Whether (handle, id)'s program asked for application cursor keys
+   *  (DECCKM), which changes the bytes an arrow key must send: `ESC O A`
+   *  instead of `ESC [ A`. Remote Control's key bar sends what xterm would. */
+  appCursorKeys(handle: number, id: number): boolean {
+    return this.entries.get(keyOf(handle, id))?.term.modes.applicationCursorKeysMode ?? false;
+  }
+
   /** (handle, id)'s current selection, colors and all, for a pin (⌘⇧P). The
    *  selection is cleared once taken, so the pane shows it went somewhere. */
   pinSelection(handle: number, id: number): PinRun[][] | null {

@@ -28,3 +28,20 @@ portable-pty = "0.9"
 mulpex-core = { path = "../crates/mulpex-core" }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-notification = "2.3.3"
+# Remote Control (`remote/`): a blocking client on its own thread, like the
+# rest of the backend, and the pairing QR code drawn as SVG.
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# End-to-end encryption between this Mac and a paired phone (`remote/crypto.rs`);
+# the phone runs the same primitives from @noble.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+# Web Push from the Mac straight to a paired phone (`remote/push.rs`): VAPID
+# signing and the RFC 8291 payload encryption, sent with a small blocking client.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+aes-gcm = "0.10"
+ureq = "3"
