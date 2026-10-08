@@ -1,11 +1,23 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { projects, activeProject, toast } from "../stores";
+  import { projects, activeProject, activeId, saves, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
   import PinStack from "./PinStack.svelte";
+  import SaveOverlay from "./SaveOverlay.svelte";
+
+  let {
+    onsaveclose,
+    onsaveretry,
+  }: {
+    /** Close a row ⌘S holds, once its save is done. */
+    onsaveclose: (id: number) => void;
+    /** Re-run its failed save. */
+    onsaveretry: (id: number) => void;
+  } = $props();
 
   let paneEl: HTMLDivElement;
+  const activeSave = $derived($activeId != null ? $saves.get($activeId) : undefined);
 
   // Every session across ALL open projects, so background projects' terminals
   // stay mounted (alive-while-hidden). Only the active project's active session
@@ -36,6 +48,15 @@
     <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
   {/each}
   <PinStack />
+  {#if activeSave && $activeId != null}
+    {@const id = $activeId}
+    <SaveOverlay
+      {id}
+      status={activeSave}
+      onclose={() => onsaveclose(id)}
+      onretry={() => onsaveretry(id)}
+    />
+  {/if}
   {#if activeEmpty}
     <div class="empty">
       Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal

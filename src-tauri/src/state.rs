@@ -299,6 +299,12 @@ pub struct Core {
     /// stays readable — so "dead" alone can't mean "remove", and this is what
     /// distinguishes the two. Removal still happens uniformly in `reap_dead`.
     closing: HashSet<usize>,
+    /// Claudes stopped by ⌘S (`begin_save`). Saving means the user is done with
+    /// that claude, so its process is killed at once — nothing can move on past
+    /// the conversation the save forks — but its row is **kept**, locked, until
+    /// the user closes it: the save's progress, its result and its Retry live
+    /// there. Out of the hub like a failed row. Released by `close`.
+    saving: HashSet<usize>,
     /// Remote terminals that have been given something and owe an answer.
     ///
     /// The idle backstop is meaningless without this. A remote claude sitting at
@@ -523,6 +529,7 @@ impl Core {
             collapsed,
             worked,
             closing: HashSet::new(),
+            saving: HashSet::new(),
             remote_awaiting: HashSet::new(),
             restored,
             started,
@@ -1119,6 +1126,14 @@ impl Core {
                                  hub_terminal_close."
                             ),
                         })),
+                        // Only the user closes a row ⌘S holds: it carries the
+                        // save's result, and its Close is what they wait for.
+                        Some(false) if self.saving.contains(&id) => refused.push(serde_json::json!({
+                            "id": id,
+                            "reason": format!(
+                                "claude#{id} is being saved by the user — they close it themselves."
+                            ),
+                        })),
                         Some(false) => match mulpex_core::close_busy_reason(&self.state_dir, id)
                             .filter(|_| !force)
                         {
@@ -1442,8 +1457,69 @@ impl Core {
     /// point for a shell that exits on its own but exactly wrong here.
     pub fn close(&mut self, id: usize) {
         self.closing.insert(id);
+        self.saving.remove(&id);
         if let Some(session) = self.session_mut(id) {
             session.kill();
+        }
+    }
+
+    /// ⌘S: stop claude#`id` for good and hold its row for the save. Returns the
+    /// project dir and the conversation uuid the save forks.
+    ///
+    /// Refused mid-turn and over an open question rather than warned about: the
+    /// save is the last word on this conversation, so a step it would miss is
+    /// lost for good. A retry on a row already held skips the checks and the
+    /// kill — there is no process left to be busy.
+    pub fn begin_save(&mut self, id: usize) -> Result<(PathBuf, String), String> {
+        if let Some(why) = self.save_refusal(id) {
+            return Err(why);
+        }
+        let uuid = self.sessions.iter().find(|s| s.id == id).map(|s| s.session_id.clone()).unwrap_or_default();
+        if !self.saving.contains(&id) {
+            self.saving.insert(id);
+            if let Some(session) = self.session_mut(id) {
+                session.kill();
+            }
+            self.write_live_instances();
+        }
+        Ok((self.project_dir.clone(), uuid))
+    }
+
+    /// Why ⌘S must not save claude#`id` now, or `None`. Asked before the confirm
+    /// (`save_check`) and again by `begin_save`. A `working` claude is allowed
+    /// when its turn is over and only background work is left
+    /// (`only_background_work`) — saving stops that work with it.
+    pub fn save_refusal(&self, id: usize) -> Option<String> {
+        let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
+            return Some(format!("claude#{id} is not open"));
+        };
+        if s.is_shell() {
+            return Some(format!("term#{id} is a terminal — only a claude can be saved"));
+        }
+        if s.session_id.is_empty() || !self.worked.contains(&id) {
+            return Some(format!("claude#{id} has nothing to save yet — send it a prompt first"));
+        }
+        if self.saving.contains(&id) {
+            return None;
+        }
+        let status = std::fs::read_to_string(self.state_dir.join(id.to_string())).unwrap_or_default();
+        match status.trim() {
+            "working" if !mulpex_core::only_background_work(&self.state_dir, id) => {
+                Some("Wait for it to finish first".into())
+            }
+            "needs" => Some("Answer or close the open question first".into()),
+            _ => None,
+        }
+    }
+
+    /// The save of a held row succeeded: drop it from the restore store, so a
+    /// quit before the user clicks Close does not bring the claude back next
+    /// launch. Saved is done; the conversation stays reachable through ⌘L.
+    /// Not done on failure — then the store is the only way back to it.
+    pub fn save_succeeded(&mut self, id: usize) {
+        if self.saving.contains(&id) {
+            self.worked.remove(&id);
+            self.persist_sessions();
         }
     }
 
@@ -1474,6 +1550,9 @@ impl Core {
             .ok_or_else(|| anyhow::anyhow!("claude#{id} is not open"))?;
         if self.sessions[pos].is_shell() {
             anyhow::bail!("term#{id} is a terminal — only a claude can be restarted");
+        }
+        if self.saving.contains(&id) {
+            anyhow::bail!("claude#{id} was saved — continue it from ⌘L instead");
         }
         let session_id = self.sessions[pos].session_id.clone();
         if session_id.is_empty() || !self.worked.contains(&id) {
@@ -1718,6 +1797,7 @@ impl Core {
         self.parents.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.collapsed.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
+        self.saving.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.failed.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         for id in &removed {
@@ -1747,7 +1827,7 @@ impl Core {
         if self.closing.contains(&s.id) {
             return true;
         }
-        !s.is_shell() && !self.failed_to_start(s)
+        !s.is_shell() && !self.saving.contains(&s.id) && !self.failed_to_start(s)
     }
 
     /// A dead instance that failed to start and has not been marked as such yet
@@ -1756,6 +1836,7 @@ impl Core {
         !s.is_alive()
             && !s.is_shell()
             && !self.closing.contains(&s.id)
+            && !self.saving.contains(&s.id)
             && !self.failed.contains_key(&s.id)
             && self.failed_to_start(s)
     }
@@ -2237,7 +2318,8 @@ impl Core {
     /// having a status entry, so this excludes a failed instance from all three
     /// for free — exactly how a terminal stays out of them.
     fn live_instances(&self) -> impl Iterator<Item = &Session> {
-        self.instances().filter(|s| !self.failed.contains_key(&s.id))
+        self.instances()
+            .filter(|s| !self.failed.contains_key(&s.id) && !self.saving.contains(&s.id))
     }
 
     /// Persist the worked-on sessions' ids (+ names + mute), preserving order.
@@ -3430,6 +3512,45 @@ mod tests {
             !core.failed.contains_key(&id),
             "still marked as failed to start, so it is not offered as a live peer"
         );
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⌘S stops the claude but keeps its row until the user closes it; mid-turn
+    /// and over an open question it refuses without killing anything.
+    #[test]
+    fn saving_stops_the_claude_and_holds_its_row_until_closed() {
+        let saved = [record("one", Some(1)), record("two", Some(2))];
+        let (_env, root, mut core) = core_from_store("saveholds", &saved);
+        let id = core.sessions[1].id;
+        let status = core.state_dir.join(id.to_string());
+
+        for busy in ["working", "needs"] {
+            std::fs::write(&status, busy).unwrap();
+            assert!(core.begin_save(id).is_err(), "saved a claude that is {busy}");
+            assert!(core.sessions[1].is_alive(), "a refused save killed the claude ({busy})");
+        }
+        std::fs::write(&status, "waiting").unwrap();
+
+        let (_, uuid) = core.begin_save(id).expect("the save was refused");
+        assert_eq!(uuid, core.sessions[1].session_id);
+        assert!(wait_until(|| !core.sessions[1].is_alive()), "the claude was not stopped");
+        assert!(core.reap_dead().is_empty(), "the held row was reaped");
+        assert!(core.failed.is_empty(), "the held row was marked as failed to start");
+        assert!(!core.live_instances().any(|s| s.id == id), "a held row is still a hub peer");
+        assert!(core.restart_instance(id).is_err(), "⌘⇧R brought a saved claude back");
+        // A retry on the held row needs no live process.
+        assert!(core.begin_save(id).is_ok(), "a retry was refused");
+
+        core.save_succeeded(id);
+        assert!(
+            !core.store.load().iter().any(|s| s.session_id == uuid),
+            "a saved claude would come back at the next launch"
+        );
+
+        core.close(id);
+        assert_eq!(core.reap_dead(), vec![id], "Close did not remove the held row");
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

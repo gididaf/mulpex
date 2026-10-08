@@ -20,6 +20,7 @@
     closeSession,
     restartSession,
     saveSession,
+    saveCheck,
     focusSession,
     getHubSnapshot,
     sendBytes,
@@ -59,6 +60,8 @@
     applyHubFor,
     applySaveProgress,
     clearSaveState,
+    saves,
+    saveStatusOf,
     displayOrder,
     stepSlot,
     dragOrder,
@@ -320,7 +323,7 @@
               run: () => openSecrets(h, s.id),
             },
           ]),
-      { label: "Close", hint: key("⌘W"), danger: true, run: () => closeSession(h, s.id) },
+      { label: "Close", hint: key("⌘W"), danger: true, run: () => closeInstance(h, s.id) },
     ];
     ctx = { x: e.clientX, y: e.clientY, items };
   }
@@ -631,6 +634,11 @@
     terminals.refocus();
   }
 
+  /** ⌘W / Close. Refused (toast) while a ⌘S save of that row is running. */
+  function closeInstance(handle: ProjectHandle, id: number) {
+    closeSession(handle, id).catch((e) => flashToast(String(e)));
+  }
+
   /** The row's retry after a failed save: no second confirm — the user already
    *  said yes to this save. */
   async function retrySave(id: number) {
@@ -703,6 +711,7 @@
     const s = p?.sessions.find((x) => x.id === id);
     let why: string | null = null;
     if (!p || !s || s.kind === "shell" || s.exited || s.failed) why = "That claude isn't running";
+    else if (saveStatusOf(handle, id)) why = "That claude was saved and stopped";
     else if (p.statuses.get(id) === "needs") why = "Answer the open question first";
     else {
       const box = terminals.promptBox(handle, id);
@@ -835,27 +844,43 @@
   }
 
   /**
-   * ⌘S: save one claude's work as a handoff doc in the repo (`saves.rs`). Asked
-   * first, because it runs three Opus steps; allowed mid-turn, with a warning,
-   * since the save captures whatever the conversation holds right now. The
-   * instance stays usable throughout — progress shows on its sidebar row.
+   * ⌘S: save one claude's work as a handoff doc in the repo (`saves.rs`), and
+   * end it. Saving means the user is done with this claude, so the backend stops
+   * it at once and its pane stays locked (`SaveOverlay`) until the save ends and
+   * the user closes it — no wondering later whether it moved on since. Asked
+   * first; refused mid-turn and over an open question, since the save is the
+   * last word on the conversation.
    */
   async function saveInstance(handle: ProjectHandle, id: number) {
-    const s = get(projects)
-      .get(handle)
-      ?.sessions.find((x) => x.id === id);
-    if (!s) return;
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    if (!p || !s) return;
     if (s.kind === "shell") {
       flashNotice(`term #${id} can't be saved — only a claude has a conversation.`, 4000);
       return;
     }
+    const sv = get(saves).get(id);
+    if (sv) {
+      // A row ⌘S already holds: the lock card is the way forward.
+      if (sv.state === "error") void retrySave(id);
+      else flashToast(sv.state === "done" ? "Already saved — close it" : "Already saving");
+      return;
+    }
+    // The backend decides: a `working` claude whose turn is over and only has
+    // background work left may be saved (`Core::save_refusal`).
+    const why = await saveCheck(handle, id).catch((e) => String(e));
+    if (why) {
+      flashToast(why);
+      return;
+    }
     const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
-    const busy = get(projects).get(handle)?.statuses.get(id) === "working";
-    const ok = await confirm(
-      `Save ${who} so you can continue it later?` +
-        (busy ? `\n\nIt's still working. The last step may be missed.` : ""),
-      { title: "Save Session", kind: "info", okLabel: "Save", cancelLabel: "Cancel" },
-    );
+    const bg = p.statuses.get(id) === "working" ? "\n\nIts background commands will be stopped too." : "";
+    const ok = await confirm(`Save ${who}? It will stop now and close once saved.${bg}`, {
+      title: "Save Session",
+      kind: "info",
+      okLabel: "Save",
+      cancelLabel: "Cancel",
+    });
     terminals.refocus();
     if (!ok) return;
     try {
@@ -983,7 +1008,7 @@
         break;
       case "close_session": {
         const cur = get(activeId);
-        if (h != null && cur != null) closeSession(h, cur);
+        if (h != null && cur != null) closeInstance(h, cur);
         break;
       }
       case "restart": {
@@ -1291,15 +1316,17 @@
         oncontext={openRowMenu}
         oncontextempty={openEmptyMenu}
         onsaveretry={retrySave}
-        onsavedismiss={(id) => {
-          const h = get(activeProjectHandle);
-          if (h != null) clearSaveState(h, id);
-        }}
       />
       <HubPanel />
     </aside>
     <main class="pane">
-      <TerminalPane />
+      <TerminalPane
+        onsaveretry={retrySave}
+        onsaveclose={(id) => {
+          const h = get(activeProjectHandle);
+          if (h != null) closeInstance(h, id);
+        }}
+      />
     </main>
     <BottomBar />
   </div>

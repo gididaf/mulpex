@@ -51,14 +51,47 @@ The Hebrew is simple everyday Hebrew, a title of at most 6 words and a
 description of one sentence of at most 15 words. An English term stays in English exactly as
 written, never transliterated.
 
-## UI (Phase 1)
+## UI: saving ends the claude (2026-10-07)
 
-- **⌘S / right-click ▸ Save… / the palette:** a native confirm. It is allowed mid-turn, but the
-  confirm then warns that the save may miss the step in progress.
-- **The instance stays usable.** Its sidebar row shows `saving… writing / checking / fixing`, then
-  `saved ✓`, which fades after 10 s.
-- **A failure** shows the reason on the row, with **Retry** (no second confirm) and **✕**.
-- **A second ⌘S on the same instance** is refused while a save is running.
+Saving means the user is done with that claude. Until 2026-10-07 the instance stayed usable during
+and after a save, and the user could not tell later whether it had moved on since, or whether to
+save again. So now a save **stops the claude and locks its row**:
+
+- **⌘S / right-click ▸ Save… / the palette** first asks the backend whether it may save
+  (`save_check` → `Core::save_refusal`, which `begin_save` asks again). It is refused with a toast
+  mid-turn or over an open question (`needs`), because the save is the last word on the
+  conversation and a missed step would be lost for good. Otherwise a native confirm asks:
+  *"Save claude #N? It will stop now and close once saved."*
+  - **`working` is not always mid-turn.** A turn that ended with background work (a dev server, a
+    background agent) also reads `working`, and refusing it meant such a claude could never be
+    saved.
+    - `mulpex_core::only_background_work` tells the two apart. `Stop` writes `bg/<id>` **after** the
+      status file, while a new turn or a tool call rewrites the status. So a flag no older than the
+      status means the turn is over.
+    - Measured with the real helper: after `Stop` the flag was 32 µs newer, and after a
+      `UserPromptSubmit` the status was newer.
+    - The save is then allowed, and the confirm adds that the background commands will stop too.
+- **On confirm, `Core::begin_save` kills the claude at once and holds its row** (`saving`).
+  - The forks read the transcript from disk, so nothing can move past the snapshot. Hub mail can't
+    wake it.
+  - Its background commands (dev servers, `tail -f`, Monitors) die with it. `Session::kill`'s
+    `kill_child_groups` does this on every close, not only on a save.
+  - The held row is out of the hub like a failed one. `reap_dead` keeps it, and ⌘⇧R and `hub_close`
+    refuse it.
+  - `SaveOverlay.svelte` dims the pane under a card showing the step, then `Saved ✓ <title>` with
+    **Close** as the only action. On a failure it shows the reason with **Retry**.
+- **⌘W is refused while the save runs** (`close_session` checks `saves::is_running`). It is allowed
+  after success or failure.
+- **On success the row leaves the restore store** (`save_succeeded` drops it from `worked`). A quit
+  before Close therefore does not bring the claude back; ⌘L ↺ Continue is the way back. On failure
+  it stays in the store, which is then the only way back to it.
+- **The phone** (Remote Control) is refused too.
+- A second ⌘S on a held row retries a failed save, and is refused otherwise.
+- **The fork was kept on purpose.** Having the claude write its own doc (a typed `/save` skill
+  with subagents) was considered and dropped:
+  - It needs an idle, draft-free TUI to type into.
+  - It gives no reliable progress or done signal.
+  - It would have to work inside the pane that is meant to be locked.
 
 ## Load (Phase 2)
 

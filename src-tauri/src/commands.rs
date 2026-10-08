@@ -147,10 +147,19 @@ pub fn create_terminal(
 /// Close a session (⌘W) — kills its process group and reaps. Works for both
 /// kinds; for a terminal this is also what removes an already-exited row.
 #[tauri::command]
-pub fn close_session(state: State<AppState>, project_handle: ProjectHandle, id: usize) {
+pub fn close_session(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+) -> Result<(), String> {
+    // A row ⌘S holds stays until its save ends: the result shows there.
+    if crate::saves::is_running(project_handle, id) {
+        return Err(format!("claude#{id} is being saved — wait for it to finish"));
+    }
     if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
         core.close(id);
     }
+    Ok(())
 }
 
 /// Restart one claude in place (⌘⇧R): kill it and relaunch on the same row with
@@ -349,10 +358,27 @@ pub fn get_hub_snapshot(
         .map(Core::hub_snapshot)
 }
 
+/// Why ⌘S can't save claude#`id` right now (`Core::save_refusal`), or null.
+/// Asked before the confirm, so the user isn't asked a question only to be
+/// refused after answering it.
+#[tauri::command]
+pub fn save_check(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+) -> Option<String> {
+    let ws = state.ws.lock().unwrap();
+    match ws.project(project_handle) {
+        Some(core) => core.save_refusal(id),
+        None => Some("no such project".into()),
+    }
+}
+
 /// Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry
 /// after a failed save). Returns once the save is under way; progress arrives as
-/// `save-progress`. Refuses — for the same reason ⌘⇧R does — an instance with no
-/// transcript yet: there is no conversation to fork.
+/// `save-progress`. Saving ends the claude: it is stopped at once and its row
+/// held, locked, until the user closes it (`Core::begin_save`). Refuses what
+/// `save_check` refuses.
 #[tauri::command]
 pub fn save_session(
     app: AppHandle,
@@ -360,17 +386,13 @@ pub fn save_session(
     project_handle: ProjectHandle,
     id: usize,
 ) -> Result<(), String> {
+    if crate::saves::is_running(project_handle, id) {
+        return Err(format!("claude#{id} is already being saved"));
+    }
     let (dir, uuid) = {
-        let ws = state.ws.lock().unwrap();
-        let core = ws.project(project_handle).ok_or("no such project")?;
-        let s = core.sessions.iter().find(|s| s.id == id).ok_or(format!("claude#{id} is not open"))?;
-        if s.is_shell() {
-            return Err(format!("term#{id} is a terminal — only a claude can be saved"));
-        }
-        if s.session_id.is_empty() || !core.worked.contains(&id) {
-            return Err(format!("claude#{id} has nothing to save yet — send it a prompt first"));
-        }
-        (core.project_dir.clone(), s.session_id.clone())
+        let mut ws = state.ws.lock().unwrap();
+        let core = ws.project_mut(project_handle).ok_or("no such project")?;
+        core.begin_save(id)?
     };
     crate::saves::start(app, project_handle, id, dir, uuid)
 }

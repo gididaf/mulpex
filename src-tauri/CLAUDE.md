@@ -35,12 +35,16 @@ Traps that live in this directory specifically:
   is the one reader now.
 - **Never `wait()` a terminal's child to learn it exited.** Liveness is reader-thread EOF; a zombie
   keeps the pid unrecyclable, which is what makes the `killpg` in teardown safe.
-- **`Session::kill` cannot reach a `claude`'s background commands.** Claude Code runs each in its
-  own process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`, `Ss`), so both
-  the `killpg` and `kill_tty_session` miss it. The hub listener is the one that matters — it spins
-  forever — and it is handled from the other end: `pty.rs` publishes `pids/<id>` so `listen.rs` can
-  see its owner die, and `pty::reap_orphaned_listeners` (launch + teardown) kills the ones that
-  predate that. Anything else long-lived a child backgrounds has the same hole.
+- **A `claude`'s background commands are reachable only while the `claude` is alive.**
+  - **Why:** Claude Code runs each one as a direct child in its own process group, with no
+    controlling terminal (measured: `PGID == pid`, `SESS 0`, `Ss`). So the `killpg` and
+    `kill_tty_session` both miss it.
+  - **The fix:** since 2026-10-07, `Session::kill` first runs `kill_child_groups` and kills the
+    group of every direct child of the `claude`. That covers ⌘W, ⌘S, ⌘⇧R and quit.
+  - **What it can't catch:** a `claude` that dies on its own (a crash, `/exit`). Its children are
+    reparented to launchd and can no longer be told apart. The hub listener therefore still has to
+    notice its owner die by itself (`pids/<id>` → `listen.rs`), and
+    `pty::reap_orphaned_listeners` (launch + teardown) stays as the reaper for orphans.
   → [../docs/hub.md](../docs/hub.md)
 - **A task is an argv argument, not keystrokes** — for a spawned child here and for a remote peer
   in `mcp.rs`. Typing it into the TUI capped it at 1022 characters with no error anywhere. If you

@@ -119,6 +119,24 @@ pub fn user_prompt_path(state_dir: &std::path::Path, id: usize) -> std::path::Pa
     state_dir.join(USERPROMPT_DIR).join(id.to_string())
 }
 
+/// Whether claude#id's `working` means only "its turn ended with background
+/// work still running" (a dev server, a background agent) rather than a turn in
+/// progress. `Stop` writes `bg/<id>` AFTER the status file, and anything that
+/// starts a turn or runs a tool rewrites the status — so a flag no older than
+/// the status is a turn that ended. Same-machine mtimes, so no clock skew; a
+/// heuristic all the same, used only to allow ⌘S (which stops that background
+/// work along with the claude).
+pub fn only_background_work(state_dir: &std::path::Path, id: usize) -> bool {
+    let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (
+        mtime(state_dir.join("bg").join(id.to_string())),
+        mtime(state_dir.join(id.to_string())),
+    ) {
+        (Some(flag), Some(status)) => flag >= status,
+        _ => false,
+    }
+}
+
 /// Why closing `claude#id` right now would interrupt work in progress, or `None`
 /// if it is safely idle. The refusal `hub_close` reports when it was called
 /// without `force`.
@@ -294,6 +312,28 @@ pub fn uuid_from_transcript_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Stop` writes `bg/<id>` after the status, so that reads as "turn over,
+    /// background work left"; any later status write (a new turn) undoes it.
+    #[test]
+    fn only_background_work_follows_write_order() {
+        let dir = std::env::temp_dir().join(format!("mulpex-onlybg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bg")).unwrap();
+        let status = dir.join("4");
+        let flag = dir.join("bg").join("4");
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+        std::fs::write(&status, "working").unwrap();
+        assert!(!only_background_work(&dir, 4), "no flag at all");
+        pause();
+        std::fs::write(&flag, "").unwrap();
+        assert!(only_background_work(&dir, 4), "Stop's order: status, then flag");
+        pause();
+        std::fs::write(&status, "working").unwrap();
+        assert!(!only_background_work(&dir, 4), "a new turn rewrote the status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The one case worth pinning: a spawned instance whose task is still in
     /// flight reads `waiting` exactly like an idle one — a missing status file

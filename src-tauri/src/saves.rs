@@ -36,9 +36,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::claude_bin;
+use crate::state::AppState;
 use crate::snapshot::{ProjectHandle, SaveProgress};
 
 const WRITE_PROMPT: &str = include_str!("save_prompts/write.md");
@@ -91,31 +92,39 @@ pub fn start(
         }
     }
     std::thread::spawn(move || {
-        let emit = |state: &str, detail: Option<String>| {
+        let emit = |state: &str, detail: Option<String>, title: Option<String>| {
             let _ = app.emit(
                 "save-progress",
-                SaveProgress { handle, id, state: state.into(), detail },
+                SaveProgress { handle, id, state: state.into(), detail, title },
             );
         };
         // An instance that was loaded from a save, or saved before, updates
         // that file in place instead of starting a second one.
         let existing = save_for_uuid(&read_links(&links_file()), &uuid);
-        let result = save(&dir, &uuid, existing.as_deref(), |stage| emit(stage, None));
+        let result = save(&dir, &uuid, existing.as_deref(), |stage| emit(stage, None, None));
         if let Ok(path) = &result {
             link("saved", &uuid, &dir, path);
+            if let Some(core) = app.state::<AppState>().ws.lock().unwrap().project_mut(handle) {
+                core.save_succeeded(id);
+            }
         }
         if let Some(running) = RUNNING.lock().unwrap().as_mut() {
             running.remove(&(handle, id));
         }
         match result {
-            Ok(path) => emit("done", Some(path.display().to_string())),
+            Ok(path) => emit("done", Some(path.display().to_string()), title_of(&path)),
             Err(reason) => {
                 eprintln!("[saves] claude#{id} failed: {reason}");
-                emit("error", Some(reason));
+                emit("error", Some(reason), None);
             }
         }
     });
     Ok(())
+}
+
+/// Whether a save of claude#`id` is under way right now.
+pub fn is_running(handle: ProjectHandle, id: usize) -> bool {
+    RUNNING.lock().unwrap().as_ref().is_some_and(|r| r.contains(&(handle, id)))
 }
 
 /// The three steps, then the file. Returns the path written.

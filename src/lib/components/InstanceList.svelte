@@ -26,7 +26,6 @@
     oncontext,
     oncontextempty,
     onsaveretry,
-    onsavedismiss,
   }: {
     onselect: (id: number) => void;
     /** Toggle mute for any row, without selecting it first. */
@@ -47,8 +46,6 @@
     oncontextempty: (e: MouseEvent) => void;
     /** Re-run a failed ⌘S save for this row. */
     onsaveretry: (id: number) => void;
-    /** Hide a failed save's message. */
-    onsavedismiss: (id: number) => void;
   } = $props();
 
   const SAVE_LABEL = {
@@ -414,7 +411,7 @@
         </button>
       {/if}
       <!-- ⌘S progress. Full-width under the row (the row wraps), and outside the
-           select button so Retry / ✕ can be real buttons. -->
+           select button so Retry can be a real button. -->
       {#if sv}
         <div class="save" class:err={sv.state === "error"} class:ok={sv.state === "done"}>
           <span class="save-text" title={sv.detail ?? ""}>
@@ -422,7 +419,6 @@
           </span>
           {#if sv.state === "error"}
             <button class="save-btn" onclick={() => onsaveretry(s.id)}>Retry</button>
-            <button class="save-btn" title="Dismiss" onclick={() => onsavedismiss(s.id)}>✕</button>
           {/if}
         </div>
       {/if}

@@ -216,6 +216,8 @@ pub struct SaveProgress {
     pub id: usize,
     pub state: String,
     pub detail: Option<String>,
+    /// On `done`: the save's title, for the locked pane's card.
+    pub title: Option<String>,
 }
 
 /// `hub-update` event payload, now scoped to the project it describes.

@@ -273,6 +273,10 @@ pub struct Session {
     /// child is definitely up. `killpg` alone is not enough to tear a session
     /// down — see `kill`.
     tty_dev: Arc<AtomicU32>,
+    /// `kill` already ran. Its `wait()` reaps the child, after which the pid can
+    /// be recycled — so a second `killpg` (from `Drop`, minutes later for a row
+    /// ⌘S holds) could hit a stranger.
+    killed: bool,
     rows: u16,
     cols: u16,
 }
@@ -591,6 +595,7 @@ impl Session {
             recorder,
             child_pid,
             tty_dev,
+            killed: false,
             rows,
             cols,
         })
@@ -748,6 +753,9 @@ impl Session {
     /// since the device is ours for as long as the master is open. That is also
     /// what a terminal emulator does when you close a tab with jobs running.
     pub fn kill(&mut self) {
+        if std::mem::replace(&mut self.killed, true) {
+            return;
+        }
         // Ours only while `self.master` is still open — which it is, since Drop
         // runs this before dropping the fields. Once the device is released the
         // kernel can hand the same number to someone else's pty.
@@ -759,6 +767,13 @@ impl Session {
         };
         if let Some(dev) = dev {
             kill_tty_session(dev);
+        }
+        // Before the claude itself: once it is gone they are reparented to
+        // launchd and nothing tells them apart from anyone else's.
+        if !self.is_shell() {
+            if let Some(pid) = self.child_pid {
+                kill_child_groups(pid);
+            }
         }
 
         if let Some(pid) = self.child.process_id() {
@@ -892,6 +907,38 @@ fn kill_tty_session(dev: u32) {
         }
     }
 }
+
+/// Hang up, then kill, the process group of every direct child of `parent`
+/// that runs in a group of its own — a `claude`'s background commands.
+///
+/// Claude Code starts each background Bash command (a dev server, a `tail -f`,
+/// a Monitor) as its own process group with no controlling terminal (measured:
+/// `PGID == pid`, `SESS 0`, parent = the `claude`). So neither `killpg` on the
+/// claude's group nor `kill_tty_session` reaches them, and closing a claude
+/// left them running forever. Children in the claude's own group (its MCP
+/// servers) are left to that `killpg`; Mulpex's own group is never touched.
+#[cfg(target_os = "macos")]
+fn kill_child_groups(parent: libc::pid_t) {
+    let theirs = unsafe { libc::getpgid(parent) };
+    let mine = unsafe { libc::getpgid(0) };
+    let mut groups: Vec<libc::pid_t> = all_pids()
+        .into_iter()
+        .filter(|&pid| pid > 1 && ppid_of(pid) == Some(parent))
+        .map(|pid| unsafe { libc::getpgid(pid) })
+        .filter(|&g| g > 1 && g != theirs && g != mine)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    for g in &groups {
+        unsafe { libc::killpg(*g, libc::SIGHUP) };
+    }
+    for g in &groups {
+        unsafe { libc::killpg(*g, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kill_child_groups(_parent: libc::pid_t) {}
 
 /// `PROC_ALL_PIDS` from `<sys/proc_info.h>`; the `libc` crate exposes
 /// `proc_listpids` but not this constant.
@@ -1205,6 +1252,47 @@ fn b64encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claude's background command runs in a process group of its own, which
+    /// `killpg` on the claude misses; `kill_child_groups` reaches it, and leaves
+    /// a child in the parent's own group alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_groups_of_a_child_are_killed() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        // `sh` stands in for the claude: one child in a group of its own (perl
+        // setpgrp, then exec sleep), one in sh's group. Both pids on stdout.
+        let mut sh = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("perl -e 'setpgrp(0,0); exec q(sleep), q(9999)' & echo $!; sleep 9999 & echo $!; wait")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(sh.stdout.take().unwrap()).lines();
+        let own: libc::pid_t = lines.next().unwrap().unwrap().trim().parse().unwrap();
+        let same: libc::pid_t = lines.next().unwrap().unwrap().trim().parse().unwrap();
+        let alive = |pid: libc::pid_t| ppid_of(pid) == Some(sh.id() as libc::pid_t);
+        let settled = |f: &dyn Fn() -> bool| {
+            (0..100).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                f()
+            })
+        };
+        assert!(
+            settled(&|| unsafe { libc::getpgid(own) } == own),
+            "the background child never got a group of its own"
+        );
+
+        kill_child_groups(sh.id() as libc::pid_t);
+
+        assert!(settled(&|| !alive(own)), "the background group survived");
+        assert!(alive(same), "a child in the parent's own group was killed");
+
+        unsafe { libc::killpg(sh.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = sh.wait();
+    }
 
     /// A Remote Control tap gets the recent output, then every byte after it;
     /// the tail is bounded; a phone that went away is forgotten; and a claude

@@ -116,6 +116,7 @@ pub fn run() {
             commands::resize_terminals,
             commands::focus_session,
             commands::get_hub_snapshot,
+            commands::save_check,
             commands::save_session,
             commands::list_saves,
             commands::delete_save,

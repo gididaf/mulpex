@@ -113,13 +113,14 @@ export interface HubUpdateEvent {
   snapshot: HubSnapshot;
 }
 /** `save-progress`: one step of a ⌘S save. `detail` is the path on `done` and
- *  the reason on `error`. */
+ *  the reason on `error`; `title` is the save's title on `done`. */
 export type SaveState = "writing" | "checking" | "fixing" | "done" | "error";
 export interface SaveProgressEvent {
   handle: ProjectHandle;
   id: number;
   state: SaveState;
   detail: string | null;
+  title: string | null;
 }
 export interface SessionsChangedEvent {
   handle: ProjectHandle;
@@ -170,6 +171,7 @@ export const createSession = (projectHandle: ProjectHandle) =>
 export const createTerminal = (projectHandle: ProjectHandle) =>
   invoke<SessionInfo>("create_terminal", { projectHandle });
 
+/** Rejects with the reason while a ⌘S save of that row is running. */
 export const closeSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("close_session", { projectHandle, id });
 
@@ -298,10 +300,14 @@ export const focusSession = (projectHandle: ProjectHandle, id: number) =>
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
   invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
+/** Why ⌘S can't save claude#id right now, or null. Asked before the confirm. */
+export const saveCheck = (projectHandle: ProjectHandle, id: number) =>
+  invoke<string | null>("save_check", { projectHandle, id });
+
 /** Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry).
- *  Resolves once the save is under way — progress arrives as `save-progress` —
- *  and rejects with the reason when there is nothing to save or one is already
- *  running for that instance. */
+ *  Stops the claude and holds its row. Resolves once the save is under way —
+ *  progress arrives as `save-progress` — and rejects with the reason it was
+ *  refused (see `saveCheck`) or when one is already running. */
 export const saveSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("save_session", { projectHandle, id });
 

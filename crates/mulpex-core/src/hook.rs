@@ -457,7 +457,6 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     write_session_uuid(ctx, payload.as_ref());
     let patterns = user_watcher_patterns();
     let busy = background_work_running(ctx, payload.as_ref(), &patterns);
-    set_background_flag(ctx, busy);
     // ...but a watcher is still a reason not to restart the app underneath this
     // instance: the restart kills the `claude` and drops whatever the watcher is
     // attached to. Recorded separately, for the updater's busy guard — the status
@@ -485,6 +484,8 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
         );
         println!("{}", serde_json::json!({ "decision": "block", "reason": reason }));
         // The turn continues, so keep the `working` status (locks already freed).
+        // Flag first: a status newer than it reads as a turn in progress.
+        set_background_flag(ctx, busy);
         let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), "working");
         return Ok(());
     }
@@ -500,6 +501,10 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // later a red "needs you") would be a lie.
     let status = if busy { "working" } else { "waiting" };
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), status);
+    // AFTER the status here (before it on the block path): `bg/<id>` no older than the status file
+    // is how the app tells "turn over, only background work left" from a turn in
+    // progress, which rewrites the status (`crate::only_background_work`).
+    set_background_flag(ctx, busy);
     Ok(())
 }
 

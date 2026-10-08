@@ -381,11 +381,14 @@ and cost real time; each links to the measurement that settled it.
   correct re-arm happen twice an hour. The end of that road is that `HUB_RULES` no longer carries
   the command at all: Claude Code arms it from the generated plugin monitor, and the rules only say
   *don't arm a second one*. Same lesson as argv-vs-TUI, two layers up. → [docs/hub.md](docs/hub.md)
-- **Nothing this app signals can reach what a `claude` backgrounds.** Claude Code runs each
-  background command in its own process group with no controlling terminal, so `Session::kill`'s
-  `killpg` *and* its tty sweep both miss it — the hub listener survived ⌘W, crashes and teardown
-  alike and was found six-deep on one machine, a day old, still spinning. Such a process has to
-  notice on its own (`pids/<id>`) and be reapable from outside (`ppid == 1`). `reap_orphaned_listeners`
+- **What a `claude` backgrounds is reachable only through its living `claude`.** Claude Code runs
+  each background command as a direct child in its own process group, with no controlling
+  terminal. So `killpg` *and* the tty sweep both miss it: the hub listener survived ⌘W, crashes and
+  teardown alike, and was found six-deep on one machine, a day old, still spinning.
+  - Since 2026-10-07, `Session::kill` kills those groups first (`kill_child_groups`, by parent pid).
+  - A `claude` that dies on its own leaves them orphaned and unidentifiable. Such a process
+    therefore still has to notice on its own (`pids/<id>`) and be reapable from outside
+    (`ppid == 1`). `reap_orphaned_listeners`
   is that outside reaper, and it must stay **orphans-only** (`ppid == 1`): an unconditional sweep
   shipped on 2026-09-18 and killed live listeners once a minute, which is indistinguishable from
   mail never arriving. → [docs/hub.md](docs/hub.md)
