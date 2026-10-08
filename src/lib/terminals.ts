@@ -24,7 +24,7 @@ import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
 import type { SessionKind } from "./ipc";
 import { readPromptBox } from "./promptbox";
 import type { PromptBox } from "./promptbox";
-import { captureSelection } from "./pins";
+import { captureSelection, plainText } from "./pins";
 import type { PinRun } from "./pins";
 
 export const THEME: ITheme = {
@@ -322,6 +322,18 @@ class TerminalManager {
     const lines = captureSelection(e.term, THEME);
     if (lines) e.term.clearSelection();
     return lines;
+  }
+
+  /** (handle, id)'s selection as plain text, for ⌘E — read the same way a pin
+   *  is (soft wraps joined, blank edges trimmed), then cleared. */
+  selectionText(handle: number, id: number): string | null {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return null;
+    const lines = captureSelection(e.term, THEME);
+    if (!lines) return null;
+    e.term.clearSelection();
+    const text = plainText(lines);
+    return text.trim() ? text : null;
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

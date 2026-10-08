@@ -84,61 +84,12 @@ pub const MCP_CONFIG_JSON: &str = r#"{
 /// Nothing is installed and nothing is fetched: this is a folder shape Claude
 /// Code reads, generated into the scratch dir beside `settings.json` and
 /// `mcp.json` and rewritten before every spawn for the same three-day-fuse
-/// reason. The plugin carries the monitor below and the `explain` skill.
-///
-/// The name is also the skill's namespace (`/mulpex:explain`), which is why it
-/// is `mulpex` and not something longer.
+/// reason. The plugin carries the monitor below.
 pub const PLUGIN_MANIFEST_JSON: &str = r#"{
   "name": "mulpex",
-  "description": "Mulpex: the hub inbox listener, armed by the host, and /explain.",
+  "description": "Mulpex: the hub inbox listener, armed by the host.",
   "version": "1.0.0"
 }
-"#;
-
-/// `skills/explain/SKILL.md`: `/explain` makes the claude *itself* explain the
-/// conversation in very simple Hebrew — in the pane, in its own turn, with the
-/// whole context it already has. It replaced the Explainer panel's side
-/// conversation. `disable-model-invocation` keeps it user-only: a claude that
-/// decided on its own to explain itself would be noise.
-///
-/// The formatting rules are rendering rules, not taste. The pane picks each
-/// row's direction from its first strong character (`unicode-bidi: plaintext`,
-/// docs/rendering.md), so a row that opens with an English word flips to LTR,
-/// and English mixed into a Hebrew row reorders the words around it.
-pub const EXPLAIN_SKILL_MD: &str = r#"---
-name: explain
-description: Explain the conversation so far to the user in very simple Hebrew, with no technical words.
-disable-model-invocation: true
----
-
-המשתמש ביקש שתסביר לו מה קורה עכשיו. הוא לא מתכנת. דבר אליו כמו אל חבר שלא מבין בתכנות.
-
-אל תפעיל שום כלי. אל תקרא קבצים. תסביר רק ממה שכבר קרה בשיחה הזאת.
-אם המשתמש כתב מילים אחרי הפקודה, הן אומרות לך על מה להתמקד. ענה על זה, באותו מבנה.
-
-כתוב בדיוק ארבעה חלקים, בסדר הזה, כל אחד עם הכותרת המודגשת שלו:
-
-**מה עשיתי**
-משפט אחד או שניים על מה שעשיתי בתשובה האחרונה שלי.
-
-**למה**
-משפט אחד: למה עשיתי את זה.
-
-**מה אני צריך ממך**
-בדיוק מה אני מחכה לו ממך: החלטה, תשובה או בדיקה. אם אני לא צריך כלום, כתוב: כלום כרגע.
-
-**איפה אנחנו**
-משפט אחד על התמונה הגדולה: על מה אנחנו עובדים, מה כבר גמור ומה הלאה.
-
-כללים:
-- עברית פשוטה מאוד. משפטים קצרים. רעיון אחד בכל משפט.
-- בלי שום מילה באנגלית. בלי שמות קבצים, פקודות, קוד או מונחים טכניים. אם צריך לדבר על משהו כזה, תאר מה הוא עושה במילים של כל יום.
-- כל שורה מתחילה במילה בעברית, אף פעם לא במספר, סימן או מילה לועזית.
-- אם משהו מופשט, תן דוגמה קצרה מהחיים.
-- גוף ראשון: עשיתי, בדקתי, אני צריך. "אתה" ו"ממך" הם תמיד המשתמש.
-- מה, לא איך. בלי להסביר איך משהו עובד מבפנים.
-- אם נכשלתי או נתקעתי, תגיד את זה ישר ב"מה עשיתי".
-- שום דבר לפני החלק הראשון ושום דבר אחרי האחרון.
 "#;
 
 /// `monitors/monitors.json`: the hub inbox listener, armed by **Claude Code

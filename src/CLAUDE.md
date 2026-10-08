@@ -24,7 +24,13 @@ them without asking.
 Hidden terminals use `visibility: hidden`, **never** `display: none` — the latter zeroes their size
 and breaks `fit()`.
 
-⌘E (`App.svelte::explainInstance`) types `/explain` into the focused claude, but only after
-`promptbox.ts` reads its input box as empty off the xterm buffer — a guess at someone else's TUI,
-measured and documented in [../docs/explain.md](../docs/explain.md). Keep it refusing (with a toast)
-on anything it does not recognize; typing onto a draft or into an open dialog is the failure.
+Anything Mulpex *types* into a claude (⌘K's key tag, Remote Control's messages) first has
+`promptbox.ts` read its input box off the xterm buffer — a guess at someone else's TUI, measured on
+claude 2.1.283 (U+00A0 after `❯`; dim = claude's own text) — see `promptbox.ts`'s header and the
+2026-09-28 entry in [../docs/verification-log.md](../docs/verification-log.md).
+Keep it refusing (with a toast) on anything it does not recognize; typing onto a draft or into an
+open dialog is the failure.
+
+⌘E's panel (`ExplainPanel.svelte`) renders model output through `{@html}` — only ever via
+`lib/markdown.ts`'s sanitizer, since this webview can invoke Tauri commands.
+→ [../docs/explain.md](../docs/explain.md)

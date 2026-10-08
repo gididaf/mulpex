@@ -1485,6 +1485,31 @@ impl Core {
         Ok((self.project_dir.clone(), uuid))
     }
 
+    /// ⌘E: the project dir and conversation uuid an explain forks. Unlike
+    /// `begin_save` it touches nothing — the fork only reads the transcript, so
+    /// mid-turn and over an open question are both fine.
+    ///
+    /// Gated on the transcript FILE, not on `worked`: a conversation opened with
+    /// an in-TUI `/resume` has its whole history on disk before anyone prompts
+    /// it, and `worked` only turns on at the first prompt. (`session_id` follows
+    /// the file through `reconcile_session_ids`.)
+    pub fn explain_target(&self, id: usize) -> Result<(PathBuf, String), String> {
+        let s = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or(format!("claude#{id} is not open"))?;
+        if s.is_shell() {
+            return Err("Explain works on claudes only".into());
+        }
+        if s.session_id.is_empty()
+            || !crate::saves::transcript_path(&self.project_dir, &s.session_id).is_file()
+        {
+            return Err("Nothing to explain yet — this claude has no conversation".into());
+        }
+        Ok((self.project_dir.clone(), s.session_id.clone()))
+    }
+
     /// Why ⌘S must not save claude#`id` now, or `None`. Asked before the confirm
     /// (`save_check`) and again by `begin_save`. A `working` claude is allowed
     /// when its turn is over and only background work is left

@@ -122,6 +122,15 @@ export interface SaveProgressEvent {
   detail: string | null;
   title: string | null;
 }
+/** `explain-progress`: the next piece of an explanation (`delta`), its end
+ *  (`done`), or why it failed (`error`, reason in `text`). */
+export interface ExplainProgressEvent {
+  handle: ProjectHandle;
+  id: number;
+  reqId: string;
+  kind: "delta" | "done" | "error";
+  text: string;
+}
 export interface SessionsChangedEvent {
   handle: ProjectHandle;
   sessions: SessionInfo[];
@@ -310,6 +319,29 @@ export const saveCheck = (projectHandle: ProjectHandle, id: number) =>
  *  refused (see `saveCheck`) or when one is already running. */
 export const saveSession = (projectHandle: ProjectHandle, id: number) =>
   invoke<void>("save_session", { projectHandle, id });
+
+/** ⌘E: explain `selection` from claude#id's pane in the side panel, in a fresh
+ *  fork of its conversation (`explain.rs`). Resolves once the fork is running;
+ *  the answer streams as `explain-progress` events carrying `reqId`. Rejects
+ *  when there is no conversation to fork yet. */
+export const explainStart = (
+  projectHandle: ProjectHandle,
+  id: number,
+  reqId: string,
+  selection: string,
+) => invoke<void>("explain_start", { projectHandle, id, reqId, selection });
+
+/** A follow-up question in claude#id's panel, answered by its fork. */
+export const explainFollowup = (
+  projectHandle: ProjectHandle,
+  id: number,
+  reqId: string,
+  question: string,
+) => invoke<void>("explain_followup", { projectHandle, id, reqId, question });
+
+/** Claude#id's panel closed: stop its explain and delete its fork. */
+export const explainClose = (projectHandle: ProjectHandle, id: number) =>
+  invoke<void>("explain_close", { projectHandle, id });
 
 /** One save in the repo's `mulpex/saves/`, as the ⌘L list shows it. `file` is
  *  the bare file name — the only handle passed back to the backend. */

@@ -33,6 +33,7 @@
     type ClaudeStatus,
     type HubUpdateEvent,
     type SaveProgressEvent,
+    type ExplainProgressEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
     type ProjectHandle,
@@ -77,6 +78,7 @@
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
   import { addPin, clearPin, dropPins, loadPins, pins, pinKey } from "./lib/pins";
+  import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
 
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
@@ -523,6 +525,7 @@
     await closeProject(handle);
     terminals.disposeProject(handle);
     dropPins(handle);
+    dropExplains(handle);
     removeProject(handle); // re-picks the active handle (neighbor / null)
     const next = get(activeProjectHandle);
     if (next != null) selectProject(next);
@@ -651,17 +654,6 @@
     }
   }
 
-  /**
-   * ⌘E: type `/explain` + Enter into the focused claude, so it explains itself in
-   * simple Hebrew (the plugin skill, `config::EXPLAIN_SKILL_MD`). Mid-turn is
-   * fine — claude queues it. Refused with a toast when typing would land
-   * somewhere else: an open question/plan box (`needs`), or a draft in the input
-   * box (`promptbox.ts`), which the command would be glued onto.
-   *
-   * One write for the text and the Enter, like Shift+Enter's two bytes: typed
-   * into the TUI, not argv — fine for nine characters, see "A TUI is not an
-   * interface" for why nothing longer should ever go this way.
-   */
   /** The prompt state that rules out typing into claude#id, as a toast; null when
    *  typing is fine. A draft is fine here: the line is appended to it. */
   function secretsBlocked(handle: ProjectHandle, id: number): string | null {
@@ -702,7 +694,7 @@
 
   /** Remote Control: a phone's message for claude#id (`remote/mod.rs::on_type`;
    *  over 900 bytes it is already a one-line pointer to a file). Refused like
-   *  ⌘E — never onto a draft or into an open dialog — and the answer goes back to
+   *  ⌘K — never onto a draft or into an open dialog — and the answer goes back to
    *  the phone. One bracketed paste plus Enter, in one write: measured to arrive
    *  exact, newlines and Hebrew included. */
   type RemoteTypeEvent = { handle: ProjectHandle; id: number; text: string; rid: string };
@@ -801,24 +793,24 @@
     if (b) sendBytes(handle, id, new TextEncoder().encode(b));
   }
 
-  function explainInstance(handle: ProjectHandle, id: number) {
-    const p = get(projects).get(handle);
-    const s = p?.sessions.find((x) => x.id === id);
-    if (!p || !s || s.kind === "shell" || s.exited) return;
-    if (p.statuses.get(id) === "needs") {
-      flashToast("Answer or close the open question first");
+  /** ⌘E: explain the focused claude's selection in a side panel, in simple
+   *  Hebrew (`lib/explain.ts`, `explain.rs`). A hidden fork of the conversation
+   *  writes it, so nothing is typed and mid-turn is fine. Claudes only — a shell
+   *  has no conversation to explain from. */
+  function explainSelection(handle: ProjectHandle, id: number) {
+    const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
+    if (!s) return;
+    if (s.kind === "shell") {
+      flashToast("Explain works on claudes only");
       return;
     }
-    const box = terminals.promptBox(handle, id);
-    if (box === "draft") {
-      flashToast("Clear the prompt first");
+    const text = terminals.selectionText(handle, id);
+    if (!text) {
+      flashToast("Select some text first");
       return;
     }
-    if (box === "none") {
-      flashToast("No prompt to type into right now");
-      return;
-    }
-    sendBytes(handle, id, new TextEncoder().encode("/explain\r"));
+    startExplain(handle, id, text);
+    terminals.refocus();
   }
 
   /** ⌘⇧P: float the focused claude's selection over the top of its pane
@@ -1057,7 +1049,7 @@
       }
       case "explain": {
         const cur = get(activeId);
-        if (h != null && cur != null) explainInstance(h, cur);
+        if (h != null && cur != null) explainSelection(h, cur);
         break;
       }
       case "pin_selection": {
@@ -1211,10 +1203,12 @@
         applyHubFor(e.payload.handle, e.payload.snapshot),
       ),
       listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
+      listen<ExplainProgressEvent>("explain-progress", (e) => applyExplainProgress(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
         dropPins(e.payload.handle, e.payload.id);
+        dropExplains(e.payload.handle, e.payload.id);
       }),
       listen<SessionsChangedEvent>("sessions-changed", async (e) => {
         const { handle, sessions: list } = e.payload;

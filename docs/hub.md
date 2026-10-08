@@ -25,8 +25,7 @@ against the *local* hub:
   see [the command is a binary now](#the-command-is-a-binary-now-and-the-old-one-is-why) for why
   that had to stop.
 - **Arming (a plugin monitor — the host does it, not the model):** every `claude` is spawned with
-  `--plugin-dir <state_dir>/plugin`, a plugin (named `mulpex`; it also carries the `/explain` skill,
-  [explain.md](explain.md)) Mulpex *generates* beside `settings.json`
+  `--plugin-dir <state_dir>/plugin`, a plugin (named `mulpex`) Mulpex *generates* beside `settings.json`
   and `mcp.json` (`config::PLUGIN_MANIFEST_JSON` + `PLUGIN_MONITORS_JSON`, written by
   `state_dir::write_state_dir`). Its `monitors/monitors.json` declares the listener, and **Claude
   Code arms it itself at session start** — including on `--resume`. No turn is spent arming it,

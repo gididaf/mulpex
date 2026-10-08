@@ -27,7 +27,7 @@ reasoning in `docs/`.
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
-| [docs/explain.md](docs/explain.md) | `/explain` (a skill in the generated plugin: the claude itself explains in simple Hebrew, four fixed parts, no English, why plain `/explain` works) and ⌘E (types it; refused with a toast on an open dialog, a draft, or no input box; reading claude's input box off the xterm buffer — U+00A0 after `❯`, dim = claude's own text). Replaced the Explainer panel on 2026-09-28 | `config.rs`'s `EXPLAIN_SKILL_MD`, `promptbox.ts`, `App.svelte`'s `explainInstance` |
+| [docs/explain.md](docs/explain.md) | ⌘E Explain Selection: select text in a claude, a right-side overlay panel explains it in simple Hebrew; a hidden Sonnet `--fork-session` of the conversation writes it (streamed, markdown sanitized, hard RTL); follow-ups `--resume` that fork (cache: $0.12 vs $0.91 for a re-fork), which Mulpex deletes on close; gated on the transcript file, not `worked`. Replaced `/explain` (2026-10-08) and the Explainer panel before it | `explain.rs`, `explain_prompt.md`, `lib/explain.ts`, `ExplainPanel.svelte`, `lib/markdown.ts`, `Core::explain_target` |
 | [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion). ⌘L Load (Saves / Guides tabs, continue-the-conversation links in `~/.mulpex/save-links.tsv`). File ▸ Import Docs (Sonnet sorts a repo's `.md` into save / guide / stale / skip; Apply commits once and fixes links) | `saves.rs`, `docs_import.rs`, `save_prompts/*`, `LoadDialog`/`ImportDialog.svelte`, the save row status in `InstanceList.svelte` |
 | [docs/secrets.md](docs/secrets.md) | ⌘K Secrets: KEY=VALUE rows → a 0600 `.env`; only `🔑 KEY` is typed, and the path + rules ride every turn as hidden hook context; one-off (scratch dir, gone when the claude closes) vs saved (`<mulpex home>/secrets/`, global or project-only, refs); the shared file format | `secrets.rs` (both crates), `SecretsDialog.svelte`, `commands.rs` `secrets_*`, the `userpromptsubmit` note |
 | [docs/remote-control.md](docs/remote-control.md) | ⌘⇧O Remote Control: a phone PWA drives every project through a relay (`mulpex.dreamvps.com`); QR pairing + end-to-end encryption (the relay reads nothing); chat from transcripts; typing via the desktop's prompt check (>900 B → a file); dialogs as buttons → measured keys; terminals as readable text over a hidden same-geometry xterm; start/close; Web Push sent by the Mac; keep-awake; on/off persists | `src-tauri/src/remote/*`, `crates/mulpex-relay`, `remote/`, `RemoteDialog.svelte`, the `remote-*` handlers in `App.svelte`, `OutputSink::tap`, the `dialog/` hook file, `scripts/deploy-relay.sh` |
@@ -112,8 +112,7 @@ is kept deliberately even though its second caller is gone (see the invariants b
 directory on the instance's behalf. That something is `mulpex-helper listen` — and since
 2026-09-20 **Claude Code arms it, not the model**. Every `claude` is spawned with
 `--plugin-dir <state_dir>/plugin`, a plugin named `mulpex` that Mulpex *generates* beside
-`settings.json` and `mcp.json`, whose `monitors/monitors.json` declares the listener (it also carries
-the `/explain` skill — [docs/explain.md](docs/explain.md)). It starts at session start
+`settings.json` and `mcp.json`, whose `monitors/monitors.json` declares the listener. It starts at session start
 and on `--resume`, costs no turn, and does not expire.
 
 **What it replaced.** A model-armed `Monitor` is capped at 30 minutes and has no `persistent`
@@ -222,7 +221,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project

@@ -2396,3 +2396,26 @@ Measured:
 
 Not measured: the next-prompt suggestion through the replay (seen dim, SGR 2, in `tmux capture-pane
 -e` only). ⌘E was QA'd by the user in a dev build, not driven by me.
+
+## 2026-10-08 — `/explain` replaced by ⌘E Explain Selection
+
+Design in [explain.md](explain.md). The 2026-09-28 entry above is history: the skill is deleted
+(and removed from older scratch dirs); `promptbox.ts` and its measurements still stand.
+
+Measured, on a real 2.4 MB / 233 k-token conversation of this repo, with `claude -p --model sonnet`
+and the exact flags `explain.rs` uses, env scrubbed (`env -i` + the OAuth token):
+- **A fork answers in 12–22 s for $0.92–0.95**, almost all of it the cache write; the original
+  `.jsonl` was byte-identical before and after (`shasum`).
+- **`stream-json` with `--include-partial-messages`** gives `stream_event`/`content_block_delta`/
+  `text_delta` lines, after a `thinking` block. Two `result` lines appear; the first is the old
+  conversation's (`num_turns: 0`), so only the last counts.
+- **Follow-up cost**: a re-fork with the exchange in a longer prompt read 8 k from cache and wrote
+  226 k ($0.91). `--resume <fork>` read 467 k and wrote 1.5 k ($0.12, 7 s). An *identical* re-fork
+  prompt did hit the cache ($0.06), which is what pins the cause on where the last message ends.
+- **The `system/init` line's `session_id` is the fork's `.jsonl` name**, one id across the stream,
+  with no sidecar dir created. The test forks were deleted by hand.
+
+QA'd by the user in a dev build, not driven by me: phase 1 (panel, toasts, switching, mid-turn),
+then rendering, follow-ups, and the `/resume` fix together. Not tested: deleting forks on crash
+(it doesn't happen — a known residue), and the DOMPurify strip of `<script>`/links; `marked` was seen
+to pass both through in node, and the sanitizer was not run outside the webview.

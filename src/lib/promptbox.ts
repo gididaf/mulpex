@@ -1,6 +1,6 @@
-// Reading claude's input box off the xterm screen, for ⌘E (Explain): typing
-// `/explain` onto a draft would glue the two together, so the key must know
-// whether the box is empty first.
+// Reading claude's input box off the xterm screen, for anything Mulpex types
+// into it (⌘K's key tag, Remote Control's messages): typing onto a draft would
+// glue the two together, so it must know whether the box is empty first.
 //
 // There is no declared interface for this — it is claude's TUI, read back — so
 // the rule is kept to the two facts measured on claude 2.1.283 (tmux

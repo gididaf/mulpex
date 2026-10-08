@@ -1,70 +1,82 @@
-# `/explain` and ⌘E
+# ⌘E Explain Selection
 
-The user works in Hebrew and is not always following the technical detail. `/explain` makes the
-claude **itself** explain where things stand, in very simple Hebrew with no technical words, in its
-own pane, as an ordinary turn. ⌘E types it for you.
+The user works in Hebrew and is not always following the technical detail. **Select the part you
+don't understand in a claude's pane, press ⌘E**, and a side panel explains it in simple Hebrew. The
+selection is only the target; the context is the whole conversation. A box under the answer takes
+follow-up questions.
 
-It replaced the **Explainer** (2026-09-28): a third column that summarized every turn, pending
-question and pending plan through a headless `claude -p --model sonnet` side conversation, fed by
-the hooks writing `explainreq/<id>`. That design is gone — `explainer.rs`, `ExplainerPanel.svelte`,
-⌘⇧E and the request dir were all deleted; git history has them, and
-[verification-log.md](verification-log.md) keeps what was measured about them as history. What
-replaced it is on demand, uses the real conversation instead of a transcript excerpt, and costs no
-model call unless asked.
+## History: why the last two designs went
 
-## The skill
+- **The Explainer** (until 2026-09-28): a third column that summarized every turn through a
+  headless Sonnet side conversation fed by the hooks. Gone; [verification-log.md](verification-log.md)
+  keeps what was measured about it.
+- **`/explain`** (2026-09-28 → 2026-10-08): a plugin skill, typed by ⌘E, that made the claude explain
+  "my last response" in four fixed one-line parts. It did not help. "Last response" was often a
+  monitor tick or a hub wake rather than the long answer the user meant, and four one-liners were too thin
+  for a dense reply. The user asked for something they could *aim*. The skill is deleted, and
+  `state_dir::write_state_dir` removes `plugin/skills/` from scratch dirs older builds wrote, or a
+  claude would keep offering `/explain`. `promptbox.ts` stayed: ⌘K and Remote Control still read the
+  input box with it.
 
-`config::EXPLAIN_SKILL_MD`, written to `<state_dir>/plugin/skills/explain/SKILL.md` by
-`state_dir::write_state_dir` — the same generated `--plugin-dir` plugin that carries the hub
-listener monitor ([hub.md](hub.md)), rewritten before every spawn for the same three-day-fuse
-reason. Nothing is installed. A claude picks the skill up at start, so an instance that was already
-running gets it only after a restart (⌘⇧R).
+## How it works
 
-- **The plugin is named `mulpex`**, and that name is the skill's namespace: Claude Code lists it as
-  `/mulpex:explain (explain)`. Typing plain **`/explain` works** — Claude Code resolves it to
-  `/mulpex:explain` (measured on 2.1.283, both typed and sent as one write with the Enter).
-- **`disable-model-invocation: true`**: only the user runs it. A claude that decided on its own to
-  explain itself would be noise.
-- **No tools.** The skill tells the claude to explain only from what is already in the conversation.
-- **Four fixed parts, Hebrew bold headings:** מה עשיתי / למה / מה אני צריך ממך (or "כלום כרגע") /
-  איפה אנחנו. Words after the command set the focus, same structure.
-- **No English at all, and every line starts with a Hebrew word.** That is a rendering rule, not
-  taste: the pane picks each row's direction from its first strong character
-  (`unicode-bidi: plaintext`, [rendering.md](rendering.md)), so a row opening with an English word
-  flips to LTR, and English inside a Hebrew row reorders the words around it.
+`App.svelte::explainSelection` → `terminals.selectionText` (the pin reader, `captureSelection` +
+`plainText`, then clears the selection) → `lib/explain.ts::startExplain` → `explain_start` →
+`src-tauri/src/explain.rs`.
 
-## ⌘E
+- **A hidden fork, not a typed command.** `claude -p --model sonnet --resume <uuid> --fork-session
+  --tools "" --setting-sources "" --strict-mcp-config`, in the project dir, with the env scrubbed the
+  way ⌘S does it ([saves.md](saves.md)). The selection goes in the prompt (`explain_prompt.md`).
+  Nothing is typed into the claude, so it works mid-turn and over an open question, and the
+  conversation stays clean.
+- **Streams.** `--output-format stream-json --verbose --include-partial-messages`; each `text_delta`
+  becomes an `explain-progress {handle, id, reqId, kind: delta|done|error, text}` event. The
+  frontend's `reqId` drops late events from a replaced request. **A resumed fork prints a stale
+  `result` line first** (the old conversation's, `num_turns: 0`), so only the last one counts.
+- **Gated on the transcript file**, not `worked`: `Core::explain_target` checks
+  `saves::transcript_path(dir, session_id).is_file()`. A conversation opened with an in-TUI
+  `/resume` has its whole history on disk before anyone prompts it, while `worked` only turns on at
+  the first prompt. Gating on `worked` was the first build's bug: "Nothing to explain yet" over a
+  full resumed conversation.
+- **Claudes only, a selection required.** A toast otherwise ("Select some text first", "Explain
+  works on claudes only").
 
-Menu item `explain` (Session menu, `Cmd+E`, and in ⌘P), handled by `App.svelte::explainInstance`,
-which writes `/explain\r` to the focused claude **in one `send_bytes`** — text and Enter together,
-like Shift+Enter's two bytes. That is typing into the TUI, which [hub.md](hub.md) warns against for
-anything long; nine characters is fine, and nothing longer should ever go this way.
+## Follow-ups resume the fork; they do not re-fork
 
-Mid-turn is allowed: Claude Code queues it ("Press up to edit queued messages") and runs it when the
-turn ends (measured). It is **refused, with a toast over the terminal** (`flashToast`, rendered by
-`TerminalPane.svelte`), when typing would land somewhere else:
+Measured on a 233 k-token conversation (2026-10-08):
 
-- **status `needs`** — a question or plan box is open, and `/explain` would be typed into it;
-- **a draft in the input box** — the command would be glued onto the user's text;
-- **no input box on screen** — claude still starting, or something unrecognized.
+| | cache read | cache written | cost | time |
+| --- | --- | --- | --- | --- |
+| first ⌘E | 0 | 233 k | $0.92–0.95 | 12–22 s |
+| follow-up as a **re-fork**, exchange carried in a longer prompt | 8 k | 226 k | $0.91 | 15 s |
+| follow-up as **`--resume <fork>`** | 467 k | 1.5 k | $0.12 | 7 s |
 
-### Reading the input box (`promptbox.ts`)
+The prompt cache is consulted at the end of the previous request, and a re-fork's last message is
+never that, so it pays the whole conversation again. So the first ask **keeps** its fork's
+transcript (no `--no-session-persistence`), its uuid is taken from the child's `system/init` line
+(`init_session`; it equals the `.jsonl` name, measured), and a follow-up runs `--resume <fork>`
+with only the question in its prompt.
 
-There is no declared interface for "is the box empty", so it is read off the xterm buffer. Measured
-on claude 2.1.283 (`tmux capture-pane -e`, then the same bytes replayed through `@xterm/headless`
-5.5.0 — the build Mulpex uses — at idle, draft, multi-line draft, busy, busy with a draft, after a
-turn, and with an `AskUserQuestion` open; all read correctly):
+**Mulpex deletes that fork itself** (`explain::discard`). Without that, every ⌘E would leave a
+conversation in the project's `claude --resume` list. Deleted on: panel ✕/Esc, a new ⌘E on the same
+instance, instance exit, project close (`dropExplains` → `explain_close`), and app teardown
+(`discard_all`, in `lib.rs::teardown`). The fork slot carries the request id that created it, so a
+replaced request's late `init` line is deleted instead of recorded (`note_fork`). A crash can leave
+one stray fork. That is the known residue.
 
-- The box is a **`❯` row with a `───` rule row directly above it**, closed by another rule row.
-  Past prompts are echoed in the history as `❯` rows too, which is why the rule above is required
-  and the scan runs bottom-up.
-- The character after `❯` is **U+00A0 (NO-BREAK SPACE)**, not a space. Matching `"❯ "` found
-  nothing at all — every state read as "none" until this was measured.
-- **Everything claude puts in an empty box is dim (SGR 2)**: the `Try "…"` placeholder, the
-  next-prompt suggestion, `Press up to edit queued messages`. Typed text is not. So the box is
-  empty exactly when every cell after `❯` up to the closing rule is blank or dim.
-- A question dialog replaces the box (its `❯ 1. Red` cursor row has no rule directly above), so it
-  reads as "none" even without the `needs` check.
+## The panel (`ExplainPanel.svelte`)
 
-If a Claude Code update changes that drawing, the symptom is ⌘E refusing with "No prompt to type
-into right now" — safe, visible, and the place to look.
+- **An overlay on the right of the pane, not a column.** Narrowing the terminal would resize every PTY
+  in the workspace ([rendering.md](rendering.md), one geometry) on each open, close, and switch
+  between an instance with a panel and one without.
+- **Per instance, memory only.** Kept while you switch away; gone on quit, instance or project
+  close. A new ⌘E replaces the thread.
+- **Esc closes it only while focus is inside it.** In the terminal, Esc belongs to claude.
+- **Markdown via `marked`, sanitized with `dompurify`** (`lib/markdown.ts`). The answer can quote
+  anything the conversation held, and this webview can invoke Tauri commands. Links and images are
+  dropped and their text kept: a link click would navigate the app's only window away.
+- **Hard `dir="rtl"` on the body**, not `auto`. A line that opens with an English term
+  (`**CRDT**: …`) must still read right-to-left. Inline `code` is `unicode-bidi: isolate` so an
+  English snippet doesn't reorder the Hebrew around it. Unlike the terminal, the prompt *allows* a
+  key English term with a short explanation, which the user asked for. The panel is HTML, so the
+  terminal's first-strong-character row rule ([rendering.md](rendering.md)) does not apply.

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { projects, activeProject, activeId, saves, toast } from "../stores";
+  import { projects, activeProject, activeProjectHandle, activeId, saves, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
   import PinStack from "./PinStack.svelte";
+  import ExplainPanel from "./ExplainPanel.svelte";
   import SaveOverlay from "./SaveOverlay.svelte";
 
   let {
@@ -48,6 +49,9 @@
     <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
   {/each}
   <PinStack />
+  {#if $activeProjectHandle != null && $activeId != null}
+    <ExplainPanel handle={$activeProjectHandle} id={$activeId} />
+  {/if}
   {#if activeSave && $activeId != null}
     {@const id = $activeId}
     <SaveOverlay

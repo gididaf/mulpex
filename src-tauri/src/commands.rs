@@ -397,6 +397,46 @@ pub fn save_session(
     crate::saves::start(app, project_handle, id, dir, uuid)
 }
 
+/// ⌘E: explain `selection` from claude#`id`'s pane in a side panel
+/// (`explain.rs`), in a fresh fork that replaces the panel's last one. The
+/// answer streams as `explain-progress` events tagged with the caller's `req_id`.
+#[tauri::command]
+pub fn explain_start(
+    app: AppHandle,
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    req_id: String,
+    selection: String,
+) -> Result<(), String> {
+    let (dir, uuid) = {
+        let ws = state.ws.lock().unwrap();
+        let core = ws.project(project_handle).ok_or("no such project")?;
+        core.explain_target(id)?
+    };
+    crate::explain::start(app, project_handle, id, req_id, dir, uuid, selection)
+}
+
+/// A follow-up question in claude#`id`'s explain panel, answered by resuming
+/// that panel's fork.
+#[tauri::command]
+pub fn explain_followup(
+    app: AppHandle,
+    project_handle: ProjectHandle,
+    id: usize,
+    req_id: String,
+    question: String,
+) -> Result<(), String> {
+    crate::explain::followup(app, project_handle, id, req_id, question)
+}
+
+/// Claude#`id`'s explain panel closed (or its instance is gone): stop it and
+/// delete its fork.
+#[tauri::command]
+pub fn explain_close(project_handle: ProjectHandle, id: usize) {
+    crate::explain::discard(project_handle, id);
+}
+
 /// ⌘K: write a one-off secrets file for claude#`id` and return its path. The
 /// frontend types the reference line itself (`App.svelte::sendSecretsRef`).
 #[tauri::command]

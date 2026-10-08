@@ -167,9 +167,9 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let messages = MenuItemBuilder::with_id("messages", "Messages")
         .accelerator("Cmd+Shift+M")
         .build(app)?;
-    // Types `/explain` into the focused claude — the built-in plugin skill
-    // (`config::EXPLAIN_SKILL_MD`), so the claude itself explains, in Hebrew.
-    let explain = MenuItemBuilder::with_id("explain", "Explain")
+    // Explains the focused claude's selection in a side panel, in Hebrew
+    // (`explain.rs`, `ExplainPanel.svelte`).
+    let explain = MenuItemBuilder::with_id("explain", "Explain Selection")
         .accelerator("Cmd+E")
         .build(app)?;
     // Hands the focused claude a 0600 .env and types its path (`secrets.rs`).

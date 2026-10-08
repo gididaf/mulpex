@@ -10,6 +10,7 @@ mod pins;
 mod pty;
 mod remote;
 mod docs_import;
+mod explain;
 mod saves;
 mod secrets;
 mod snapshot;
@@ -71,6 +72,7 @@ fn is_forwarded(id: &str) -> bool {
 /// Idempotent, so running it on both window-close and exit is safe.
 fn teardown(app: &tauri::AppHandle) {
     app.state::<AppState>().ws.lock().unwrap().teardown_all();
+    explain::discard_all();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -118,6 +120,9 @@ pub fn run() {
             commands::get_hub_snapshot,
             commands::save_check,
             commands::save_session,
+            commands::explain_start,
+            commands::explain_followup,
+            commands::explain_close,
             commands::list_saves,
             commands::delete_save,
             commands::load_save,
