@@ -12,7 +12,9 @@ the reason that outlived it.)
 
 | Module | Read first |
 | --- | --- |
-| `hook.rs`, `config.rs` | [../../docs/sessions.md](../../docs/sessions.md) — what each status word means and why `needs` must mean "needs YOU"; [../../docs/hub.md](../../docs/hub.md) — listener arming and naming nudges |
+| `hook.rs`, `config.rs` | [../../docs/sessions.md](../../docs/sessions.md) — what each status word means and why `needs` must mean "needs YOU"; [../../docs/hub.md](../../docs/hub.md) — listener arming and naming nudges; [../../docs/remote-control.md](../../docs/remote-control.md) — the `askq`/`plan` hooks write `dialog/<id>.json` before `needs` |
+| `statusline.rs` (`mulpex-helper statusline`) | its header — `--settings` replaces the person's own statusline, so it is found (project local > project > user) and run with the same stdin; context % goes to `ctx/<id>`. [../../docs/frontend.md](../../docs/frontend.md) — the sidebar side |
+| `secrets.rs` | [../../docs/secrets.md](../../docs/secrets.md) — the file format both processes read |
 | `mcp.rs` (`hub_send`/`hub_spawn`/`hub_set_name`) | [../../docs/hub.md](../../docs/hub.md) |
 | `mcp.rs` (`hub_terminal_*`), `termlog.rs` | [../../docs/shell-terminals.md](../../docs/shell-terminals.md) |
 | `registry.rs` | [../../docs/hub.md](../../docs/hub.md) — the `<project>#<n>` grammar and its ordered parser |
@@ -26,8 +28,8 @@ Traps that live in this crate specifically:
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `watching/`, `compacting/`,
   `armed/`, `relisten/`, `pids/`, `listeners/`,
-  `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, like `peers/`
-  already does.
+  `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, `ctx/`,
+  `dialog/`, `secrets/`, like `peers/` already does.
 - **A re-arm-only wake must leave no trace, and proving it *is* re-arm-only is the whole job.**
   `quietturn/<id>` is written when a `<task-notification>` turn starts and cleared by the first
   tool call that is not `is_listener_rearm` — so surviving to `Stop` is evidence, not a guess.

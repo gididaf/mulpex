@@ -10,6 +10,9 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
 | `saves.rs`, `docs_import.rs`, `save_prompts/*` (⌘S: fork → memoryless check → fork fix, read-only tools, writes `mulpex/saves/` at the git root; guides; the links file; Import Docs' sort / apply / one commit / link fixing) | [../docs/saves.md](../docs/saves.md) — why the doc must stand alone, why the forks run in the project dir, why `total_cost_usd` over-reports |
 | `remote/*` (Remote Control: relay connection, pairing/E2E crypto, transcript chat, dialog keys, Web Push), `pty.rs` `OutputSink::tap` | [../docs/remote-control.md](../docs/remote-control.md) — the security model, why typing goes through the desktop, the measured dialog keys |
+| `explain.rs`, `explain_prompt.md` (⌘E: a Sonnet `--fork-session` explains a selection; follow-ups `--resume` that fork; Mulpex deletes it) | [../docs/explain.md](../docs/explain.md) — why follow-ups resume instead of re-fork (measured cache cost), why it is gated on the transcript file |
+| `secrets.rs` (⌘K) | [../docs/secrets.md](../docs/secrets.md) |
+| `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 

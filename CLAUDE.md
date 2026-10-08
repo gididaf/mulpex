@@ -55,7 +55,11 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
                         otherwise copy, so they live here and must stay byte-identical
                       + listen (the hub listener's 1 Hz inbox watch — the loop HUB_RULES
                         used to spell out for the model to retype)
-crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` dispatch → mulpex-core
+                      + statusline (saves claude's context-window % to `ctx/<id>` for the
+                        sidebar, then runs the person's own statusline)
+                      + secrets (the ⌘K `secrets/<id>/` layout the app writes and the
+                        hook announces — docs/secrets.md)
+crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` / `statusline` dispatch → mulpex-core
                       (there was a `crates/mulpex-cli/` here — `mpx`, a second host over
                        tmux — deleted 2026-09-17; see the note under this block)
 crates/mulpex-relay/  bin: the Remote Control relay (runs on the VM; routes sealed frames,
@@ -72,8 +76,13 @@ src-tauri/            the Tauri app (Rust backend)
   src/commands.rs     #[tauri::command] surface (session cmds carry a projectHandle)
   src/hub.rs          200ms poll over ALL projects → emits handle-scoped hub-update /
                       session-exited / sessions-changed (+ projects-changed)
-  src/saves.rs        ⌘S Save / ⌘L Load: headless read-only `claude -p` steps write a
-                      handoff doc to `mulpex/saves/`; guides; the links file
+  src/saves.rs        ⌘S Save / ⌘L Load: stops the claude, then headless read-only
+                      `claude -p` steps write a handoff doc to `mulpex/saves/`; guides;
+                      the links file
+  src/explain.rs      ⌘E Explain Selection: a Sonnet fork explains selected text in Hebrew,
+                      follow-ups resume it, the fork is deleted on close — docs/explain.md
+  src/secrets.rs      ⌘K Secrets: writes the 0600 `.env` files — docs/secrets.md
+  src/pins.rs         ⌘⇧P pins, one per instance, saved per project — docs/frontend.md
   src/docs_import.rs  File ▸ Import Docs: Sonnet sorts a repo's `.md`, Apply commits once
   src/remote/         ⌘⇧O Remote Control, the Mac side: connection, crypto, chat, dialogs,
                       push — docs/remote-control.md
@@ -86,9 +95,11 @@ src/                  Svelte/Vite frontend
   lib/ipc.ts          typed command/event/channel wrappers
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
   lib/updater.ts      update check/download/apply + the cross-project busy-session count
+  lib/pins.ts         ⌘⇧P: reads an xterm selection with its colours (also ⌘E's reader)
+  lib/explain.ts      ⌘E panel state; lib/markdown.ts sanitizes what the panel renders
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename,
-                      ContextMenu, UpdateBanner…
+                      TerminalPane/View, MessageReader, Rename, PinStack, ExplainPanel,
+                      SaveOverlay, SecretsDialog, ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 scripts/deploy-relay.sh  Remote Control relay + phone app → the VM (docs/remote-control.md)
 remote/               the phone web app (PWA) for Remote Control
@@ -147,8 +158,8 @@ happen has to be as visible as one that does.
 
 ## The helper (why it's a separate binary)
 
-Child `claude` processes invoke `<helper> hook <event>` (from `settings.json`) and `<helper> mcp`
-(from `mcp.json`) **by absolute path** — `claude`, not Tauri, spawns them. A `PreToolUse` hook
+Child `claude` processes invoke `<helper> hook <event>` and `<helper> statusline` (from
+`settings.json`) and `<helper> mcp` (from `mcp.json`) **by absolute path** — `claude`, not Tauri, spawns them. A `PreToolUse` hook
 forks on every Read/Write/Edit/Bash and the MCP server is long-lived per instance, so the helper
 must be tiny and fast to exec. It links only `mulpex-core` (~1.8 MB vs the ~29 MB app).
 
@@ -254,10 +265,11 @@ teleporting from one end of the strip to the other reads as a mistake. It commit
 
 **⌘⇧↑ / ⌘⇧↓ (Move Instance Up/Down) is the same thing one axis over**: the focused sidebar row
 slides one slot, clamped, committing through `applySessionOrder` — the path a row drag uses — so it
-persists and ⌘[ / ⌘] cycle the new order. The clamp is `stores.ts::clampToGroup`, not just the list
-ends: a row can only move inside its own block (unmuted claudes / muted claudes / terminals),
-because `displayOrder` re-applies on top of any committed order and a cross-block move would snap
-back on the next poll.
+persists and ⌘[ / ⌘] cycle the new order. The clamp is `stores.ts::stepSlot`/`clampToGroup`, not
+just the list ends: a row moves only among its **siblings** — inside its own block (unmuted claudes /
+muted claudes / terminals) and, for a nested claude, under its own spawner — carrying its whole
+family with it and stepping over a sibling's family, never into it. `displayOrder` re-applies on
+top of any committed order, so a cross-boundary move would snap back on the next poll.
 
 **⌘M is Mute Session; the message reader moved to ⌘⇧M.** ⌘M has a *third* claimant nobody
 declares: muda hard-binds `PredefinedMenuItem::minimize` to ⌘M and exposes no accelerator setter.
@@ -465,4 +477,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`29b6acc0a71d934a1db09d25baca6e97b156b8d7` — 2026-09-28
+`3a1a29ca02df1c9f155b4a8555d9b76cab11f9d1` — 2026-10-08

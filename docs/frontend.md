@@ -394,6 +394,10 @@ project the lock list was always that session's own files — which is why it wa
 at `sessions.length <= 1`, and why it was never worth the panel row. Don't "restore" either
 section without asking.
 
+**Unread messages are marked**: a message still sitting in a live recipient's inbox gets a red dot
+and is always listed, even past the newest 8 the feed otherwise shows (`HubPanel.svelte`). The
+header's `(N unread)` count leaves out muted recipients, while the list does not.
+
 Contention is still visible, in the place you're already looking: the ⏳ on the blocked session's
 row in `InstanceList`, which reads `$hub.waiting` directly. So the **backend snapshot still carries
 `locks` and `waiting`** (`ipc.ts::HubSnapshot`, `snapshot.rs`) — this was a UI-only removal, and
@@ -405,3 +409,20 @@ material, the session list is what you steer with). Both rows scroll independent
 item's *auto* minimum lets it grow past its track and the children's `overflow-y: auto` never
 engages.
 
+
+## Context window % in the sidebar
+
+Each claude row shows how full its context window is, under the status word: gray, **yellow from
+50 %**, **red from 75 %** (`InstanceList.svelte::ctxLevel`). A muted row stays gray, since mute
+drops every attention signal. Shells and failed rows show nothing.
+
+The number is Claude Code's own `context_window.used_percentage`, which it publishes **only** to
+a statusline command. So `settings.json` sets `statusLine` to `<helper> statusline`
+(`mulpex-core/src/statusline.rs`), which writes it to `ctx/<id>`, and the poll loop carries it in
+the snapshot. Counting tokens off the transcript instead would mean guessing the window size
+(200 k vs 1 M is not recorded there).
+
+**The catch:** `--settings` outranks the person's own settings, so ours replaces their statusline.
+To leave their pane looking the same, the helper finds their own `statusLine.command` (project
+`settings.local.json`, then project `settings.json`, then user `settings.json`) and runs it with
+the same stdin, printing what it prints (5 s timeout, and an env guard against running itself).
