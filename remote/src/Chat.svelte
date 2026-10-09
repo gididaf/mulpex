@@ -11,7 +11,9 @@
     | { k: "text"; text: string }
     | { k: "tool"; id: string; name: string; summary: string; detail: string }
     | { k: "result"; id: string; text: string; error: boolean }
-    | { k: "sys"; text: string };
+    | { k: "sys"; text: string }
+    /** The human messages waiting in claude's queue — the latest one wins. */
+    | { k: "queue"; items: string[] };
 
   let {
     title,
@@ -83,7 +85,18 @@
     for (const it of items) if (it.k === "result") m.set(it.id, it);
     return m;
   });
-  const shown = $derived(items.filter((it) => it.k !== "result"));
+  const shown = $derived(items.filter((it) => it.k !== "result" && it.k !== "queue"));
+  /** Messages typed while claude was busy, not taken yet. An idle claude has
+   *  nothing queued (it takes them the moment it stops), so a leftover from a
+   *  conversation that was killed mid-turn isn't shown as waiting forever. */
+  const queued = $derived.by(() => {
+    if (status === "waiting") return [];
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (it.k === "queue") return it.items;
+    }
+    return [];
+  });
   let open = $state(new Set<string>());
 
   function toggle(id: string) {
@@ -103,6 +116,7 @@
   }
   $effect(() => {
     void shown.length;
+    void queued.length;
     if (pinned) tick().then(() => scroller?.scrollTo({ top: scroller.scrollHeight }));
   });
 </script>
@@ -120,7 +134,7 @@
       <div class="note">Loading…</div>
     {:else if gone}
       <div class="note">This claude is no longer running.</div>
-    {:else if shown.length === 0}
+    {:else if shown.length === 0 && queued.length === 0}
       <div class="note">Nothing here yet.</div>
     {/if}
     {#each shown as it, i (i)}
@@ -142,6 +156,10 @@
           {#if r}<pre class="detail result" class:err={r.error} dir="auto">{r.text || "(no output)"}</pre>{/if}
         {/if}
       {/if}
+    {/each}
+    {#each queued as text, i (i)}
+      <div class="bubble user queued">{@html render(text)}</div>
+      <div class="queued-label">queued</div>
     {/each}
   </div>
 
@@ -270,6 +288,16 @@
   }
   .user :global(pre) {
     background: rgba(0, 0, 0, 0.2);
+  }
+  /* Sent, but claude hasn't taken it yet: it's busy and will read it next. */
+  .user.queued {
+    opacity: 0.55;
+  }
+  .queued-label {
+    align-self: flex-end;
+    margin-top: -0.3rem;
+    font-size: 0.72rem;
+    color: var(--label);
   }
   .claude {
     align-self: flex-start;
