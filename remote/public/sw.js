@@ -6,7 +6,24 @@
 // A push comes from the Mac itself (`src-tauri/src/remote/push.rs`), encrypted
 // to this browser: { title, body, handle, id } — "claude#3 needs you".
 self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+// A phone that cached the page before the relay sent `Cache-Control` keeps
+// showing the old app for hours. A changed sw.js is the one thing it fetches
+// past that cache, so this worker reloads open windows once when it takes over.
+self.addEventListener("activate", (e) =>
+  e.waitUntil(
+    (async () => {
+      await self.clients.claim();
+      for (const c of await self.clients.matchAll({ type: "window" })) c.navigate(c.url).catch(() => {});
+    })(),
+  ),
+);
+
+// The page itself always comes from the network, never the HTTP cache — so a
+// deploy shows up on the next open. Assets are content-hashed and stay cached.
+self.addEventListener("fetch", (e) => {
+  if (e.request.mode !== "navigate") return;
+  e.respondWith(fetch(e.request.url, { cache: "no-store", credentials: "same-origin" }).catch(() => fetch(e.request)));
+});
 
 self.addEventListener("push", (e) => {
   let n = {};

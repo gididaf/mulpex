@@ -295,6 +295,22 @@ fn arg(name: &str) -> Option<String> {
     None
 }
 
+/// Without a `Cache-Control` the browser guesses a lifetime from
+/// `Last-Modified` — hours, for a page deployed days ago — so a phone kept
+/// opening the old app after a deploy. The page and everything not
+/// content-hashed must be rechecked every time; `/assets/` names change with
+/// their content, so those never need to be.
+async fn cache_headers(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let mut res = next.run(req).await;
+    if !path.starts_with("/ws/") {
+        let v = if path.starts_with("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+        res.headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static(v));
+    }
+    res
+}
+
 #[tokio::main]
 async fn main() {
     let listen: SocketAddr = arg("--listen")
@@ -311,6 +327,7 @@ async fn main() {
         .route("/ws/host", get(host_ws))
         .route("/ws/client", get(client_ws))
         .fallback_service(ServeDir::new(&static_dir).fallback(ServeFile::new(index)))
+        .layer(axum::middleware::from_fn(cache_headers))
         .with_state(relay);
 
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
