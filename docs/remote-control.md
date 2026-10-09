@@ -52,6 +52,14 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   tool calls collapsed with their results joined by id; task-notification wakes and interrupts as
   system lines. Hidden: thinking, `isMeta`, sidechain, all bookkeeping entry types. First load reads
   the last 4 MB / 400 items.
+- **Queued messages** — a message typed while the claude is busy goes into Claude Code's queue,
+  which the transcript records as `queue-operation` entries: `enqueue` (+content), `dequeue` (oldest
+  taken at turn end → later a `user` entry), `remove` (+content; `absorbed_mid_turn` → it exists
+  only as a `queued_command` attachment, which is now shown as a user bubble), `popAll` (pulled back
+  to edit). `chat.rs::Queue` replays them — notifications too, since a `dequeue` names nothing — and
+  sends the human ones as a `queue` item whenever they change; the phone shows them as faded
+  "queued" bubbles, hidden while the claude is `waiting` (a killed turn can leave a stale one).
+  Replayed against 4,788 real transcripts (41,148 operations): 2 messages left queued.
 - **Typing into a claude goes through the desktop**, never straight to the PTY: only the frontend
   can read the input box (`promptbox.ts`), so it refuses onto a draft, into an open dialog, or with no
   prompt on screen, and the reason goes back to the phone. One bracketed paste + `\r` in one write
@@ -68,6 +76,13 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   text**: wrapped rows joined, re-wrapped to the phone, colors kept, a BiDi paragraph per line.
   Full-screen programs don't survive the re-wrap; that was the user's choice over a tiny exact screen.
   Phone input reaches shells directly (`write_terminal`) — never a claude.
+- **Tabs and rows** — the phone shows the desktop's two tab badges (green idle, red needs you,
+  muted excluded) and its sidebar order (`ordered()` mirrors `stores.ts::displayOrder`). Long-press
+  (0.4 s) + drag reorders (`remote/src/order.ts::dragSort`, touch events — a non-passive
+  `touchmove` is what stops the page scrolling under the drag); rows only among siblings, the
+  desktop's rule. A drop is sent as `reorder` → `remote-reorder` → `applyProjectOrder` /
+  `applySessionOrder`, i.e. committed like a desktop drag, and comes back in the next view. There is
+  no phone-local order (a phone-only one shipped for a day; its `mulpex.order` key is deleted).
 - **Start / close** — forwarded to the desktop (`remote-action`), the same calls as ⌘T / ⌘⇧T / ⌘W,
   aimed at the phone's project, never moving the Mac's focus. The phone confirms a close. (The message
   is `close-instance`; plain `close` means "leave the chat view".)
@@ -87,9 +102,18 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 
 `mulpex.dreamvps.com`: Caddy (auto TLS) → `mulpex-relay` on `127.0.0.1:8787`, systemd unit
 `mulpex-relay`, its own user, `ProtectSystem=strict`. Deploy with
-`MULPEX_RELAY_SSH=root@mulpex.dreamvps.com scripts/deploy-relay.sh` (key
-`~/.ssh/mulpex_relay_ed25519`); it builds the phone app here and the relay **on the VM** with this
-repo's `Cargo.lock`. `--setup` (`scripts/relay-setup.sh`) only for a fresh box. Locally:
+`MULPEX_RELAY_SSH=root@185.145.254.21 scripts/deploy-relay.sh` (key
+`~/.ssh/mulpex_relay_ed25519`; by IP because only the IP is in `known_hosts`); it builds the phone app here and the relay **on the VM** with this
+repo's `Cargo.lock`. `--setup` (`scripts/relay-setup.sh`) only for a fresh box. A deploy that touches only `remote/`
+needs no Mulpex release — the Mac reconnects to the restarted relay on its own.
+
+**Caching.** The relay sends `Cache-Control: no-cache` on everything but the content-hashed
+`/assets/` (immutable). Before that it sent none, the browser guessed a lifetime from
+`Last-Modified`, and a phone kept opening a two-day-old app for hours after a deploy. `sw.js` also
+fetches navigations with `cache: "no-store"`, and on activation reloads open windows once — a
+changed `sw.js` is the one file a browser re-fetches past its HTTP cache, which is what un-stuck
+phones that had cached the page before the header existed (measured in headless Chrome against a
+server caching everything for an hour). Locally:
 `target/debug/mulpex-relay --listen 0.0.0.0:8787 --static remote/dist --data <dir>` and set the
 dialog's relay address to `http://<lan ip>:8787`.
 
