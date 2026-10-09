@@ -4,6 +4,7 @@
   import type { DialogView } from "./Dialog.svelte";
   import Term from "./Term.svelte";
   import { unb64 } from "./crypto";
+  import { dragSort, moveTo } from "./order";
 
   // Mulpex Remote Control — the phone side: the project tabs and the sidebar,
   // live, and a chat view per claude. The Mac pushes a `state` view (see
@@ -299,20 +300,62 @@
     return view.projects.find((p) => p.handle === h) ?? view.projects[0] ?? null;
   });
 
-  /** Sidebar order: claudes (unmuted, then muted) above terminals, each child
-   *  right under its parent. */
+  // ---- Reordering (order.ts) -----------------------------------------------
+  // The order is the Mac's, both ways: tabs and rows arrive in it, and a drag
+  // here is sent there to be committed like a desktop drag. It is also applied
+  // to the view at once, so the drop doesn't jump back until the Mac answers.
+
+  const tabs = $derived(view?.projects ?? []);
+
+  function dropTab(from: string, to: string) {
+    if (!view) return;
+    const handles = moveTo(view.projects.map((p) => p.handle), Number(from), Number(to));
+    view.projects = handles.map((h) => view!.projects.find((p) => p.handle === h)!);
+    conn.send({ t: "reorder", handles });
+  }
+
+  const rows = $derived(shown ? ordered(shown.sessions) : []);
+
+  /** Rows that may trade places — the desktop's rule: same parent and the same
+   *  block (unmuted claude / muted claude / terminal). */
+  function siblings(a: number, b: number): boolean {
+    const list = shown?.sessions ?? [];
+    const ra = list.find((r) => r.id === a);
+    const rb = list.find((r) => r.id === b);
+    if (!ra || !rb) return false;
+    return parentOf(list, ra) === parentOf(list, rb) && rank(ra) === rank(rb);
+  }
+
+  function dropRow(from: string, to: string) {
+    if (!shown) return;
+    const moved = moveTo(rows.map((r) => r.row.id), Number(from), Number(to));
+    const byId = new Map(shown.sessions.map((s) => [s.id, s]));
+    // Grouped again, so what's sent is exactly what the desktop will show.
+    const ids = ordered(moved.map((id) => byId.get(id)!)).map((r) => r.row.id);
+    shown.sessions = ids.map((id) => byId.get(id)!);
+    conn.send({ t: "reorder", handle: shown.handle, ids });
+  }
+
+  const rank = (r: Row) => (r.kind === "shell" ? 2 : r.muted ? 1 : 0);
+
+  /** A row's parent, if it is a claude in `list` (`stores.ts::parentOf`). */
+  function parentOf(list: Row[], r: Row): number | null {
+    if (r.kind === "shell" || r.parent == null) return null;
+    const p = list.find((x) => x.id === r.parent);
+    return p && p.kind === "claude" ? p.id : null;
+  }
+
+  /** Sidebar order, as the desktop's `displayOrder`: claudes (unmuted, then
+   *  muted) above terminals, each family right under its parent, and every
+   *  set of siblings sorted the same way; otherwise the order `rows` come in. */
   function ordered(rows: Row[]): Array<{ row: Row; depth: number }> {
-    const rank = (r: Row) => (r.kind === "shell" ? 2 : r.muted ? 1 : 0);
-    const ids = new Set(rows.map((r) => r.id));
-    const tops = rows
-      .filter((r) => r.parent == null || !ids.has(r.parent))
-      .sort((a, b) => rank(a) - rank(b));
+    const byRank = (a: Row, b: Row) => rank(a) - rank(b);
     const out: Array<{ row: Row; depth: number }> = [];
     const walk = (r: Row, depth: number) => {
       out.push({ row: r, depth });
-      for (const c of rows.filter((x) => x.parent === r.id)) walk(c, depth + 1);
+      for (const c of rows.filter((x) => parentOf(rows, x) === r.id).sort(byRank)) walk(c, depth + 1);
     };
-    for (const t of tops) walk(t, 0);
+    for (const t of rows.filter((r) => parentOf(rows, r) == null).sort(byRank)) walk(t, 0);
     return out;
   }
 
@@ -326,8 +369,14 @@
     return r.status === "needs" ? "needs you" : (r.status ?? "");
   }
 
+  // The desktop tab's two badges: red = needs you, green = idle. Working is
+  // left unbadged, and muted claudes never count.
   function needsCount(p: Project): number {
     return p.sessions.filter((s) => s.status === "needs" && !s.muted).length;
+  }
+
+  function readyCount(p: Project): number {
+    return p.sessions.filter((s) => s.status === "waiting" && !s.muted).length;
   }
 
 </script>
@@ -385,15 +434,19 @@
     {#if pushNote}<div class="pushnote" dir="auto">{pushNote}</div>{/if}
 
     {#if view}
-      <nav class="tabs">
-        {#each view.projects as p (p.handle)}
+      <nav class="tabs" use:dragSort={{ selector: ".tab", canDrop: () => true, onDrop: dropTab }}>
+        {#each tabs as p (p.handle)}
+          {@const ready = readyCount(p)}
+          {@const needs = needsCount(p)}
           <button
             class="tab"
+            data-key={p.handle}
             class:active={shown?.handle === p.handle}
             onclick={() => (picked = p.handle)}
           >
             <span dir="auto">{p.name}</span>
-            {#if needsCount(p) > 0}<span class="badge">{needsCount(p)}</span>{/if}
+            {#if ready > 0}<span class="badge ready">{ready}</span>{/if}
+            {#if needs > 0}<span class="badge needs">{needs}</span>{/if}
           </button>
         {/each}
       </nav>
@@ -404,11 +457,15 @@
           <button onclick={() => startInstance(shown.handle, "shell")}>+ Terminal</button>
           {#if starting}<span class="err" dir="auto">{starting}</span>{/if}
         </div>
-        <ul class="rows">
-          {#each ordered(shown.sessions) as { row, depth } (row.id)}
+        <ul
+          class="rows"
+          use:dragSort={{ selector: ".row", canDrop: (a, b) => siblings(Number(a), Number(b)), onDrop: dropRow }}
+        >
+          {#each rows as { row, depth } (row.id)}
             <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
             <li
               class="row"
+              data-key={row.id}
               class:muted={row.muted}
               class:tappable={true}
               style="padding-inline-start: {0.9 + depth * 1.1}rem"
@@ -452,6 +509,8 @@
     --green: #1a7f37;
     --yellow: #9a6700;
     --red: #cf222e;
+    --on-green: #fff;
+    --on-red: #fff;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
@@ -465,6 +524,9 @@
       --green: #3fb950;
       --yellow: #d29922;
       --red: #f85149;
+      /* Dark text on the bright dark-mode pills — white fails contrast. */
+      --on-green: #0c2110;
+      --on-red: #2a0a0d;
     }
   }
   :global(html, body) {
@@ -528,10 +590,34 @@
     min-width: 1.2rem;
     padding: 0 0.3rem;
     border-radius: 999px;
-    background: var(--red);
-    color: #fff;
     font-size: 0.75rem;
+    font-weight: 700;
     text-align: center;
+  }
+  .badge.ready {
+    background: var(--green);
+    color: var(--on-green);
+  }
+  .badge.needs {
+    background: var(--red);
+    color: var(--on-red);
+  }
+  /* Long-press drag (order.ts): the item in hand fades, the slot it would
+     take gets an accent edge — the desktop's look. */
+  .tab,
+  .row {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  :global([data-drag="src"]) {
+    opacity: 0.45;
+  }
+  .tab:global([data-drag="target"]) {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .row:global([data-drag="target"]) {
+    box-shadow: inset 0 3px 0 var(--accent);
   }
   .rows {
     list-style: none;

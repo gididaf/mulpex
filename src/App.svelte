@@ -163,11 +163,25 @@
    * Sidebar order is also what ⌘[ / ⌘] cycle, so a drag remaps those too — the
    * "what you see is what you cycle" rule the muted-sinking sort already follows.
    */
-  function applySessionOrder(ids: number[]) {
-    const h = get(activeProjectHandle);
+  function applySessionOrder(ids: number[], h = get(activeProjectHandle)) {
     if (h == null) return;
     reorderSessionsLocal(h, ids);
     reorderSessions(h, ids);
+  }
+
+  /** Remote Control: a drag on the phone, committed exactly like one here —
+   *  tabs, or one project's rows (which need not be the project in front). The
+   *  phone keeps the desktop's sibling rules, and the backend appends anything
+   *  missing, so a stale list can't drop a tab or a row. */
+  type RemoteReorderEvent = { handles?: ProjectHandle[] | null; handle?: ProjectHandle | null; ids?: number[] | null };
+  function remoteReorder({ handles, handle, ids }: RemoteReorderEvent) {
+    if (Array.isArray(handles)) {
+      const open = get(projects);
+      const order = handles.filter((h) => open.has(h));
+      if (order.length) applyProjectOrder(order);
+    } else if (handle != null && Array.isArray(ids) && get(projects).has(handle)) {
+      applySessionOrder(ids, handle);
+    }
   }
 
   /**
@@ -1199,6 +1213,7 @@
       listen<RemoteKeyEvent>("remote-key", (e) => remoteKey(e.payload)),
       listen<RemoteKeysEvent>("remote-keys", (e) => remoteKeys(e.payload)),
       listen<RemoteActionEvent>("remote-action", (e) => remoteAction(e.payload)),
+      listen<RemoteReorderEvent>("remote-reorder", (e) => remoteReorder(e.payload)),
       listen<HubUpdateEvent>("hub-update", (e) =>
         applyHubFor(e.payload.handle, e.payload.snapshot),
       ),

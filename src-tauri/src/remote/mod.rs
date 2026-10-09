@@ -1068,6 +1068,20 @@ impl Server {
                     }));
                 }
             }
+            // A drag on the phone: the project tabs (`handles`), or one
+            // project's sidebar rows (`handle` + `ids`, top to bottom). The
+            // desktop commits it through the same path as its own drag, and the
+            // next view carries it back to every phone.
+            Some("reorder") => {
+                let app = inner().lock().unwrap().app.clone();
+                if let Some(app) = app {
+                    let _ = app.emit("remote-reorder", json!({
+                        "handles": req.get("handles"),
+                        "handle": req.get("handle"),
+                        "ids": req.get("ids"),
+                    }));
+                }
+            }
             Some("key") => {
                 let app = inner().lock().unwrap().app.clone();
                 if let Some(app) = app {
