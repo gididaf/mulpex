@@ -18,6 +18,7 @@
   let {
     title,
     status,
+    ctx = null,
     items,
     gone,
     loading,
@@ -30,6 +31,8 @@
   }: {
     title: string;
     status: string | null;
+    /** Context window used, with its color level ("", "warn", "crit"). */
+    ctx?: { pct: number; level: string } | null;
     items: Item[];
     gone: boolean;
     loading: boolean;
@@ -126,6 +129,7 @@
     <button class="back" onclick={onback} aria-label="Back">‹</button>
     <span class="title" dir="auto">{title}</span>
     {#if status}<span class="st {status}">{status === "needs" ? "needs you" : status}</span>{/if}
+    {#if ctx}<span class="ctx {ctx.level}">{ctx.pct}%</span>{/if}
     <button class="close" onclick={onclose}>Close</button>
   </header>
 
@@ -235,6 +239,17 @@
   .st {
     font-size: 0.8rem;
     color: var(--label);
+  }
+  .ctx {
+    font-size: 0.75rem;
+    color: var(--label);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctx.warn {
+    color: var(--yellow);
+  }
+  .ctx.crit {
+    color: var(--red);
   }
   .st.needs {
     color: var(--red);

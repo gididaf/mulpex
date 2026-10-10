@@ -408,6 +408,7 @@
     <Chat
       title={chatRow ? `${label(chatRow)}${chatRow.name || chatRow.task ? " · " + (chatRow.name ?? chatRow.task) : ""}` : `claude#${chat.id}`}
       status={chatRow?.status ?? null}
+      ctx={chatRow?.ctx_pct != null ? { pct: chatRow.ctx_pct, level: ctxLevel(chatRow) } : null}
       items={chat.items}
       gone={chat.gone}
       loading={chat.loading}
