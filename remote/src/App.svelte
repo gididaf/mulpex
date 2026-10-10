@@ -395,6 +395,29 @@
     return p.sessions.filter((s) => s.status === "needs" && !s.muted).length;
   }
 
+  /** Claudes that need you in the projects not on screen — with many tabs,
+   *  the one badge that matters can be scrolled out of sight. */
+  const elsewhere = $derived(
+    view ? view.projects.filter((p) => p.handle !== shown?.handle).reduce((n, p) => n + needsCount(p), 0) : 0,
+  );
+
+  /** Jump to the next project, in tab order after this one, with a claude
+   *  that needs you; tapping again cycles through them. */
+  function nextNeeds() {
+    if (!view) return;
+    const ps = view.projects;
+    const at = ps.findIndex((p) => p.handle === shown?.handle);
+    for (let k = 1; k <= ps.length; k++) {
+      const p = ps[(at + k) % ps.length];
+      if (p.handle !== shown?.handle && needsCount(p) > 0) {
+        picked = p.handle;
+        // Bring its tab into view on the strip.
+        setTimeout(() => document.querySelector(`.tab[data-key="${p.handle}"]`)?.scrollIntoView({ inline: "center", block: "nearest" }), 0);
+        return;
+      }
+    }
+  }
+
   function readyCount(p: Project): number {
     return p.sessions.filter((s) => s.status === "waiting" && !s.muted).length;
   }
@@ -435,6 +458,11 @@
   {:else}
     <header>
       <span class="title">Mulpex</span>
+      {#if elsewhere > 0}
+        <button class="elsewhere" onclick={nextNeeds} aria-label="Claudes that need you in other projects">
+          ● {elsewhere} need{elsewhere === 1 ? "s" : ""} you
+        </button>
+      {/if}
       <span class="link {link}">
         {link === "online"
           ? "connected · encrypted"
@@ -565,14 +593,26 @@
   header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     padding: 0.75rem 1rem;
     border-bottom: 1px solid var(--border);
+  }
+  .elsewhere {
+    margin-inline-start: 0.5rem;
+    padding: 0.2rem 0.55rem;
+    border: 0;
+    border-radius: 999px;
+    background: var(--red);
+    color: var(--on-red);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 700;
+    white-space: nowrap;
   }
   .title {
     font-weight: 600;
   }
   .link {
+    margin-inline-start: auto;
     font-size: 0.8rem;
     color: var(--label);
   }
