@@ -28,9 +28,14 @@ export type PromptBox = "empty" | "draft" | "none";
 const RULE = "─";
 const PROMPT = "❯";
 
+/** A run of "─", or — once a session is named (`/rename`, measured on claude
+ *  2.1.296) — a run with the name set into its right end:
+ *  `──────── database-migration-analysis ─`. Missing that second form made
+ *  every named claude read as "no prompt", so the phone could type into none. */
+const RULE_ROW = new RegExp(`^${RULE}{10,}(?: \\S.* ${RULE}+)?$`);
+
 function isRule(text: string): boolean {
-  const t = text.trim();
-  return t.length >= 10 && [...t].every((c) => c === RULE);
+  return RULE_ROW.test(text.trim());
 }
 
 /** The box's own prompt is "❯" + U+00A0 (NO-BREAK SPACE), not a plain space —
