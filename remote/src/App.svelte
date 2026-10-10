@@ -279,9 +279,22 @@
   // starts on the list, but the history still holds the entry an open chat or
   // terminal pushed: the first Back would pop it and do nothing visible. Drop it.
   if (history.state?.chat || history.state?.term) history.back();
-  document.addEventListener("visibilitychange", () =>
-    conn.send({ t: "visible", on: document.visibilityState === "visible" }),
-  );
+  document.addEventListener("visibilitychange", () => {
+    conn.send({ t: "visible", on: document.visibilityState === "visible" });
+    clearNotifications();
+  });
+
+  /** In the app, the bar's Mulpex notifications are old news: clear them on
+   *  open and on every return. New ones aren't shown while it's in front
+   *  (`sw.js`). */
+  function clearNotifications() {
+    if (document.visibilityState !== "visible") return;
+    navigator.serviceWorker?.ready
+      .then((reg) => reg.getNotifications())
+      .then((ns) => ns.forEach((n) => n.close()))
+      .catch(() => {});
+  }
+  clearNotifications();
 
   const chatRow = $derived(
     chat ? view?.projects.find((p) => p.handle === chat!.handle)?.sessions.find((s) => s.id === chat!.id) : null,

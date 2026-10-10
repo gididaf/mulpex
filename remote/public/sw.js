@@ -31,15 +31,21 @@ self.addEventListener("push", (e) => {
     n = e.data ? e.data.json() : {};
   } catch {}
   e.waitUntil(
-    self.registration.showNotification(n.title || "Mulpex", {
-      body: n.body || "A claude needs you",
-      icon: "/icons/icon-192.png",
-      badge: "/icons/icon-192.png",
-      // One notification per claude: a second question replaces the first.
-      tag: n.handle != null ? `claude-${n.handle}-${n.id}` : "mulpex",
-      renotify: true,
-      data: { handle: n.handle, id: n.id },
-    }),
+    (async () => {
+      // The app is open in front: you're already looking at it, so nothing
+      // goes to the bar (the app clears what's there when it comes up).
+      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      if (wins.some((w) => w.visibilityState === "visible")) return;
+      await self.registration.showNotification(n.title || "Mulpex", {
+        body: n.body || "A claude needs you",
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        // One notification per claude: a second question replaces the first.
+        tag: n.handle != null ? `claude-${n.handle}-${n.id}` : "mulpex",
+        renotify: true,
+        data: { handle: n.handle, id: n.id },
+      });
+    })(),
   );
 });
 
