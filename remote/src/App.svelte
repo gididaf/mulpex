@@ -5,6 +5,7 @@
   import Term from "./Term.svelte";
   import { unb64 } from "./crypto";
   import { dragSort, moveTo } from "./order";
+  import { swipePages } from "./swipe";
 
   // Mulpex Remote Control — the phone side: the project tabs and the sidebar,
   // live, and a chat view per claude. The Mac pushes a `state` view (see
@@ -404,6 +405,27 @@
     view ? view.projects.filter((p) => p.handle !== shown?.handle).reduce((n, p) => n + needsCount(p), 0) : 0,
   );
 
+  /** Swipe left/right on the main screen: the next/previous tab, stopping at
+   *  the ends (`swipe.ts`). */
+  function canSwipe(dir: -1 | 1): boolean {
+    if (!view || !shown) return false;
+    const i = view.projects.findIndex((p) => p.handle === shown!.handle) + dir;
+    return i >= 0 && i < view.projects.length;
+  }
+
+  function swipeTo(dir: -1 | 1) {
+    if (!view || !shown) return;
+    const p = view.projects[view.projects.findIndex((x) => x.handle === shown!.handle) + dir];
+    if (!p) return;
+    picked = p.handle;
+    showTab(p.handle);
+  }
+
+  /** Bring a project's tab into view on the strip. */
+  function showTab(handle: number) {
+    setTimeout(() => document.querySelector(`.tab[data-key="${handle}"]`)?.scrollIntoView({ inline: "center", block: "nearest" }), 0);
+  }
+
   /** Jump to the next project, in tab order after this one, with a claude
    *  that needs you; tapping again cycles through them. */
   function nextNeeds() {
@@ -414,8 +436,7 @@
       const p = ps[(at + k) % ps.length];
       if (p.handle !== shown?.handle && needsCount(p) > 0) {
         picked = p.handle;
-        // Bring its tab into view on the strip.
-        setTimeout(() => document.querySelector(`.tab[data-key="${p.handle}"]`)?.scrollIntoView({ inline: "center", block: "nearest" }), 0);
+        showTab(p.handle);
         return;
       }
     }
@@ -504,6 +525,7 @@
       </nav>
 
       {#if shown}
+        <div class="page" use:swipePages={{ can: canSwipe, go: swipeTo }}>
         <div class="actions">
           <button onclick={() => startInstance(shown.handle, "claude")}>+ Claude</button>
           <button onclick={() => startInstance(shown.handle, "shell")}>+ Terminal</button>
@@ -539,6 +561,7 @@
             <li class="none">No instances in this project.</li>
           {/each}
         </ul>
+        </div>
       {:else}
         <div class="empty">No projects are open on the Mac.</div>
       {/if}
@@ -590,6 +613,8 @@
   }
   main {
     min-height: 100dvh;
+    /* A swiped page slides past the screen edge. */
+    overflow-x: hidden;
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -682,6 +707,10 @@
   }
   .row:global([data-drag="target"]) {
     box-shadow: inset 0 3px 0 var(--accent);
+  }
+  .page {
+    /* The swipe needs the empty space below the rows too. */
+    min-height: 70dvh;
   }
   .rows {
     list-style: none;
