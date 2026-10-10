@@ -11,6 +11,7 @@ mod pty;
 mod remote;
 mod docs_import;
 mod explain;
+mod fda;
 mod saves;
 mod secrets;
 mod snapshot;
@@ -65,6 +66,7 @@ fn is_forwarded(id: &str) -> bool {
             | "move_instance_down"
             | "check_updates"
             | "remote_control"
+            | "full_disk_access"
     ) || id.starts_with("project_")
 }
 
@@ -146,6 +148,8 @@ pub fn run() {
             remote::remote_set_relay_url,
             remote::remote_revoke_device,
             remote::remote_reply,
+            fda::has_full_disk_access,
+            fda::open_full_disk_access_settings,
         ])
         .setup(|app| {
             // Warm the `claude` lookup off-thread: it shells out to the user's

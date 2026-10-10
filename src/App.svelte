@@ -85,6 +85,8 @@
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
+  import FdaBanner from "./lib/components/FdaBanner.svelte";
+  import { checkFda, openFda } from "./lib/fda";
   import { checkForUpdate, startUpdateChecks } from "./lib/updater";
   import BottomBar from "./lib/components/BottomBar.svelte";
   import InstanceList from "./lib/components/InstanceList.svelte";
@@ -1083,6 +1085,9 @@
         // periodic check which stays silent on both.
         await checkForUpdate(true);
         break;
+      case "full_disk_access":
+        await openFda();
+        break;
       case "next":
         cycle(1);
         break;
@@ -1258,6 +1263,7 @@
     // Check at startup, then every 6h. Silent unless something is actually
     // available — a failed check never surfaces on this path.
     const stopUpdateChecks = startUpdateChecks();
+    void checkFda();
 
     // Dock badge + "a claude needs you" notifications. Clicking a banner routes
     // through the same select path as clicking the sidebar row, so it lands on
@@ -1460,6 +1466,7 @@
      was late enough to look like the launch check had simply not run. The card
      owns nothing that bootstrap provides, so it has no reason to wait for it. -->
 <UpdateBanner />
+<FdaBanner />
 
 <style>
   .shell {

@@ -149,6 +149,13 @@ export const listRecentProjects = () =>
 /** Whether the user's `claude` CLI was found (checked once, at startup). */
 export const claudeStatus = () => invoke<ClaudeStatus>("claude_status");
 
+/** Whether Mulpex has Full Disk Access (applies only after a relaunch). */
+export const hasFullDiskAccess = () => invoke<boolean>("has_full_disk_access");
+
+/** Open System Settings at Privacy & Security ▸ Full Disk Access. */
+export const openFullDiskAccessSettings = () =>
+  invoke<void>("open_full_disk_access_settings");
+
 /** Open (or re-activate) a project; returns its bootstrap info. */
 export const openProject = (path: string) =>
   invoke<BootstrapInfo>("open_project", { path });

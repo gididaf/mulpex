@@ -43,9 +43,14 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // "is there one right now?" escape hatch, and every free ⌘-key is worth more
     // to a terminal app than to a menu item you use twice a month.
     let check_updates = MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
+    // Opens System Settings at Full Disk Access (`fda.rs`). Always present, even
+    // once granted, since the grant can be revoked behind our back.
+    let full_disk_access =
+        MenuItemBuilder::with_id("full_disk_access", "Grant Full Disk Access…").build(app)?;
     let app_menu = SubmenuBuilder::new(app, "Mulpex")
         .about(None)
         .item(&check_updates)
+        .item(&full_disk_access)
         .separator()
         .services()
         .separator()

@@ -24,6 +24,15 @@ beside the main binary.
 
 ## macOS file access (TCC) — the failure with no symptom, and why signing is load-bearing
 
+**Full Disk Access (`fda.rs`, 2026-10-10).** Everything a child `claude`/shell touches is charged
+to Mulpex, so a claude reading another app's container pops *"Mulpex.app would like to access data
+from other apps"* — a Mac-only modal that stalls that claude, unanswerable from Remote Control.
+Full Disk Access covers it (and the folder prompts below). No app can grant itself TCC access, so
+Mulpex only detects and points: at launch it **opens** `~/Library/Application
+Support/com.apple.TCC/TCC.db` (`stat` succeeds without the grant — measured, it must be an open)
+and shows `FdaBanner` if that fails; Mulpex ▸ *Grant Full Disk Access…* opens the Settings pane.
+The grant applies only after a relaunch, hence the banner's "restart" state and no re-checking.
+
 **Symptom, as the user experiences it: "Claude refuses to open."** A session appears in the sidebar
 for about 100 ms, an error flashes in the pane, and both are gone. Every project is affected at
 once, so the whole app looks broken. Nothing is logged anywhere.
