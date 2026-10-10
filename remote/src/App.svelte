@@ -218,6 +218,9 @@
     if (e.data?.open) {
       pendingOpen = e.data.open;
       openPending();
+    } else if (e.data?.home && (chat || term)) {
+      // The summary was tapped: back to the list, where every project shows.
+      history.back();
     }
   });
   function openPending() {

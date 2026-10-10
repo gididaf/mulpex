@@ -167,6 +167,8 @@ struct Inner {
     /// a change worth a notification. `None` until the first view after turning
     /// on, so whatever was already waiting then doesn't buzz the phone.
     last_status: Option<HashMap<String, String>>,
+    /// What the phones' one summary notification last said (`summary_for`).
+    summary: Summary,
     /// (device, handle, id): that phone has that claude's chat open with the
     /// app in front — no notification for it, they're looking at it.
     viewing: std::collections::HashSet<(String, u64, usize)>,
@@ -192,6 +194,7 @@ fn inner() -> &'static Mutex<Inner> {
             pending: HashMap::new(),
             outbox: Vec::new(),
             last_status: None,
+            summary: Summary::default(),
             viewing: Default::default(),
             awake: None,
             app: None,
@@ -367,79 +370,145 @@ pub fn publish(view: Value) {
         g.view = Some(s);
         g.view_seq += 1;
     }
-    let (statuses, notes) = notes_for(&view, g.last_status.as_ref());
+    let prev = g.last_status.take();
+    let (statuses, note) = summary_for(&view, prev.as_ref(), &mut g.summary);
     g.last_status = Some(statuses);
-    if !notes.is_empty() {
-        notify(&g, notes);
+    if let Some(note) = note {
+        notify(&g, note);
     }
 }
 
-/// Every claude's status in `view`, and the notifications its changes since
-/// `prev` call for. Two events, the ones the user asked for:
-/// - **needs you** — it opened a question or a plan;
-/// - **done** — it went from working to finished, i.e. it replied.
-/// Only claudes the user started (no `parent`: a hub-spawned worker reports to
-/// its spawner, not to the phone), never a muted one, and nothing at all on the
-/// first view (`prev` is `None`).
-fn notes_for(view: &Value, prev: Option<&HashMap<String, String>>) -> (HashMap<String, String>, Vec<Value>) {
+/// A phone opened the app: everything "done" has now been seen.
+fn seen_done() {
+    inner().lock().unwrap().summary.unseen.clear();
+}
+
+/// The one notification the phones keep: a summary of the claudes that need
+/// you, and of those that finished since you last opened the app.
+#[derive(Default)]
+struct Summary {
+    /// "handle:id" of claudes that went working → done and haven't been seen
+    /// yet, newest first. Cleared when a phone opens the app (`seen_done`); a
+    /// claude leaves it as soon as it's no longer done (you typed to it).
+    unseen: Vec<String>,
+    /// (needs, unseen) as last sent, so only a change sends again.
+    last: (Vec<String>, Vec<String>),
+}
+
+/// How many claude lines the summary lists before "+N more".
+const SUMMARY_LINES: usize = 6;
+
+/// Every claude's status in `view`, and the summary notification to send, if
+/// it changed. Counted: claudes the user started (no `parent`: a hub-spawned
+/// worker reports to its spawner, not to the phone), never a muted one.
+/// - **needs you** — every such claude on `needs` right now;
+/// - **done** — those that went from working to finished and weren't seen yet.
+/// It buzzes (`alert`) only when one is new on either list; a smaller number
+/// is a silent edit. Nothing is sent when both reach zero — every push must
+/// show a notification, or Android may show its own; the app clears the bar
+/// when opened. Nothing at all on the first view (`prev` is `None`).
+fn summary_for(
+    view: &Value,
+    prev: Option<&HashMap<String, String>>,
+    sum: &mut Summary,
+) -> (HashMap<String, String>, Option<Value>) {
     let mut now = HashMap::new();
-    let mut notes = Vec::new();
+    // key → (project, id, what), for the claudes that count.
+    let mut counted: HashMap<String, (String, u64, String)> = HashMap::new();
+    let mut needs = Vec::new();
+    let mut alert = false;
     for p in view["projects"].as_array().into_iter().flatten() {
         for s in p["sessions"].as_array().into_iter().flatten() {
             let Some(status) = s["status"].as_str() else { continue };
-            let (handle, id) = (&p["handle"], &s["id"]);
-            let key = format!("{handle}:{id}");
+            let key = format!("{}:{}", p["handle"], s["id"]);
             let before = prev.and_then(|m| m.get(&key)).map(String::as_str);
-            now.insert(key, status.to_string());
-            if prev.is_none() || s["muted"] == true || !s["parent"].is_null() {
+            now.insert(key.clone(), status.to_string());
+            if s["muted"] == true || !s["parent"].is_null() {
                 continue;
             }
-            let title = match (before, status) {
-                (Some(b), "needs") if b != "needs" => format!("claude#{id} needs you"),
-                (Some("working"), "waiting") => format!("claude#{id} is done"),
-                _ => continue,
-            };
-            let what = s["name"].as_str().or(s["task"].as_str()).unwrap_or("");
-            let project = p["name"].as_str().unwrap_or("");
-            let body = if what.is_empty() {
-                project.to_string()
-            } else {
-                format!("{project} · {}", what.chars().take(120).collect::<String>())
-            };
-            notes.push(json!({"title": title, "body": body, "handle": handle, "id": id}));
+            let what = s["name"].as_str().or(s["task"].as_str()).unwrap_or("").chars().take(80).collect();
+            counted.insert(key.clone(), (p["name"].as_str().unwrap_or("").to_string(), s["id"].as_u64().unwrap_or(0), what));
+            if prev.is_none() {
+                continue;
+            }
+            if status == "needs" {
+                alert |= before.is_some_and(|b| b != "needs");
+                needs.push(key.clone());
+            }
+            if before == Some("working") && status == "waiting" && !sum.unseen.contains(&key) {
+                sum.unseen.insert(0, key.clone());
+                alert = true;
+            }
         }
     }
-    (now, notes)
+    if prev.is_none() {
+        sum.unseen.clear();
+        return (now, None);
+    }
+    sum.unseen.retain(|k| counted.contains_key(k) && now.get(k).map(String::as_str) == Some("waiting"));
+    let sig = (needs.clone(), sum.unseen.clone());
+    if sig == sum.last {
+        return (now, None);
+    }
+    sum.last = sig;
+    if needs.is_empty() && sum.unseen.is_empty() {
+        return (now, None);
+    }
+    let line = |mark: &str, k: &String| {
+        let (project, id, what) = &counted[k];
+        let what = if what.is_empty() { String::new() } else { format!(" · {what}") };
+        format!("{mark} {project} · claude#{id}{what}")
+    };
+    let mut lines: Vec<String> =
+        needs.iter().map(|k| line("●", k)).chain(sum.unseen.iter().map(|k| line("✓", k))).collect();
+    if lines.len() > SUMMARY_LINES {
+        let more = lines.len() - (SUMMARY_LINES - 1);
+        lines.truncate(SUMMARY_LINES - 1);
+        lines.push(format!("+{more} more"));
+    }
+    let mut title = Vec::new();
+    if !needs.is_empty() {
+        title.push(format!("{} need{} you", needs.len(), if needs.len() == 1 { "s" } else { "" }));
+    }
+    if !sum.unseen.is_empty() {
+        title.push(format!("{} done", sum.unseen.len()));
+    }
+    let note = json!({
+        "summary": true,
+        "title": title.join(" · "),
+        "body": lines.join("\n"),
+        "alert": alert,
+    });
+    (now, Some(note))
 }
 
-/// Push each notification to every phone that allowed them, off the calling
-/// thread. A subscription the push service says is gone is forgotten.
-fn notify(g: &Inner, notes: Vec<Value>) {
-    let targets: Vec<(String, push::Subscription)> =
-        g.devices.iter().filter_map(|d| d.push.clone().map(|p| (d.id.clone(), p))).collect();
+/// Push the summary to every phone that allowed notifications, off the calling
+/// thread. Not to a phone with a chat open in front — it's looking (the service
+/// worker also skips any push while the app is in front). A subscription the
+/// push service says is gone is forgotten.
+fn notify(g: &Inner, note: Value) {
+    let targets: Vec<(String, push::Subscription)> = g
+        .devices
+        .iter()
+        .filter(|d| !g.viewing.iter().any(|(dev, _, _)| dev == &d.id))
+        .filter_map(|d| d.push.clone().map(|p| (d.id.clone(), p)))
+        .collect();
     if targets.is_empty() {
         return;
     }
     let (key, _) = push::vapid_key(&g.cfg.vapid_secret);
-    let viewing = g.viewing.clone();
     std::thread::spawn(move || {
-        for note in &notes {
-            let (h, i) = (note["handle"].as_u64().unwrap_or(0), note["id"].as_u64().unwrap_or(0) as usize);
-            for (device, sub) in &targets {
-                if viewing.contains(&(device.clone(), h, i)) {
-                    continue;
+        for (device, sub) in &targets {
+            let sent = push::send(&key, sub, note.to_string().as_bytes());
+            if let push::Sent::Failed(why) = &sent {
+                eprintln!("mulpex: push to a phone failed: {why}");
+            }
+            if sent == push::Sent::Gone {
+                let mut g = inner().lock().unwrap();
+                if let Some(d) = g.devices.iter_mut().find(|d| &d.id == device) {
+                    d.push = None;
                 }
-                let sent = push::send(&key, sub, note.to_string().as_bytes());
-                if let push::Sent::Failed(why) = &sent {
-                    eprintln!("mulpex: push to a phone failed: {why}");
-                }
-                if sent == push::Sent::Gone {
-                    let mut g = inner().lock().unwrap();
-                    if let Some(d) = g.devices.iter_mut().find(|d| &d.id == device) {
-                        d.push = None;
-                    }
-                    write_json("devices.json", &g.devices);
-                }
+                write_json("devices.json", &g.devices);
             }
         }
     });
@@ -521,6 +590,7 @@ pub fn set_enabled(on: bool) {
         g.enabled = on;
         g.view = None;
         g.last_status = None;
+        g.summary = Summary::default();
         if g.cfg.enabled != on {
             g.cfg.enabled = on;
             write_json("config.json", &g.cfg);
@@ -1130,8 +1200,12 @@ impl Server {
                 }
             }
             Some("visible") => {
+                let on = req.get("on").and_then(Value::as_bool).unwrap_or(true);
                 if let Some(s) = self.sessions.get_mut(&cid) {
-                    s.visible = req.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    s.visible = on;
+                }
+                if on {
+                    seen_done();
                 }
             }
             _ => {}
@@ -1571,10 +1645,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The two events, for top-level unmuted claudes only, and silence on the
-    /// first view.
+    /// The one summary notification: who counts, when it buzzes, when it's a
+    /// silent edit, and when nothing is sent.
     #[test]
-    fn what_notifies() {
+    fn the_summary_notification() {
+        // #1 started by the user, #2 muted, #3 hub-spawned, #4 user's, #5 shell-like.
         let view = |a: &str, b: &str, c: &str, d: &str| json!({"projects": [{"handle": 1, "name": "cloud", "sessions": [
             {"id": 1, "status": a, "muted": false, "parent": null, "name": "Fix billing", "task": null},
             {"id": 2, "status": b, "muted": true, "parent": null, "name": null, "task": "x"},
@@ -1582,17 +1657,57 @@ mod tests {
             {"id": 4, "status": d, "muted": false, "parent": null, "name": null, "task": null},
             {"id": 5, "status": null, "muted": false, "parent": null, "name": null, "task": null},
         ]}]});
-        let (first, notes) = notes_for(&view("working", "working", "working", "waiting"), None);
-        assert!(notes.is_empty(), "nothing on the first view");
+        let mut sum = Summary::default();
+        let (s0, note) = summary_for(&view("working", "working", "working", "needs"), None, &mut sum);
+        assert!(note.is_none(), "nothing on the first view, even for what already needs you");
 
-        let (second, notes) = notes_for(&view("waiting", "waiting", "waiting", "needs"), Some(&first));
-        let titles: Vec<&str> = notes.iter().map(|n| n["title"].as_str().unwrap()).collect();
-        assert_eq!(titles, ["claude#1 is done", "claude#4 needs you"], "not muted #2, not spawned #3");
-        assert_eq!(notes[0]["body"], "cloud · Fix billing");
-        assert_eq!(notes[1]["body"], "cloud");
+        // #1 finishes, #4 is (still) on needs: the first summary, and it buzzes.
+        let (s1, note) = summary_for(&view("waiting", "waiting", "waiting", "needs"), Some(&s0), &mut sum);
+        let n = note.expect("a summary");
+        assert_eq!(n["title"], "1 needs you · 1 done", "not muted #2, not spawned #3");
+        assert_eq!(n["body"], "● cloud · claude#4\n✓ cloud · claude#1 · Fix billing");
+        assert_eq!(n["alert"], true);
 
-        let (_, notes) = notes_for(&view("waiting", "waiting", "waiting", "needs"), Some(&second));
-        assert!(notes.is_empty(), "no change, no note");
+        let (s2, note) = summary_for(&view("waiting", "waiting", "waiting", "needs"), Some(&s1), &mut sum);
+        assert!(note.is_none(), "no change, nothing sent");
+
+        // #4 answered (on the Mac): a smaller number is a silent edit.
+        let (s3, note) = summary_for(&view("waiting", "waiting", "waiting", "working"), Some(&s2), &mut sum);
+        let n = note.expect("an edit");
+        assert_eq!((n["title"].as_str(), n["alert"].as_bool()), (Some("1 done"), Some(false)));
+
+        // Opening the app sees the done one; with both at zero nothing is sent.
+        sum.unseen.clear();
+        let (s4, note) = summary_for(&view("waiting", "waiting", "waiting", "working"), Some(&s3), &mut sum);
+        assert!(note.is_none(), "nothing is pushed at zero");
+
+        // #4 asks again: back, and buzzing.
+        let (s5, note) = summary_for(&view("waiting", "waiting", "waiting", "needs"), Some(&s4), &mut sum);
+        assert_eq!(note.expect("needs again")["alert"], true);
+
+        // Typing to a done claude takes it off the done list.
+        let (s6, _) = summary_for(&view("working", "waiting", "waiting", "needs"), Some(&s5), &mut sum);
+        let (_, note) = summary_for(&view("waiting", "waiting", "waiting", "needs"), Some(&s6), &mut sum);
+        assert_eq!(note.expect("done again")["title"], "1 needs you · 1 done");
+        assert_eq!(sum.unseen, vec!["1:1".to_string()]);
+    }
+
+    #[test]
+    fn a_long_summary_is_cut() {
+        let sessions: Vec<Value> = (1..=9)
+            .map(|i| json!({"id": i, "status": "working", "muted": false, "parent": null, "name": null, "task": null}))
+            .collect();
+        let done: Vec<Value> = (1..=9)
+            .map(|i| json!({"id": i, "status": "waiting", "muted": false, "parent": null, "name": null, "task": null}))
+            .collect();
+        let mut sum = Summary::default();
+        let (a, _) = summary_for(&json!({"projects": [{"handle": 1, "name": "p", "sessions": sessions}]}), None, &mut sum);
+        let (_, n) = summary_for(&json!({"projects": [{"handle": 1, "name": "p", "sessions": done}]}), Some(&a), &mut sum);
+        let n = n.unwrap();
+        assert_eq!(n["title"], "9 done");
+        let body = n["body"].as_str().unwrap();
+        assert_eq!(body.lines().count(), SUMMARY_LINES);
+        assert_eq!(body.lines().last(), Some("+4 more"));
     }
 
     #[test]

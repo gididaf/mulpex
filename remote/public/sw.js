@@ -4,7 +4,8 @@
 // the Home Screen, and to show notifications.
 //
 // A push comes from the Mac itself (`src-tauri/src/remote/push.rs`), encrypted
-// to this browser: { title, body, handle, id } — "claude#3 needs you".
+// to this browser: { summary: true, title, body, alert } — "2 need you · 1
+// done" — or, from an older Mac, { title, body, handle, id } per claude.
 self.addEventListener("install", () => self.skipWaiting());
 // A phone that cached the page before the relay sent `Cache-Control` keeps
 // showing the old app for hours. A changed sw.js is the one thing it fetches
@@ -36,6 +37,25 @@ self.addEventListener("push", (e) => {
       // goes to the bar (the app clears what's there when it comes up).
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       if (wins.some((w) => w.visibilityState === "visible")) return;
+      if (n.summary) {
+        // One notification, edited in place: a summary of who needs you and
+        // who finished (`remote/mod.rs::summary_for`). It buzzes only when
+        // something new arrived; a smaller number replaces it silently.
+        for (const old of await self.registration.getNotifications()) {
+          if (old.tag !== "mulpex-summary") old.close();
+        }
+        await self.registration.showNotification(n.title || "Mulpex", {
+          body: n.body || "",
+          icon: "/icons/icon-192.png",
+          badge: "/icons/icon-192.png",
+          tag: "mulpex-summary",
+          renotify: !!n.alert,
+          silent: !n.alert,
+          data: {},
+        });
+        return;
+      }
+      // A Mac from before the summary: one notification per claude.
       await self.registration.showNotification(n.title || "Mulpex", {
         body: n.body || "A claude needs you",
         icon: "/icons/icon-192.png",
@@ -49,7 +69,8 @@ self.addEventListener("push", (e) => {
   );
 });
 
-// Tapping it opens that claude: in the app if it's already open, else fresh.
+// Tapping it opens that claude (an older Mac's per-claude notification), or the
+// main screen (the summary): in the app if it's already open, else fresh.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const { handle, id } = e.notification.data || {};
@@ -59,7 +80,7 @@ self.addEventListener("notificationclick", (e) => {
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       if (wins.length) {
         await wins[0].focus();
-        if (open) wins[0].postMessage({ open });
+        wins[0].postMessage(open ? { open } : { home: true });
         return;
       }
       await self.clients.openWindow(open ? `/?open=${open}` : "/");
