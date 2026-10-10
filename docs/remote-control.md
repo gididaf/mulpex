@@ -70,6 +70,12 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   (`mulpex_core::DIALOG_DIR`); the view carries it while the status is `needs`. The answer is turned
   into keys **on the Mac against the file as it is now** (`dialog.rs`, every sequence measured on a
   real claude — see its module doc), and the desktop plays them 250 ms apart after re-checking `needs`.
+  **Esc on a dialog fires no hook at all** (measured on claude 2.1.296, both dialogs), so nothing
+  cleared `needs`. The phone kept the card up and refused every message ("Answer the open question
+  first"), a deadlock, and the desktop row stayed red. `Core::clear_escaped_dialogs` (in the poll
+  loop) now reads the transcript of a `needs` claude that has a dialog on file. An `is_error` result
+  for the dialog call followed by `[Request interrupted…` sets `waiting`. The same result followed
+  by more assistant output (a plan rejected with feedback) sets `working`.
 - **Terminals** — shells only keep a 256 KB output tail plus taps (`pty.rs::OutputSink::tap`); the
   phone gets the tail, then every byte. The phone feeds them to a **hidden xterm at the desktop's one
   geometry** (the emulator — never resized from the phone) and shows its buffer as **readable 13 px
