@@ -363,6 +363,13 @@
     return r.kind === "shell" ? `term#${r.id}` : `claude#${r.id}`;
   }
 
+  /** Context window used, as the desktop colors it: gray, then yellow at 50%,
+   *  red at 75%. A muted row stays gray — mute drops every attention signal. */
+  function ctxLevel(r: Row): string {
+    if (r.muted || r.ctx_pct == null) return "";
+    return r.ctx_pct >= 75 ? "crit" : r.ctx_pct >= 50 ? "warn" : "";
+  }
+
   function statusWord(r: Row): string {
     if (r.failed) return "failed";
     if (r.kind === "shell") return r.exited ? "exited" : "";
@@ -476,7 +483,7 @@
                 <div class="top">
                   <span class="id">{label(row)}</span>
                   <span class="st {row.status ?? ''}">{statusWord(row)}</span>
-                  {#if row.ctx_pct != null}<span class="ctx">{row.ctx_pct}%</span>{/if}
+                  {#if row.ctx_pct != null}<span class="ctx {ctxLevel(row)}">{row.ctx_pct}%</span>{/if}
                 </div>
                 {#if row.name || row.task}
                   <div class="name" dir="auto">{row.name ?? row.task}</div>
@@ -726,6 +733,12 @@
     margin-inline-start: auto;
     font-size: 0.75rem;
     color: var(--label);
+  }
+  .ctx.warn {
+    color: var(--yellow);
+  }
+  .ctx.crit {
+    color: var(--red);
   }
   .name {
     margin-top: 0.15rem;
