@@ -82,6 +82,9 @@ pub fn start(app: AppHandle) {
                 // mid-run: an in-TUI `/resume` moves the file under a `claude`
                 // that never restarts, which is how warweb#75 lost its restore.
                 core.reconcile_session_ids();
+                // Before the snapshot reads statuses: an escaped question or
+                // plan fires no hook, so its `needs` is cleared from here.
+                core.clear_escaped_dialogs();
                 // A shell can exit at any moment with nothing else happening;
                 // this is what stops the manifest instances read from going on
                 // advertising it as running. Writes only on change.

@@ -2085,6 +2085,33 @@ impl Core {
     /// restore, which is recoverable, against two claudes appending to one
     /// conversation, which is not. The refusal is logged rather than shown,
     /// because a guard that can silently decline to act has to say why.
+    /// Clear `needs` from a claude whose question or plan was dismissed with Esc.
+    ///
+    /// `askq`/`plan` write `needs` when the dialog opens, and `PostToolUse` or
+    /// `Stop` normally clears it — but an escaped dialog fires **no hook at all**
+    /// (measured, claude 2.1.296, both dialogs). The row then stayed red until
+    /// the next prompt typed on the Mac, and from the phone that was a deadlock:
+    /// it kept drawing the question, and refused every message with "Answer the
+    /// open question first". The transcript does record it — an `is_error`
+    /// result for the dialog's tool call — so that is what's read here, only
+    /// for claudes showing `needs` with a dialog on file.
+    pub fn clear_escaped_dialogs(&self) {
+        for s in self.instances() {
+            let status = self.state_dir.join(s.id.to_string());
+            if !std::fs::read_to_string(&status).is_ok_and(|t| t.trim() == "needs")
+                || !mulpex_core::dialog_path(&self.state_dir, s.id).is_file()
+            {
+                continue;
+            }
+            let path = crate::saves::transcript_path(&self.project_dir, &s.session_id);
+            let Some(tail) = read_tail(&path, DIALOG_TAIL_BYTES) else { continue };
+            if let Some(word) = escaped_dialog(&tail) {
+                eprintln!("[dialog] claude#{}: its dialog was dismissed (no hook fires for that) — {word}", s.id);
+                let _ = std::fs::write(&status, word);
+            }
+        }
+    }
+
     pub fn reconcile_session_ids(&mut self) {
         let mut changed = false;
         let reports: Vec<(usize, String)> = self
@@ -2783,9 +2810,139 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How much of a transcript's end `clear_escaped_dialogs` reads: the dialog
+/// call and what followed it are the last few entries.
+const DIALOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The last `max` bytes of `path`, from its first whole line.
+fn read_tail(path: &Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let start = size.saturating_sub(max);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let from = if start > 0 { buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1) } else { 0 };
+    Some(String::from_utf8_lossy(&buf[from..]).into_owned())
+}
+
+/// What a claude's status should be if the LAST question/plan in this
+/// transcript tail was dismissed without an answer, or `None` while it's open
+/// or was answered (an answer fires `PostToolUse`, which clears it).
+///
+/// Dismissed = its tool call got an `is_error` result (measured shape, both
+/// AskUserQuestion and ExitPlanMode). What followed says where the turn went:
+/// - `[Request interrupted by user for tool use]` → Esc ended the turn: `waiting`;
+/// - an assistant entry → the plan was rejected with feedback and claude went
+///   on working (its tool calls can't clear a `needs`): `working`;
+/// - nothing yet → wait for the next line rather than guess.
+fn escaped_dialog(tail: &str) -> Option<&'static str> {
+    let blocks = |e: &serde_json::Value| -> Vec<serde_json::Value> {
+        e.pointer("/message/content").and_then(|c| c.as_array()).cloned().unwrap_or_default()
+    };
+    // The last dialog call. Lines are tested as text first and parsed only when
+    // they could be one: this runs every tick for a claude sitting on a
+    // question. The name alone isn't enough — a `prompt_snapshot` entry (the
+    // system prompt, tool list included) can come after the call.
+    let lines: Vec<&str> = tail.lines().collect();
+    let (from, id) = lines.iter().enumerate().rev().find_map(|(i, l)| {
+        if !l.contains("\"tool_use\"") || !(l.contains("\"AskUserQuestion\"") || l.contains("\"ExitPlanMode\"")) {
+            return None;
+        }
+        let e: serde_json::Value = serde_json::from_str(l).ok()?;
+        (e.get("type")?.as_str()? == "assistant")
+            .then(|| blocks(&e))?
+            .iter()
+            .rev()
+            .find(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && matches!(b.get("name").and_then(|n| n.as_str()), Some("AskUserQuestion" | "ExitPlanMode"))
+            })
+            .and_then(|b| b.get("id")?.as_str().map(|id| (i, id.to_string())))
+    })?;
+    let mut rejected = false;
+    for e in lines[from + 1..].iter().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        let kind = e.get("type").and_then(|t| t.as_str());
+        if kind == Some("user") {
+            for b in blocks(&e) {
+                if b.get("tool_use_id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+                    if b.get("is_error").and_then(|v| v.as_bool()) != Some(true) {
+                        return None; // answered
+                    }
+                    rejected = true;
+                }
+                if rejected && b.get("text").and_then(|t| t.as_str()).is_some_and(|t| t.starts_with("[Request interrupted"))
+                {
+                    return Some("waiting");
+                }
+            }
+        } else if rejected && kind == Some("assistant") {
+            return Some("working");
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transcript after a dialog, in the shapes measured on claude 2.1.296.
+    fn dialog_tail(tool: &str, after: &[serde_json::Value]) -> String {
+        let mut lines = vec![
+            serde_json::json!({"type":"user","message":{"content":"ask me"}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":tool,"input":{}}]}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"prompt_snapshot"}}),
+        ];
+        lines.extend(after.iter().cloned());
+        lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n") + "\n"
+    }
+
+    #[test]
+    fn an_escaped_dialog_is_read_from_the_transcript() {
+        use serde_json::json;
+        let rejected = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+            "content":"The user doesn't want to proceed with this tool use. The tool use was rejected"}]}});
+        let interrupted = json!({"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}});
+        let answered = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"User has answered"}]}});
+        let went_on = json!({"type":"assistant","message":{"content":[{"type":"text","text":"Changing the plan."}]}});
+        for tool in ["AskUserQuestion", "ExitPlanMode"] {
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[])), None, "{tool}: still open");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone()])), None, "{tool}: wait for what follows");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), interrupted.clone()])), Some("waiting"), "{tool}: Esc");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), went_on.clone()])), Some("working"), "{tool}: feedback");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[answered.clone(), went_on.clone()])), None, "{tool}: answered");
+        }
+        // A newer dialog after an escaped one is the one that counts.
+        let mut two = dialog_tail("AskUserQuestion", &[rejected.clone(), interrupted.clone()]);
+        two.push_str(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{}}]}}).to_string());
+        two.push('\n');
+        assert_eq!(escaped_dialog(&two), None, "the new question is open");
+        assert_eq!(escaped_dialog("not json\n"), None);
+    }
+
+    /// Every real transcript on this machine whose LAST dialog was dismissed:
+    /// how `escaped_dialog` reads its end. Reports, never fails — run with
+    /// `--ignored --nocapture` after Claude Code changes its transcript shape.
+    #[test]
+    #[ignore]
+    fn escaped_dialogs_in_real_transcripts() {
+        let root = crate::saves::transcript_path(Path::new("/"), "x");
+        let root = root.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for d in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                let Some(tail) = read_tail(&f.path(), DIALOG_TAIL_BYTES) else { continue };
+                let got = escaped_dialog(&tail).unwrap_or("none");
+                *seen.entry(got).or_default() += 1;
+                if got != "none" && f.path().to_string_lossy().contains("probe") {
+                    eprintln!("{got}: {}", f.path().display());
+                }
+            }
+        }
+        eprintln!("escaped-dialog reading of real transcripts: {seen:?}");
+    }
 
     /// What `Workspace::geometry` hands a `Core` at open. Deliberately not the
     /// DEFAULT pair, so a test asserting a spawn used the *workspace's* size
