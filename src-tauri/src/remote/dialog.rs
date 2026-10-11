@@ -18,6 +18,13 @@
 //!   where `1` is "Submit answers". One single-choice question has none.
 //! - Plan approval: `1` approve, `2` approve but review edits, `3` + text +
 //!   Enter sends feedback instead.
+//! - A question whose options carry a `preview` is drawn side by side with the
+//!   preview (claude 2.1.296): there a digit only moves the cursor, Enter picks
+//!   and moves on, and there is no "Type something" row — so the phone offers no
+//!   typed answer for it. Measured with two questions, the first one previewed:
+//!   `2`, Enter, `1`, `1` → "Bottom" + "Hebrew" in the `tool_result`. Before
+//!   this the digit alone was sent: the cursor moved, nothing was picked, and
+//!   the phone's Answer did nothing it could see.
 
 use std::path::Path;
 
@@ -56,10 +63,14 @@ fn phone_view(raw: &Value) -> Option<Value> {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let preview = q.get("options").and_then(Value::as_array).is_some_and(|o| {
+                        o.iter().any(|o| o.get("preview").and_then(Value::as_str).is_some_and(|p| !p.is_empty()))
+                    });
                     json!({
                         "question": s("question"),
                         "header": s("header"),
                         "multi": q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                        "preview": preview,
                         "options": options,
                     })
                 })
@@ -163,6 +174,15 @@ fn ask_keys(questions: &[Value], answer: &Value) -> Result<Vec<String>, String> 
                 }
                 None => out.push("\t".into()),
             }
+        } else if q["preview"].as_bool().unwrap_or(false) {
+            match (other, picks.as_slice()) {
+                (None, [p]) => {
+                    out.push(digit(p + 1)?);
+                    out.push("\r".into());
+                }
+                (Some(_), _) => return Err("This question can only be answered by picking an option".into()),
+                _ => return Err("Pick one answer for every question".into()),
+            }
         } else {
             match (other, picks.as_slice()) {
                 (Some(text), []) => {
@@ -217,6 +237,22 @@ mod tests {
             keys_for(&v, &a).unwrap(),
             vec!["1", "3", DOWN, DOWN, "\x1b[200~Drill\x1b[201~", "\t", "\r", "1"]
         );
+    }
+
+    /// Played into a real claude 2.1.296: "Where?" (options with previews) →
+    /// Bottom, "Which text?" → Hebrew.
+    #[test]
+    fn a_question_with_previews_takes_enter() {
+        let mut previewed = q(false, &["Top", "Bottom"]);
+        previewed["options"][0]["preview"] = json!("TOP\n[box]");
+        previewed["options"][1]["preview"] = json!("[box]\nBOTTOM");
+        let v = ask(vec![previewed, q(false, &["Hebrew", "English"])]);
+        assert_eq!(v["questions"][0]["preview"], true);
+        assert_eq!(v["questions"][1]["preview"], false);
+        let a = json!({"answers": [{"pick": [1]}, {"pick": [0]}]});
+        assert_eq!(keys_for(&v, &a).unwrap(), vec!["2", "\r", "1", "1"]);
+        let typed = json!({"answers": [{"other": "Middle"}, {"pick": [0]}]});
+        assert!(keys_for(&v, &typed).is_err(), "no 'Type something' row there");
     }
 
     #[test]

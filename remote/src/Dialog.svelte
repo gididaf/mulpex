@@ -7,6 +7,9 @@
     question: string;
     header: string;
     multi: boolean;
+    /** Options with previews: claude draws them side by side and offers no
+     *  "Type something" row, so there's no typed answer here either. */
+    preview?: boolean;
     options: { label: string; description: string }[];
   };
   export type DialogView = { kind: "ask"; questions: Question[] } | { kind: "plan"; plan: string };
@@ -93,13 +96,15 @@
             </span>
           </button>
         {/each}
-        <input
-          class="other"
-          dir="auto"
-          placeholder="Something else…"
-          bind:value={others[qi]}
-          oninput={() => typed(qi, q.multi)}
-        />
+        {#if !q.preview}
+          <input
+            class="other"
+            dir="auto"
+            placeholder="Something else…"
+            bind:value={others[qi]}
+            oninput={() => typed(qi, q.multi)}
+          />
+        {/if}
       </div>
     {/each}
     <button class="primary" disabled={!ready || sending} onclick={submitAsk}>
