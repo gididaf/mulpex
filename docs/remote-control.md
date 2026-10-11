@@ -76,6 +76,9 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   loop) now reads the transcript of a `needs` claude that has a dialog on file. An `is_error` result
   for the dialog call followed by `[Request interrupted…` sets `waiting`. The same result followed
   by more assistant output (a plan rejected with feedback) sets `working`.
+  **A question whose options carry a `preview` is drawn side by side** (measured on claude 2.1.296):
+  a digit only moves the cursor, Enter picks, and there is no "Type something" row. So the answer is
+  digit + Enter, and the phone offers no typed answer for such a question.
 - **Terminals** — shells only keep a 256 KB output tail plus taps (`pty.rs::OutputSink::tap`); the
   phone gets the tail, then every byte. The phone feeds them to a **hidden xterm at the desktop's one
   geometry** (the emulator — never resized from the phone) and shows its buffer as **readable 13 px
@@ -89,17 +92,28 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   desktop's rule. A drop is sent as `reorder` → `remote-reorder` → `applyProjectOrder` /
   `applySessionOrder`, i.e. committed like a desktop drag, and comes back in the next view. There is
   no phone-local order (a phone-only one shipped for a day; its `mulpex.order` key is deleted).
+  **Swipe** left/right on the main screen switches project (`remote/src/swipe.ts`): the page follows
+  the finger, a quarter width or a flick commits, the ends stretch and spring back. Vertical
+  scrolls, long-press drags and touches at the screen edge (Android's back gesture) are left alone.
+  A **header pill** counts unmuted `needs` claudes in *other* projects; a tap jumps to the next one
+  in tab order. The chat header shows the claude's **context-window %**, colored like the desktop
+  (gray, yellow ≥ 50 %, red ≥ 75 %, muted stays gray).
 - **Start / close** — forwarded to the desktop (`remote-action`), the same calls as ⌘T / ⌘⇧T / ⌘W,
   aimed at the phone's project, never moving the Mac's focus. The phone confirms a close. (The message
   is `close-instance`; plain `close` means "leave the chat view".)
 - **Push** — the **Mac** sends Web Push itself (VAPID + RFC 8291 `aes128gcm`, `push.rs`), so neither
-  the relay nor the push service can read it; payload is only the title + project + task. Two
-  events (`notes_for`): **needs you** (a claude enters `needs`) and **done** (`working` → `waiting`,
-  i.e. it replied — the first thing the user tested, and not in the first build). Only claudes the
-  user started (no `parent`), never muted ones; nothing for what was already so when turned on.
-  Skipped for a phone that has that claude's chat open **with the app in front** — the phone reports
-  `visible` on every change, because a minimized Android app stays connected for a while and would
-  otherwise swallow every notification. A 404/410 drops the subscription. Encryption was checked against `http_ece` (the library
+  the relay nor the push service can read it. It is **one summary notification, edited in place**
+  (`remote/mod.rs::summary_for`): `2 need you · 3 done`, then a line per claude (needs first, "+N
+  more" past a cap). **needs you** = every counted claude on `needs` now; **done** = went `working` →
+  `waiting` and not yet seen — opening the app sees them (`seen_done`), typing to one removes it.
+  Counted: only claudes the user started (no `parent`), never muted ones; nothing on the first view.
+  It **buzzes only when something is new** on either list; a smaller number is a silent edit; at
+  zero nothing is sent (every push must show a notification, or Android shows its own). Tapping it
+  opens the main screen. The service worker still renders an older Mac's per-claude pushes.
+  **Nothing in the bar while the app is open**: the Mac skips a phone with a chat open in front (the
+  phone reports `visible` on every change, since a minimized Android app stays connected a while),
+  the service worker skips any push while an app window is visible, and the app clears its
+  notifications on open and on every return. A 404/410 drops the subscription. Encryption was checked against `http_ece` (the library
   `web-push` uses). iOS needs the app on the Home Screen.
 - **Keep awake** — `caffeinate -i -w <mulpex pid>` while on: the Mac doesn't idle-sleep, the
   display still does, and a closed lid still sleeps.

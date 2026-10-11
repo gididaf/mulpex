@@ -26,7 +26,8 @@ and breaks `fit()`.
 
 Anything Mulpex *types* into a claude (⌘K's key tag, Remote Control's messages) first has
 `promptbox.ts` read its input box off the xterm buffer — a guess at someone else's TUI, measured on
-claude 2.1.283 (U+00A0 after `❯`; dim = claude's own text) — see `promptbox.ts`'s header and the
+claude 2.1.283 (U+00A0 after `❯`; dim = claude's own text; a `/rename`d claude draws its name into
+the rule above the box, 2.1.296) — see `promptbox.ts`'s header and the
 2026-09-28 entry in [../docs/verification-log.md](../docs/verification-log.md).
 Keep it refusing (with a toast) on anything it does not recognize; typing onto a draft or into an
 open dialog is the failure.

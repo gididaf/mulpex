@@ -104,9 +104,12 @@ otherwise.
 
 Red is cleared by anything that proves the instance moved on — `PostToolUse` **for the dialog's own
 tool** (answering the question, approving the plan) writes `working`, `UserPromptSubmit` the same,
-`Stop` writes `waiting`. The one residual case is escaping the dialog and then doing nothing at all:
-the row stays red until the next prompt. It is a true statement about a question that was never
-answered, so it is left alone.
+`Stop` writes `waiting`. Escaping the dialog fires **no hook at all** (measured on claude 2.1.296),
+so that case is cleared from outside: `Core::clear_escaped_dialogs` in the poll loop reads the
+transcript of a `needs` claude with a `dialog/<id>.json` on file — an `is_error` result for the
+dialog call plus the interrupt line → `waiting`; plus more assistant output (a plan rejected with
+feedback) → `working`. Left red, it also deadlocked Remote Control
+([remote-control.md](remote-control.md)).
 
 #### "the dialog's own tool" is load-bearing: a background agent's `PostToolUse` fires here too
 
