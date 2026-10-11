@@ -50,10 +50,12 @@ else. If the user named this instance themselves, their name wins and yours is i
 anyone) is currently editing it and why.\n\
 - mcp__mulpex__hub_send / mcp__mulpex__hub_inbox — message another instance, and read messages \
 sent to you. Address one in THIS project by its number (to: \"3\", or equivalently \
-\"claude#3\"), or pass to: \"all\" to broadcast to every other instance in this project at once. \
-Whatever you send is mandatory reading for each recipient (an instance cannot finish a turn \
-holding unread mail), so broadcast only what genuinely concerns them all — for anything \
-narrower, name the one instance it affects. You can also message an instance in ANOTHER PROJECT \
+\"claude#3\"), several at once as a list (to: [\"3\", \"5\"]), or pass to: \"all\" to broadcast \
+to every other instance in this project at once. Whatever you send is mandatory reading for each \
+recipient (an instance cannot finish a turn holding unread mail), so \"all\" is ONLY for what \
+genuinely concerns every one of them. Before broadcasting, ask who actually needs it: if that is \
+one instance, name it; if it is a few, list just those. A list recipient sees who else got it. \
+You can also message an instance in ANOTHER PROJECT \
 — see OTHER PROJECTS below.\n\
 - mcp__mulpex__hub_spawn — start NEW instances IN THIS PROJECT, each seeded with its own task \
 that it begins immediately. Use this to fan work out in parallel (e.g. one instance per \

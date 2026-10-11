@@ -2796,14 +2796,15 @@ const UNREAD_TS_SLACK: u64 = 5;
 /// and a timestamp within `UNREAD_TS_SLACK`. Each inbox file accounts for one
 /// directed message; a broadcast (`to: all`) is one log line but a file per
 /// recipient, so it takes every matching file and stays unread while any
-/// recipient still holds it.
+/// recipient still holds it. A list send (`to: "claude#3, claude#5"`) is the
+/// same shape.
 fn mark_unread(messages: &mut [MsgEntry], mut queued: Vec<(u64, String)>) {
     if queued.is_empty() {
         return;
     }
     let near = |m: &MsgEntry, q: &(u64, String)| q.1 == m.body && q.0.abs_diff(m.ts) <= UNREAD_TS_SLACK;
     for m in messages.iter_mut() {
-        if m.to == "all" {
+        if m.to == "all" || m.to.contains(',') {
             let before = queued.len();
             queued.retain(|q| !near(m, q));
             m.unread = queued.len() < before;
@@ -3190,12 +3191,18 @@ mod tests {
         };
         // Newest first, as `read_messages` returns them.
         let mut log = vec![
+            msg("claude#3, claude#6", "heads up", 400),
+            msg("claude#6", "heads up", 400),
             msg("all", "ship it", 300),
             msg("claude#4", "status?", 200),
             msg("claude#4", "status?", 100),
             msg("claude#5", "old", 50),
         ];
         let queued = vec![
+            // Both list recipients still hold it: the list line takes both
+            // files, so the lone direct line of the same body stays read.
+            (400, "heads up".to_string()),
+            (400, "heads up".to_string()),
             (299, "ship it".to_string()),
             (300, "ship it".to_string()),
             (199, "status?".to_string()),
@@ -3203,7 +3210,7 @@ mod tests {
         ];
         mark_unread(&mut log, queued);
         let marks: Vec<bool> = log.iter().map(|m| m.unread).collect();
-        assert_eq!(marks, vec![true, true, false, false]);
+        assert_eq!(marks, vec![true, false, true, true, false, false]);
     }
 
     #[test]

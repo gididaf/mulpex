@@ -336,6 +336,24 @@ the bug) and was confirmed to fail when the label is inserted into `names`.
 `.name` in `InstanceList.svelte` is line-clamped to 2 like `.task`, because a name is no longer
 always 2-5 words.
 
+## Sending to a list (`to: ["3", "5"]`)
+
+Added 2026-10-11 because instances used `to: "all"` whenever more than one peer cared, and every
+broadcast is mandatory reading for everyone. `hub_send`'s `to` now also takes an array
+(`mcp.rs::send_many`); `HUB_RULES` tells instances "all" is only for what concerns every one.
+
+- **Mixed lists work** — local numbers, `claude#N` and `<project>#<n>` in one call. Duplicates
+  collapse; your own number is skipped.
+- **A closed recipient doesn't sink the send.** The rest get it; the reply's `skipped` says who
+  didn't and why. A malformed entry, `"all"` inside a list, or an empty list aborts with nothing
+  written — those are mistakes, not news.
+- **Each inbox file carries `cc`** (the other recipients, addressed *from that recipient's side*:
+  `claude#3` to a neighbour, `proj-a#3` across projects). `take_inbox` prefixes the body with
+  `[also sent to: …]`; `body` itself stays raw.
+- **One `messages.log` line per project**, `to` = `claude#1, claude#3, proj-b#1`. The app's
+  `state.rs::mark_unread` treats a comma in `to` like `"all"` — one line, a file per recipient —
+  which is why `body` must stay raw (it matches on body).
+
 ## Cross-project messaging (`<project>#<n>`)
 
 `hub_send` / `hub_inbox` / `hub_instances` reach **every project open in this Mulpex window**.

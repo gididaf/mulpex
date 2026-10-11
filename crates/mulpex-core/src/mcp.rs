@@ -168,11 +168,11 @@ fn tool_defs() -> Value {
         },
         {
             "name": "hub_send",
-            "description": "Leave a message for another instance (e.g. 'I'm refactoring auth, hold off on session.rs'), or broadcast to every other instance in this project at once with to: \"all\". It appears in the recipient's hub_inbox and wakes it even if it is sitting idle. A message is mandatory reading for whoever receives it — an instance cannot finish a turn holding unread mail — so broadcast only what genuinely concerns everyone, and name a single recipient otherwise. You can also message an instance in ANOTHER project open in Mulpex, as \"<project>#<n>\" (get the exact addresses from hub_instances' `other_projects`). That instance works in a DIFFERENT repository and working tree and cannot see your files, so make such a message self-contained.",
+            "description": "Leave a message for another instance (e.g. 'I'm refactoring auth, hold off on session.rs'), or broadcast to every other instance in this project at once with to: \"all\". It appears in the recipient's hub_inbox and wakes it even if it is sitting idle. A message is mandatory reading for whoever receives it — an instance cannot finish a turn holding unread mail — so use \"all\" only for what genuinely concerns EVERY instance. When a message concerns a few of them, pass to as a list of just those (e.g. [\"3\", \"5\"]) — each recipient sees who else got it. You can also message an instance in ANOTHER project open in Mulpex, as \"<project>#<n>\" (get the exact addresses from hub_instances' `other_projects`). That instance works in a DIFFERENT repository and working tree and cannot see your files, so make such a message self-contained.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Who to message. In THIS project: the instance number (\"3\") or \"claude#3\". In another open project: \"<project>#<n>\", e.g. \"central-one#3\". Or \"all\" to broadcast to every other instance in this project (a broadcast is always project-local). Terminals cannot receive messages — use hub_terminal_send for those." },
+                    "to": { "description": "Who to message. In THIS project: the instance number (\"3\") or \"claude#3\". In another open project: \"<project>#<n>\", e.g. \"central-one#3\". A list of any of those to reach several at once, e.g. [\"3\", \"claude#5\", \"central-one#2\"] — prefer this over \"all\" whenever only some instances are concerned; a closed one in the list is skipped and reported, the rest still get it. Or \"all\" to broadcast to every other instance in this project (a broadcast is always project-local). Terminals cannot receive messages — use hub_terminal_send for those." },
                     "message": { "type": "string", "description": "The message body." },
                 },
                 "required": ["to", "message"],
@@ -536,14 +536,15 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or("missing 'message'")?;
     // `to` may arrive as a number or a string ("2" / "claude#2" / "all" /
-    // "central-one#3").
+    // "central-one#3"), or as an array of those to reach a few instances at once.
     let to_raw = match args.get("to") {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Array(arr)) => return send_many(ctx, arr, message),
         _ => {
             return Err("missing 'to' — an instance in this project (\"3\" or \"claude#3\"), one \
-                        in another open project (\"central-one#3\"), or \"all\" to broadcast to \
-                        this project."
+                        in another open project (\"central-one#3\"), a list of those \
+                        ([\"3\", \"5\"]), or \"all\" to broadcast to this project."
                 .into())
         }
     };
@@ -604,6 +605,197 @@ fn send_local(
         );
     }
     Ok(json!({ "ok": !delivered.is_empty(), "delivered_to": delivered }).to_string())
+}
+
+/// One recipient of a list send, already resolved and known to be live.
+struct ListTarget {
+    /// The recipient's project directory. It decides how every OTHER recipient's
+    /// address reads from where this one sits: `claude#3` to a neighbour,
+    /// `warweb#3` to anyone else.
+    dir: String,
+    project: String,
+    id: usize,
+    local: bool,
+    inbox: PathBuf,
+    log: PathBuf,
+}
+
+impl ListTarget {
+    /// This recipient's address as an instance in `from_dir` would write it.
+    fn label_from(&self, from_dir: &str) -> String {
+        if registry::same_dir(Path::new(&self.dir), Path::new(from_dir)) {
+            format!("claude#{}", self.id)
+        } else {
+            format!("{}#{}", self.project, self.id)
+        }
+    }
+}
+
+/// `hub_send` with `to` as a list: reach a few instances without broadcasting
+/// to everyone.
+///
+/// A malformed entry or an `"all"` aborts the whole call before anything is
+/// written — those are mistakes, not news. A recipient that has closed is
+/// different: the rest still get the message, and the reply's `skipped` names
+/// who didn't and why. Each inbox file carries a `cc` list (the other
+/// recipients, addressed from that recipient's side) so a receiver knows who
+/// else is on it, and each project's `messages.log` gets ONE line naming them
+/// all — `mark_unread` in the app treats a comma in `to` like `"all"`.
+fn send_many(ctx: &Ctx, entries: &[Value], message: &str) -> Result<String, String> {
+    const HELP: &str = "Give a list of instances, e.g. [\"3\", \"claude#5\", \"central-one#2\"].";
+    if entries.is_empty() {
+        return Err(format!("'to' is an empty list — name at least one instance. {HELP}"));
+    }
+    let reg = Registry::read_for(&ctx.state_dir);
+    let live = live_ids(ctx);
+    let my_name = my_project_name(ctx, &reg);
+    let my_dir = ctx.project_dir.to_string_lossy().into_owned();
+
+    let mut targets: Vec<ListTarget> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for v in entries {
+        let word = address_word(v)
+            .ok_or_else(|| format!("'to' contains an entry that is not an address. {HELP}"))?;
+        let (id, foreign) = match registry::parse_address(&word)? {
+            Address::LocalAll => {
+                return Err(format!(
+                    "\"all\" cannot go inside a list — nothing was sent. Pass to: \"all\" on its \
+                     own to broadcast, or name only the instances it concerns. {HELP}"
+                ))
+            }
+            Address::Local(id) => (id, None),
+            Address::Foreign { qualifier, id } => match reg.resolve(&qualifier) {
+                // My own project by name is a local send, as in `send_foreign`.
+                Ok(t) if t.is_dir(&ctx.project_dir) => (id, None),
+                Ok(t) => (id, Some(t)),
+                Err(e) => {
+                    skipped.push(json!({ "to": word, "reason": e }));
+                    continue;
+                }
+            },
+        };
+        match foreign {
+            None => {
+                let reason = if id == ctx.instance {
+                    Some("that is you".to_string())
+                } else if !live.contains(&id) {
+                    Some(format!("claude#{id} is not a running instance — it has closed"))
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    skipped.push(json!({ "to": word, "reason": reason }));
+                    continue;
+                }
+                if targets.iter().any(|t| t.local && t.id == id) {
+                    continue;
+                }
+                targets.push(ListTarget {
+                    dir: my_dir.clone(),
+                    project: my_name.clone(),
+                    id,
+                    local: true,
+                    inbox: ctx.inbox_dir.join(id.to_string()),
+                    log: ctx.state_dir.join("messages.log"),
+                });
+            }
+            Some(t) => {
+                if !t.has_instance(id) {
+                    skipped.push(json!({
+                        "to": word,
+                        "reason": format!("{} is not a running instance", t.address(id)),
+                    }));
+                    continue;
+                }
+                if targets.iter().any(|x| !x.local && x.dir == t.dir && x.id == id) {
+                    continue;
+                }
+                targets.push(ListTarget {
+                    dir: t.dir.clone(),
+                    project: t.name.clone(),
+                    id,
+                    local: false,
+                    inbox: t.inbox_dir(id),
+                    log: t.messages_log(),
+                });
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        let reasons: Vec<String> = skipped
+            .iter()
+            .filter_map(|s| s.get("reason").and_then(|r| r.as_str()).map(String::from))
+            .collect();
+        return Err(format!(
+            "nothing was sent — no one in the list can receive it ({}). Call \
+             mcp__mulpex__hub_instances to see who is still active.",
+            reasons.join("; ")
+        ));
+    }
+
+    let mut delivered: Vec<&ListTarget> = Vec::new();
+    for (i, r) in targets.iter().enumerate() {
+        let cc: Vec<String> = targets
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, t)| t.label_from(&r.dir))
+            .collect();
+        let mut payload = json!({ "from": ctx.instance, "ts": now(), "body": message });
+        if !cc.is_empty() {
+            payload["cc"] = json!(cc);
+        }
+        if !r.local {
+            payload["from_project"] = json!(my_name);
+            payload["from_project_dir"] = json!(my_dir);
+        }
+        let written = std::fs::create_dir_all(&r.inbox).is_ok()
+            && std::fs::write(r.inbox.join(format!("{}.json", new_uuid())), payload.to_string())
+                .is_ok();
+        if written {
+            delivered.push(r);
+        } else {
+            skipped.push(json!({
+                "to": r.label_from(&my_dir),
+                "reason": "could not write to its inbox",
+            }));
+        }
+    }
+    if delivered.is_empty() {
+        return Err("nothing was sent — no recipient's inbox could be written.".into());
+    }
+
+    // One line per project's feed, each naming the recipients as that project
+    // reads them.
+    let me_here = format!("claude#{}", ctx.instance);
+    let me_there = format!("{my_name}#{}", ctx.instance);
+    let to_from = |dir: &str| {
+        delivered.iter().map(|t| t.label_from(dir)).collect::<Vec<_>>().join(", ")
+    };
+    log_message(&ctx.state_dir.join("messages.log"), &me_here, &to_from(&my_dir), message);
+    let mut logged: Vec<&str> = Vec::new();
+    for t in delivered.iter().filter(|t| !t.local) {
+        if !logged.contains(&t.dir.as_str()) {
+            logged.push(&t.dir);
+            log_message(&t.log, &me_there, &to_from(&t.dir), message);
+        }
+    }
+
+    let mut out = json!({
+        "ok": true,
+        "delivered_to": delivered.iter().map(|t| t.label_from(&my_dir)).collect::<Vec<_>>(),
+    });
+    if !skipped.is_empty() {
+        out["skipped"] = json!(skipped);
+    }
+    if delivered.iter().any(|t| !t.local) {
+        out["note"] = json!(format!(
+            "Some recipients are in another PROJECT — a different repository and working tree — \
+             so they cannot see your files. Reply address for them: {me_there}."
+        ));
+    }
+    Ok(out.to_string())
 }
 
 /// Deliver to an instance in ANOTHER open project.
@@ -2473,7 +2665,18 @@ fn take_inbox(ctx: &Ctx, id: usize) -> Vec<(u64, String, String)> {
                 if let Ok(v) = serde_json::from_str::<Value>(&content) {
                     let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
                     let from = sender_label(&v);
-                    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let mut body =
+                        v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    // A list send names the other recipients, so no two of them
+                    // pick up the same work thinking they were the only one told.
+                    let cc: Vec<&str> = v
+                        .get("cc")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|c| c.as_str()).collect())
+                        .unwrap_or_default();
+                    if !cc.is_empty() {
+                        body = format!("[also sent to: {}]\n{body}", cc.join(", "));
+                    }
                     out.push((ts, from, body));
                 }
             }
@@ -2998,6 +3201,90 @@ mod tests {
         assert!(err("term#3").contains("hub_terminal_send"));
         assert!(err("proj-b#all").contains("project-local"));
         assert!(err("claude#9").contains("not a running instance"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn log_lines(path: &Path) -> Vec<Vec<String>> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split('\t').map(String::from).collect())
+            .collect()
+    }
+
+    /// A list reaches exactly the instances named — each told who else got it,
+    /// addressed from its own side — and each project's feed gets ONE line.
+    #[test]
+    fn a_list_send_reaches_only_those_named_and_tells_each_who_else() {
+        let (root, ctx, b_state) = two_projects("list-send");
+        // A: claude#1, #2 (me), #3, #4.
+        std::fs::write(ctx.state_dir.join("instances"), "1\n2\n3\n4\n").unwrap();
+
+        let reply = hub_send(
+            &ctx,
+            &json!({ "to": ["1", "claude#3", 1, "proj-b#1"], "message": "auth moved" }),
+        )
+        .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["delivered_to"], json!(["claude#1", "claude#3", "proj-b#1"]));
+        assert!(reply.get("skipped").is_none(), "{reply}");
+        assert!(reply["note"].as_str().unwrap().contains("proj-a#2"));
+
+        // claude#4 was not named, so it hears nothing.
+        assert!(!ctx.inbox_dir.join("4").exists());
+        // "1" twice is one delivery.
+        assert_eq!(std::fs::read_dir(ctx.inbox_dir.join("1")).unwrap().count(), 1);
+
+        let one = only_file(&ctx.inbox_dir.join("1"));
+        assert_eq!(one["body"], "auth moved", "the body stays raw for mark_unread");
+        assert_eq!(one["cc"], json!(["claude#3", "proj-b#1"]));
+        let theirs = only_file(&b_state.join("inbox").join("1"));
+        assert_eq!(theirs["from_project"], "proj-a");
+        assert_eq!(theirs["cc"], json!(["proj-a#1", "proj-a#3"]));
+
+        let mine = log_lines(&ctx.state_dir.join("messages.log"));
+        assert_eq!(mine.len(), 1);
+        assert_eq!((mine[0][1].as_str(), mine[0][2].as_str()), ("claude#2", "claude#1, claude#3, proj-b#1"));
+        let b_log = log_lines(&b_state.join("messages.log"));
+        assert_eq!(b_log.len(), 1);
+        assert_eq!((b_log[0][1].as_str(), b_log[0][2].as_str()), ("proj-a#2", "proj-a#1, proj-a#3, claude#1"));
+
+        // The receiver reads who else got it.
+        let got = take_inbox(&ctx, 3);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "claude#2");
+        assert_eq!(got[0].2, "[also sent to: claude#1, proj-b#1]\nauth moved");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A closed instance in the list doesn't sink the send: the rest get it and
+    /// the reply says who didn't. Mistakes in the list do abort it.
+    #[test]
+    fn a_list_send_skips_the_closed_and_refuses_mistakes() {
+        let (root, ctx, _b) = two_projects("list-skip");
+
+        let reply = hub_send(&ctx, &json!({ "to": ["1", "9", "2", "proj-b#7"], "message": "x" }))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["delivered_to"], json!(["claude#1"]));
+        let skipped = reply["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 3, "{reply}");
+        assert!(skipped[0]["reason"].as_str().unwrap().contains("not a running instance"));
+        assert!(skipped[1]["reason"].as_str().unwrap().contains("you"));
+        // A single recipient left: no cc to show.
+        assert!(only_file(&ctx.inbox_dir.join("1")).get("cc").is_none());
+        assert_eq!(take_inbox(&ctx, 1)[0].2, "x");
+
+        let err = |to: Value| hub_send(&ctx, &json!({ "to": to, "message": "x" })).unwrap_err();
+        assert!(err(json!(["1", "all"])).contains("cannot go inside a list"));
+        assert!(err(json!([])).contains("empty"));
+        assert!(err(json!(["1", true])).contains("not an address"));
+        assert!(err(json!(["9", "proj-b#7"])).contains("nothing was sent"));
+        // None of the refusals wrote anything.
+        assert_eq!(std::fs::read_dir(ctx.inbox_dir.join("1")).unwrap().count(), 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
