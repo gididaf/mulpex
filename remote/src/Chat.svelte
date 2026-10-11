@@ -28,6 +28,8 @@
     dialog,
     onanswer,
     onclose,
+    compact = null,
+    oncompact,
   }: {
     title: string;
     status: string | null;
@@ -45,6 +47,10 @@
     onanswer: (answer: unknown) => Promise<{ ok: boolean; why: string | null }>;
     /** Close this instance (the phone confirms first). */
     onclose: () => void;
+    /** The Mac's compact request for this claude (⌘⇧K), if any. */
+    compact?: "requested" | "compacting" | "resume" | null;
+    /** Start or cancel that request. */
+    oncompact: () => void;
   } = $props();
 
   let draft = $state("");
@@ -130,8 +136,16 @@
     <span class="title" dir="auto">{title}</span>
     {#if status}<span class="st {status}">{status === "needs" ? "needs you" : status}</span>{/if}
     {#if ctx}<span class="ctx {ctx.level}">{ctx.pct}%</span>{/if}
+    <button class="compact" onclick={oncompact} disabled={gone}>
+      {compact ? "Cancel compact" : "Compact"}
+    </button>
     <button class="close" onclick={onclose}>Close</button>
   </header>
+  {#if compact}
+    <div class="compact-line">
+      {compact === "requested" ? "compact: waiting for checkpoint…" : "compacting…"}
+    </div>
+  {/if}
 
   <div class="scroll" bind:this={scroller} onscroll={onScroll}>
     {#if loading}
@@ -218,6 +232,22 @@
     color: var(--red, #f85149);
     font: inherit;
     font-size: 0.8rem;
+  }
+  .compact {
+    padding: 0.25rem 0.6rem;
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+  .compact-line {
+    padding: 0.3rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-dim, #8b949e);
+    border-bottom: 1px solid var(--border);
   }
   .back {
     font-size: 1.8rem;

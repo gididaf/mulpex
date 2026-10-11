@@ -45,7 +45,12 @@ export interface StatusEntry {
   /** Context window used, whole percent (Claude Code's own number, via the
    *  statusline). Null until the first reply. */
   ctx_pct: number | null;
+  /** The ⌘⇧K compact request's phase, as on disk (`compactreq/<id>`). */
+  compact_phase: CompactPhase | null;
+  /** Between `PreCompact` and the `SessionStart` that ends it. */
+  compacting: boolean;
 }
+export type CompactPhase = "requested" | "compacting" | "resume";
 export interface TaskEntry {
   id: number;
   task: string;
@@ -247,6 +252,13 @@ export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | 
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>
   invoke<void>("set_mute_menu_checked", { checked });
+
+/** ⌘⇧K: set or (null) clear claude#id's compact-request phase on disk. */
+export const setCompactPhase = (
+  projectHandle: ProjectHandle,
+  id: number,
+  phase: CompactPhase | null,
+) => invoke<void>("set_compact_phase", { projectHandle, id, phase });
 
 export const sendBytes = (
   projectHandle: ProjectHandle,

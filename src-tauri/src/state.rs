@@ -1165,6 +1165,24 @@ impl Core {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// Set (or, with `None`, drop) a claude's ⌘⇧K compact-request phase. The
+    /// frontend drives the steps; this file is what the hook and the phone see.
+    /// → `mulpex_core::COMPACTREQ_DIR`.
+    pub fn set_compact_phase(&self, id: usize, phase: Option<&str>) {
+        let path = mulpex_core::compactreq_path(&self.state_dir, id);
+        match phase {
+            Some(p) if matches!(p, "requested" | "compacting" | "resume") => {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&path, p);
+            }
+            _ => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     /// Rename an instance **as the user** (⌘R): a non-empty (trimmed) name sets
     /// it, empty clears it. Persists so it survives restart. Ports
     /// `App::commit_rename`.
@@ -1624,6 +1642,8 @@ impl Core {
         // The context % belongs to the old process; the new one reports its own
         // on its first statusline draw.
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
+        // A compact request was for the old process's conversation turn.
+        let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
         // ...and because it was cleared, the resumed child has to re-arm — which,
         // with no task on its command line, only happens if it takes a turn. The
         // one thing that makes it take one is the "orphaned background task" wake
@@ -1907,6 +1927,7 @@ impl Core {
         // would adopt the dead instance's conversation on its first tick.
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
         crate::pty::clear_delivery(&self.state_dir, id);
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
@@ -2187,11 +2208,19 @@ impl Core {
                     .ok()
                     .and_then(|t| t.trim().parse::<f64>().ok())
                     .map(|p| p.round().clamp(0.0, 100.0) as u8);
+                let compact_phase =
+                    std::fs::read_to_string(mulpex_core::compactreq_path(&self.state_dir, s.id))
+                        .ok()
+                        .map(|w| w.trim().to_owned())
+                        .filter(|w| !w.is_empty());
+                let compacting = mulpex_core::compacting_path(&self.state_dir, s.id).exists();
                 StatusEntry {
                     id: s.id,
                     status,
                     watching,
                     ctx_pct,
+                    compact_phase,
+                    compacting,
                 }
             })
             .collect();

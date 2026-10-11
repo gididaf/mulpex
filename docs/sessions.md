@@ -779,3 +779,40 @@ focused one. Terminals are excluded everywhere — a shell has no conversation t
 Guarded by `restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it` and
 `restarting_an_instance_keeps_its_row_and_clears_the_dead_childs_state`. **Not yet driven in the
 real app** — the reattach half is unverified in the GUI; see [verification-log.md](verification-log.md).
+
+## Request Compact (⌘⇧K)
+
+A claude can't run `/compact` on itself, and compacting mid-step loses the step. ⌘⇧K (Session menu,
+⌘P, the phone's chat header) has Mulpex do it at a safe point, in three phases kept in
+`compactreq/<id>` (`mulpex_core::COMPACTREQ_DIR`), one word each:
+
+- **`requested`** — `hook::posttooluse` adds `COMPACT_NOTE` to **every** tool call: stop at the next
+  safe checkpoint, start nothing new, end the turn with a line saying where it stopped. Hidden: nothing
+  is typed. An idle claude skips this phase.
+- **`compacting`** — `lib/compact.ts` saw status `waiting` *and* an empty input box
+  (`promptbox.ts`; a `needs` dialog or a draft just keeps it waiting) and typed `/compact\r` in one
+  write.
+- **`resume`** — `hook::sessionstart` (source `compact`) flips `compacting` → `resume`, only from
+  `compacting`, so an automatic compaction during `requested` does not skip the checkpoint. The app
+  types the resume prompt (bracketed paste + `\r`, like Remote Control) at the next empty box and
+  deletes the file.
+
+The **frontend drives every step** because only it can read the input box; the file is what the
+hook and the phone see. It polls every 300 ms while a request exists — the box emptying is not a hub
+change. Pressing ⌘⇧K again cancels (after `/compact` is typed, that only skips the resume prompt).
+In-memory by design: a restart, ⌘⇧R or the row exiting drops it (`forget_session_files`, the
+⌘⇧R cleanup, `dropCompact`).
+
+**A refused compaction never ends.** On an empty or tiny conversation Claude Code prints
+`Not enough messages to compact.` after `PreCompact` has fired, and no `SessionStart` follows
+(measured on claude 2.1.296). So `compacting` fails — sidebar line "compact didn't run" for 6 s, no
+resume typed — when that text appears on the screen (only if it wasn't there before typing), when no
+`PreCompact` arrives within 15 s, when the `compacting/` flag clears without a `resume`, or after
+15 minutes.
+
+Measured end to end on a real claude 2.1.296 in tmux (2026-10-11): the note arrived mid-turn on a
+12-step task and claude stopped after step 6 with "Next is b7.txt…"; `/compact\r` in one write ran
+the compaction; the phase went `compacting` → `resume` with status `waiting`; the resume paste
+started a turn. The first note wording ("finish to a safe checkpoint") let claude finish all 8
+steps of a short task, which is why it now says *next* checkpoint and *no new steps*. **Not driven in
+the GUI** (the sidebar line, ⌘⇧K with the terminal focused, the phone button).

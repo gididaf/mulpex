@@ -219,6 +219,19 @@ pub fn rename_session(
     }
 }
 
+/// ⌘⇧K: set or clear a claude's compact-request phase (`lib/compact.ts`).
+#[tauri::command]
+pub fn set_compact_phase(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    phase: Option<String>,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project(project_handle) {
+        core.set_compact_phase(id, phase.as_deref());
+    }
+}
+
 /// The project's saved ⌘⇧P pins, by instance id (`pins.rs`).
 #[tauri::command]
 pub fn get_pins(

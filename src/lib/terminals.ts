@@ -307,6 +307,18 @@ class TerminalManager {
     return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols);
   }
 
+  /** (handle, id)'s visible screen as plain text, one line per row. */
+  screenText(handle: number, id: number): string {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e) return "";
+    const buf = e.term.buffer.active;
+    const lines: string[] = [];
+    for (let y = buf.viewportY; y < buf.viewportY + e.term.rows; y++) {
+      lines.push(buf.getLine(y)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  }
+
   /** Whether (handle, id)'s program asked for application cursor keys
    *  (DECCKM), which changes the bytes an arrow key must send: `ESC O A`
    *  instead of `ESC [ A`. Remote Control's key bar sends what xterm would. */

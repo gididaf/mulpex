@@ -15,6 +15,7 @@
     descendantsOf,
   } from "../stores";
   import type { SessionInfo, Status } from "../ipc";
+  import { compactLines } from "../compact";
 
   let {
     onselect,
@@ -282,6 +283,7 @@
   {#each $sessions as s, i (s.id)}
     {@const st = statusOf(s.id)}
     {@const sv = $saves.get(s.id)}
+    {@const cl = $compactLines.get(s.id)}
     <!-- The rule between the two blocks. Drawn from the first terminal rather
          than emitted once after the loop, so it lands in the right place no
          matter how the list is ordered, and only when there is actually a claude
@@ -420,6 +422,12 @@
           {#if sv.state === "error"}
             <button class="save-btn" onclick={() => onsaveretry(s.id)}>Retry</button>
           {/if}
+        </div>
+      {/if}
+      <!-- ⌘⇧K compact request (`lib/compact.ts`), styled like the save line. -->
+      {#if cl}
+        <div class="save" class:err={cl.failed}>
+          <span class="save-text">{cl.text}</span>
         </div>
       {/if}
     </div>

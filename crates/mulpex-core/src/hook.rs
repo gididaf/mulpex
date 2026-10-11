@@ -1085,7 +1085,17 @@ fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
     }
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), compaction_end_status(ctx));
     clear_compacting(ctx);
+    mark_compact_resume(ctx);
     Ok(())
+}
+
+/// The `/compact` the app typed for a ⌘⇧K request has finished: hand it back to
+/// the app, which types the resume prompt. Only from `compacting` — an automatic
+/// compaction while the request is still `requested` is not the one we asked for.
+fn mark_compact_resume(ctx: &Ctx) {
+    if compact_phase(ctx).as_deref() == Some("compacting") {
+        let _ = std::fs::write(compactreq_file(ctx), "resume");
+    }
 }
 
 /// `SessionStart` also fires for `startup`, `resume` and `clear`; only the
@@ -1296,16 +1306,45 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
         notes.push(NAME_NUDGE_MIDTURN.to_string());
     }
 
+    let mut context: Vec<String> = Vec::new();
     if !notes.is_empty() {
+        context.push(format!("[Mulpex hub] {}", notes.join("\n\n")));
+    }
+    // (d) The user pressed ⌘⇧K: on every tool call until the turn ends, so a long
+    // turn cannot forget it.
+    if compact_requested(ctx) {
+        context.push(COMPACT_NOTE.to_string());
+    }
+
+    if !context.is_empty() {
         let out = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": format!("[Mulpex hub] {}", notes.join("\n\n")),
+                "additionalContext": context.join("\n\n"),
             }
         });
         println!("{out}");
     }
     Ok(())
+}
+
+/// What a claude is told, mid-turn, after the user asks for a compact (⌘⇧K).
+pub(crate) const COMPACT_NOTE: &str = "[Mulpex] The user wants to /compact this conversation \
+     now. Stop at the NEXT safe checkpoint: finish only the step you are on (leave nothing \
+     half-done), do not start new steps, and end your turn with one short line saying where you \
+     stopped and what is next. Mulpex will run /compact and then tell you to continue.";
+
+fn compactreq_file(ctx: &Ctx) -> PathBuf {
+    crate::compactreq_path(&ctx.state_dir, ctx.instance)
+}
+
+fn compact_phase(ctx: &Ctx) -> Option<String> {
+    read_field_or_line(&compactreq_file(ctx))
+}
+
+/// A ⌘⇧K request is waiting for this claude to reach a checkpoint.
+fn compact_requested(ctx: &Ctx) -> bool {
+    compact_phase(ctx).as_deref() == Some("requested")
 }
 
 /// A one-line nudge naming the instances that have just closed, told to the
@@ -2846,6 +2885,29 @@ mod tests {
     /// `PreCompact` 09:18:10 → `Notification{idle_prompt}` 09:19:10, to the
     /// second. Between `PreCompact` and the `SessionStart` that ends it nothing
     /// else fires at all (09:24:19 → 09:24:53 on a real compaction).
+    /// ⌘⇧K: the note rides tool calls only while `requested`, and only the
+    /// compaction the app typed (`compacting`) hands back as `resume`.
+    #[test]
+    fn compact_request_phases() {
+        let dir = std::env::temp_dir().join(format!("mulpex-compactreq-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join(crate::COMPACTREQ_DIR)).unwrap();
+        let ctx = test_ctx(&dir, 3);
+
+        assert!(!compact_requested(&ctx), "no file is no request");
+        std::fs::write(compactreq_file(&ctx), "requested\n").unwrap();
+        assert!(compact_requested(&ctx));
+        // An auto-compaction mid-turn must not skip the checkpoint.
+        mark_compact_resume(&ctx);
+        assert_eq!(compact_phase(&ctx).as_deref(), Some("requested"));
+
+        std::fs::write(compactreq_file(&ctx), "compacting").unwrap();
+        assert!(!compact_requested(&ctx), "the note stops once /compact is typed");
+        mark_compact_resume(&ctx);
+        assert_eq!(compact_phase(&ctx).as_deref(), Some("resume"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn compaction_is_working_and_never_needs_you() {
         let dir = std::env::temp_dir().join(format!("mulpex-compact-{}", crate::persist::new_uuid()));

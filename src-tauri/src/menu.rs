@@ -187,6 +187,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let pin = MenuItemBuilder::with_id("pin_selection", "Pin Selection")
         .accelerator("Cmd+Shift+P")
         .build(app)?;
+    // ⌘⇧K: ask the focused claude to stop at a checkpoint, then /compact it and
+    // tell it to continue (`lib/compact.ts`). Pressed again, it cancels. Also
+    // claimed in the webview, like ⌘⇧P.
+    let compact = MenuItemBuilder::with_id("request_compact", "Request Compact")
+        .accelerator("Cmd+Shift+K")
+        .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
         .build(app)?;
@@ -215,6 +221,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&explain)
         .item(&secrets)
         .item(&pin)
+        .item(&compact)
         .separator()
         .item(&next)
         .item(&prev)

@@ -78,6 +78,7 @@
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
   import { addPin, clearPin, dropPins, loadPins, pins, pinKey } from "./lib/pins";
+  import { dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
 
@@ -649,6 +650,7 @@
     }
     // Same row, different process: the pane has to be wiped and bound to the new
     // PTY, which the backend is buffering until we do.
+    dropCompact(handle, id);
     terminals.reattach(handle, id);
     terminals.refocus();
   }
@@ -755,7 +757,7 @@
    *  project and never moving the Mac's focus — the new row just appears, the
    *  way an instance's `hub_spawn` does. The phone confirms a close itself. */
   type RemoteActionEvent = {
-    action: "new" | "close";
+    action: "new" | "close" | "compact";
     handle: ProjectHandle;
     id: number | null;
     kind: "claude" | "shell" | null;
@@ -764,6 +766,12 @@
   async function remoteAction({ action, handle, id, kind, rid }: RemoteActionEvent) {
     const p = get(projects).get(handle);
     if (!p) return remoteReply(rid, false, "That project isn't open");
+    // The phone's Compact button: ⌘⇧K on that claude, toggled.
+    if (action === "compact") {
+      if (id == null) return remoteReply(rid, false, "No claude to compact");
+      const why = saveStatusOf(handle, id) ? "That claude was saved and stopped" : toggleCompact(handle, id);
+      return remoteReply(rid, why == null, why);
+    }
     if (action === "close") {
       if (id == null || !p.sessions.some((s) => s.id === id)) return remoteReply(rid, false, "Already closed");
       try {
@@ -1073,6 +1081,13 @@
         if (h != null && cur != null) pinSelection(h, cur);
         break;
       }
+      case "request_compact": {
+        const cur = get(activeId);
+        if (h == null || cur == null) break;
+        const why = saveStatusOf(h, cur) ? "That claude was saved and stopped" : toggleCompact(h, cur);
+        if (why) flashToast(why);
+        break;
+      }
       case "messages":
         showMessages.update((v) => !v);
         break;
@@ -1159,6 +1174,12 @@
         void handleMenu("pin_selection");
         return;
       }
+      // ⌘⇧K — Request Compact, claimed here for the same reason.
+      if (e.code === "KeyK") {
+        e.preventDefault();
+        void handleMenu("request_compact");
+        return;
+      }
       // `code` is the physical key — `key` is "}"/"{" here, and layout-dependent.
       const back = e.code === "BracketLeft";
       if (back || e.code === "BracketRight") {
@@ -1229,6 +1250,7 @@
         clearSaveState(e.payload.handle, e.payload.id);
         dropPins(e.payload.handle, e.payload.id);
         dropExplains(e.payload.handle, e.payload.id);
+        dropCompact(e.payload.handle, e.payload.id);
       }),
       listen<SessionsChangedEvent>("sessions-changed", async (e) => {
         const { handle, sessions: list } = e.payload;

@@ -163,6 +163,12 @@ pub struct StatusEntry {
     /// it to the statusline (`mulpex_core::CTX_DIR`). `None` until the first
     /// reply. Rounded so the snapshot only changes when the number shown does.
     pub ctx_pct: Option<u8>,
+    /// Where this instance's ⌘⇧K compact request stands (`requested` /
+    /// `compacting` / `resume`), or `None`. → `mulpex_core::COMPACTREQ_DIR`.
+    pub compact_phase: Option<String>,
+    /// Between `PreCompact` and the `SessionStart` that ends it — the hook's own
+    /// flag. Lets the app tell a `/compact` that ran from one that was refused.
+    pub compacting: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]

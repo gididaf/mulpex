@@ -215,6 +215,25 @@ pub const WATCHING_DIR: &str = "watching";
 /// (`context_window.used_percentage`). Written by `statusline::run`.
 pub const CTX_DIR: &str = "ctx";
 
+/// `compactreq/<id>` = where that instance's ⌘⇧K compact request stands, one
+/// word: `requested` (the hook tells claude to stop at a checkpoint on every tool
+/// call), `compacting` (the app typed `/compact`), `resume` (the compaction's
+/// `SessionStart` arrived; the app types the resume prompt next). Absent = none.
+/// Written by the app and by `hook::sessionstart`, read by both.
+pub const COMPACTREQ_DIR: &str = "compactreq";
+
+/// `compactreq/<id>` for one instance.
+pub fn compactreq_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(COMPACTREQ_DIR).join(id.to_string())
+}
+
+/// `compacting/<id>` for one instance — the hook's own PreCompact→SessionStart
+/// flag (`hook::precompact`). The app reads it to tell a compaction that ran from
+/// one Claude Code refused.
+pub fn compacting_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join("compacting").join(id.to_string())
+}
+
 /// `ctx/<id>` for one instance.
 pub fn ctx_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
     state_dir.join(CTX_DIR).join(id.to_string())

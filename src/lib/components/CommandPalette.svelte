@@ -157,6 +157,7 @@
       // mid-turn, so the dialog is part of the command rather than of the menu.
       ["restart", "Restart Session…", "⌘⇧R", isClaude],
       ["save_session", "Save Session…", "⌘S", isClaude],
+      ["request_compact", "Request Compact", "⌘⇧K", isClaude],
       ["load_session", "Load Session…", "⌘L", true],
       ["import_docs", "Import Docs…", "", true],
       ["remote_control", "Remote Control…", "⌘⇧O", true],

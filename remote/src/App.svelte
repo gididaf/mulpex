@@ -19,6 +19,8 @@
     task: string | null;
     status: "working" | "waiting" | "needs" | null;
     ctx_pct: number | null;
+    /** The Mac's ⌘⇧K compact request for this claude, if one is pending. */
+    compact: "requested" | "compacting" | "resume" | null;
     muted: boolean;
     parent: number | null;
     exited: boolean;
@@ -256,6 +258,12 @@
     else alert(r.why ?? "Couldn't close it");
   }
 
+  /** ⌘⇧K from the phone: start or cancel a compact request on the Mac. */
+  async function toggleCompact(handle: number, id: number) {
+    const r = await request({ t: "compact-request", handle, id });
+    if (!r.ok) alert(r.why ?? "Couldn't do that");
+  }
+
   function sendKey(key: string) {
     if (chat) conn.send({ t: "key", handle: chat.handle, id: chat.id, key });
   }
@@ -475,6 +483,8 @@
       onback={() => history.back()}
       onsend={sendText}
       onclose={() => chat && closeInstance(chat.handle, chat.id, "claude")}
+      compact={chatRow?.compact ?? null}
+      oncompact={() => chat && toggleCompact(chat.handle, chat.id)}
       onkey={sendKey}
       dialog={chatRow?.status === "needs" ? (chatRow.dialog ?? null) : null}
       onanswer={sendAnswer}

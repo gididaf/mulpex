@@ -59,6 +59,7 @@ fn is_forwarded(id: &str) -> bool {
             | "explain"
             | "secrets"
             | "pin_selection"
+            | "request_compact"
             | "minimize"
             | "next"
             | "prev"
@@ -111,6 +112,7 @@ pub fn run() {
             commands::reorder_sessions,
             commands::reparent_session,
             commands::rename_session,
+            commands::set_compact_phase,
             commands::set_session_muted,
             commands::get_pins,
             commands::set_pin,

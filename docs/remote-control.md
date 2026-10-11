@@ -101,6 +101,9 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 - **Start / close** — forwarded to the desktop (`remote-action`), the same calls as ⌘T / ⌘⇧T / ⌘W,
   aimed at the phone's project, never moving the Mac's focus. The phone confirms a close. (The message
   is `close-instance`; plain `close` means "leave the chat view".)
+- **Compact** — the chat header's Compact / Cancel compact button sends `compact-request`, forwarded
+  as `remote-action {action: "compact"}` to the desktop's ⌘⇧K (`lib/compact.ts`); the row's `compact`
+  field (the phase) drives the button label and the line under the header. → [sessions.md](sessions.md)
 - **Push** — the **Mac** sends Web Push itself (VAPID + RFC 8291 `aes128gcm`, `push.rs`), so neither
   the relay nor the push service can read it. It is **one summary notification, edited in place**
   (`remote/mod.rs::summary_for`): `2 need you · 3 done`, then a line per claude (needs first, "+N

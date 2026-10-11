@@ -544,6 +544,7 @@ pub fn project_view(
                     None
                 },
                 "ctx_pct": st.and_then(|e| e.ctx_pct),
+                "compact": st.and_then(|e| e.compact_phase.clone()),
                 "muted": s.muted,
                 "parent": s.parent,
                 "exited": s.exited,
@@ -1115,8 +1116,14 @@ impl Server {
             // Start a claude or a terminal, or close one. The desktop does it,
             // through the same paths as ⌘T / ⌘⇧T / ⌘W, and answers like typing.
             // (Not `close`: that one closes the phone's chat view.)
-            Some(t @ ("new-instance" | "close-instance")) => {
-                let action = if t == "new-instance" { "new" } else { "close" };
+            // ⌘⇧K from the phone (`compact-request`) toggles a claude's compact
+            // request through the desktop's own path.
+            Some(t @ ("new-instance" | "close-instance" | "compact-request")) => {
+                let action = match t {
+                    "new-instance" => "new",
+                    "close-instance" => "close",
+                    _ => "compact",
+                };
                 let rid = req.get("rid").and_then(Value::as_str).unwrap_or("").chars().take(64).collect::<String>();
                 let app = {
                     let mut g = inner().lock().unwrap();
@@ -1729,7 +1736,14 @@ mod tests {
             mk(3, SessionKind::Shell, None),
         ];
         let snap = HubSnapshot {
-            statuses: vec![StatusEntry { id: 1, status: Status::Needs, watching: false, ctx_pct: Some(40) }],
+            statuses: vec![StatusEntry {
+                id: 1,
+                status: Status::Needs,
+                watching: false,
+                ctx_pct: Some(40),
+                compact_phase: Some("requested".into()),
+                compacting: false,
+            }],
             tasks: vec![],
             locks: vec![],
             waiting: vec![],
