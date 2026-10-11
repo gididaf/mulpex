@@ -52,6 +52,9 @@ pub fn start(app: AppHandle) {
             let remote_on = crate::remote::is_enabled();
             let mut remote_projects = Vec::new();
             let active = ws.active;
+            // ⌘⇧Q's wake after a relaunch, one claude at a time as its listener
+            // comes up. A no-op unless the user just clicked "Wake all".
+            ws.drain_wake_queue();
             for core in &mut ws.projects {
                 live.insert(core.handle);
                 let removed = core.reap_dead();

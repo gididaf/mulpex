@@ -47,6 +47,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // once granted, since the grant can be revoked behind our back.
     let full_disk_access =
         MenuItemBuilder::with_id("full_disk_access", "Grant Full Disk Access…").build(app)?;
+    // ⌘⇧Q: ask every claude to stop at a checkpoint, then quit once they have
+    // (`checkpoint.rs`). Plain ⌘Q stays the instant quit. Also claimed in
+    // `App.svelte::onGlobalKey`, since a focused terminal can eat a ⌘⇧ chord.
+    let checkpoint_quit = MenuItemBuilder::with_id("checkpoint_quit", "Checkpoint & Quit…")
+        .accelerator("Cmd+Shift+Q")
+        .build(app)?;
     let app_menu = SubmenuBuilder::new(app, "Mulpex")
         .about(None)
         .item(&check_updates)
@@ -58,6 +64,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .hide_others()
         .show_all()
         .separator()
+        .item(&checkpoint_quit)
         .quit()
         .build()?;
 

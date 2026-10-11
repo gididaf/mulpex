@@ -49,6 +49,9 @@ pub struct Workspace {
     /// that happens to have no xterms yet must still spawn at the size the
     /// frontend is about to build them at. See `resize_all`.
     pub geometry: (u16, u16),
+    /// ⌘⇧Q Checkpoint & Quit: who was asked to stop, and wakes still queued
+    /// after a relaunch. See `checkpoint.rs`.
+    pub checkpoint: crate::checkpoint::Checkpoint,
 }
 
 impl Default for Workspace {
@@ -65,6 +68,7 @@ impl Workspace {
             next_handle: 1,
             state_root: std::env::temp_dir().join(format!("mulpex-{}", std::process::id())),
             geometry: (DEFAULT_COLS, DEFAULT_ROWS),
+            checkpoint: Default::default(),
         }
     }
 
@@ -2050,25 +2054,88 @@ impl Core {
     /// recipient is told a *terminal* is calling and not claude#N — replying
     /// with `hub_send` to a terminal id would go nowhere.
     fn deliver_hub_message(&self, to: usize, from_terminal: usize, body: &str) {
-        let dir = self.state_dir.join("inbox").join(to.to_string());
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let name = format!("{}-{}.json", ts, mulpex_core::persist::new_uuid());
-        let _ = std::fs::write(
-            dir.join(name),
+        self.write_inbox(to, |ts| {
             serde_json::json!({
                 "from": 0,
                 "from_terminal": from_terminal,
                 "ts": ts,
                 "body": body,
             })
-            .to_string(),
+        });
+    }
+
+    /// Drop a message into `claude#to`'s inbox **as the app itself** — sender
+    /// "Mulpex" (`from_app`), which `HUB_RULES` says not to reply to. Logged to
+    /// `messages.log` like a peer's `hub_send`, so the hub panel shows it.
+    /// Returns the inbox file, whose disappearing is how the caller learns the
+    /// message was read (`hub_inbox` deletes what it returns).
+    pub fn send_app_message(&self, to: usize, body: &str) -> Option<PathBuf> {
+        let file = self.write_inbox(to, |ts| {
+            serde_json::json!({ "from": 0, "from_app": true, "ts": ts, "body": body })
+        })?;
+        mulpex_core::mcp::log_message(
+            &self.state_dir.join("messages.log"),
+            mulpex_core::mcp::APP_SENDER,
+            &format!("claude#{to}"),
+            body,
         );
+        Some(file)
+    }
+
+    fn write_inbox(
+        &self,
+        to: usize,
+        msg: impl FnOnce(u64) -> serde_json::Value,
+    ) -> Option<PathBuf> {
+        let dir = self.state_dir.join("inbox").join(to.to_string());
+        std::fs::create_dir_all(&dir).ok()?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let file = dir.join(format!("{}-{}.json", ts, mulpex_core::persist::new_uuid()));
+        std::fs::write(&file, msg(ts).to_string()).ok()?;
+        Some(file)
+    }
+
+    /// The claudes that can take a message right now: alive, and not a terminal,
+    /// a ⌘S-stopped row or a failed start. ⌘⇧Q Checkpoint & Quit asks exactly
+    /// these to stop.
+    pub fn live_claude_ids(&self) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.is_alive()
+                    && !s.is_shell()
+                    && !self.saving.contains(&s.id)
+                    && !self.failed.contains_key(&s.id)
+            })
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// The sidebar label for `claude#id`, if it has one.
+    pub fn label_of(&self, id: usize) -> Option<String> {
+        self.display_name(id)
+    }
+
+    /// Whether `claude#id`'s hub listener is running and has been for a moment.
+    ///
+    /// The listener only announces mail that arrives **after** it starts (it
+    /// seeds its count from what is already there), so a message dropped into the
+    /// inbox of a claude still booting would sit unannounced until its next turn.
+    /// `armed/<id>` is touched every second while it runs; its creation time is
+    /// when it started.
+    pub fn listener_ready(&self, id: usize) -> bool {
+        let Ok(meta) = std::fs::metadata(self.state_dir.join("armed").join(id.to_string())) else {
+            return false;
+        };
+        let age = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok().and_then(|t| t.elapsed().ok())
+        };
+        let fresh = age(meta.modified()).is_some_and(|a| a < Duration::from_secs(30));
+        let settled = age(meta.created()).is_none_or(|a| a >= Duration::from_secs(2));
+        fresh && settled
     }
 
     /// Mark instances "worked on" once their hook state file appears (a prompt

@@ -356,6 +356,60 @@ pub fn restart_app(app: AppHandle) {
     app.request_restart()
 }
 
+/// Quit Mulpex — the end of ⌘⇧Q Checkpoint & Quit. `exit` goes through
+/// `RunEvent::ExitRequested`/`Exit`, so teardown runs exactly as for ⌘Q.
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    app.exit(0)
+}
+
+/// ⌘⇧Q: ask every live claude in every project to stop at a checkpoint.
+#[tauri::command]
+pub fn checkpoint_stop(state: State<AppState>) -> Vec<crate::checkpoint::Target> {
+    state.ws.lock().unwrap().checkpoint_stop()
+}
+
+/// Per claude asked to stop: alive, stop message still unread, listener up.
+#[tauri::command]
+pub fn checkpoint_progress(state: State<AppState>) -> Vec<crate::checkpoint::Progress> {
+    state.ws.lock().unwrap().checkpoint_progress()
+}
+
+/// ⌘⇧Q's Cancel: take back unread stop messages, tell the rest to carry on.
+#[tauri::command]
+pub fn checkpoint_cancel(state: State<AppState>) {
+    state.ws.lock().unwrap().checkpoint_cancel()
+}
+
+/// Record who was asked to stop, right before quitting or restarting.
+#[tauri::command]
+pub fn checkpoint_commit(state: State<AppState>) -> Result<(), String> {
+    state
+        .ws
+        .lock()
+        .unwrap()
+        .checkpoint_commit()
+        .map_err(|e| e.to_string())
+}
+
+/// On launch: the claudes from the last checkpoint that are back.
+#[tauri::command]
+pub fn checkpoint_pending(state: State<AppState>) -> Vec<crate::checkpoint::Target> {
+    state.ws.lock().unwrap().checkpoint_pending()
+}
+
+/// "Wake all": queue "Mulpex is back" for every checkpointed claude.
+#[tauri::command]
+pub fn checkpoint_wake(state: State<AppState>) -> usize {
+    state.ws.lock().unwrap().checkpoint_wake()
+}
+
+/// "Not now": forget the checkpoint.
+#[tauri::command]
+pub fn checkpoint_dismiss() {
+    crate::checkpoint::dismiss()
+}
+
 /// A project's current hub snapshot for the initial HubPanel paint (thereafter
 /// pushed via the scoped `hub-update` event from the poll loop).
 #[tauri::command]

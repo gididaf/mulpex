@@ -643,3 +643,13 @@ refused, and `force: true` then closes the busy one.
 **Not verified: the `mpx` (tmux) side.** It compiles and mirrors the desktop arm, and it shares
 `close_busy_reason`, but no test drives it — `mulpex-cli` has no tmux fixture, and this was not
 run against a live daemon.
+
+## Messages from the app itself
+
+`Core::send_app_message` writes `{"from":0,"from_app":true,"ts","body"}` into an inbox and logs
+it to `messages.log` as sent by `Mulpex` (`mcp::APP_SENDER`). `sender_label` turns `from_app` into
+"Mulpex" — without it `from: 0` would read as a "claude#0" to reply to — and `HUB_RULES` says a
+message from "Mulpex" is the app: do what it asks, never `hub_send` a reply. `bounce_dead_inbox`
+already skips `from: 0`, so an app message to a claude that dies is dropped, not bounced. The only
+sender today is ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)); each body also
+says "do not reply" itself, because a claude spawned before this shipped has the old `HUB_RULES`.

@@ -9,6 +9,7 @@
     updateState,
     type UpdateState,
   } from "../updater";
+  import { startCheckpoint } from "../checkpoint";
 
   const s = $derived($updateState as UpdateState);
   // `checking` IS shown: only a manual check ever sets it (the periodic one stays
@@ -43,10 +44,22 @@
       </div>
       <p class="notes">
         Updating restarts every session. They come back with <code>--resume</code
-        >, but whatever they're doing right now is lost.
+        >, but whatever they're doing right now is lost — unless you checkpoint first:
+        each claude stops at a safe point, and after the update Mulpex offers to wake
+        them all.
       </p>
       <div class="row">
-        <button class="primary" onclick={() => applyUpdate(true)}>
+        <!-- ⌘⇧Q's flow, ending in this update's restart instead of a quit. -->
+        <button
+          class="primary"
+          onclick={() => {
+            dismissUpdate();
+            void startCheckpoint("update");
+          }}
+        >
+          Checkpoint &amp; update
+        </button>
+        <button class="ghost" onclick={() => applyUpdate(true)}>
           Restart anyway
         </button>
         <button class="ghost" onclick={dismissUpdate}>Cancel</button>

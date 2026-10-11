@@ -716,7 +716,11 @@ fn my_address(ctx: &Ctx, reg: &Registry) -> String {
 /// show the full conversation. One `write_all` under `O_APPEND` is atomic across
 /// instances — and across projects, since a cross-project send appends to two
 /// different logs.
-fn log_message(log: &Path, from: &str, to: &str, body: &str) {
+/// How a message the app sends as itself (`"from_app": true`) is labelled, in
+/// `hub_inbox` and in `messages.log`. `HUB_RULES` names it too.
+pub const APP_SENDER: &str = "Mulpex";
+
+pub fn log_message(log: &Path, from: &str, to: &str, body: &str) {
     let esc = body.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
     let line = format!("{}\t{}\t{}\t{}\n", now(), from, to, esc);
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -2444,6 +2448,11 @@ fn locks_by_holder(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
 /// its behalf and tags it with the terminal it came from, so the recipient is
 /// never told to reply to a peer number that does not exist.
 fn sender_label(v: &Value) -> String {
+    // The app itself (⌘⇧Q Checkpoint & Quit, and the wake after relaunch).
+    // `from` is 0, so without this it would read as a "claude#0" to reply to.
+    if v.get("from_app").and_then(|x| x.as_bool()) == Some(true) {
+        return APP_SENDER.to_string();
+    }
     if let Some(t) = v.get("from_terminal").and_then(|x| x.as_u64()) {
         return format!("term#{t} (remote claude)");
     }
@@ -2949,6 +2958,8 @@ mod tests {
             sender_label(&json!({ "from": 0, "from_terminal": 4 })),
             "term#4 (remote claude)"
         );
+        // The app itself is "Mulpex", never a "claude#0" to reply to.
+        assert_eq!(sender_label(&json!({ "from": 0, "from_app": true })), "Mulpex");
         // And the two local forms both parse back as addresses.
         assert_eq!(registry::parse_address("claude#2").unwrap(), Address::Local(2));
         assert!(matches!(

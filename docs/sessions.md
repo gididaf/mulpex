@@ -816,3 +816,47 @@ the compaction; the phase went `compacting` → `resume` with status `waiting`; 
 started a turn. The first note wording ("finish to a safe checkpoint") let claude finish all 8
 steps of a short task, which is why it now says *next* checkpoint and *no new steps*. **Not driven in
 the GUI** (the sidebar line, ⌘⇧K with the terminal focused, the phone button).
+
+## Checkpoint & Quit (⌘⇧Q), and waking them after the relaunch
+
+Quitting with several projects of working claudes used to mean stopping each one by hand and,
+after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the update banner's
+"Checkpoint & update") does both ends. Plain ⌘Q is unchanged and still quits at once.
+
+- **Stop.** `checkpoint.rs::checkpoint_stop` drops one hub message into the inbox of every live
+  claude in every project, idle ones too (an idle one may hold agentalk or another monitor that
+  could wake it mid-quit). Terminals, remote claudes, ⌘S-stopped rows and failed starts are
+  skipped. The message says: finish the current step, start nothing new, stop your dev servers
+  and background jobs, end with a note on what's done, what's next and which monitors you had
+  armed — and don't reply. It goes in as the **app itself** (`from_app`, sender "Mulpex", see
+  [hub.md](hub.md#messages-from-the-app-itself)), not typed: a working claude gets it through the
+  Stop hook's unread-mail block, an idle one through its listener.
+- **"Stopped" is two signals.** The message's inbox file is gone (`hub_inbox` deletes what it
+  returns) **and** the status word is `waiting` — `watching` included, a watcher is idle. The
+  frontend (`lib/checkpoint.ts`) holds "stopped" back 1.5 s after the read, because the read and
+  the status arrive from two different polls and a claude looks read-and-idle for a beat before
+  its `working` lands. Nothing latches: a monitor event that wakes a claude flips its row back.
+- **The panel is not a modal.** A claude asking a question (`needs`) can only be moved by the
+  user, in its pane, so the sidebar stays usable and clicking a row opens that claude. An idle
+  claude whose message stays unread with no fresh `armed/<id>` is "can't hear" — its listener is
+  dead and it will never read it by itself. **Quit anyway** appears only when every claude left is
+  stuck (needs you, can't hear, unread after 60 s, or working 5 min after reading); never as a way
+  to skip claudes still on their way.
+- **Cancel** takes back every stop message still unread (deletes the file — that claude never
+  saw it) and tells the ones that read it to carry on.
+- **Quit** writes `<mulpex home>/checkpoint.json` (project dir + instance id per claude still
+  alive) and calls `quit_app` → `app.exit(0)`, the same teardown as ⌘Q. In update mode it calls
+  `applyUpdate(true)` instead; if the update fails the file is deleted again and the panel stays
+  up for a Cancel, since nothing quit.
+- **Wake.** After bootstrap the frontend asks `checkpoint_pending`, which keeps only entries whose
+  project is open and whose id is a live claude again (instance numbers survive a restore), and
+  deletes the file if nothing matches. "Wake all" queues "Mulpex is back — re-arm the monitors you
+  noted, continue if anything is left" for each and deletes the file; "Not now" just deletes it.
+- **The wake waits for the listener.** `listen.rs` seeds its count from what is already in the
+  inbox, so mail that lands before the listener starts is **never announced** — a restored claude
+  still booting would sit on it until its next turn. So the poll loop (`drain_wake_queue`)
+  delivers each wake only once `armed/<id>` is fresh *and* at least 2 s old (its creation time is
+  when that listener started), or after 3 minutes regardless, so it at least waits in the inbox.
+- Monitors are why the note matters: quitting kills every background task a claude armed, and
+  `--resume` restores only the conversation. The Mulpex hub listener comes back by itself (plugin
+  monitor); agentalk and artifact watches come back only because the claude wrote them down.

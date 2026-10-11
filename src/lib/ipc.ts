@@ -480,6 +480,38 @@ export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecis
  * scratch root) before re-execing. Used to apply a downloaded update. */
 export const restartApp = () => invoke<void>("restart_app");
 
+/** Quit through the normal teardown — the end of ⌘⇧Q Checkpoint & Quit. */
+export const quitApp = () => invoke<void>("quit_app");
+
+/** ⌘⇧Q Checkpoint & Quit (`checkpoint.rs`): one claude asked to stop, or to wake. */
+export interface CheckpointTarget {
+  handle: ProjectHandle;
+  project: string;
+  id: number;
+  name: string | null;
+}
+
+/** What only the backend knows about a claude asked to stop; its status word
+ * comes from the hub snapshot like everywhere else. */
+export interface CheckpointProgress {
+  handle: ProjectHandle;
+  id: number;
+  /** Still running. One that exited has stopped, trivially. */
+  alive: boolean;
+  /** The stop message is still in its inbox. */
+  unread: boolean;
+  /** Its hub listener is running — an idle claude without one never reads it. */
+  listener: boolean;
+}
+
+export const checkpointStop = () => invoke<CheckpointTarget[]>("checkpoint_stop");
+export const checkpointProgress = () => invoke<CheckpointProgress[]>("checkpoint_progress");
+export const checkpointCancel = () => invoke<void>("checkpoint_cancel");
+export const checkpointCommit = () => invoke<void>("checkpoint_commit");
+export const checkpointPending = () => invoke<CheckpointTarget[]>("checkpoint_pending");
+export const checkpointWake = () => invoke<number>("checkpoint_wake");
+export const checkpointDismiss = () => invoke<void>("checkpoint_dismiss");
+
 /** ⌘⇧O Remote Control (`remote.rs`). Also the `remote-changed` event payload. */
 export interface RemoteStatus {
   enabled: boolean;

@@ -185,7 +185,9 @@ causes needless back-and-forth; (4) because that turn was triggered by the hub a
 START your visible response with a marker line exactly of the form \"⟳ hub message from \
 <sender> →\" — fill in the sender exactly as hub_inbox reported it (claude#2 for an instance \
 here, central-one#3 for one in another project) — so that when I look at your pane I can tell \
-you acted on a hub message rather than on my prompt, and from whom.";
+you acted on a hub message rather than on my prompt, and from whom. A message whose sender is \
+\"Mulpex\" comes from the Mulpex app itself, not from an instance: do what it asks, and never \
+hub_send a reply to it — there is no instance there to receive one.";
 
 /// User-mandated zero-assumptions planning discipline (see old term_session.rs).
 const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
@@ -341,6 +343,12 @@ mod tests {
         assert!(HUB_RULES.contains("claude#1"));
         assert!(HUB_RULES.contains("term#5"));
         assert!(HUB_RULES.contains("central-one#3"));
+    }
+
+    /// `hub_inbox` labels the app's own messages with this exact word.
+    #[test]
+    fn hub_rules_name_the_app_sender() {
+        assert!(HUB_RULES.contains(&format!("\"{}\"", crate::mcp::APP_SENDER)));
     }
 
     /// A spawned child's prompt must carry the sentinel, or the

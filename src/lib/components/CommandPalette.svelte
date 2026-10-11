@@ -180,6 +180,7 @@
       ["move_project_right", "Move Project Right", "⌘⇧→", $projects.size > 1],
       // No accelerator by design, so the palette is its only keyboard route.
       ["check_updates", "Check for Updates…", "", true],
+      ["checkpoint_quit", "Checkpoint & Quit…", "⌘⇧Q", true],
     ];
     for (const [menu, title, keys, show] of acts) {
       if (!show) continue;

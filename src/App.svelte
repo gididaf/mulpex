@@ -86,6 +86,9 @@
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
+  import CheckpointPanel from "./lib/components/CheckpointPanel.svelte";
+  import ResumeDialog from "./lib/components/ResumeDialog.svelte";
+  import { checkpointOpen, checkResume, startCheckpoint } from "./lib/checkpoint";
   import FdaBanner from "./lib/components/FdaBanner.svelte";
   import { checkFda, openFda } from "./lib/fda";
   import { checkForUpdate, startUpdateChecks } from "./lib/updater";
@@ -379,6 +382,16 @@
       setSessionCollapsedLocal(h, up, false);
       setSessionCollapsed(h, up, false);
     }
+  }
+
+  /** Bring one instance of any project to the front — a notification click, or
+   * a row in the ⌘⇧Q checkpoint panel. Same path as clicking the sidebar row. */
+  function focusInstance(handle: ProjectHandle, id: number) {
+    selectProject(handle);
+    unfoldTo(handle, id);
+    setActiveSession(handle, id);
+    focusSession(handle, id);
+    terminals.focus(handle, id);
   }
 
   function selectSession(id: number) {
@@ -1103,6 +1116,9 @@
       case "full_disk_access":
         await openFda();
         break;
+      case "checkpoint_quit":
+        await startCheckpoint("quit");
+        break;
       case "next":
         cycle(1);
         break;
@@ -1178,6 +1194,12 @@
       if (e.code === "KeyK") {
         e.preventDefault();
         void handleMenu("request_compact");
+        return;
+      }
+      // ⌘⇧Q — Checkpoint & Quit, likewise.
+      if (e.code === "KeyQ") {
+        e.preventDefault();
+        void handleMenu("checkpoint_quit");
         return;
       }
       // `code` is the physical key — `key` is "}"/"{" here, and layout-dependent.
@@ -1291,13 +1313,7 @@
     // through the same select path as clicking the sidebar row, so it lands on
     // the pane with the question rather than merely raising the window.
     let stopAttention: (() => void) | null = null;
-    initAttention((handle, id) => {
-      selectProject(handle);
-      unfoldTo(handle, id);
-      setActiveSession(handle, id);
-      focusSession(handle, id);
-      terminals.focus(handle, id);
-    }).then((stop) => {
+    initAttention(focusInstance).then((stop) => {
       stopAttention = stop;
     });
 
@@ -1317,6 +1333,8 @@
         recents = await listRecentProjects();
       }
       ready = true;
+      // After a ⌘⇧Q Checkpoint & Quit: offer to wake the claudes that stopped.
+      void checkResume();
       // Non-blocking: the probe shells out to the login shell, so let the UI
       // paint first. Only matters for the picker's banner.
       claude = await claudeStatus();
@@ -1489,6 +1507,12 @@
      owns nothing that bootstrap provides, so it has no reason to wait for it. -->
 <UpdateBanner />
 <FdaBanner />
+{#if $checkpointOpen}
+  <CheckpointPanel onfocus={focusInstance} />
+{/if}
+<ResumeDialog
+  onwoke={(n) => flashToast(`Waking ${n} ${n === 1 ? "claude" : "claudes"} as each one comes up…`)}
+/>
 
 <style>
   .shell {

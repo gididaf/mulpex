@@ -23,7 +23,7 @@ reasoning in `docs/`.
 | --- | --- | --- |
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
-| [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
+| [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt); ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
@@ -86,6 +86,7 @@ src-tauri/            the Tauri app (Rust backend)
   src/docs_import.rs  File ▸ Import Docs: Sonnet sorts a repo's `.md`, Apply commits once
   src/remote/         ⌘⇧O Remote Control, the Mac side: connection, crypto, chat, dialogs,
                       push — docs/remote-control.md
+  src/checkpoint.rs   ⌘⇧Q Checkpoint & Quit + the wake after relaunch — docs/sessions.md
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -232,7 +233,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧K** request compact/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧K** request compact/**⌘⇧Q** checkpoint & quit/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project

@@ -1,6 +1,7 @@
 //! Tauri app wiring: managed state, command surface, native menu + event
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
+mod checkpoint;
 mod claude_bin;
 mod commands;
 mod hub;
@@ -68,6 +69,7 @@ fn is_forwarded(id: &str) -> bool {
             | "check_updates"
             | "remote_control"
             | "full_disk_access"
+            | "checkpoint_quit"
     ) || id.starts_with("project_")
 }
 
@@ -145,6 +147,14 @@ pub fn run() {
             commands::import_discard,
             commands::import_apply,
             commands::restart_app,
+            commands::quit_app,
+            commands::checkpoint_stop,
+            commands::checkpoint_progress,
+            commands::checkpoint_cancel,
+            commands::checkpoint_commit,
+            commands::checkpoint_pending,
+            commands::checkpoint_wake,
+            commands::checkpoint_dismiss,
             remote::remote_status,
             remote::remote_set_enabled,
             remote::remote_set_relay_url,
