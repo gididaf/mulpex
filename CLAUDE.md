@@ -22,9 +22,9 @@ reasoning in `docs/`.
 | File | Covers | Read it before touching |
 | --- | --- | --- |
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
-| [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
+| [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧P pins panel (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator's claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
-| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close` | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
+| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explain.md](docs/explain.md) | ⌘E Explain Selection: select text in a claude, a right-side overlay panel explains it in simple Hebrew; a hidden Sonnet `--fork-session` of the conversation writes it (streamed, markdown sanitized, hard RTL); follow-ups `--resume` that fork (cache: $0.12 vs $0.91 for a re-fork), which Mulpex deletes on close; gated on the transcript file, not `worked`. Replaced `/explain` (2026-10-08) and the Explainer panel before it | `explain.rs`, `explain_prompt.md`, `lib/explain.ts`, `ExplainPanel.svelte`, `lib/markdown.ts`, `Core::explain_target` |
@@ -482,4 +482,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`b3a8d81fcb0ebd1c5b069c8d19182dc052806a35` — 2026-10-11
+`b159b3cac64ccd9b02164946a58e09ff9dd68c10` — 2026-10-11
