@@ -403,8 +403,8 @@ const SUMMARY_LINES: usize = 6;
 /// worker reports to its spawner, not to the phone), never a muted one.
 /// - **needs you** — every such claude on `needs` right now;
 /// - **done** — those that went from working to finished and weren't seen yet.
-/// It buzzes (`alert`) only when one is new on either list; a smaller number
-/// is a silent edit. Nothing is sent when both reach zero — every push must
+/// It re-pops the banner (`alert`) only when one is new on either list; a
+/// smaller number is a quiet edit (the phone shows every one silently). Nothing is sent when both reach zero — every push must
 /// show a notification, or Android may show its own; the app clears the bar
 /// when opened. Nothing at all on the first view (`prev` is `None`).
 fn summary_for(

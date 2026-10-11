@@ -110,7 +110,9 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   more" past a cap). **needs you** = every counted claude on `needs` now; **done** = went `working` →
   `waiting` and not yet seen — opening the app sees them (`seen_done`), typing to one removes it.
   Counted: only claudes the user started (no `parent`), never muted ones; nothing on the first view.
-  It **buzzes only when something is new** on either list; a smaller number is a silent edit; at
+  Every notification is **silent** (`silent: true` in `sw.js`, since 2026-10-11); `alert` now only
+  re-pops the banner when something is new on either list, and a smaller number is a quiet edit.
+  iOS ignores `silent` — there the sound is off only via Settings → Notifications → Mulpex. At
   zero nothing is sent (every push must show a notification, or Android shows its own). Tapping it
   opens the main screen. The service worker still renders an older Mac's per-claude pushes.
   **Nothing in the bar while the app is open**: the Mac skips a phone with a chat open in front (the

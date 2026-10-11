@@ -39,8 +39,10 @@ self.addEventListener("push", (e) => {
       if (wins.some((w) => w.visibilityState === "visible")) return;
       if (n.summary) {
         // One notification, edited in place: a summary of who needs you and
-        // who finished (`remote/mod.rs::summary_for`). It buzzes only when
-        // something new arrived; a smaller number replaces it silently.
+        // who finished (`remote/mod.rs::summary_for`). Always silent: it
+        // re-pops the banner only when something new arrived (`alert`), and a
+        // smaller number replaces it quietly. iOS ignores `silent` — there the
+        // sound is switched off in Settings → Notifications → Mulpex.
         for (const old of await self.registration.getNotifications()) {
           if (old.tag !== "mulpex-summary") old.close();
         }
@@ -50,7 +52,7 @@ self.addEventListener("push", (e) => {
           badge: "/icons/icon-192.png",
           tag: "mulpex-summary",
           renotify: !!n.alert,
-          silent: !n.alert,
+          silent: true,
           data: {},
         });
         return;
@@ -63,6 +65,7 @@ self.addEventListener("push", (e) => {
         // One notification per claude: a second question replaces the first.
         tag: n.handle != null ? `claude-${n.handle}-${n.id}` : "mulpex",
         renotify: true,
+        silent: true,
         data: { handle: n.handle, id: n.id },
       });
     })(),
