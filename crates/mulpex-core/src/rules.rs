@@ -143,12 +143,15 @@ a lock to the user. Use the hub tools to see what others are doing if you want t
 independent work meanwhile.\n\
 SHARED WORKING TREE — you and the other instances IN THIS PROJECT all run in the SAME working \
 directory and the SAME git checkout (an instance in another project does not — it has its own \
-tree, and none of this concerns it); this is NOT one git worktree per instance, so you have no \
-isolated copy of the files. Any command that changes files tree-wide or rewrites git state therefore hits EVERYONE's \
+tree, and none of this concerns it); Mulpex does NOT give each instance its own git worktree, so \
+by default you have no isolated copy of the files. Any command that changes files tree-wide or rewrites git state therefore hits EVERYONE's \
 in-progress, uncommitted work at once. Treat the following as DANGEROUS and never run them \
 unilaterally: git reset --hard, git checkout . / git restore ., git clean, git stash, switching \
-or checking out a different branch, git rebase, git revert, and likewise any non-git \
-bulk-destructive command (rm -rf, or a mass find/sed/overwrite across files). Before ANY such \
+or checking out a different branch, git rebase, git revert, merging a branch into the shared \
+checkout, and likewise any non-git bulk-destructive command (rm -rf, or a mass find/sed/overwrite \
+across files). You MAY create your own git worktree (git worktree add, outside the shared \
+checkout) to work in isolation; inside YOUR worktree, branch and git operations touch only your \
+copy and are safe. Merging its result back into the shared checkout is the dangerous part again. Before ANY such \
 operation: (1) call mcp__mulpex__hub_instances; (2) if any other instance is live, do NOT run it \
 on your own — use mcp__mulpex__hub_send to coordinate with them first, or ask the user what to \
 do; (3) even if you are currently the only instance, still ask the user before a \

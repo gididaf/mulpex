@@ -339,10 +339,14 @@ applies between them. See [docs/hub.md](docs/hub.md).)
 All instances **of a given project** share one working directory and one git checkout (not a
 worktree per instance; separate projects are separate trees), so
 a tree-wide git op by one (`reset --hard`, `checkout .`/`restore .`, `clean`, `stash`, branch
-switch, `rebase`/`revert`) or any bulk-destructive command wipes every other instance's
+switch, `rebase`/`revert`, merging a branch in) or any bulk-destructive command wipes every other instance's
 uncommitted work. `HUB_RULES` (the append-system-prompt) tells each instance to treat these as
 dangerous: check `hub_instances` first, coordinate via `hub_send` or ask the user if any peer is
-live, and ask the user even when alone. This is **prompt-level guidance only** — no PreToolUse
+live, and ask the user even when alone. An instance **may** make its own `git worktree` and work
+there freely (the user's global rules ask for one per feature/bug, so a dev server on its own
+port isn't hot-reloaded by peers' edits); only merging back into the shared checkout is
+guarded again. `HUB_RULES` stays neutral about *whether* to use one — it ships to every Mulpex
+user. This is **prompt-level guidance only** — no PreToolUse
 hard block (that was considered; command-detection is heuristic and shell-bypassable).
 
 ## Invariants you can break from anywhere
