@@ -382,6 +382,13 @@
           {:else if !s.muted}
             <span class="st">{LABEL[st]}</span>
           {/if}
+          {#if !shell && s.auto_compact != null}
+            <span
+              class="auto"
+              title="Auto-compact: Mulpex compacts this row's claudes at {s.auto_compact}% context (right-click to change)"
+              >⟳ {s.auto_compact}%</span
+            >
+          {/if}
         </div>
         {#if s.name || (!shell && $tasks.get(s.id)) || pct != null}
           <!-- Name/task on the left, context % under the status word. -->
@@ -622,6 +629,11 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  .auto {
+    flex-shrink: 0;
+    font-size: 0.7rem;
+    color: var(--text-dim);
   }
   .save {
     flex-basis: 100%;

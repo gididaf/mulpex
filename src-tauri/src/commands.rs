@@ -284,6 +284,21 @@ pub fn set_session_collapsed(
     }
 }
 
+/// Set or clear a row's auto-compact rule (context menu); persisted, and the
+/// orchestrator is told. False if nothing changed.
+#[tauri::command]
+pub fn set_auto_compact(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    pct: Option<u8>,
+) -> bool {
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.set_auto_compact(id, pct),
+        None => false,
+    }
+}
+
 /// Sync the "Mute Session" menu tick to the focused session's state. Called by
 /// the frontend whenever focus or the flag moves — the menu has no view of which
 /// session is active, so the tick has to be pushed to it.

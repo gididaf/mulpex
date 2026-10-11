@@ -157,7 +157,7 @@ shape as the other silent failures in these notes — a real event with nowhere 
 
 Right-clicking a row opens a small in-app menu; right-clicking the gap below the rows opens a
 two-item **New Session / New Terminal** menu. `ContextMenu.svelte` is deliberately not a general
-widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the item list per row.
+widget — one level of submenu at most, no icons — and `App.svelte::openRowMenu` builds the item list per row.
 
 - **In-app, not `Menu::popup`.** A native item is only wired once `lib.rs::is_forwarded` lists its
   id, and one that isn't listed still builds, still draws and still ticks itself while the frontend
@@ -176,6 +176,12 @@ widget — no submenus, no icons — and `App.svelte::openRowMenu` builds the it
   for a shell, and a shell has no conversation to resume, so both would be dead weight. Close does
   not confirm, matching ⌘W; **Restart does**, because it kills a process that may be mid-turn and
   sits one shift away from Rename (see [sessions.md](sessions.md#restarting-an-instance-in-place-r)).
+- **Auto-compact its claudes ›** (claude rows only) — a submenu of Off / 50% / 60% / 70% / 80%, ✓
+  on the current one, which also shows as the item's hint. Five flat items read as noise (the user
+  rejected them), so `ContextMenu` gained **one level** of submenu (`CtxItem.sub`): hover, → or
+  Enter opens it, ← / Esc steps back out, and it flips left/up at the window edge. The row then shows a `⟳ 70%` badge after its
+  status word. This menu is the **only** way the rule is set; no model can turn it on. See
+  [sessions.md](sessions.md#auto-compact-an-orchestrators-claudes).
 - **Copy address copies the hub's own written form** — `claude#3` / `term#5` — so it pastes straight
   into a `hub_send` or a prompt. There is no clipboard plugin (and adding one means another
   capability entry, the same allowlist shape as above), so it is `navigator.clipboard.writeText`

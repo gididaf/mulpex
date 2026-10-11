@@ -15,9 +15,15 @@
 // design, and a fresh scratch dir drops the file with it.
 
 import { derived, get, writable } from "svelte/store";
-import { activeProjectHandle, projects } from "./stores";
+import { activeProjectHandle, descendantsOf, projects, saveStatusOf } from "./stores";
 import { terminals } from "./terminals";
-import { sendBytes, setCompactPhase, type CompactPhase, type ProjectHandle } from "./ipc";
+import {
+  sendBytes,
+  setCompactPhase,
+  type CompactPhase,
+  type ProjectHandle,
+  type SessionInfo,
+} from "./ipc";
 
 const RESUME =
   "The conversation was just compacted at your checkpoint. Continue the task from where you stopped.";
@@ -42,6 +48,8 @@ interface Req {
   /** The refusal text was already on screen when `/compact` was typed, so
    *  seeing it proves nothing. */
   refusedBefore: boolean;
+  /** The orchestrator whose auto-compact rule started this, if one did. */
+  by: number | null;
 }
 
 const reqs = writable<Map<string, Req>>(new Map());
@@ -79,20 +87,80 @@ function fail(h: ProjectHandle, id: number, r: Req) {
 export function toggleCompact(h: ProjectHandle, id: number): string | null {
   const s = get(projects).get(h)?.sessions.find((x) => x.id === id);
   if (!s || s.kind === "shell" || s.exited || s.failed) return "No claude to compact";
-  const cur = get(reqs).get(keyOf(h, id));
-  if (cur && cur.phase !== "failed") {
+  if (active(h, id)) {
     put(h, id, null);
     void setCompactPhase(h, id, null);
     return null;
   }
-  const r: Req = { phase: "requested", typedAt: 0, sawStart: false, refusedBefore: false };
+  startCompact(h, id, null);
+  return null;
+}
+
+/** A request is in flight on claude#id (a lingering "didn't run" notice isn't). */
+function active(h: ProjectHandle, id: number): boolean {
+  const cur = get(reqs).get(keyOf(h, id));
+  return !!cur && cur.phase !== "failed";
+}
+
+/** Start a request — never a toggle. `by` is the orchestrator whose rule fired. */
+function startCompact(h: ProjectHandle, id: number, by: number | null) {
+  const r: Req = { phase: "requested", typedAt: 0, sawStart: false, refusedBefore: false, by };
   setPhase(h, id, r, "requested");
   step(h, id);
-  return null;
+}
+
+// ---- Auto-compact (a row's context-menu rule) ----
+//
+// The user sets "auto-compact its claudes at X%" on a row; every claude in its
+// sidebar subtree whose context reaches X gets the ⌘⇧K flow above, run by Mulpex
+// itself — no model ever decides to compact. One attempt per crossing: a child
+// is `suppressed` after its attempt (success or not) until its context reads
+// below X again, which covers both a failed compact and the ctx file still
+// showing the old number right after a good one.
+
+const suppressed = new Set<string>();
+
+/** Apply every auto-compact rule in project `h`. Called on each hub update. */
+export function autoCompactTick(h: ProjectHandle) {
+  const p = get(projects).get(h);
+  if (!p) return;
+  for (const s of p.sessions) suppressedRelease(h, s.id, p.ctx.get(s.id), ruleFor(p.sessions, s.id));
+  for (const orch of p.sessions) {
+    const pct = orch.auto_compact;
+    if (pct == null || orch.kind === "shell") continue;
+    for (const c of descendantsOf(p.sessions, orch.id)) {
+      if (c.kind === "shell" || c.exited || c.failed) continue;
+      const k = keyOf(h, c.id);
+      const ctx = p.ctx.get(c.id);
+      if (ctx == null || ctx < pct || suppressed.has(k) || active(h, c.id)) continue;
+      if (saveStatusOf(h, c.id)) continue;
+      suppressed.add(k);
+      startCompact(h, c.id, orch.id);
+    }
+  }
+}
+
+/** The lowest threshold any ancestor rule puts on claude#id, if any. */
+function ruleFor(list: SessionInfo[], id: number): number | null {
+  let best: number | null = null;
+  for (const o of list) {
+    if (o.auto_compact == null) continue;
+    if (descendantsOf(list, o.id).some((d) => d.id === id)) {
+      best = best == null ? o.auto_compact : Math.min(best, o.auto_compact);
+    }
+  }
+  return best;
+}
+
+function suppressedRelease(h: ProjectHandle, id: number, ctx: number | undefined, pct: number | null) {
+  const k = keyOf(h, id);
+  if (!suppressed.has(k) || active(h, id)) return;
+  if (pct == null || ctx == null || ctx < pct) suppressed.delete(k);
 }
 
 /** Drop claude#id's request (the row exited). */
 export function dropCompact(h: ProjectHandle, id: number) {
+  suppressed.delete(keyOf(h, id));
   if (get(reqs).has(keyOf(h, id))) put(h, id, null);
 }
 
@@ -114,7 +182,7 @@ function step(h: ProjectHandle, id: number) {
     if (!ready(h, id)) return;
     sendBytes(h, id, new TextEncoder().encode("/compact\r"));
     const refusedBefore = REFUSED.test(terminals.screenText(h, id));
-    put(h, id, { phase: "compacting", typedAt: Date.now(), sawStart: false, refusedBefore });
+    put(h, id, { ...r, phase: "compacting", typedAt: Date.now(), sawStart: false, refusedBefore });
     void setCompactPhase(h, id, "compacting");
     return;
   }
@@ -170,13 +238,23 @@ const LABEL: Record<Phase, string> = {
   failed: "compact didn't run",
 };
 
+const AUTO_LABEL: Record<Phase, string> = {
+  requested: "waiting for checkpoint…",
+  compacting: "compacting…",
+  resume: "compacting…",
+  failed: "didn't run",
+};
+
 /** The active project's compact-request lines, by instance id. */
 export const compactLines = derived([reqs, activeProjectHandle], ([$m, $h]) => {
   const out = new Map<number, { text: string; failed: boolean }>();
   if ($h == null) return out;
   for (const [k, r] of $m) {
     const [h, id] = parse(k);
-    if (h === $h) out.set(id, { text: LABEL[r.phase], failed: r.phase === "failed" });
+    if (h !== $h) continue;
+    // An auto-compact names the orchestrator whose rule fired it.
+    const text = r.by != null ? `auto-compact (claude#${r.by}): ${AUTO_LABEL[r.phase]}` : LABEL[r.phase];
+    out.set(id, { text, failed: r.phase === "failed" });
   }
   return out;
 });

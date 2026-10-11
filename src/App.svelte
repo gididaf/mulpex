@@ -27,6 +27,7 @@
     remoteReply,
     setSessionMuted,
     setSessionCollapsed,
+    setAutoCompact,
     reparentSession,
     setMuteMenuChecked,
     type BootstrapInfo,
@@ -55,6 +56,7 @@
     setSessionsFor,
     setSessionMutedLocal,
     setSessionCollapsedLocal,
+    setAutoCompactLocal,
     hiddenIds,
     collapsedAncestors,
     descendantsOf,
@@ -78,7 +80,7 @@
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
   import { addPin, clearPin, dropPins, loadPins, pins, pinKey } from "./lib/pins";
-  import { dropCompact, toggleCompact } from "./lib/compact";
+  import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
 
@@ -294,6 +296,20 @@
     return shell ? `${bare} (in ${name})` : `${name}#${s.id}`;
   }
 
+  /** Context-menu thresholds for auto-compact; the backend accepts only these. */
+  const AUTO_COMPACT_CHOICES = [50, 60, 70, 80];
+
+  async function applyAutoCompact(h: ProjectHandle, id: number, pct: number | null) {
+    try {
+      if (await setAutoCompact(h, id, pct)) {
+        setAutoCompactLocal(h, id, pct);
+        autoCompactTick(h); // a child already over the line goes now
+      }
+    } catch (e) {
+      flashToast(String(e));
+    }
+  }
+
   function openRowMenu(e: MouseEvent, s: SessionInfo) {
     const h = get(activeProjectHandle);
     if (h == null) return;
@@ -343,6 +359,18 @@
               label: "Secrets…",
               hint: key("⌘K"),
               run: () => openSecrets(h, s.id),
+            },
+            // Auto-compact this row's claudes (`compact.ts`). Only ever set here,
+            // by the user — no model can turn it on. A submenu; the current
+            // choice carries a ✓.
+            {
+              label: "Auto-compact its claudes",
+              hint: s.auto_compact != null ? `${s.auto_compact}%` : undefined,
+              sub: ([null, ...AUTO_COMPACT_CHOICES] as (number | null)[]).map((pct) => ({
+                label: pct == null ? "Off" : `${pct}%`,
+                checked: s.auto_compact === pct,
+                run: () => void applyAutoCompact(h, s.id, pct),
+              })),
             },
           ]),
       { label: "Close", hint: key("⌘W"), danger: true, run: () => closeInstance(h, s.id) },
@@ -1262,9 +1290,10 @@
       listen<RemoteKeysEvent>("remote-keys", (e) => remoteKeys(e.payload)),
       listen<RemoteActionEvent>("remote-action", (e) => remoteAction(e.payload)),
       listen<RemoteReorderEvent>("remote-reorder", (e) => remoteReorder(e.payload)),
-      listen<HubUpdateEvent>("hub-update", (e) =>
-        applyHubFor(e.payload.handle, e.payload.snapshot),
-      ),
+      listen<HubUpdateEvent>("hub-update", (e) => {
+        applyHubFor(e.payload.handle, e.payload.snapshot);
+        autoCompactTick(e.payload.handle);
+      }),
       listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
       listen<ExplainProgressEvent>("explain-progress", (e) => applyExplainProgress(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {

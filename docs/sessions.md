@@ -860,3 +860,24 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
 - Monitors are why the note matters: quitting kills every background task a claude armed, and
   `--resume` restores only the conversation. The Mulpex hub listener comes back by itself (plugin
   monitor); agentalk and artifact watches come back only because the claude wrote them down.
+
+### Auto-compact an orchestrator's claudes
+
+Right-click a claude row → **Auto-compact its claudes: Off / 50 / 60 / 70 / 80 %**. Mulpex then
+runs the ⌘⇧K flow above on every claude in that row's **sidebar subtree** (its `hub_spawn`
+children, theirs, and rows dragged under it; never the row itself) whose context % reaches the
+threshold. A child already over it goes at once.
+
+- **The user is the only one who can turn it on.** There is no MCP tool and no `HUB_RULES` text: a
+  model never decides to compact anything. The rule is a persisted column on the row
+  (`SavedSession::auto_compact`, `Core::set_auto_compact`, which accepts only the menu's values).
+- **The orchestrator is told once per change**, by `Core::send_app_message` (sender "Mulpex"), so a
+  child pausing to compact isn't mistaken for stuck. It is told it needs to do nothing.
+- **Enforced in the frontend** (`compact.ts::autoCompactTick`, on every `hub-update`), because the
+  ⌘⇧K driver lives there. Context % comes from `ctx/<id>` (the statusline) — no LLM call watches it.
+- **One attempt per crossing.** After an attempt, success or "didn't run", the child is
+  `suppressed` until its context reads below the threshold again (or reads nothing). That covers a
+  failed compact looping, and the ctx file still showing the old number right after a good one —
+  the statusline only rewrites it on its next draw. With nested rules the lowest threshold above a
+  child decides when it is released.
+- The child's sidebar line says who asked: `auto-compact (claude#3): waiting for checkpoint…`.

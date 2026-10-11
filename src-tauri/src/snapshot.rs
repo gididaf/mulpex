@@ -69,6 +69,9 @@ pub struct SessionInfo {
     pub parent: Option<usize>,
     /// Its family is folded away in the sidebar (⌄/› on the row).
     pub collapsed: bool,
+    /// Auto-compact every claude in this row's sidebar subtree at this context
+    /// %. Set by the user from the context menu; `lib/compact.ts` enforces it.
+    pub auto_compact: Option<u8>,
     pub kind: SessionKind,
     /// A terminal whose shell has exited. Unlike a dead instance it is *kept*,
     /// so its output stays readable until it's explicitly closed — otherwise a

@@ -119,6 +119,7 @@ pub fn run() {
             commands::get_pins,
             commands::set_pin,
             commands::set_session_collapsed,
+            commands::set_auto_compact,
             commands::set_mute_menu_checked,
             commands::send_bytes,
             commands::resize_terminals,

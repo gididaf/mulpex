@@ -578,6 +578,15 @@ export function setSessionCollapsedLocal(
   });
 }
 
+/** Set one row's auto-compact rule locally (the backend persists it). */
+export function setAutoCompactLocal(handle: ProjectHandle, id: number, pct: number | null): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  patchProject(handle, {
+    sessions: p.sessions.map((s) => (s.id === id ? { ...s, auto_compact: pct } : s)),
+  });
+}
+
 /** Apply a hub snapshot to one project (also derives its statuses + tasks maps). */
 export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   patchProject(handle, {

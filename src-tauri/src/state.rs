@@ -295,6 +295,10 @@ pub struct Core {
     pub parents: HashMap<usize, usize>,
     /// Rows whose `hub_spawn` family is folded away in the sidebar. Persisted.
     pub collapsed: HashSet<usize>,
+    /// Auto-compact rules: row id → context % at which every claude in its
+    /// sidebar subtree is compacted (`lib/compact.ts` enforces it). Set only by
+    /// the user, from the row's context menu. Persisted.
+    pub auto_compact: HashMap<usize, u8>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -423,6 +427,7 @@ impl Core {
         let mut muted: HashSet<usize> = HashSet::new();
         let mut parents: HashMap<usize, usize> = HashMap::new();
         let mut collapsed: HashSet<usize> = HashSet::new();
+        let mut auto_compact: HashMap<usize, u8> = HashMap::new();
         let mut restored: HashMap<usize, Instant> = HashMap::new();
         let mut started: HashMap<usize, Instant> = HashMap::new();
         // Records whose session could not even be spawned. Nothing will be in
@@ -484,6 +489,9 @@ impl Core {
                 if saved.collapsed {
                     collapsed.insert(id);
                 }
+                if let Some(pct) = saved.auto_compact {
+                    auto_compact.insert(id, pct);
+                }
                 sessions.push(session);
             } else {
                 // Keep the record AND where it sat: appending it would move that
@@ -531,6 +539,7 @@ impl Core {
             muted,
             parents,
             collapsed,
+            auto_compact,
             worked,
             closing: HashSet::new(),
             saving: HashSet::new(),
@@ -579,6 +588,7 @@ impl Core {
                 muted: self.muted.contains(&s.id),
                 parent: self.parents.get(&s.id).copied(),
                 collapsed: self.collapsed.contains(&s.id),
+                auto_compact: self.auto_compact.get(&s.id).copied(),
                 kind: kind_of(s),
                 exited: s.is_shell() && !s.is_alive(),
                 failed: self.failed.get(&s.id).cloned(),
@@ -760,6 +770,7 @@ impl Core {
             muted: false,
             parent: None,
             collapsed: false,
+            auto_compact: None,
             kind: SessionKind::Claude,
             exited: false,
             failed: None,
@@ -810,6 +821,7 @@ impl Core {
             muted: false,
             parent: None,
             collapsed: false,
+            auto_compact: None,
             kind: SessionKind::Shell,
             exited: false,
             failed: None,
@@ -1359,6 +1371,30 @@ impl Core {
         }
     }
 
+    /// Set (`Some(pct)`) or clear the auto-compact rule on claude#id's sidebar
+    /// subtree — only ever from the user's context menu. Persists, and tells the
+    /// orchestrator once, so a child pausing to compact isn't mistaken for stuck.
+    /// Returns false (and does nothing) for a terminal, an unknown row, a
+    /// percent outside the menu's choices, or no change.
+    pub fn set_auto_compact(&mut self, id: usize, pct: Option<u8>) -> bool {
+        if !self.instances().any(|s| s.id == id) {
+            return false;
+        }
+        if pct.is_some_and(|p| !AUTO_COMPACT_CHOICES.contains(&p)) {
+            return false;
+        }
+        if self.auto_compact.get(&id).copied() == pct {
+            return false;
+        }
+        match pct {
+            Some(p) => self.auto_compact.insert(id, p),
+            None => self.auto_compact.remove(&id),
+        };
+        self.persist_sessions();
+        self.send_app_message(id, &auto_compact_message(pct));
+        true
+    }
+
     /// Move `id` (with its whole family) under `parent`, or to the top level
     /// with `None` — the sidebar's drag-to-nest. Presentation only, like
     /// folding: the hub never reads `parents`. `ids` is the sidebar order to
@@ -1791,6 +1827,7 @@ impl Core {
                         id: Some(session.id),
                         parent: self.parents.get(&session.id).copied(),
                         collapsed: self.collapsed.contains(&session.id),
+                        auto_compact: self.auto_compact.get(&session.id).copied(),
                     };
                     if !self
                         .sticky
@@ -1845,6 +1882,7 @@ impl Core {
         }
         self.parents.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.collapsed.retain(|id| self.sessions.iter().any(|s| s.id == *id));
+        self.auto_compact.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.saving.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
@@ -2488,6 +2526,7 @@ impl Core {
                 id: Some(s.id),
                 parent: self.parents.get(&s.id).copied(),
                 collapsed: self.collapsed.contains(&s.id),
+                auto_compact: self.auto_compact.get(&s.id).copied(),
             })
             .collect();
         // Records whose session is gone but must not be forgotten — a restore
@@ -2597,6 +2636,22 @@ impl Core {
 }
 
 // ---- module helpers (ported from app.rs) ----
+
+/// The thresholds the context menu offers for auto-compact.
+pub const AUTO_COMPACT_CHOICES: [u8; 4] = [50, 60, 70, 80];
+
+/// What the orchestrator is told when the user turns auto-compact on or off.
+fn auto_compact_message(pct: Option<u8>) -> String {
+    match pct {
+        Some(p) => format!(
+            "The user enabled auto-compact for your claudes at {p}% context. When one of them \
+             reaches it, Mulpex asks it to stop at a checkpoint, runs /compact, and tells it to \
+             continue. A child may pause briefly while that happens; don't treat it as stuck. \
+             You don't need to do anything."
+        ),
+        None => "The user disabled auto-compact for your claudes.".to_string(),
+    }
+}
 
 fn kind_of(s: &Session) -> SessionKind {
     if s.is_shell() {
@@ -3589,6 +3644,7 @@ mod tests {
             id,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }
     }
 
@@ -3646,6 +3702,7 @@ mod tests {
             id: Some(75),
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -3692,6 +3749,7 @@ mod tests {
                 id: Some(1),
                 parent: None,
                 collapsed: false,
+                auto_compact: None,
             },
             record("copycat", Some(2)),
         ];
@@ -3966,6 +4024,7 @@ mod tests {
             id: None,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }]);
         let mut core = Core::open(
             1,
@@ -4395,6 +4454,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Auto-compact is set only on a claude, only to a menu choice, persists,
+    /// and tells the orchestrator exactly once per change.
+    #[test]
+    fn auto_compact_rule_is_validated_persisted_and_announced() {
+        let (_env, root, mut core) = scratch_core("autocompact");
+        let a = core.spawn_instance().unwrap().id;
+        let term = core.spawn_terminal(None, None, false).unwrap().id;
+        core.worked.insert(a);
+        let inbox = core.state_dir.join("inbox").join(a.to_string());
+        let mail = || std::fs::read_dir(&inbox).map(|d| d.count()).unwrap_or(0);
+
+        assert!(!core.set_auto_compact(term, Some(70)), "a terminal");
+        assert!(!core.set_auto_compact(a, Some(73)), "not a menu choice");
+        assert_eq!(mail(), 0);
+
+        assert!(core.set_auto_compact(a, Some(70)));
+        assert!(!core.set_auto_compact(a, Some(70)), "no change, no second message");
+        assert_eq!(mail(), 1);
+        let infos = core.session_infos();
+        assert_eq!(infos.iter().find(|s| s.id == a).unwrap().auto_compact, Some(70));
+        let saved = core.store.load();
+        assert_eq!(saved.iter().find(|s| s.id == Some(a)).unwrap().auto_compact, Some(70));
+
+        assert!(core.set_auto_compact(a, None));
+        assert_eq!(mail(), 2);
+        assert!(core.auto_compact.is_empty());
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Drag-to-nest moves a claude (family and all) under another claude or
     /// back to the top, unfolds the new parent, keeps mute alone, and refuses
     /// a cycle or a terminal on either end without touching anything.
@@ -4774,6 +4864,7 @@ mod tests {
             id: None,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }]);
 
         let mut core = Core::open(
@@ -5180,6 +5271,7 @@ mod tests {
             id: None,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -5238,6 +5330,7 @@ mod tests {
             id: None,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");

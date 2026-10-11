@@ -23,6 +23,9 @@ export interface SessionInfo {
   parent: number | null;
   /** Its family is folded away in the sidebar. */
   collapsed: boolean;
+  /** Auto-compact every claude in this row's sidebar subtree at this context %
+   *  (set by the user from the row's menu; `compact.ts` enforces it). */
+  auto_compact: number | null;
   kind: SessionKind;
   /** A terminal whose shell has exited. Kept in the list (unlike a dead
    *  instance, which is removed) so its output stays readable until closed. */
@@ -233,6 +236,11 @@ export const setSessionCollapsed = (
   id: number,
   collapsed: boolean,
 ) => invoke<void>("set_session_collapsed", { projectHandle, id, collapsed });
+
+/** Set or (null) clear a row's auto-compact rule; persists, and the backend
+ *  tells that claude once. False if nothing changed. */
+export const setAutoCompact = (projectHandle: ProjectHandle, id: number, pct: number | null) =>
+  invoke<boolean>("set_auto_compact", { projectHandle, id, pct });
 
 /** Mute/unmute a session (⌘M or the sidebar 🔇); persists across restarts. */
 export const setSessionMuted = (

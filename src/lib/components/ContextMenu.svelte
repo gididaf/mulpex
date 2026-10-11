@@ -12,8 +12,9 @@
    * paying that trap on every entry. This one is plain DOM: what it renders is
    * what it runs.
    *
-   * It is deliberately *not* a general menu widget — no submenus, no icons, no
-   * radio groups. Two callers, one shape.
+   * It is deliberately *not* a general menu widget — no icons, no radio groups,
+   * and submenus only one level deep (auto-compact's Off / 50 … 80 %, which as
+   * five flat items read as noise). Two callers, one shape.
    */
   export interface CtxItem {
     /** A separator; every other field is ignored. */
@@ -25,6 +26,10 @@
     /** Destructive: rendered in the `needs` red. */
     danger?: boolean;
     run?: () => void;
+    /** A one-level submenu, opened by hover, → or Enter; the item gets a ›. */
+    sub?: CtxItem[];
+    /** Draw a ✓ before the label (a submenu's current choice). */
+    checked?: boolean;
   }
 
   let {
@@ -79,9 +84,52 @@
     tick().then(() => el?.focus());
   });
 
-  function choose(it: CtxItem) {
-    if (it.sep || !it.run) return;
+  /** The item whose submenu is open, and the highlighted row inside it (-1 =
+   *  the submenu is shown but the keys still walk the main menu). */
+  let openSub = $state(-1);
+  let subCursor = $state(-1);
+  let subEl: HTMLElement | undefined = $state();
+  const subItems = $derived(openSub >= 0 ? (items[openSub]?.sub ?? []) : []);
+  const subPickable = $derived(
+    subItems.map((it, i) => (it.sep ? -1 : i)).filter((i) => i >= 0),
+  );
+  /** Flip the submenu to the left / up when it would leave the window. */
+  let subFlip = $state({ left: false, up: 0 });
+  $effect(() => {
+    if (!subEl) return;
+    subFlip = { left: false, up: 0 };
+    tick().then(() => {
+      if (!subEl) return;
+      const r = subEl.getBoundingClientRect();
+      subFlip = {
+        left: r.right + 6 > window.innerWidth,
+        up: Math.max(0, r.bottom + 6 - window.innerHeight),
+      };
+    });
+  });
+
+  function hover(i: number) {
+    cursor = i;
+    openSub = items[i]?.sub ? i : -1;
+    subCursor = -1;
+  }
+
+  function choose(it: CtxItem, i?: number) {
+    if (it.sep) return;
+    if (it.sub && i != null) {
+      openSub = i;
+      subCursor = it.sub.findIndex((x) => !x.sep);
+      return;
+    }
+    if (!it.run) return;
     onclose(it);
+  }
+
+  function walk(list: number[], from: number, step: number): number {
+    if (!list.length) return -1;
+    const at = list.indexOf(from);
+    const next = at < 0 ? (step > 0 ? 0 : list.length - 1) : at + step;
+    return list[((next % list.length) + list.length) % list.length];
   }
 
   /**
@@ -91,6 +139,29 @@
    * also stopped, so it can't reach App.svelte's global handler as well.
    */
   function onKey(e: KeyboardEvent) {
+    // Inside an open submenu: its own arrows, and ← / Esc step back out.
+    if (subCursor >= 0) {
+      const handled = ["Escape", "ArrowLeft", "ArrowDown", "ArrowUp", "Enter", " "];
+      if (!handled.includes(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape" || e.key === "ArrowLeft") {
+        subCursor = -1;
+        openSub = -1;
+      } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        subCursor = walk(subPickable, subCursor, e.key === "ArrowDown" ? 1 : -1);
+      } else {
+        const it = subItems[subCursor];
+        if (it) choose(it);
+      }
+      return;
+    }
+    if (e.key === "ArrowRight" && items[cursor]?.sub) {
+      e.preventDefault();
+      e.stopPropagation();
+      choose(items[cursor], cursor);
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -100,19 +171,16 @@
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       e.stopPropagation();
-      if (!pickable.length) return;
-      const at = pickable.indexOf(cursor);
-      const step = e.key === "ArrowDown" ? 1 : -1;
       // From "nothing highlighted", ↓ takes the first item and ↑ the last.
-      const next = at < 0 ? (step > 0 ? 0 : pickable.length - 1) : at + step;
-      cursor = pickable[((next % pickable.length) + pickable.length) % pickable.length];
+      cursor = walk(pickable, cursor, e.key === "ArrowDown" ? 1 : -1);
+      openSub = -1;
       return;
     }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       e.stopPropagation();
       const it = items[cursor];
-      if (it) choose(it);
+      if (it) choose(it, cursor);
     }
   }
 </script>
@@ -146,17 +214,49 @@
     {#if it.sep}
       <div class="sep" role="separator"></div>
     {:else}
-      <button
-        class="item"
-        class:danger={it.danger}
-        class:on={cursor === i}
-        role="menuitem"
-        onpointerenter={() => (cursor = i)}
-        onclick={() => choose(it)}
-      >
-        <span class="label">{it.label}</span>
-        {#if it.hint}<span class="hint">{it.hint}</span>{/if}
-      </button>
+      <div class="wrap">
+        <button
+          class="item"
+          class:danger={it.danger}
+          class:on={cursor === i}
+          role="menuitem"
+          aria-haspopup={it.sub ? "menu" : undefined}
+          onpointerenter={() => hover(i)}
+          onclick={() => choose(it, i)}
+        >
+          <span class="label">{it.label}</span>
+          {#if it.hint}<span class="hint">{it.hint}</span>{/if}
+          {#if it.sub}<span class="hint">›</span>{/if}
+        </button>
+        {#if it.sub && openSub === i}
+          <div
+            class="menu sub ready"
+            class:left={subFlip.left}
+            style:margin-top="-{subFlip.up}px"
+            role="menu"
+            bind:this={subEl}
+          >
+            {#each it.sub as sit, j}
+              {#if sit.sep}
+                <div class="sep" role="separator"></div>
+              {:else}
+                <button
+                  class="item"
+                  class:danger={sit.danger}
+                  class:on={subCursor === j}
+                  role="menuitem"
+                  onpointerenter={() => (subCursor = j)}
+                  onclick={() => choose(sit)}
+                >
+                  <span class="check">{sit.checked ? "✓" : ""}</span>
+                  <span class="label">{sit.label}</span>
+                  {#if sit.hint}<span class="hint">{sit.hint}</span>{/if}
+                </button>
+              {/if}
+            {/each}
+          </div>
+        {/if}
+      </div>
     {/if}
   {/each}
 </div>
@@ -217,6 +317,29 @@
   }
   .item.on .hint {
     color: var(--text-dim);
+  }
+  .wrap {
+    position: relative;
+  }
+  /* The submenu hangs off the right edge of its item (or the left, flipped). */
+  .menu.sub {
+    top: -0.3rem;
+    left: 100%;
+    margin-left: 0.15rem;
+    position: absolute;
+    min-width: 6rem;
+  }
+  .menu.sub.left {
+    left: auto;
+    right: 100%;
+    margin-left: 0;
+    margin-right: 0.15rem;
+  }
+  .sub .item {
+    gap: 0.4rem;
+  }
+  .check {
+    width: 0.8rem;
   }
   .sep {
     height: 1px;

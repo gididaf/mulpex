@@ -61,6 +61,9 @@ pub struct SavedSession {
     /// Its family is folded away in the sidebar (only meaningful on a row that
     /// has `hub_spawn` children).
     pub collapsed: bool,
+    /// Auto-compact this row's sidebar subtree at this context % (set by the
+    /// user from the row's context menu; `lib/compact.ts` enforces it).
+    pub auto_compact: Option<u8>,
 }
 
 /// The tab-separated flag marking a collapsed family in the store file.
@@ -125,7 +128,7 @@ impl SessionStore {
     /// error, if there is no store yet, or if the recorded project path doesn't
     /// match (guards against a hash collision clobbering another project).
     ///
-    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`, so every older format
+    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>]]]]]]`, so every older format
     /// still loads: a bare uuid (before names existed) yields no name and
     /// unmuted, a `<uuid>\t<name>` line (before mute existed) yields unmuted, and
     /// a three-column line (before ids were persisted) yields `id: None` and is
@@ -150,7 +153,7 @@ impl SessionStore {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(|l| {
-                let mut parts = l.splitn(6, '\t');
+                let mut parts = l.splitn(7, '\t');
                 let session_id = parts.next().unwrap_or("").to_string();
                 let name = parts
                     .next()
@@ -161,6 +164,7 @@ impl SessionStore {
                 let id = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 let parent = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 let collapsed = parts.next().map(str::trim) == Some(COLLAPSED_FLAG);
+                let auto_compact = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 SavedSession {
                     session_id,
                     name,
@@ -168,6 +172,7 @@ impl SessionStore {
                     id,
                     parent,
                     collapsed,
+                    auto_compact,
                 }
             })
             .filter(|s| !s.session_id.is_empty())
@@ -175,7 +180,7 @@ impl SessionStore {
     }
 
     /// Persist `sessions` (in order) for this project as
-    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`. Trailing empty columns are dropped, so
+    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>]]]]]]`. Trailing empty columns are dropped, so
     /// a store with nothing new in it is written byte-identically to the older
     /// format. Best-effort: any I/O failure is silently ignored.
     pub fn save(&self, sessions: &[SavedSession]) {
@@ -201,6 +206,7 @@ impl SessionStore {
                 s.id.map(|i| i.to_string()).unwrap_or_default(),
                 s.parent.map(|i| i.to_string()).unwrap_or_default(),
                 if s.collapsed { COLLAPSED_FLAG.into() } else { String::new() },
+                s.auto_compact.map(|p| p.to_string()).unwrap_or_default(),
             ];
             // Positional columns, so only trailing empties can be dropped — an
             // id with no name still needs its empty name and muted fields
@@ -228,6 +234,7 @@ mod tests {
             id: None,
             parent: None,
             collapsed: false,
+            auto_compact: None,
         }
     }
 
@@ -258,6 +265,7 @@ mod tests {
             SavedSession { parent: Some(2), ..numbered("u6", None, false, 16) },
             SavedSession { parent: Some(16), ..numbered("u7", Some("kid"), true, 17) },
             SavedSession { collapsed: true, ..numbered("u8", None, false, 18) },
+            SavedSession { auto_compact: Some(70), ..numbered("u9", None, false, 19) },
         ];
         store.save(&rows);
         assert_eq!(store.load(), rows, "a column shape did not survive the round trip");
@@ -267,6 +275,7 @@ mod tests {
         assert!(text.contains("u2\t\t\t15\n"), "columns misaligned:\n{text}");
         assert!(text.contains("u6\t\t\t16\t2\n"), "columns misaligned:\n{text}");
         assert!(text.contains("u8\t\t\t18\t\tcollapsed\n"), "columns misaligned:\n{text}");
+        assert!(text.contains("u9\t\t\t19\t\t\t70\n"), "columns misaligned:\n{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

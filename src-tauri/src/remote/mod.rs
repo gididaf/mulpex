@@ -1726,6 +1726,7 @@ mod tests {
             muted: false,
             parent: None,
             collapsed: false,
+            auto_compact: None,
             kind,
             exited: false,
             failed: failed.map(String::from),
