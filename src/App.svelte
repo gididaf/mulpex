@@ -79,7 +79,7 @@
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
-  import { addPin, clearPin, dropPins, loadPins, pins, pinKey } from "./lib/pins";
+  import { addPin, dropPins, loadPins, setPanelOpen, togglePanel } from "./lib/pins";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
@@ -878,25 +878,25 @@
     terminals.refocus();
   }
 
-  /** ⌘⇧P: float the focused claude's selection over the top of its pane
-   *  (`pins.ts`), replacing its pin; with nothing selected, remove the pin.
-   *  Claudes only — a shell's rows are never restored, so a pin there could
-   *  not outlive the app. */
+  /** ⌘⇧P: add the focused claude's selection to its pins (`pins.ts`), shown in
+   *  the pins panel right of the terminal, opening the panel; with nothing
+   *  selected, open or close the panel. Claudes only — a shell's rows are never
+   *  restored, so a pin there could not outlive the app. */
   function pinSelection(handle: ProjectHandle, id: number) {
     const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
     if (!s) return;
-    if (s.kind === "shell") {
-      flashToast("Pins work on claudes only");
-      return;
-    }
-    const lines = terminals.pinSelection(handle, id);
+    const lines = s.kind === "shell" ? null : terminals.pinSelection(handle, id);
     if (!lines) {
-      // No selection: the same key unpins.
-      if (get(pins).has(pinKey(handle, id))) clearPin(handle, id);
-      else flashToast("Select some text first");
+      if (s.kind === "shell" && terminals.hasSelection(handle, id)) {
+        flashToast("Pins work on claudes only");
+        return;
+      }
+      togglePanel();
+      terminals.refocus();
       return;
     }
     addPin(handle, id, lines);
+    setPanelOpen(true);
     terminals.refocus();
   }
 

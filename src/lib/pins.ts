@@ -1,6 +1,6 @@
-// Pins: a selection lifted off a claude's pane (⌘⇧P) and floated over the top of
-// that same pane, so an important block — a QA checklist, a command — stays in
-// view while the conversation scrolls on.
+// Pins: a selection lifted off a claude's pane (⌘⇧P) and kept in the pins
+// panel, a column to the right of the terminal, so an important block — a QA
+// checklist, a command — stays in view while the conversation scrolls on.
 //
 // A pin keeps claude's own colors. It is captured cell by cell from the xterm
 // buffer (not from `getSelection()`, which is plain text), and every color is
@@ -162,8 +162,8 @@ export const pins = writable<Map<string, Pin[]>>(new Map());
 
 export const pinKey = (handle: number, id: number) => `${handle}:${id}`;
 
-/** Change one instance's pins and save the result (`pins.rs` keeps one per
- *  instance on disk, which is all the UI allows). */
+/** Change one instance's pins and save the result. `pins.rs` stores each
+ *  instance's value as opaque JSON; that value is the whole list. */
 function edit(handle: number, id: number, f: (list: Pin[]) => Pin[]) {
   const key = pinKey(handle, id);
   pins.update((m) => {
@@ -173,13 +173,14 @@ function edit(handle: number, id: number, f: (list: Pin[]) => Pin[]) {
     else next.delete(key);
     return next;
   });
-  setPin(handle, id, get(pins).get(key)?.[0] ?? null).catch(() => {});
+  const list = get(pins).get(key);
+  setPin(handle, id, list?.length ? list : null).catch(() => {});
 }
 
-/** One pin per instance: a new pin replaces the previous one. */
+/** A new pin goes to the bottom of the instance's list. */
 export function addPin(handle: number, id: number, lines: PinRun[][]) {
   const pin: Pin = { uid: crypto.randomUUID(), lines, text: plainText(lines), collapsed: false };
-  edit(handle, id, () => [pin]);
+  edit(handle, id, (l) => [...l, pin]);
 }
 
 export function removePin(handle: number, id: number, uid: string) {
@@ -192,8 +193,8 @@ export function togglePin(handle: number, id: number, uid: string) {
   );
 }
 
-/** Unpin (handle, id) — saved, unlike `dropPins`. */
-export function clearPin(handle: number, id: number) {
+/** Remove every pin of (handle, id) — saved, unlike `dropPins`. */
+export function clearPins(handle: number, id: number) {
   edit(handle, id, () => []);
 }
 
@@ -207,9 +208,12 @@ export async function loadPins(handle: number) {
   }
   pins.update((m) => {
     const next = new Map(m);
-    for (const [id, pin] of Object.entries(saved)) {
-      const p = pin as Pin;
-      if (Array.isArray(p?.lines)) next.set(pinKey(handle, Number(id)), [p]);
+    for (const [id, value] of Object.entries(saved)) {
+      // A list since the pins panel; a single pin object before it.
+      const list = (Array.isArray(value) ? value : [value]).filter(
+        (p): p is Pin => Array.isArray((p as Pin | null)?.lines),
+      );
+      if (list.length) next.set(pinKey(handle, Number(id)), list);
     }
     return next;
   });
@@ -227,3 +231,46 @@ export function dropPins(handle: number, id?: number) {
     return next;
   });
 }
+
+// ── panel ──────────────────────────────────────────────────────────────────
+
+/** The pins panel is one switch for the whole app, not per instance: every PTY
+ *  shares one geometry (docs/rendering.md), so a column that came and went with
+ *  the focused instance would resize every claude on each switch. `frac` is its
+ *  share of the pane's width. Remembered in localStorage — a per-viewer nicety. */
+export interface PinsPanel {
+  open: boolean;
+  frac: number;
+}
+
+const PANEL_KEY = "mulpex.pinsPanel";
+export const PANEL_MIN_FRAC = 0.15;
+export const PANEL_MAX_FRAC = 0.6;
+export const clampFrac = (f: number) => Math.min(PANEL_MAX_FRAC, Math.max(PANEL_MIN_FRAC, f));
+
+function loadPanel(): PinsPanel {
+  const def = { open: false, frac: 0.3 };
+  try {
+    const v = JSON.parse(localStorage.getItem(PANEL_KEY) ?? "null");
+    if (v && typeof v.open === "boolean" && typeof v.frac === "number") {
+      return { open: v.open, frac: clampFrac(v.frac) };
+    }
+  } catch {
+    /* no storage: defaults */
+  }
+  return def;
+}
+
+export const pinsPanel = writable<PinsPanel>(loadPanel());
+pinsPanel.subscribe((v) => {
+  try {
+    localStorage.setItem(PANEL_KEY, JSON.stringify(v));
+  } catch {
+    /* not remembered, still works */
+  }
+});
+
+export const setPanelOpen = (open: boolean) => pinsPanel.update((p) => ({ ...p, open }));
+export const togglePanel = () => pinsPanel.update((p) => ({ ...p, open: !p.open }));
+export const setPanelFrac = (frac: number) =>
+  pinsPanel.update((p) => ({ ...p, frac: clampFrac(frac) }));

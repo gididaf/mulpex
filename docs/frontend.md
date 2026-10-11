@@ -364,19 +364,32 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 
 ## Pins (⌘⇧P)
 
-Select text in a claude's pane and ⌘⇧P floats it over the top of that pane, so a QA list or a
-command stays in view while the conversation scrolls. One pin per instance: a new one replaces it,
-and ⌘⇧P with nothing selected removes it (the "Select some text first" toast only when there is no
-pin either). Claudes only — a shell's row is never restored, so its pin could not outlive the app.
+Select text in a claude's pane and ⌘⇧P adds it to the **pins panel**, a column right of the
+terminal, so a QA list or a command stays in view while the conversation scrolls. Many pins per
+instance, oldest on top; each has copy / collapse / ✕, and the header has **Clear all** and a close
+✕. ⌘⇧P with nothing selected opens or closes the panel; a new pin opens it. Claudes only — a
+shell's row is never restored, so its pin could not outlive the app (the panel says so on a shell).
 
+- **One switch for the whole app, not per instance.** The panel is a real column (the terminal
+  narrows instead of being covered), and every PTY shares one geometry (docs/rendering.md) — a
+  column that came and went with the focused instance would resize every claude on each switch.
+  So it stays open across instances and shows "No pins for claude#N" on one without any. Its
+  open state and width (`frac` of the pane) live in localStorage (`pins.ts::pinsPanel`).
+- **Dragging its left edge moves a ghost line; the width commits on release**, so the PTYs resize
+  once, not on every pointer move. Clamped to 15–60% (`clampFrac`), min 14rem.
+- **⌘E's panel still overlays**, now anchored to the whole row (`TerminalPane`'s `.pane-row`), so
+  it covers the pins column while open — the user's choice over stacking the two.
+- **Pins wrap** to the panel's width (`pre-wrap`, collapsed ones clip to one line) — they come off
+  a terminal much wider than the column.
 - **Captured cell by cell** off the xterm buffer (`pins.ts::captureSelection`), not
   `getSelection()`, so claude's colors survive. Colors resolve to CSS at capture time (bold 0–7 →
   bright, like xterm), so a pin is self-contained. `getSelectionPosition()` is **0-based with
   `end.x` exclusive** in xterm 5.5, whatever its typings say — measured against `@xterm/headless`.
-- **Rendered** by `PinStack.svelte` in `.pane-inner`, beside the xterms (never inside one), with
-  the terminal's own font/size/theme and the same two RTL rules as `.xterm-rows`.
+- **Rendered** by `PinPanel.svelte`, beside `.pane-inner` (never inside an xterm), with the
+  terminal's own font/size/theme and the same two RTL rules as `.xterm-rows`.
 - **Saved** to `<mulpex home>/pins/<session-store key>.json`, keyed by instance number
-  (`src-tauri/src/pins.rs`). A pin lives exactly as long as its row in the session store:
+  (`src-tauri/src/pins.rs`, which stores each instance's value as opaque JSON — the whole list;
+  `loadPins` still reads the single-object value written before the panel). A pin lives exactly as long as its row in the session store:
   `persist_sessions` prunes the file to the ids it saved. So ⌘W loses the pin, a quit keeps it, and
   a later claude given the same number can't inherit one. The frontend's `dropPins` on
   `session-exited` is memory-only for that reason — teardown exits sessions too.

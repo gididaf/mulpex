@@ -244,7 +244,7 @@ pub fn get_pins(
     }
 }
 
-/// Save (`Some`) or remove (`None`) one instance's pin.
+/// Save (`Some`, the whole list) or remove (`None`) one instance's pins.
 #[tauri::command]
 pub fn set_pin(
     state: State<AppState>,

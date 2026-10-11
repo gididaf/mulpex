@@ -336,6 +336,10 @@ class TerminalManager {
     return lines;
   }
 
+  hasSelection(handle: number, id: number): boolean {
+    return this.entries.get(keyOf(handle, id))?.term.hasSelection() ?? false;
+  }
+
   /** (handle, id)'s selection as plain text, for ⌘E — read the same way a pin
    *  is (soft wraps joined, blank edges trimmed), then cleared. */
   selectionText(handle: number, id: number): string | null {

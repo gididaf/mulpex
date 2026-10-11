@@ -99,7 +99,7 @@ src/                  Svelte/Vite frontend
   lib/pins.ts         ⌘⇧P: reads an xterm selection with its colours (also ⌘E's reader)
   lib/explain.ts      ⌘E panel state; lib/markdown.ts sanitizes what the panel renders
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename, PinStack, ExplainPanel,
+                      TerminalPane/View, MessageReader, Rename, PinPanel, ExplainPanel,
                       SaveOverlay, SecretsDialog, ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 scripts/deploy-relay.sh  Remote Control relay + phone app → the VM (docs/remote-control.md)

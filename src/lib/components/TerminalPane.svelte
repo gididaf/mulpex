@@ -3,7 +3,8 @@
   import { projects, activeProject, activeProjectHandle, activeId, saves, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
-  import PinStack from "./PinStack.svelte";
+  import PinPanel from "./PinPanel.svelte";
+  import { pinsPanel } from "../pins";
   import ExplainPanel from "./ExplainPanel.svelte";
   import SaveOverlay from "./SaveOverlay.svelte";
 
@@ -18,6 +19,7 @@
   } = $props();
 
   let paneEl: HTMLDivElement;
+  let rowEl: HTMLDivElement | undefined = $state();
   const activeSave = $derived($activeId != null ? $saves.get($activeId) : undefined);
 
   // Every session across ALL open projects, so background projects' terminals
@@ -44,39 +46,60 @@
   });
 </script>
 
-<div class="pane-inner" bind:this={paneEl}>
-  {#each all as e (e.handle + " " + e.id)}
-    <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
-  {/each}
-  <PinStack />
-  {#if $activeProjectHandle != null && $activeId != null}
-    <ExplainPanel handle={$activeProjectHandle} id={$activeId} />
-  {/if}
-  {#if activeSave && $activeId != null}
-    {@const id = $activeId}
-    <SaveOverlay
-      {id}
-      status={activeSave}
-      onclose={() => onsaveclose(id)}
-      onretry={() => onsaveretry(id)}
-    />
-  {/if}
-  {#if activeEmpty}
-    <div class="empty">
-      Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
+<!-- The terminals and, when open, the pins column beside them. ⌘E's panel
+     spans the row's right edge, over the pins. -->
+<div class="pane-row" bind:this={rowEl}>
+  <div class="pane-inner" bind:this={paneEl}>
+    {#each all as e (e.handle + " " + e.id)}
+      <TerminalView handle={e.handle} id={e.id} kind={e.kind} exited={e.exited} />
+    {/each}
+    {#if activeSave && $activeId != null}
+      {@const id = $activeId}
+      <SaveOverlay
+        {id}
+        status={activeSave}
+        onclose={() => onsaveclose(id)}
+        onretry={() => onsaveretry(id)}
+      />
+    {/if}
+    {#if activeEmpty}
+      <div class="empty">
+        Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
+      </div>
+    {/if}
+    {#if $toast}
+      <div class="toast" role="status">{$toast}</div>
+    {/if}
+  </div>
+  {#if $pinsPanel.open}
+    <div class="pin-col" style="width:{$pinsPanel.frac * 100}%">
+      <PinPanel row={rowEl} />
     </div>
   {/if}
-  {#if $toast}
-    <div class="toast" role="status">{$toast}</div>
+  {#if $activeProjectHandle != null && $activeId != null}
+    <ExplainPanel handle={$activeProjectHandle} id={$activeId} />
   {/if}
 </div>
 
 <style>
-  .pane-inner {
+  .pane-row {
     position: relative;
+    display: flex;
     height: 100%;
     width: 100%;
     overflow: hidden;
+  }
+  .pane-inner {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+  .pin-col {
+    flex: none;
+    min-width: min(14rem, 50%);
+    height: 100%;
   }
   .empty {
     display: grid;
