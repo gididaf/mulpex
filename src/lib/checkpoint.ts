@@ -94,6 +94,9 @@ let timer: ReturnType<typeof setInterval> | null = null;
 
 const key = (h: number, id: number) => `${h}:${id}`;
 
+/** Set before the stop messages go out, cleared when the panel closes. */
+const quitting = writable(false);
+
 export const checkpointOpen = derived(session, ($s) => $s.open);
 export const checkpointMeta = derived(session, ($s) => ({
   mode: $s.mode,
@@ -202,7 +205,15 @@ export async function startCheckpoint(mode: CheckpointMode = "quit"): Promise<vo
     session.update((s) => ({ ...s, mode }));
     return;
   }
-  const targets = await checkpointStop();
+  // Held before the messages go out: a claude may stop before this resolves.
+  quitting.set(true);
+  let targets: CheckpointTarget[];
+  try {
+    targets = await checkpointStop();
+  } catch (e) {
+    quitting.set(false);
+    throw e;
+  }
   session.set({ ...closed, open: true, mode, targets, sentAt: Date.now() });
   if (timer) clearInterval(timer);
   timer = setInterval(() => void poll(), POLL_MS);
@@ -213,6 +224,7 @@ function close(): void {
   if (timer) clearInterval(timer);
   timer = null;
   session.set({ ...closed });
+  quitting.set(false);
 }
 
 /** Never mind: unread stop messages are taken back, the rest told to carry on. */
@@ -254,6 +266,18 @@ export async function finishCheckpoint(): Promise<void> {
 
 /** The claudes from the last checkpoint that came back, for the resume dialog. */
 export const resumeTargets = writable<CheckpointTarget[]>([]);
+/** `checkResume` has answered (hub updates arrive before it does). */
+const resumeKnown = writable(false);
+
+/** True while no compact may be typed: from the moment the stop messages go out
+ * until the panel closes, and after a relaunch until the wake offer is answered.
+ * A compact ends with "continue the task", which undoes the stop — on 2026-10-12
+ * auto-compact typed `/compact` into cloudraw#157 the second it stopped for the
+ * quit, and it went back to work. `compact.ts` obeys this. */
+export const compactsHeld = derived(
+  [quitting, resumeKnown, resumeTargets],
+  ([$q, $k, $t]) => $q || !$k || $t.length > 0,
+);
 
 /** After bootstrap: is there a checkpoint to offer waking? */
 export async function checkResume(): Promise<void> {
@@ -261,6 +285,8 @@ export async function checkResume(): Promise<void> {
     resumeTargets.set(await checkpointPending());
   } catch (e) {
     console.error("checkpoint pending failed:", e);
+  } finally {
+    resumeKnown.set(true);
   }
 }
 

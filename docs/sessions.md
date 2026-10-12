@@ -857,6 +857,15 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
   still booting would sit on it until its next turn. So the poll loop (`drain_wake_queue`)
   delivers each wake only once `armed/<id>` is fresh *and* at least 2 s old (its creation time is
   when that listener started), or after 3 minutes regardless, so it at least waits in the inbox.
+- **No compact while it runs.** From the moment the stop messages go out until Quit or Cancel,
+  and after a relaunch until the wake offer is answered (or `checkpoint_pending` says there is
+  none), `checkpoint.ts::compactsHeld` holds every compact: auto-compact starts nothing, ⌘⇧K says
+  "Mulpex is quitting — compact after it's back", a request that hasn't typed `/compact` is called
+  off (an auto one may retry after the hold), and one already compacting finishes **without** the
+  resume prompt. That prompt says "continue the task" — on 2026-10-12 auto-compact typed `/compact`
+  into cloudraw#157 the second it stopped for the quit, and the resume prompt sent it back to work
+  (three Slack posts while the panel said "stopped"). When the hold lifts, every project gets one
+  auto-compact tick, since hub updates only come on a change.
 - Monitors are why the note matters: quitting kills every background task a claude armed, and
   `--resume` restores only the conversation. The Mulpex hub listener comes back by itself (plugin
   monitor); agentalk and artifact watches come back only because the claude wrote them down.

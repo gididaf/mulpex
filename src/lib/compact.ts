@@ -13,10 +13,16 @@
 // module drives the typing, because only the frontend can read the input box
 // (`promptbox.ts`). Nothing here survives a reload — a request is in-memory by
 // design, and a fresh scratch dir drops the file with it.
+//
+// While Checkpoint & Quit holds compacts (`checkpoint.ts::compactsHeld`) nothing
+// new starts, a request that hasn't typed `/compact` yet is called off, and one
+// already compacting finishes without the resume prompt — that prompt tells the
+// claude to carry on, which is the opposite of what the quit asked.
 
 import { derived, get, writable } from "svelte/store";
 import { activeProjectHandle, descendantsOf, projects, saveStatusOf } from "./stores";
 import { terminals } from "./terminals";
+import { compactsHeld } from "./checkpoint";
 import {
   sendBytes,
   setCompactPhase,
@@ -92,6 +98,7 @@ export function toggleCompact(h: ProjectHandle, id: number): string | null {
     void setCompactPhase(h, id, null);
     return null;
   }
+  if (get(compactsHeld)) return "Mulpex is quitting — compact after it's back";
   startCompact(h, id, null);
   return null;
 }
@@ -125,6 +132,7 @@ export function autoCompactTick(h: ProjectHandle) {
   const p = get(projects).get(h);
   if (!p) return;
   for (const s of p.sessions) suppressedRelease(h, s.id, p.ctx.get(s.id), ruleFor(p.sessions, s.id));
+  if (get(compactsHeld)) return;
   for (const orch of p.sessions) {
     const pct = orch.auto_compact;
     if (pct == null || orch.kind === "shell") continue;
@@ -158,6 +166,14 @@ function suppressedRelease(h: ProjectHandle, id: number, ctx: number | undefined
   if (pct == null || ctx == null || ctx < pct) suppressed.delete(k);
 }
 
+// Hub updates only come on a change, so a child already over the line when the
+// hold lifts would wait for its next one. Catch up at once instead.
+let wasHeld = false;
+compactsHeld.subscribe((held) => {
+  if (wasHeld && !held) for (const h of get(projects).keys()) autoCompactTick(h);
+  wasHeld = held;
+});
+
 /** Drop claude#id's request (the row exited). */
 export function dropCompact(h: ProjectHandle, id: number) {
   suppressed.delete(keyOf(h, id));
@@ -177,6 +193,14 @@ function step(h: ProjectHandle, id: number) {
   const s = p?.sessions.find((x) => x.id === id);
   if (!p || !s || s.exited) return put(h, id, null);
   const entry = p.hub?.statuses.find((e) => e.id === id);
+
+  if (get(compactsHeld) && (r.phase === "requested" || r.phase === "resume")) {
+    // A request called off before `/compact` may try again after the hold.
+    if (r.phase === "requested") suppressed.delete(keyOf(h, id));
+    put(h, id, null);
+    void setCompactPhase(h, id, null);
+    return;
+  }
 
   if (r.phase === "requested") {
     if (!ready(h, id)) return;
