@@ -136,7 +136,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "hub_instances",
-            "description": "List every parallel Claude instance Mulpex is running in THIS project (claude#1, claude#2, …), with each one's status (working/waiting/needs), current task, the files it currently holds a lock on, and the `address` to message it at. Also reports how many unread hub messages you have; every shell terminal open in this project (term#1, term#2 — whether opened by you, by another instance, or by the user) with how much output is waiting for you to read; and `other_projects`: the OTHER projects open in Mulpex right now with their instances and cross-project addresses, which is the only way to discover them. Call this to coordinate before starting overlapping work.",
+            "description": "List every parallel Claude instance Mulpex is running in THIS project (claude#1, claude#2, …), with each one's status (working/waiting/needs), current task, its sidebar `name` (null if unnamed) and `name_set_by` (who set it: `user` = the user named it, so treat it as a role they assigned; `instance` = it named itself; `spawn` = cut from its hub_spawn task; `auto` = a label Mulpex made up), the files it currently holds a lock on, and the `address` to message it at. Also reports how many unread hub messages you have; every shell terminal open in this project (term#1, term#2 — whether opened by you, by another instance, or by the user) with how much output is waiting for you to read; and `other_projects`: the OTHER projects open in Mulpex right now with their instances and cross-project addresses, which is the only way to discover them. Call this to coordinate before starting overlapping work.",
             "inputSchema": empty,
         },
         {
@@ -172,7 +172,7 @@ fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "description": "Who to message. In THIS project: the instance number (\"3\") or \"claude#3\". In another open project: \"<project>#<n>\", e.g. \"central-one#3\". A list of any of those to reach several at once, e.g. [\"3\", \"claude#5\", \"central-one#2\"] — prefer this over \"all\" whenever only some instances are concerned; a closed one in the list is skipped and reported, the rest still get it. Or \"all\" to broadcast to every other instance in this project (a broadcast is always project-local). Terminals cannot receive messages — use hub_terminal_send for those." },
+                    "to": { "description": "Who to message. In THIS project: the instance number (\"3\") or \"claude#3\", or its exact sidebar name (e.g. \"Deployer\", case-insensitive; refused if no instance or several have it). In another open project: \"<project>#<n>\", e.g. \"central-one#3\". A list of any of those to reach several at once, e.g. [\"3\", \"claude#5\", \"central-one#2\"] — prefer this over \"all\" whenever only some instances are concerned; a closed one in the list is skipped and reported, the rest still get it. Or \"all\" to broadcast to every other instance in this project (a broadcast is always project-local). Terminals cannot receive messages — use hub_terminal_send for those." },
                     "message": { "type": "string", "description": "The message body." },
                 },
                 "required": ["to", "message"],
@@ -327,6 +327,7 @@ fn hub_instances(ctx: &Ctx) -> String {
     let holds = locks_by_holder(ctx);
     let reg = Registry::read_for(&ctx.state_dir);
     let project = my_project_name(ctx, &reg);
+    let mine = reg.project_for_dir(&ctx.project_dir);
     let list: Vec<Value> = live_ids(ctx)
         .into_iter()
         .map(|id| {
@@ -338,6 +339,11 @@ fn hub_instances(ctx: &Ctx) -> String {
                 "is_me": id == ctx.instance,
                 "status": status_of(ctx, id),
                 "task": task_of(ctx, id),
+                // The sidebar label, from the registry the app publishes. Peers
+                // agree on roles by name ("only Deployer deploys"), which is
+                // unworkable while the name is invisible here.
+                "name": local_name(mine, id).map(|i| i.name.clone()),
+                "name_set_by": local_name(mine, id).map(|i| i.name_by.clone()),
                 "holds": holds.get(&id).cloned().unwrap_or_default(),
             });
             // A spawned child whose task has not been typed into it yet looks
@@ -368,6 +374,58 @@ fn hub_instances(ctx: &Ctx) -> String {
     .to_string()
 }
 
+/// The registry row for instance `id` of my project, when it has a name.
+fn local_name(mine: Option<&ProjectEntry>, id: usize) -> Option<&registry::InstanceEntry> {
+    mine?.instances.iter().find(|i| i.id == id && i.name.is_some())
+}
+
+/// Resolve a `to` word that is not an address as an instance's sidebar name in
+/// MY project: exact, trimmed, case-insensitive. `Ok(None)` when no live
+/// instance has it, so the caller can report the address error it already has.
+/// Several matches are refused outright — a role name that two rows carry is a
+/// question for the sender, not something to guess at.
+fn resolve_name(ctx: &Ctx, reg: &Registry, word: &str) -> Result<Option<usize>, String> {
+    let want = word.trim().to_lowercase();
+    let live = live_ids(ctx);
+    let hits: Vec<usize> = reg
+        .project_for_dir(&ctx.project_dir)
+        .map(|p| {
+            p.instances
+                .iter()
+                .filter(|i| live.contains(&i.id))
+                .filter(|i| i.name.as_deref().is_some_and(|n| n.trim().to_lowercase() == want))
+                .map(|i| i.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        many => {
+            let who: Vec<String> = many.iter().map(|id| format!("claude#{id}")).collect();
+            Err(format!(
+                "\"{}\" is the sidebar name of {} instances ({}) — nothing was sent. Address \
+                 the one you mean by number.",
+                word.trim(),
+                many.len(),
+                who.join(", ")
+            ))
+        }
+    }
+}
+
+/// `parse_address`, falling back to a sidebar name in my project. The address
+/// grammar wins, so a name can never shadow "all", "3" or "claude#3".
+fn parse_target(ctx: &Ctx, reg: &Registry, word: &str) -> Result<Address, String> {
+    match registry::parse_address(word) {
+        Ok(a) => Ok(a),
+        Err(e) => match resolve_name(ctx, reg, word)? {
+            Some(id) => Ok(Address::Local(id)),
+            None => Err(format!("{e} No instance in this project has that sidebar name either.")),
+        },
+    }
+}
+
 /// Every open project except mine, with each one's live instances and the
 /// address to reach them at. Terminals are absent by design — a terminal is not
 /// a hub peer, and one in another project cannot be driven from here either.
@@ -386,6 +444,7 @@ fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
                         "status": i.status,
                         "task": i.task,
                         "name": i.name,
+                        "name_set_by": i.name_by,
                     })
                 })
                 .collect();
@@ -549,7 +608,8 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
         }
     };
 
-    match registry::parse_address(&to_raw)? {
+    let reg = Registry::read_for(&ctx.state_dir);
+    match parse_target(ctx, &reg, &to_raw)? {
         Address::LocalAll => send_local(ctx, peer_ids(ctx), "all", message),
         Address::Local(id) => {
             // Refuse to "deliver" to an instance that isn't running: it has closed,
@@ -557,6 +617,11 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // reaps a dead recipient's inbox). Tell the sender plainly instead of
             // faking success — this is what stops instances messaging a peer
             // that's gone.
+            if id == ctx.instance && registry::parse_address(&to_raw).is_err() {
+                return Err(format!(
+                    "\"{to_raw}\" is your own sidebar name (claude#{id}) — nothing was sent."
+                ));
+            }
             if !live_ids(ctx).contains(&id) {
                 return Err(format!(
                     "claude#{id} is not a running instance — it has closed, so it can't receive \
@@ -656,7 +721,7 @@ fn send_many(ctx: &Ctx, entries: &[Value], message: &str) -> Result<String, Stri
     for v in entries {
         let word = address_word(v)
             .ok_or_else(|| format!("'to' contains an entry that is not an address. {HELP}"))?;
-        let (id, foreign) = match registry::parse_address(&word)? {
+        let (id, foreign) = match parse_target(ctx, &reg, &word)? {
             Address::LocalAll => {
                 return Err(format!(
                     "\"all\" cannot go inside a list — nothing was sent. Pass to: \"all\" on its \
@@ -2489,7 +2554,13 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
         for id in peers {
             let task = task_of(ctx, id);
             let held = holds.get(&id).cloned().unwrap_or_default();
-            s.push_str(&format!("\n  - claude#{id} [{}]", status_of(ctx, id)));
+            s.push_str(&format!("\n  - claude#{id}"));
+            if let Some(name) = local_name(reg.project_for_dir(&ctx.project_dir), id)
+                .and_then(|i| i.name.as_deref())
+            {
+                s.push_str(&format!(" \"{name}\""));
+            }
+            s.push_str(&format!(" [{}]", status_of(ctx, id)));
             if !task.is_empty() {
                 s.push_str(&format!(" task: \"{task}\""));
             }
@@ -3070,6 +3141,7 @@ mod tests {
                     status: "waiting".into(),
                     task: String::new(),
                     name: None,
+                    name_by: None,
                 })
                 .collect(),
         };
@@ -3104,6 +3176,95 @@ mod tests {
             .unwrap_or_else(|| panic!("nothing in {}", dir.display()))
             .path();
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Project A from `two_projects`, rewritten with three live instances and
+    /// the given sidebar names — `(id, name, set_by)`.
+    fn name_project_a(root: &Path, ctx: &Ctx, b_state: &Path, rows: &[(usize, Option<&str>, &str)]) {
+        std::fs::write(ctx.state_dir.join("instances"), "1\n2\n3\n").unwrap();
+        let mut reg = Registry::read(root);
+        reg.projects[0].instances = rows
+            .iter()
+            .map(|&(id, name, by)| registry::InstanceEntry {
+                id,
+                status: "waiting".into(),
+                task: String::new(),
+                name: name.map(str::to_string),
+                name_by: name.map(|_| by.to_string()),
+            })
+            .collect();
+        reg.projects[1].instances[0].name = Some("Reviewer".into());
+        reg.projects[1].instances[0].name_by = Some("instance".into());
+        assert_eq!(reg.projects[1].state_dir, b_state.to_string_lossy());
+        assert!(Registry::write_if_changed(root, &reg));
+    }
+
+    /// Peers agree on roles by sidebar name ("only Deployer deploys"); an
+    /// instance that cannot see names concludes the role is unfilled and takes
+    /// it — which is how warweb shipped to production from the wrong row.
+    #[test]
+    fn hub_instances_reports_each_rows_sidebar_name_and_who_set_it() {
+        let (root, ctx, b_state) = two_projects("names");
+        name_project_a(&root, &ctx, &b_state, &[(1, Some("Deployer"), "user"), (2, None, ""), (3, Some("auth fix"), "spawn")]);
+
+        let v: Value = serde_json::from_str(&hub_instances(&ctx)).unwrap();
+        let row = |id: u64| v["instances"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
+        assert_eq!(row(1)["name"], "Deployer");
+        assert_eq!(row(1)["name_set_by"], "user");
+        assert_eq!(row(2)["name"], Value::Null);
+        assert_eq!(row(2)["name_set_by"], Value::Null);
+        assert_eq!(row(3)["name_set_by"], "spawn");
+        let other = &v["other_projects"][0]["instances"][0];
+        assert_eq!(other["name"], "Reviewer");
+        assert_eq!(other["name_set_by"], "instance");
+
+        let block = peers_context(&ctx).unwrap();
+        assert!(block.contains("claude#1 \"Deployer\" [waiting]"), "{block}");
+        assert!(block.contains("claude#3 \"auth fix\" [waiting]"), "{block}");
+        // The source stays out of the per-turn block: it is paid for every prompt.
+        assert!(!block.contains("user"), "{block}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hub_send_reaches_a_row_by_its_sidebar_name() {
+        let (root, ctx, b_state) = two_projects("sendname");
+        name_project_a(&root, &ctx, &b_state, &[(1, Some("Deployer"), "user"), (2, Some("me"), "instance"), (3, None, "")]);
+
+        let reply: Value =
+            serde_json::from_str(&hub_send(&ctx, &json!({ "to": " deployer ", "message": "ship?" })).unwrap()).unwrap();
+        assert_eq!(reply["delivered_to"], json!([1]));
+        assert_eq!(only_file(&ctx.inbox_dir.join("1"))["body"], "ship?");
+
+        // In a list too, beside a plain number.
+        let reply: Value = serde_json::from_str(
+            &hub_send(&ctx, &json!({ "to": ["Deployer", "3"], "message": "both" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["ok"], true, "{reply}");
+
+        // My own name is not a recipient.
+        assert!(hub_send(&ctx, &json!({ "to": "me", "message": "x" })).unwrap_err().contains("your own"));
+        // No such name: the address error, plus that no name matched either.
+        let e = hub_send(&ctx, &json!({ "to": "Nobody", "message": "x" })).unwrap_err();
+        assert!(e.contains("not a valid address") && e.contains("sidebar name"), "{e}");
+        // A name in ANOTHER project is not resolved — names are project-local.
+        assert!(hub_send(&ctx, &json!({ "to": "Reviewer", "message": "x" })).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sidebar_name_two_rows_share_is_refused_and_lists_them() {
+        let (root, ctx, b_state) = two_projects("dupname");
+        name_project_a(&root, &ctx, &b_state, &[(1, Some("Deployer"), "user"), (2, None, ""), (3, Some("deployer"), "instance")]);
+
+        let e = hub_send(&ctx, &json!({ "to": "Deployer", "message": "x" })).unwrap_err();
+        assert!(e.contains("claude#1") && e.contains("claude#3") && e.contains("nothing was sent"), "{e}");
+        assert!(!ctx.inbox_dir.join("1").exists() && !ctx.inbox_dir.join("3").exists());
+        // A list aborts whole, like any other malformed entry.
+        assert!(hub_send(&ctx, &json!({ "to": ["Deployer", "1"], "message": "x" })).is_err());
+        assert!(!ctx.inbox_dir.join("1").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The delivery lands in the OTHER project's own inbox — which is the whole

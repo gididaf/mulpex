@@ -68,6 +68,9 @@ pub struct InstanceEntry {
     pub status: String,
     pub task: String,
     pub name: Option<String>,
+    /// Who set `name`: `user`, `instance`, `spawn` or `auto`
+    /// (`persist::NameSource`). `None` exactly when `name` is.
+    pub name_by: Option<String>,
 }
 
 /// One open project.
@@ -170,6 +173,7 @@ impl Registry {
                             "status": i.status,
                             "task": i.task,
                             "name": i.name,
+                            "name_by": i.name_by,
                         })
                     })
                     .collect();
@@ -207,6 +211,10 @@ impl Registry {
                                             task: str_of(i, "task", ""),
                                             name: i
                                                 .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .map(str::to_string),
+                                            name_by: i
+                                                .get("name_by")
                                                 .and_then(|n| n.as_str())
                                                 .map(str::to_string),
                                         })
@@ -424,6 +432,7 @@ mod tests {
             status: "waiting".into(),
             task: String::new(),
             name: None,
+            name_by: None,
         }
     }
 

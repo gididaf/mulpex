@@ -64,6 +64,48 @@ pub struct SavedSession {
     /// Auto-compact this row's sidebar subtree at this context % (set by the
     /// user from the row's context menu; `lib/compact.ts` enforces it).
     pub auto_compact: Option<u8>,
+    /// Who gave the row its `name`, so `hub_instances` can still say so after a
+    /// restart. `None` is a store written before this column existed (or a row
+    /// with no name); a name read back without it is reported as the user's,
+    /// which is how a restored name has always been treated.
+    pub name_by: Option<NameSource>,
+}
+
+/// Who set an instance's sidebar name — reported by `hub_instances` as
+/// `name_set_by`, so a peer can tell a role the user assigned ("Deployer") from
+/// a label the instance picked for itself or one Mulpex cut from a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameSource {
+    /// ⌘R, or a ⌘L Load of a save (whose title is kept like a ⌘R name).
+    User,
+    /// The instance's own `hub_set_name`.
+    Instance,
+    /// The label a `hub_spawn` child gets from its task.
+    Spawn,
+    /// A label Mulpex made up: the provisional one for an instance that never
+    /// named itself, or a guide's title on ⌘L Load.
+    Auto,
+}
+
+impl NameSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameSource::User => "user",
+            NameSource::Instance => "instance",
+            NameSource::Spawn => "spawn",
+            NameSource::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<NameSource> {
+        match s {
+            "user" => Some(NameSource::User),
+            "instance" => Some(NameSource::Instance),
+            "spawn" => Some(NameSource::Spawn),
+            "auto" => Some(NameSource::Auto),
+            _ => None,
+        }
+    }
 }
 
 /// The tab-separated flag marking a collapsed family in the store file.
@@ -128,7 +170,7 @@ impl SessionStore {
     /// error, if there is no store yet, or if the recorded project path doesn't
     /// match (guards against a hash collision clobbering another project).
     ///
-    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>]]]]]]`, so every older format
+    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>]]]]]]]`, so every older format
     /// still loads: a bare uuid (before names existed) yields no name and
     /// unmuted, a `<uuid>\t<name>` line (before mute existed) yields unmuted, and
     /// a three-column line (before ids were persisted) yields `id: None` and is
@@ -153,7 +195,7 @@ impl SessionStore {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(|l| {
-                let mut parts = l.splitn(7, '\t');
+                let mut parts = l.splitn(8, '\t');
                 let session_id = parts.next().unwrap_or("").to_string();
                 let name = parts
                     .next()
@@ -165,6 +207,7 @@ impl SessionStore {
                 let parent = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 let collapsed = parts.next().map(str::trim) == Some(COLLAPSED_FLAG);
                 let auto_compact = parts.next().map(str::trim).and_then(|v| v.parse().ok());
+                let name_by = parts.next().map(str::trim).and_then(NameSource::parse);
                 SavedSession {
                     session_id,
                     name,
@@ -173,6 +216,7 @@ impl SessionStore {
                     parent,
                     collapsed,
                     auto_compact,
+                    name_by,
                 }
             })
             .filter(|s| !s.session_id.is_empty())
@@ -180,7 +224,7 @@ impl SessionStore {
     }
 
     /// Persist `sessions` (in order) for this project as
-    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>]]]]]]`. Trailing empty columns are dropped, so
+    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>]]]]]]]`. Trailing empty columns are dropped, so
     /// a store with nothing new in it is written byte-identically to the older
     /// format. Best-effort: any I/O failure is silently ignored.
     pub fn save(&self, sessions: &[SavedSession]) {
@@ -200,6 +244,12 @@ impl SessionStore {
                 .map(|n| n.replace(['\t', '\n', '\r'], " "))
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty());
+            // Only meaningful beside a name; a source with nothing to describe
+            // would just be a non-empty trailing column for nothing.
+            let name_by = match (&name, s.name_by) {
+                (Some(_), Some(by)) => by.as_str().to_string(),
+                _ => String::new(),
+            };
             let mut cols = [
                 name.unwrap_or_default(),
                 if s.muted { MUTED_FLAG.into() } else { String::new() },
@@ -207,6 +257,7 @@ impl SessionStore {
                 s.parent.map(|i| i.to_string()).unwrap_or_default(),
                 if s.collapsed { COLLAPSED_FLAG.into() } else { String::new() },
                 s.auto_compact.map(|p| p.to_string()).unwrap_or_default(),
+                name_by,
             ];
             // Positional columns, so only trailing empties can be dropped — an
             // id with no name still needs its empty name and muted fields
@@ -235,6 +286,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }
     }
 
@@ -243,6 +295,32 @@ mod tests {
             id: Some(id),
             ..saved(uuid, name, muted)
         }
+    }
+
+    /// Who named a row survives a restart, and a store without the column
+    /// still loads (its names report as the user's, upstream in the app).
+    #[test]
+    fn the_name_source_round_trips_and_old_lines_still_load() {
+        let dir = std::env::temp_dir().join(format!("mulpex-nameby-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionStore::in_home(&dir, &dir.join("proj"));
+        let rows = vec![
+            SavedSession { name_by: Some(NameSource::Instance), ..numbered("u1", Some("auth"), false, 1) },
+            SavedSession { name_by: Some(NameSource::Spawn), ..numbered("u2", Some("kid"), false, 2) },
+            // A source with no name is dropped rather than written alone.
+            SavedSession { name_by: Some(NameSource::User), ..numbered("u3", None, false, 3) },
+            numbered("u4", Some("old"), false, 4),
+        ];
+        store.save(&rows);
+        let back = store.load();
+        assert_eq!(back[0].name_by, Some(NameSource::Instance));
+        assert_eq!(back[1].name_by, Some(NameSource::Spawn));
+        assert_eq!(back[2].name_by, None);
+        assert_eq!(back[3].name_by, None);
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(text.lines().any(|l| l == "u3\t\t\t3"), "{text}");
+        assert!(text.lines().any(|l| l == "u4\told\t\t4"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The instance number survives a save/load, including the awkward shapes:

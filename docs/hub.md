@@ -336,6 +336,28 @@ the bug) and was confirmed to fail when the label is inserted into `names`.
 `.name` in `InstanceList.svelte` is line-clamped to 2 like `.task`, because a name is no longer
 always 2-5 words.
 
+### Names are visible to peers (2026-10-11)
+
+Requested by warweb#792 after a real incident: the user made "only the row named *Deployer*
+deploys" a rule, another instance called `hub_instances`, saw no name on any row, concluded no
+Deployer existed, and shipped to production itself. Names were in the registry all along (for
+`other_projects`), just never in the local rows.
+
+- **`hub_instances`** rows carry `name` (null if unnamed) and `name_set_by`: `user` (⌘R, or a ⌘L
+  save's title), `instance` (`hub_set_name`), `spawn` (a `hub_spawn` child's task label), `auto`
+  (the provisional fallback, or a guide's title). `other_projects` rows carry both too. The helper
+  reads them from `registry.json`; the app fills `InstanceEntry::name_by` from `Core::name_source`.
+- **The source is persisted** as an 8th store column (`persist::NameSource`), written only beside
+  a name. A name without it — any store from before this — reports as `user`, matching how
+  `manual_names` has always treated a restored name. Restore *protection* is unchanged: every
+  restored name still refuses `hub_set_name`.
+- **`hub_send` accepts a sidebar name** (`parse_target`): exact, trimmed, case-insensitive, this
+  project only, alone or in a list. The address grammar is tried first, so a name can never
+  shadow `all`, `3` or `claude#3`. Two rows with one name → refused with both addresses; your own
+  name → refused.
+- **The per-turn peer block shows the name** (`claude#1 "Deployer" [working]`) but not its source:
+  that block is paid for on every prompt, the source is one `hub_instances` call away.
+
 ## Sending to a list (`to: ["3", "5"]`)
 
 Added 2026-10-11 because instances used `to: "all"` whenever more than one peer cared, and every

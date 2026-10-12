@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use mulpex_core::persist::{self, SessionStore};
+use mulpex_core::persist::{self, NameSource, SessionStore};
 use mulpex_core::registry;
 
 use crate::pty::{self, Session, SpawnSpec, SpawnTask};
@@ -283,6 +283,10 @@ pub struct Core {
     ///
     /// So it is a display-only overlay, dropped the moment a real name lands.
     fallback_names: HashMap<usize, String>,
+    /// Who set each entry in `names` — reported by `hub_instances` (via the
+    /// registry) as `name_set_by`, and persisted so it survives a restart. A
+    /// name without an entry here is the user's (`name_source`).
+    name_by: HashMap<usize, NameSource>,
     /// Muted instance ids (⌘M), persisted alongside session ids. Presentation
     /// only — a muted instance runs and coordinates exactly like any other; the
     /// frontend just dims it, sorts it last, and leaves it out of the badges.
@@ -424,6 +428,7 @@ impl Core {
         let mut sessions: Vec<Session> = Vec::new();
         let mut worked: HashSet<usize> = HashSet::new();
         let mut names: HashMap<usize, String> = HashMap::new();
+        let mut name_by: HashMap<usize, NameSource> = HashMap::new();
         let mut muted: HashSet<usize> = HashSet::new();
         let mut parents: HashMap<usize, usize> = HashMap::new();
         let mut collapsed: HashSet<usize> = HashSet::new();
@@ -479,6 +484,9 @@ impl Core {
                 started.insert(id, Instant::now());
                 if let Some(name) = saved.name {
                     names.insert(id, name);
+                    if let Some(by) = saved.name_by {
+                        name_by.insert(id, by);
+                    }
                 }
                 if saved.muted {
                     muted.insert(id);
@@ -535,6 +543,7 @@ impl Core {
             // instance is neither nudged to rename itself nor allowed to.
             manual_names: names.keys().copied().collect(),
             names,
+            name_by,
             fallback_names: HashMap::new(),
             muted,
             parents,
@@ -640,6 +649,10 @@ impl Core {
         match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
             Some(name) => {
                 self.names.insert(info.id, name.clone());
+                // A save's title is the user's; a guide's is only Mulpex's
+                // starting label (see `spawn_instance_with_prompt`).
+                let by = if user_owned { NameSource::User } else { NameSource::Auto };
+                self.name_by.insert(info.id, by);
                 if user_owned {
                     self.manual_names.insert(info.id);
                 }
@@ -701,6 +714,7 @@ impl Core {
         let info = SessionInfo { parent, muted, ..info };
         if let Some(name) = name {
             self.names.insert(info.id, name.clone());
+            self.name_by.insert(info.id, NameSource::Spawn);
             return Ok(SessionInfo {
                 name: Some(name),
                 ..info
@@ -1214,10 +1228,12 @@ impl Core {
         self.fallback_names.remove(&id);
         if name.is_empty() {
             self.names.remove(&id);
+            self.name_by.remove(&id);
             self.manual_names.remove(&id);
             self.clear_named(id);
         } else {
             self.names.insert(id, name.to_string());
+            self.name_by.insert(id, NameSource::User);
             self.manual_names.insert(id);
             self.mark_named(id);
         }
@@ -1255,6 +1271,7 @@ impl Core {
             );
             if let NameVerdict::Apply(name) = verdict {
                 self.names.insert(id, name);
+                self.name_by.insert(id, NameSource::Instance);
                 // A real name supersedes anything we guessed for this row.
                 self.fallback_names.remove(&id);
                 changed = true;
@@ -1274,6 +1291,19 @@ impl Core {
             .get(&id)
             .or_else(|| self.fallback_names.get(&id))
             .cloned()
+    }
+
+    /// Who set the label `display_name` returns. A name with no recorded source
+    /// is the user's: that is a store written before the source was saved, and
+    /// treating a restored name as the user's is what Mulpex has always done.
+    fn name_source(&self, id: usize) -> Option<NameSource> {
+        if self.names.contains_key(&id) {
+            Some(self.name_by.get(&id).copied().unwrap_or(NameSource::User))
+        } else if self.fallback_names.contains_key(&id) {
+            Some(NameSource::Auto)
+        } else {
+            None
+        }
     }
 
     /// Give an instance that has finished a turn without naming itself a
@@ -1828,6 +1858,7 @@ impl Core {
                         parent: self.parents.get(&session.id).copied(),
                         collapsed: self.collapsed.contains(&session.id),
                         auto_compact: self.auto_compact.get(&session.id).copied(),
+                        name_by: self.name_by.get(&session.id).copied(),
                     };
                     if !self
                         .sticky
@@ -2478,6 +2509,7 @@ impl Core {
                     .map(|t| t.task.clone())
                     .unwrap_or_default(),
                 name: self.display_name(s.id),
+                name_by: self.name_source(s.id).map(|b| b.as_str().to_string()),
             })
             .collect();
         registry::ProjectEntry {
@@ -2527,6 +2559,7 @@ impl Core {
                 parent: self.parents.get(&s.id).copied(),
                 collapsed: self.collapsed.contains(&s.id),
                 auto_compact: self.auto_compact.get(&s.id).copied(),
+                name_by: self.name_by.get(&s.id).copied(),
             })
             .collect();
         // Records whose session is gone but must not be forgotten — a restore
@@ -3269,6 +3302,7 @@ mod tests {
                         status: "waiting".into(),
                         task: String::new(),
                         name: None,
+                        name_by: None,
                     }],
                 },
                 registry::ProjectEntry {
@@ -3652,6 +3686,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }
     }
 
@@ -3710,6 +3745,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -3757,6 +3793,7 @@ mod tests {
                 parent: None,
                 collapsed: false,
                 auto_compact: None,
+                name_by: None,
             },
             record("copycat", Some(2)),
         ];
@@ -4032,6 +4069,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }]);
         let mut core = Core::open(
             1,
@@ -4231,6 +4269,7 @@ mod tests {
         assert_eq!(core.session_infos()[0].name.as_deref(), Some(task));
         // Once, not on every one of the five ticks a second takes.
         assert!(!core.apply_fallback_names(&snap), "the label churns every tick");
+        assert_eq!(core.name_source(id), Some(NameSource::Auto), "a guess is not reported as a real name");
 
         // It is a display overlay only — the store must stay empty of it, or the
         // next launch would restore it as a name the user chose.
@@ -4248,6 +4287,15 @@ mod tests {
         assert!(core.process_name_requests());
         assert_eq!(core.session_infos()[0].name.as_deref(), Some("brand switcher gate"));
         assert!(!core.fallback_names.contains_key(&id), "the guess outlived the real name");
+        assert_eq!(core.name_source(id), Some(NameSource::Instance));
+        assert_eq!(core.store.load()[0].name_by, Some(NameSource::Instance), "the source must survive a restart");
+        // ⌘R takes it over, and says so.
+        core.rename(id, "Deployer");
+        assert_eq!(core.registry_entry(&snap).instances[0].name_by.as_deref(), Some("user"));
+        assert_eq!(core.store.load()[0].name_by, Some(NameSource::User));
+        core.rename(id, "");
+        assert_eq!(core.name_source(id), None);
+        core.rename(id, "brand switcher gate");
         assert_eq!(
             core.store.load().first().and_then(|s| s.name.clone()).as_deref(),
             Some("brand switcher gate"),
@@ -4872,6 +4920,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }]);
 
         let mut core = Core::open(
@@ -5279,6 +5328,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -5338,6 +5388,7 @@ mod tests {
             parent: None,
             collapsed: false,
             auto_compact: None,
+            name_by: None,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");
