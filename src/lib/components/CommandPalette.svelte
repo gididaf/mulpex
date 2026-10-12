@@ -31,6 +31,7 @@
   } from "../stores";
   import type { Status } from "../ipc";
   import { terminals } from "../terminals";
+  import { hosts, slotOf } from "../hosts";
 
   let {
     onproject,
@@ -103,14 +104,19 @@
     const q = query.trim();
     const out: Row[] = [];
 
+    // Every host's projects: picking one on another host brings that host to
+    // the front with it.
     for (const p of $projects.values()) {
+      const slot = slotOf(p.handle);
+      const host = slot ? $hosts.get(slot) : undefined;
+      const prefix = host ? `◆ ${host.name} ▸ ` : "";
       out.push({
         key: `p${p.handle}`,
         group: "Projects",
-        title: p.name,
-        sub: p.dir,
+        title: prefix + p.name,
+        sub: host && host.state !== "connected" ? `${p.dir} (offline)` : p.dir,
         keys: "",
-        hay: `${p.name} ${p.dir}`,
+        hay: `${host?.name ?? ""} ${p.name} ${p.dir}`,
         current: p.handle === $activeProjectHandle,
         run: () => onproject(p.handle),
       });
@@ -161,6 +167,9 @@
       ["load_session", "Load Session…", "⌘L", true],
       ["import_docs", "Import Docs…", "", true],
       ["remote_control", "Remote Control…", "⌘⇧O", true],
+      ["connect_host", "Connect to Remote Mulpex…", "", true],
+      ["next_host", "Next Host", "⌘⌥]", $hosts.size > 0],
+      ["prev_host", "Previous Host", "⌘⌥[", $hosts.size > 0],
       // Mute is meaningless for a terminal — it produces none of the signals mute
       // silences, and the backend refuses to record the flag (see InstanceList).
       ["mute", cur?.muted ? "Unmute Session" : "Mute Session", "⌘M", isClaude],

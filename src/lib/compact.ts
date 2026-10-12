@@ -23,6 +23,7 @@ import { derived, get, writable } from "svelte/store";
 import { activeProjectHandle, descendantsOf, projects, saveStatusOf } from "./stores";
 import { terminals } from "./terminals";
 import { compactsHeld } from "./checkpoint";
+import { isRemote } from "./hosts";
 import {
   sendBytes,
   setCompactPhase,
@@ -129,6 +130,8 @@ const suppressed = new Set<string>();
 
 /** Apply every auto-compact rule in project `h`. Called on each hub update. */
 export function autoCompactTick(h: ProjectHandle) {
+  // A remote host enforces its own rules, in its own window.
+  if (isRemote(h)) return;
   const p = get(projects).get(h);
   if (!p) return;
   for (const s of p.sessions) suppressedRelease(h, s.id, p.ctx.get(s.id), ruleFor(p.sessions, s.id));
@@ -269,10 +272,18 @@ const AUTO_LABEL: Record<Phase, string> = {
   failed: "didn't run",
 };
 
-/** The active project's compact-request lines, by instance id. */
-export const compactLines = derived([reqs, activeProjectHandle], ([$m, $h]) => {
+/** The active project's compact-request lines, by instance id. A remote host's
+ *  requests run in ITS window, so for its projects the line comes from the
+ *  phase its hub reports (`compactreq/<id>`) instead. */
+export const compactLines = derived([reqs, activeProjectHandle, projects], ([$m, $h, $p]) => {
   const out = new Map<number, { text: string; failed: boolean }>();
   if ($h == null) return out;
+  if (isRemote($h)) {
+    for (const e of $p.get($h)?.hub?.statuses ?? []) {
+      if (e.compact_phase) out.set(e.id, { text: LABEL[e.compact_phase], failed: false });
+    }
+    return out;
+  }
   for (const [k, r] of $m) {
     const [h, id] = parse(k);
     if (h !== $h) continue;

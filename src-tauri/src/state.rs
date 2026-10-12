@@ -49,6 +49,11 @@ pub struct Workspace {
     /// that happens to have no xterms yet must still spawn at the size the
     /// frontend is about to build them at. See `resize_all`.
     pub geometry: (u16, u16),
+    /// The remote desktop driving `geometry` right now, as (device id, name):
+    /// while one is, this window's own resizes are ignored (`resize_terminals`)
+    /// and its xterms follow the lease instead. `None`: this window drives it.
+    /// See `remote/desktop.rs`.
+    pub geometry_owner: Option<(String, String)>,
     /// ⌘⇧Q Checkpoint & Quit: who was asked to stop, and wakes still queued
     /// after a relaunch. See `checkpoint.rs`.
     pub checkpoint: crate::checkpoint::Checkpoint,
@@ -68,6 +73,7 @@ impl Workspace {
             next_handle: 1,
             state_root: std::env::temp_dir().join(format!("mulpex-{}", std::process::id())),
             geometry: (DEFAULT_COLS, DEFAULT_ROWS),
+            geometry_owner: None,
             checkpoint: Default::default(),
         }
     }
@@ -164,6 +170,7 @@ impl Workspace {
             active: self.active,
             cols: self.geometry.0,
             rows: self.geometry.1,
+            geometry_owner: self.geometry_owner.as_ref().map(|(_, name)| name.clone()),
         }
     }
 

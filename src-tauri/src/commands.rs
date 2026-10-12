@@ -100,9 +100,17 @@ pub fn switch_project(state: State<AppState>, project_handle: ProjectHandle) {
 /// Commit a new tab order after the user drags a project tab. `handles` is the
 /// full left-to-right order; the backend is the source of truth for persistence,
 /// so this also rewrites `open.txt` (see `Workspace::reorder_projects`).
+///
+/// Emits `projects-changed` like open/close do: a remote desktop can reorder
+/// this Mulpex's tabs too (`remote/rpc.rs`), and this window has to follow.
 #[tauri::command]
-pub fn reorder_projects(state: State<AppState>, handles: Vec<ProjectHandle>) {
-    state.ws.lock().unwrap().reorder_projects(&handles);
+pub fn reorder_projects(state: State<AppState>, app: AppHandle, handles: Vec<ProjectHandle>) {
+    let wsinfo = {
+        let mut ws = state.ws.lock().unwrap();
+        ws.reorder_projects(&handles);
+        ws.workspace_info()
+    };
+    let _ = app.emit("projects-changed", wsinfo);
 }
 
 /// Bind a session's frontend terminal channel: flush any pre-attach output, then
@@ -167,15 +175,24 @@ pub fn close_session(
 /// installed skill) without the user losing the conversation, the instance number
 /// or its undelivered mail. Refuses — killing nothing — when that instance has no
 /// transcript to resume yet; the frontend shows the reason.
+///
+/// Emits `session-restarted`: whichever window asked (this one, or a remote
+/// desktop through `remote/rpc.rs`), every frontend holding an xterm for the
+/// row rebinds it to the new PTY from that one event.
 #[tauri::command]
 pub fn restart_session(
     state: State<AppState>,
+    app: AppHandle,
     project_handle: ProjectHandle,
     id: usize,
 ) -> Result<(), String> {
-    let mut ws = state.ws.lock().unwrap();
-    let core = ws.project_mut(project_handle).ok_or("no such project")?;
-    core.restart_instance(id).map_err(|e| e.to_string())
+    {
+        let mut ws = state.ws.lock().unwrap();
+        let core = ws.project_mut(project_handle).ok_or("no such project")?;
+        core.restart_instance(id).map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("session-restarted", crate::snapshot::SessionExited { handle: project_handle, id });
+    Ok(())
 }
 
 /// Commit a new sidebar order after the user drags a session row. `ids` is the
@@ -245,9 +262,13 @@ pub fn get_pins(
 }
 
 /// Save (`Some`, the whole list) or remove (`None`) one instance's pins.
+///
+/// Emits `pins-changed`, so a pin added from a remote desktop reaches this
+/// window's panel (and the other way round).
 #[tauri::command]
 pub fn set_pin(
     state: State<AppState>,
+    app: AppHandle,
     project_handle: ProjectHandle,
     id: usize,
     pin: Option<serde_json::Value>,
@@ -255,6 +276,7 @@ pub fn set_pin(
     if let Some(core) = state.ws.lock().unwrap().project(project_handle) {
         core.pin_store().set(id, pin);
     }
+    let _ = app.emit("pins-changed", crate::snapshot::SessionExited { handle: project_handle, id });
 }
 
 /// Mute or unmute a session (⌘M / the sidebar's 🔇). Presentation only — the
@@ -331,9 +353,77 @@ pub fn send_bytes(
 /// its next session there and hand the frontend a PTY whose emulator is a
 /// different shape — which corrupts the session permanently, not transiently
 /// (see `WorkspaceInfo::cols`).
+///
+/// Ignored while a remote desktop holds the geometry lease (`Workspace::
+/// geometry_owner`): it is driving every PTY at its own window's size, and this
+/// window shows those panes at that size until the user takes it back.
 #[tauri::command]
 pub fn resize_terminals(state: State<AppState>, cols: u16, rows: u16) {
-    state.ws.lock().unwrap().resize_all(cols, rows);
+    let mut ws = state.ws.lock().unwrap();
+    if ws.geometry_owner.is_none() {
+        ws.resize_all(cols, rows);
+    }
+}
+
+/// "Take back" on the banner a remote desktop's lease puts up: this window's
+/// own size wins again (until the remote desktop claims it again — its window
+/// regaining focus does). The frontend refits right after, which resizes.
+#[tauri::command]
+pub fn geometry_take_back(state: State<AppState>, app: AppHandle) {
+    let geo = {
+        let mut ws = state.ws.lock().unwrap();
+        ws.geometry_owner = None;
+        ws.geometry
+    };
+    emit_geometry(&app, geo, None);
+}
+
+/// Tell this window the PTYs' geometry and who drives it (`None`: itself).
+pub fn emit_geometry(app: &AppHandle, geo: (u16, u16), owner: Option<String>) {
+    let _ = app.emit(
+        "geometry-changed",
+        serde_json::json!({"cols": geo.0, "rows": geo.1, "owner": owner}),
+    );
+}
+
+/// One folder's subfolders, for opening a project on this machine from a
+/// remote desktop (it has no native folder dialog onto this disk). An empty
+/// `path` means the home folder.
+#[derive(serde::Serialize)]
+pub struct DirListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub dirs: Vec<String>,
+}
+
+#[tauri::command]
+pub fn browse_dir(path: String) -> Result<DirListing, String> {
+    let path = if path.trim().is_empty() {
+        std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    } else {
+        path
+    };
+    let dir = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut dirs: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    dirs.sort_by_key(|n| n.to_lowercase());
+    Ok(DirListing {
+        parent: dir.parent().map(|p| p.display().to_string()),
+        path: dir.display().to_string(),
+        dirs,
+    })
+}
+
+/// The frontend's answer to a `host-serialize` (`remote/desktop.rs`): one
+/// xterm's screen and scrollback, serialized at stream offset `offset`.
+#[tauri::command]
+pub fn remote_snapshot_reply(rid: String, data: Option<String>, offset: u64, cols: u16, rows: u16) {
+    crate::remote::snapshot_reply(&rid, data, offset, cols, rows);
 }
 
 /// Set the focused instance (⌘1–9 / ⌘[ ⌘] / sidebar click); also makes its project
@@ -770,4 +860,40 @@ pub fn load_save(
         crate::saves::link("loaded", &s.session_id, &dir, &path);
     }
     Ok(LoadResult { info, existing: false })
+}
+
+/// Headless testing (`docs/remote-hosts.md`): with `MULPEX_DEBUG_DUMP` set, the
+/// frontend writes every pane's buffer to `<mulpex home>/dump/`, so a run with
+/// its window hidden can still be checked. A no-op otherwise.
+#[tauri::command]
+pub fn debug_dump_enabled() -> bool {
+    std::env::var_os("MULPEX_DEBUG_DUMP").is_some()
+}
+
+/// Headless testing: the next UI action a test left in `<mulpex home>/drive/`
+/// (`scripts/test-remote-hosts.sh`), oldest first, taken off the queue.
+#[tauri::command]
+pub fn debug_drive_take() -> Option<String> {
+    if !debug_dump_enabled() {
+        return None;
+    }
+    let dir = mulpex_core::mulpex_home().join("drive");
+    let mut files: Vec<_> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json")).collect();
+    files.sort();
+    let f = files.into_iter().next()?;
+    let body = std::fs::read_to_string(&f).ok();
+    let _ = std::fs::remove_file(&f);
+    body
+}
+
+#[tauri::command]
+pub fn debug_dump(name: String, text: String) {
+    if !debug_dump_enabled() {
+        return;
+    }
+    let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let dir = mulpex_core::mulpex_home().join("dump");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("{name}.txt")), text);
 }

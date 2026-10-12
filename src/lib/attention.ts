@@ -22,6 +22,7 @@ import {
 import { projects, blockedTotal, type ProjectState } from "./stores";
 import type { ProjectHandle } from "./ipc";
 import { IS_LINUX } from "./platform";
+import { hostName, slotOf } from "./hosts";
 
 /** Jump the UI to one claude — App.svelte passes its own select path in. */
 export type Reveal = (handle: ProjectHandle, id: number) => void;
@@ -36,6 +37,14 @@ let blocked = new Set<string>();
  *  one would bury the live event we actually care about under stale ones. */
 let primed = false;
 let granted = false;
+/** Remote hosts just (re)connected, until when: what already needs you there
+ *  is recorded, not announced — the priming pass, per host. */
+const quiet = new Map<number, number>();
+
+/** Treat host `slot`'s next `ms` of updates as priming (`remoteHosts.ts`). */
+export function quietHost(slot: number, ms: number) {
+  quiet.set(slot, Date.now() + ms);
+}
 
 /** One instance's ask, resolved to display strings. */
 interface Ask {
@@ -50,11 +59,14 @@ function describe(p: ProjectState, id: number, name: string | null): Ask {
   // line distinguishes them. Unnamed instances fall back to their hub id.
   const who = name ?? `#${id}`;
   const task = p.tasks.get(id)?.trim();
+  // A remote host's claude says which machine it is on.
+  const slot = slotOf(p.handle);
+  const where = slot ? `${hostName(slot)} ▸ ${p.name}` : p.name;
   return {
     handle: p.handle,
     id,
     title: `${who} needs you`,
-    body: task ? `${p.name} · ${task}` : p.name,
+    body: task ? `${where} · ${task}` : where,
   };
 }
 
@@ -74,7 +86,8 @@ function collect(m: Map<ProjectHandle, ProjectState>): Ask[] {
       if (p.statuses.get(s.id) !== "needs") continue;
       const k = keyOf(p.handle, s.id);
       next.add(k);
-      if (!blocked.has(k)) fresh.push(describe(p, s.id, s.name));
+      const hush = (quiet.get(slotOf(p.handle)) ?? 0) > Date.now();
+      if (!blocked.has(k) && !hush) fresh.push(describe(p, s.id, s.name));
     }
   }
   const priming = !primed;

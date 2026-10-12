@@ -19,8 +19,12 @@ import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@tauri-apps/api/core";
 import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
+import { slotOf, hostClipboardImage } from "./hosts";
+import { pastePaths } from "./paths";
 import type { SessionKind } from "./ipc";
 import { readPromptBox } from "./promptbox";
 import type { PromptBox } from "./promptbox";
@@ -72,7 +76,24 @@ interface Entry {
   term: Terminal;
   fit: FitAddon;
   container: HTMLElement;
+  /** The remote host this pane mirrors (`hosts.ts`), or 0 for a local one. A
+   *  mirror's size follows its host's stream, never this window's refit. */
+  slot: number;
+  /** Local panes: bytes handed to `term.write` since attach — the stream
+   *  offset a serialized screen corresponds to (`serialize`). */
+  received: number;
+  ser: SerializeAddon;
 }
+
+/** One frame of a remote pane's stream (`client.rs::on_message`). */
+type MirrorFrame =
+  | { t: "snap"; d: string; cols: number; rows: number; partial: boolean }
+  | { t: "o"; d: string }
+  | { t: "r"; cols: number; rows: number }
+  | { t: "gone" };
+
+/** How much scrollback a remote host's snapshot of a pane carries. */
+const SNAPSHOT_SCROLLBACK = 2000;
 
 /** Composite key: instance ids are per-project, so (handle, id) disambiguates. */
 function keyOf(handle: number, id: number): string {
@@ -84,6 +105,17 @@ class TerminalManager {
   private activeKey: string | null = null;
   private cols = 80;
   private rows = 24;
+  /** A remote desktop drives this Mulpex's geometry (`geometry-changed`):
+   *  every local xterm stays at this size whatever the pane measures. */
+  private lock: { cols: number; rows: number } | null = null;
+  /** The pane has been measured at least once — until then `cols`/`rows` are
+   *  the backend's spawn default, not this window's size. */
+  private measured = false;
+  /** Each remote host's PTY size, for building a mirror before its first frame. */
+  private hostGeo = new Map<number, { cols: number; rows: number }>();
+  /** Told this window's pane size whenever it changes (`remoteHosts.ts` passes
+   *  it on to the hosts whose geometry this Mulpex drives). */
+  onGeometry: ((cols: number, rows: number) => void) | null = null;
 
   /** Adopt the geometry the backend spawned every PTY at, before any terminal is
    *  built. Called once from `bootstrap()`; after that `refit` owns the value and
@@ -101,6 +133,55 @@ class TerminalManager {
     return this.entries.has(keyOf(handle, id));
   }
 
+  /** This window's pane size, as last measured. */
+  geometry(): { cols: number; rows: number } | null {
+    return this.measured ? { cols: this.cols, rows: this.rows } : null;
+  }
+
+  setHostGeo(slot: number, cols: number, rows: number): void {
+    if (cols >= 1 && rows >= 1) this.hostGeo.set(slot, { cols, rows });
+  }
+
+  /** Hold every local xterm at a remote desktop's size (`null`: back to the
+   *  pane's). Releasing refits at once, which resizes every PTY back. */
+  setLock(geo: { cols: number; rows: number } | null): void {
+    this.lock = geo;
+    if (geo) {
+      this.cols = geo.cols;
+      this.rows = geo.rows;
+      for (const e of this.entries.values()) {
+        if (!e.slot && (e.term.cols !== geo.cols || e.term.rows !== geo.rows)) e.term.resize(geo.cols, geo.rows);
+      }
+    } else {
+      this.refit(true);
+    }
+  }
+
+  /** (handle, id)'s screen and scrollback, serialized — for a remote desktop
+   *  starting to mirror it (`remote/desktop.rs`). `offset` is the stream
+   *  position it shows: taken before an empty write that xterm processes in
+   *  order, so by its callback every byte up to `offset` is on screen. */
+  serialize(handle: number, id: number): Promise<{ data: string; offset: number; cols: number; rows: number } | null> {
+    const e = this.entries.get(keyOf(handle, id));
+    if (!e || e.slot) return Promise.resolve(null);
+    const offset = e.received;
+    return new Promise((resolve) => {
+      e.term.write("", () => {
+        try {
+          const data = e.ser.serialize({ scrollback: SNAPSHOT_SCROLLBACK });
+          resolve({ data, offset, cols: e.term.cols, rows: e.term.rows });
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  /** Every pane mirroring host `slot`. */
+  mirrorsOf(slot: number): { handle: number; id: number }[] {
+    return [...this.entries.values()].filter((e) => e.slot === slot).map((e) => ({ handle: e.handle, id: e.id }));
+  }
+
   /** Create the xterm for (handle, id) inside `container` and bind its PTY stream.
    *  `kind` gates only the Shift+Enter carve-out below — everything else is one
    *  code path for both kinds, deliberately (the DOM-renderer / no-WebGL rule
@@ -113,6 +194,12 @@ class TerminalManager {
   ): void {
     const key = keyOf(handle, id);
     if (this.entries.has(key)) return;
+    const slot = slotOf(handle);
+    // A mirror starts at its host's size; its first frame (`snap`) sets it
+    // exactly, before a single byte is written.
+    const geo = slot
+      ? (this.hostGeo.get(slot) ?? { cols: this.cols, rows: this.rows })
+      : { cols: this.cols, rows: this.rows };
 
     // `cols`/`rows`, NOT xterm's 80x24 default. This terminal is about to be
     // attached, and `attach_session` flushes everything the PTY has produced so
@@ -133,8 +220,8 @@ class TerminalManager {
     // is fully self-healing (claude repaints everything on SIGWINCH), which is
     // why keeping the sizes equal AT ATTACH TIME is the whole fix.
     const term = new Terminal({
-      cols: this.cols,
-      rows: this.rows,
+      cols: geo.cols,
+      rows: geo.rows,
       scrollback: 10000,
       macOptionIsMeta: true,
       allowProposedApi: true,
@@ -146,6 +233,8 @@ class TerminalManager {
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    const ser = new SerializeAddon();
+    term.loadAddon(ser);
     term.loadAddon(
       new WebLinksAddon((_e, uri) => {
         openUrl(uri).catch(() => {});
@@ -180,10 +269,24 @@ class TerminalManager {
     //
     // On Linux every kind gets a handler as well: a Super chord is a Mulpex
     // shortcut there (lib/linuxKeys.ts), never input, so xterm must not encode it.
+    // Ctrl+V in a remote claude: Claude Code would read the clipboard of the
+    // machine IT runs on. The image on this Mac's clipboard goes there first
+    // and its path is pasted; with no image, the Ctrl+V goes through as is.
+    const isImagePaste = (e: KeyboardEvent): boolean =>
+      slot > 0 && kind === "claude" && e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyV";
     if (kind === "claude" || IS_LINUX) {
       term.attachCustomKeyEventHandler((e) => {
         if (IS_LINUX && isSuper(e)) return false;
         if (kind !== "claude") return true;
+        if (isImagePaste(e)) {
+          if (e.type === "keydown") {
+            e.preventDefault();
+            hostClipboardImage(slot)
+              .then((path) => sendBytes(handle, id, path ? pastePaths([path]) : new Uint8Array([0x16])))
+              .catch(() => sendBytes(handle, id, new Uint8Array([0x16])));
+          }
+          return false;
+        }
         if (e.type === "keydown" && isNewlineKey(e)) {
           e.preventDefault();
           e.stopPropagation();
@@ -195,12 +298,44 @@ class TerminalManager {
       });
     }
 
-    // PTY output arrives base64-chunked over this session's channel.
-    const channel = new Channel<string>();
-    channel.onmessage = (chunk) => term.write(b64ToBytes(chunk));
-    attachSession(handle, id, channel);
-
-    const entry: Entry = { handle, id, term, fit, container };
+    const entry: Entry = { handle, id, term, fit, container, slot, received: 0, ser };
+    if (slot) {
+      // A remote host's pane: its screen, then every byte and resize after it,
+      // in the order they happened there (`remote/desktop.rs`).
+      const channel = new Channel<MirrorFrame>();
+      // A resize reflows the scrollback, and xterm can leave the view
+      // scrolled up afterwards; a mirror that was following the bottom keeps
+      // following it. Queued behind the writes, so it runs in stream order.
+      const resize = (cols: number, rows: number) =>
+        term.write("", () => {
+          if (term.cols === cols && term.rows === rows) return;
+          const buf = term.buffer.active;
+          const atBottom = buf.viewportY >= buf.baseY;
+          term.resize(cols, rows);
+          if (atBottom) term.scrollToBottom();
+        });
+      channel.onmessage = (f) => {
+        if (f.t === "snap") {
+          term.reset();
+          if (term.cols !== f.cols || term.rows !== f.rows) term.resize(f.cols, f.rows);
+          term.write(b64ToBytes(f.d), () => term.scrollToBottom());
+        } else if (f.t === "o") {
+          term.write(b64ToBytes(f.d));
+        } else if (f.t === "r") {
+          resize(f.cols, f.rows);
+        }
+      };
+      void invoke("host_attach", { host: slot, projectHandle: handle, id, channel });
+    } else {
+      // PTY output arrives base64-chunked over this session's channel.
+      const channel = new Channel<string>();
+      channel.onmessage = (chunk) => {
+        const bytes = b64ToBytes(chunk);
+        entry.received += bytes.length;
+        term.write(bytes);
+      };
+      attachSession(handle, id, channel);
+    }
     this.entries.set(key, entry);
     container.style.visibility = key === this.activeKey ? "visible" : "hidden";
   }
@@ -234,10 +369,15 @@ class TerminalManager {
    *  buffers a session's bytes until something attaches. */
   reattach(handle: number, id: number): void {
     const e = this.entries.get(keyOf(handle, id));
-    if (!e) return;
+    if (!e || e.slot) return;
     e.term.reset();
+    e.received = 0;
     const channel = new Channel<string>();
-    channel.onmessage = (chunk) => e.term.write(b64ToBytes(chunk));
+    channel.onmessage = (chunk) => {
+      const bytes = b64ToBytes(chunk);
+      e.received += bytes.length;
+      e.term.write(bytes);
+    };
     attachSession(handle, id, channel);
   }
 
@@ -245,6 +385,7 @@ class TerminalManager {
     const key = keyOf(handle, id);
     const e = this.entries.get(key);
     if (!e) return;
+    if (e.slot) void invoke("host_detach", { host: e.slot, projectHandle: handle, id }).catch(() => {});
     e.term.dispose();
     this.entries.delete(key);
   }
@@ -274,7 +415,16 @@ class TerminalManager {
    * on a pane-size change — so a newly opened instance (whose xterm starts at the
    * 80×24 default while its PTY spawned at another size) gets corrected too;
    * otherwise Claude draws at one width and xterm shows another (garbled wrap). */
-  refit(): void {
+  refit(force = false): void {
+    if (this.lock) {
+      // A remote desktop drives the size: local panes stay at it, and nothing
+      // here may resize a PTY.
+      const { cols, rows } = this.lock;
+      for (const e of this.entries.values()) {
+        if (!e.slot && (e.term.cols !== cols || e.term.rows !== rows)) e.term.resize(cols, rows);
+      }
+      return;
+    }
     const active = this.activeKey
       ? this.entries.get(this.activeKey)
       : undefined;
@@ -289,10 +439,15 @@ class TerminalManager {
     ) {
       return;
     }
-    let resized = dims.cols !== this.cols || dims.rows !== this.rows;
+    const first = !this.measured;
+    this.measured = true;
+    const changed = dims.cols !== this.cols || dims.rows !== this.rows || first;
+    let resized = changed || force;
     this.cols = dims.cols;
     this.rows = dims.rows;
     for (const e of this.entries.values()) {
+      // A mirror is sized by its host's stream (`create`), never from here.
+      if (e.slot) continue;
       if (e.term.cols !== this.cols || e.term.rows !== this.rows) {
         e.term.resize(this.cols, this.rows);
         resized = true;
@@ -303,6 +458,7 @@ class TerminalManager {
     // including background projects. All PTYs share this one geometry; resize each
     // open project's sessions (one backend call per distinct project handle).
     if (resized) resizeTerminals(this.cols, this.rows);
+    if (changed || force) this.onGeometry?.(this.cols, this.rows);
   }
 
   /** Whether (handle, id)'s claude input box is empty, holds a draft, or can't
@@ -377,6 +533,25 @@ class TerminalManager {
   selectAllActive(): void {
     const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
     e?.term.selectAll();
+  }
+
+  /** Every pane's buffer as text, with its size and scroll position — the
+   *  headless-test dump (`App.svelte`, `debug_dump`). */
+  dumpAll(): { key: string; text: string }[] {
+    return [...this.entries.values()].map((e) => {
+      const b = e.term.buffer.active;
+      const lines: string[] = [];
+      for (let i = 0; i < b.length; i++) lines.push(b.getLine(i)?.translateToString(true) ?? "");
+      const head = `cols=${e.term.cols} rows=${e.term.rows} viewportY=${b.viewportY} baseY=${b.baseY} slot=${e.slot} received=${e.received}`;
+      return { key: `${e.handle}-${e.id}`, text: `${head}\n${lines.join("\n")}` };
+    });
+  }
+
+  /** Headless testing: type into the focused pane exactly as a keyboard
+   *  would — through xterm, so its `onData` handler sends it. */
+  inputActive(text: string): void {
+    const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
+    e?.term.input(text, true);
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

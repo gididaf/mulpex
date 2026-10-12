@@ -3,6 +3,7 @@
   import type { RemoteStatus } from "../ipc";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { remoteRevokeDevice, remoteSetEnabled, remoteSetRelayUrl, remoteStatus } from "../ipc";
+  import { IS_LINUX } from "../platform";
 
   // ⌘⇧O: turn Remote Control on or off and pair a phone (`remote.rs`). The
   // status is live — `remote-changed` fires on every connect, drop and join.
@@ -29,10 +30,32 @@
     };
   });
 
-  async function revoke(id: string, name: string) {
-    if (!(await confirm(`Remove ${name}? It will need a new QR scan to connect again.`, { title: "Remove phone", kind: "warning" })))
+  async function revoke(id: string, name: string, kind: string) {
+    const what = kind === "desktop" ? "computer" : "phone";
+    const again = kind === "desktop" ? "a new pairing link" : "a new QR scan";
+    if (!(await confirm(`Remove ${name}? It will need ${again} to connect again.`, { title: `Remove ${what}`, kind: "warning" })))
       return;
     st = await remoteRevokeDevice(id);
+  }
+
+  /** The pairing link, for another Mulpex (File ▸ Connect to Remote Mulpex…):
+   *  the QR code's own link, one use, 10 minutes. On Linux through the
+   *  clipboard plugin — WebKitGTK's own clipboard API can't be relied on. */
+  let copied = $state(false);
+  async function copyLink() {
+    if (!st?.pair_url) return;
+    try {
+      if (IS_LINUX) {
+        const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+        await writeText(st.pair_url);
+      } else {
+        await navigator.clipboard.writeText(st.pair_url);
+      }
+      copied = true;
+      setTimeout(() => (copied = false), 2000);
+    } catch (e) {
+      error = `Couldn't copy: ${e}`;
+    }
   }
 
   const since = (secs: number) => new Date(secs * 1000).toLocaleDateString();
@@ -107,15 +130,22 @@
           To add a phone, scan this. Each code works once, for 10 minutes.
           {#if st.devices.length > 0}Phones already added just open the page again.{/if}
         </div>
+        <div class="row link">
+          <button onclick={copyLink}>{copied ? "Copied ✓" : "Copy link"}</button>
+          <span class="muted">To drive this Mulpex from another one: paste it there in File ▸ Connect to Remote Mulpex… (once, within 10 minutes).</span>
+        </div>
       {/if}
 
       {#if st.devices.length > 0}
-        <div class="label sub">Phones</div>
+        <div class="label sub">Paired</div>
         {#each st.devices as d (d.id)}
           <div class="row device">
             <span class="dot {d.online ? 'connected' : ''}"></span>
-            <span class="state">{d.name}{#if d.push} 🔔{/if} <span class="muted">· added {since(d.added)}</span></span>
-            <button onclick={() => revoke(d.id, d.name)}>Remove</button>
+            <span class="state"
+              >{d.kind === "desktop" ? "💻" : "📱"} {d.name}{#if d.push} 🔔{/if}
+              <span class="muted">· added {since(d.added)}</span></span
+            >
+            <button onclick={() => revoke(d.id, d.name, d.kind)}>Remove</button>
           </div>
         {/each}
       {/if}
@@ -233,6 +263,13 @@
   }
   .device {
     margin-bottom: 0.35rem;
+  }
+  .link {
+    margin-top: 0.7rem;
+    align-items: flex-start;
+  }
+  .link button {
+    flex: none;
   }
   .muted {
     color: var(--label);

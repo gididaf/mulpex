@@ -2,6 +2,21 @@
 // `snapshot.rs` types and `commands.rs` handlers.
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { slotOf } from "./hosts";
+
+/**
+ * Every command goes through here. A remote project's handle (`hosts.ts`)
+ * sends the call to that host instead — the same command, run there by
+ * `remote/rpc.rs`, with the handle translated on the way (`client.rs`) — so
+ * no caller has to know whether a project is local. `host` routes a call that
+ * names no project (recents, a secrets set by name) to a given host.
+ */
+function call<T>(cmd: string, args: Record<string, unknown> = {}, host?: number): Promise<T> {
+  const h = args.projectHandle;
+  const slot = host ?? (typeof h === "number" ? slotOf(h) : 0);
+  if (slot > 0) return invoke<T>("host_invoke", { host: slot, cmd, args });
+  return invoke<T>(cmd, args);
+}
 
 export type Status = "working" | "waiting" | "needs";
 
@@ -107,6 +122,8 @@ export interface WorkspaceInfo {
    *  this size before they are attached — see `terminals.ts::create`. */
   cols: number;
   rows: number;
+  /** The remote desktop driving that geometry, or null when this window does. */
+  geometry_owner?: string | null;
 }
 
 export interface ClaudeStatus {
@@ -149,13 +166,22 @@ export interface SessionExitedEvent {
 }
 
 /** Every open project + active handle, for the initial paint. */
-export const bootstrap = () => invoke<WorkspaceInfo>("bootstrap");
+export const bootstrap = (host = 0) => call<WorkspaceInfo>("bootstrap", {}, host);
 
-export const listRecentProjects = () =>
-  invoke<string[]>("list_recent_projects");
+export const listRecentProjects = (host = 0) =>
+  call<string[]>("list_recent_projects", {}, host);
 
 /** Whether the user's `claude` CLI was found (checked once, at startup). */
-export const claudeStatus = () => invoke<ClaudeStatus>("claude_status");
+export const claudeStatus = (host = 0) => call<ClaudeStatus>("claude_status", {}, host);
+
+/** One folder's subfolders on `host` — the remote project picker's browser
+ *  (a remote disk has no native folder dialog). Empty `path`: the home folder. */
+export interface DirListing {
+  path: string;
+  parent: string | null;
+  dirs: string[];
+}
+export const browseDir = (path: string, host: number) => call<DirListing>("browse_dir", { path }, host);
 
 /** Whether Mulpex has Full Disk Access (applies only after a relaunch). */
 export const hasFullDiskAccess = () => invoke<boolean>("has_full_disk_access");
@@ -165,21 +191,23 @@ export const openFullDiskAccessSettings = () =>
   invoke<void>("open_full_disk_access_settings");
 
 /** Open (or re-activate) a project; returns its bootstrap info. */
-export const openProject = (path: string) =>
-  invoke<BootstrapInfo>("open_project", { path });
+export const openProject = (path: string, host = 0) =>
+  call<BootstrapInfo>("open_project", { path }, host);
 
 /** Close a project (kills its sessions); returns the new workspace. */
 export const closeProject = (projectHandle: ProjectHandle) =>
-  invoke<WorkspaceInfo>("close_project", { projectHandle });
+  call<WorkspaceInfo>("close_project", { projectHandle });
 
 /** Make a project the active one on the backend. */
-export const switchProject = (projectHandle: ProjectHandle) =>
-  invoke<void>("switch_project", { projectHandle });
+export const switchProject = async (projectHandle: ProjectHandle) => {
+  // A remote host's own window picks what it shows; never moved from here.
+  if (slotOf(projectHandle) === 0) await invoke<void>("switch_project", { projectHandle });
+};
 
 /** Commit a new tab order after a drag. The backend persists it to `open.txt`,
  *  so the arrangement survives relaunch (and ⌘1–⌘9 follow it). */
 export const reorderProjects = (handles: ProjectHandle[]) =>
-  invoke<void>("reorder_projects", { handles });
+  call<void>("reorder_projects", { handles }, handles.length ? slotOf(handles[0]) : 0);
 
 /** Bind a session's PTY output stream (base64 chunks) to its xterm. */
 export const attachSession = (
@@ -189,15 +217,15 @@ export const attachSession = (
 ) => invoke<void>("attach_session", { projectHandle, id, channel });
 
 export const createSession = (projectHandle: ProjectHandle) =>
-  invoke<SessionInfo>("create_session", { projectHandle });
+  call<SessionInfo>("create_session", { projectHandle });
 
 /** Open a plain shell terminal (⌘⇧T) in the project dir. */
 export const createTerminal = (projectHandle: ProjectHandle) =>
-  invoke<SessionInfo>("create_terminal", { projectHandle });
+  call<SessionInfo>("create_terminal", { projectHandle });
 
 /** Rejects with the reason while a ⌘S save of that row is running. */
 export const closeSession = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("close_session", { projectHandle, id });
+  call<void>("close_session", { projectHandle, id });
 
 /** Restart one claude in place (⌘⇧R): the backend kills it and relaunches on the
  *  same row with `--resume`, so it re-reads its environment while keeping its
@@ -206,13 +234,13 @@ export const closeSession = (projectHandle: ProjectHandle, id: number) =>
  *  The PTY behind the row is a different process afterwards, so the pane has to
  *  be rebound with `terminals.reattach`. */
 export const restartSession = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("restart_session", { projectHandle, id });
+  call<void>("restart_session", { projectHandle, id });
 
 /** Commit a new sidebar order after a session-row drag. The backend persists it
  *  to the session store, so the arrangement survives relaunch (and ⌘[ / ⌘]
  *  follow it). */
 export const reorderSessions = (projectHandle: ProjectHandle, ids: number[]) =>
-  invoke<void>("reorder_sessions", { projectHandle, ids });
+  call<void>("reorder_sessions", { projectHandle, ids });
 
 /** Drag-to-nest: move a claude (with its family) under `parent`, or to the top
  *  level with `null`, committing the sidebar order `ids` with it. Resolves
@@ -222,57 +250,65 @@ export const reparentSession = (
   id: number,
   parent: number | null,
   ids: number[],
-) => invoke<boolean>("reparent_session", { projectHandle, id, parent, ids });
+) => call<boolean>("reparent_session", { projectHandle, id, parent, ids });
 
 export const renameSession = (
   projectHandle: ProjectHandle,
   id: number,
   name: string,
-) => invoke<void>("rename_session", { projectHandle, id, name });
+) => call<void>("rename_session", { projectHandle, id, name });
 
 /** Fold/unfold a row's `hub_spawn` family in the sidebar; persists. */
 export const setSessionCollapsed = (
   projectHandle: ProjectHandle,
   id: number,
   collapsed: boolean,
-) => invoke<void>("set_session_collapsed", { projectHandle, id, collapsed });
+) => call<void>("set_session_collapsed", { projectHandle, id, collapsed });
 
 /** Set or (null) clear a row's auto-compact rule; persists, and the backend
  *  tells that claude once. False if nothing changed. */
 export const setAutoCompact = (projectHandle: ProjectHandle, id: number, pct: number | null) =>
-  invoke<boolean>("set_auto_compact", { projectHandle, id, pct });
+  call<boolean>("set_auto_compact", { projectHandle, id, pct });
 
 /** Mute/unmute a session (⌘M or the sidebar 🔇); persists across restarts. */
 export const setSessionMuted = (
   projectHandle: ProjectHandle,
   id: number,
   muted: boolean,
-) => invoke<void>("set_session_muted", { projectHandle, id, muted });
+) => call<void>("set_session_muted", { projectHandle, id, muted });
 
 /** The project's saved ⌘⇧P pins, by instance id (`pins.rs`). Pin data is the
  *  frontend's own (`pins.ts`); the backend stores it opaque. */
 export const getPins = (projectHandle: ProjectHandle) =>
-  invoke<Record<string, unknown>>("get_pins", { projectHandle });
+  call<Record<string, unknown>>("get_pins", { projectHandle });
 
 export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | null) =>
-  invoke<void>("set_pin", { projectHandle, id, pin });
+  call<void>("set_pin", { projectHandle, id, pin });
 
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>
   invoke<void>("set_mute_menu_checked", { checked });
 
 /** ⌘⇧K: set or (null) clear claude#id's compact-request phase on disk. */
-export const setCompactPhase = (
+export const setCompactPhase = async (
   projectHandle: ProjectHandle,
   id: number,
   phase: CompactPhase | null,
-) => invoke<void>("set_compact_phase", { projectHandle, id, phase });
+) => {
+  // A remote host's ⌘⇧K runs in its own window (`compact.ts` there).
+  if (slotOf(projectHandle) === 0) await invoke<void>("set_compact_phase", { projectHandle, id, phase });
+};
 
+/** Keystrokes for a session; a remote one's go straight to its host's PTY. */
 export const sendBytes = (
   projectHandle: ProjectHandle,
   id: number,
   data: Uint8Array,
-) => invoke<void>("send_bytes", { projectHandle, id, data });
+) => {
+  const slot = slotOf(projectHandle);
+  if (slot > 0) return invoke<void>("host_input", { host: slot, projectHandle, id, data: Array.from(data) });
+  return invoke<void>("send_bytes", { projectHandle, id, data });
+};
 
 export interface SecretRow {
   key: string;
@@ -284,7 +320,7 @@ export const secretsCreateEphemeral = (
   projectHandle: ProjectHandle,
   id: number,
   rows: SecretRow[],
-) => invoke<string>("secrets_create_ephemeral", { projectHandle, id, rows });
+) => call<string>("secrets_create_ephemeral", { projectHandle, id, rows });
 
 /** A saved set as listed: never its values. */
 export interface SavedSet {
@@ -295,7 +331,7 @@ export interface SavedSet {
 
 /** Saved sets usable in this project (untagged ones + this project's). */
 export const secretsList = (projectHandle: ProjectHandle) =>
-  invoke<SavedSet[]>("secrets_list", { projectHandle });
+  call<SavedSet[]>("secrets_list", { projectHandle });
 
 /** Save a new set and, if `send`, hand it to claude#id; resolves to its keys. */
 export const secretsSave = (
@@ -305,11 +341,11 @@ export const secretsSave = (
   projectOnly: boolean,
   rows: SecretRow[],
   send: boolean,
-) => invoke<string[]>("secrets_save", { projectHandle, id, name, projectOnly, rows, send });
+) => call<string[]>("secrets_save", { projectHandle, id, name, projectOnly, rows, send });
 
 /** A saved set's rows, values included — only for the edit form. */
-export const secretsGet = (name: string) =>
-  invoke<{ rows: SecretRow[]; project_only: boolean }>("secrets_get", { name });
+export const secretsGet = (name: string, projectHandle: ProjectHandle) =>
+  call<{ rows: SecretRow[]; project_only: boolean }>("secrets_get", { name }, slotOf(projectHandle));
 
 /** Replace a saved set's rows; `projectOnly` re-tags it to this project. */
 export const secretsUpdate = (
@@ -317,35 +353,44 @@ export const secretsUpdate = (
   name: string,
   projectOnly: boolean,
   rows: SecretRow[],
-) => invoke<void>("secrets_update", { projectHandle, name, projectOnly, rows });
+) => call<void>("secrets_update", { projectHandle, name, projectOnly, rows });
 
-export const secretsDelete = (name: string) => invoke<void>("secrets_delete", { name });
+export const secretsDelete = (name: string, projectHandle: ProjectHandle) =>
+  call<void>("secrets_delete", { name }, slotOf(projectHandle));
 
 /** Hand saved set `name` to claude#id; resolves to its keys. */
 export const secretsAttach = (projectHandle: ProjectHandle, id: number, name: string) =>
-  invoke<string[]>("secrets_attach", { projectHandle, id, name });
+  call<string[]>("secrets_attach", { projectHandle, id, name });
 
 /** Bring every PTY in every open project to the center pane's geometry. One call
  *  for the whole workspace — see `resize_terminals` in commands.rs. */
 export const resizeTerminals = (cols: number, rows: number) =>
   invoke<void>("resize_terminals", { cols, rows });
 
-export const focusSession = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("focus_session", { projectHandle, id });
+export const focusSession = async (projectHandle: ProjectHandle, id: number) => {
+  if (slotOf(projectHandle) === 0) await invoke<void>("focus_session", { projectHandle, id });
+};
+
+/** "Take back" on the banner a remote desktop's geometry lease puts up. */
+export const geometryTakeBack = () => invoke<void>("geometry_take_back");
+
+/** This window's xterm answering a `host-serialize` (`remote/desktop.rs`). */
+export const remoteSnapshotReply = (rid: string, data: string | null, offset: number, cols: number, rows: number) =>
+  invoke<void>("remote_snapshot_reply", { rid, data, offset, cols, rows });
 
 export const getHubSnapshot = (projectHandle: ProjectHandle) =>
-  invoke<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
+  call<HubSnapshot | null>("get_hub_snapshot", { projectHandle });
 
 /** Why ⌘S can't save claude#id right now, or null. Asked before the confirm. */
 export const saveCheck = (projectHandle: ProjectHandle, id: number) =>
-  invoke<string | null>("save_check", { projectHandle, id });
+  call<string | null>("save_check", { projectHandle, id });
 
 /** Save one claude's work as a handoff doc in the repo (⌘S, and the row's retry).
  *  Stops the claude and holds its row. Resolves once the save is under way —
  *  progress arrives as `save-progress` — and rejects with the reason it was
  *  refused (see `saveCheck`) or when one is already running. */
 export const saveSession = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("save_session", { projectHandle, id });
+  call<void>("save_session", { projectHandle, id });
 
 /** ⌘E: explain `selection` from claude#id's pane in the side panel, in a fresh
  *  fork of its conversation (`explain.rs`). Resolves once the fork is running;
@@ -356,7 +401,7 @@ export const explainStart = (
   id: number,
   reqId: string,
   selection: string,
-) => invoke<void>("explain_start", { projectHandle, id, reqId, selection });
+) => call<void>("explain_start", { projectHandle, id, reqId, selection });
 
 /** A follow-up question in claude#id's panel, answered by its fork. */
 export const explainFollowup = (
@@ -364,11 +409,11 @@ export const explainFollowup = (
   id: number,
   reqId: string,
   question: string,
-) => invoke<void>("explain_followup", { projectHandle, id, reqId, question });
+) => call<void>("explain_followup", { projectHandle, id, reqId, question });
 
 /** Claude#id's panel closed: stop its explain and delete its fork. */
 export const explainClose = (projectHandle: ProjectHandle, id: number) =>
-  invoke<void>("explain_close", { projectHandle, id });
+  call<void>("explain_close", { projectHandle, id });
 
 /** One save in the repo's `mulpex/saves/`, as the ⌘L list shows it. `file` is
  *  the bare file name — the only handle passed back to the backend. */
@@ -395,11 +440,11 @@ export interface LoadResult {
 
 /** The saves of the project's repo, most recently updated first. */
 export const listSaves = (projectHandle: ProjectHandle) =>
-  invoke<SaveEntry[]>("list_saves", { projectHandle });
+  call<SaveEntry[]>("list_saves", { projectHandle });
 
 /** Delete one save file. */
 export const deleteSave = (projectHandle: ProjectHandle, file: string) =>
-  invoke<void>("delete_save", { projectHandle, file });
+  call<void>("delete_save", { projectHandle, file });
 
 /** Start a claude on a save. `fresh`: it reads the doc, checks the repo, reports
  *  and waits. `continue`: resume the conversation that last saved it (or hand
@@ -408,7 +453,7 @@ export const loadSave = (
   projectHandle: ProjectHandle,
   file: string,
   mode: "fresh" | "continue",
-) => invoke<LoadResult>("load_save", { projectHandle, file, mode });
+) => call<LoadResult>("load_save", { projectHandle, file, mode });
 
 /** One guide pointer in the repo's `mulpex/guides/` — a recurring-incident
  *  runbook that stays where it is (`source`, relative to the repo root). */
@@ -422,15 +467,15 @@ export interface GuideEntry {
 }
 
 export const listGuides = (projectHandle: ProjectHandle) =>
-  invoke<GuideEntry[]>("list_guides", { projectHandle });
+  call<GuideEntry[]>("list_guides", { projectHandle });
 
 /** Retire a guide: deletes its runbook AND its pointer. */
 export const deleteGuide = (projectHandle: ProjectHandle, file: string) =>
-  invoke<void>("delete_guide", { projectHandle, file });
+  call<void>("delete_guide", { projectHandle, file });
 
 /** Start a claude on a guide: it reads it and asks what the user needs. */
 export const loadGuide = (projectHandle: ProjectHandle, file: string) =>
-  invoke<SessionInfo>("load_guide", { projectHandle, file });
+  call<SessionInfo>("load_guide", { projectHandle, file });
 
 // ---- Import Docs (docs_import.rs) ----
 
@@ -475,13 +520,13 @@ export interface ApplyReport {
 /** Start the project's import, or get the one already running / in review.
  *  Progress arrives as `import-update` (payload: the project handle). */
 export const importStart = (projectHandle: ProjectHandle) =>
-  invoke<ImportState>("import_start", { projectHandle });
+  call<ImportState>("import_start", { projectHandle });
 export const importState = (projectHandle: ProjectHandle) =>
-  invoke<ImportState | null>("import_state", { projectHandle });
+  call<ImportState | null>("import_state", { projectHandle });
 export const importDiscard = (projectHandle: ProjectHandle) =>
-  invoke<void>("import_discard", { projectHandle });
+  call<void>("import_discard", { projectHandle });
 export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecision[]) =>
-  invoke<ApplyReport>("import_apply", { projectHandle, decisions });
+  call<ApplyReport>("import_apply", { projectHandle, decisions });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the
@@ -542,6 +587,8 @@ export interface RemoteDevice {
   online: boolean;
   /** Gets notifications. */
   push: boolean;
+  /** `desktop`: another Mulpex that paired to drive this one. */
+  kind: "phone" | "desktop";
 }
 /** Answer a phone's typing request (`remote-type`). */
 export const remoteReply = (rid: string, ok: boolean, why: string | null, id: number | null = null) =>

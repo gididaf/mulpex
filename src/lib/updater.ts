@@ -10,6 +10,7 @@
 // over the app's own HTTP client, so nothing sets the xattr and the extracted
 // bundle has none to inherit — no `xattr -dr` needed after the first install.
 
+import { isRemote } from "./hosts";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { get, writable } from "svelte/store";
 
@@ -88,6 +89,8 @@ export function dismissUpdate(): void {
 export function busySessionCount(): number {
   let n = 0;
   for (const p of get(projects).values()) {
+    // Updating this app touches only this machine's claudes.
+    if (isRemote(p.handle)) continue;
     for (const [id, status] of p.statuses) {
       if (status === "working" || status === "needs" || p.watching.has(id)) n++;
     }

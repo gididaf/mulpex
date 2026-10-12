@@ -219,6 +219,28 @@ export async function loadPins(handle: number) {
   });
 }
 
+/** One instance's pins changed on disk (`pins-changed`): from another window —
+ *  a remote desktop editing this Mulpex's, or the host this one is a remote
+ *  desktop of. Re-read that instance's list, replacing what is shown. */
+export async function reloadPins(handle: number, id: number) {
+  let saved: Record<string, unknown>;
+  try {
+    saved = await getPins(handle);
+  } catch {
+    return;
+  }
+  const value = saved[String(id)];
+  const list = (Array.isArray(value) ? value : value ? [value] : []).filter(
+    (p): p is Pin => Array.isArray((p as Pin | null)?.lines),
+  );
+  pins.update((m) => {
+    const next = new Map(m);
+    if (list.length) next.set(pinKey(handle, id), list);
+    else next.delete(pinKey(handle, id));
+    return next;
+  });
+}
+
 /** Forget pins in memory only — an instance whose terminal is gone, or a closed
  *  project. The disk copy is the backend's to prune (`persist_sessions`), because
  *  an app quit exits sessions too and must not lose them. */

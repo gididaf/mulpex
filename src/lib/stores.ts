@@ -18,6 +18,8 @@ import type {
   Status,
 } from "./ipc";
 
+import { activeHost, slotOf } from "./hosts";
+
 export type { ProjectHandle } from "./ipc";
 
 /** Everything the UI tracks for one open project. */
@@ -395,10 +397,34 @@ export function unreadCount(p: ProjectState): number {
  * here either, so a project holding only shells adds nobody you could address.
  */
 export function claudeInAnotherProject(handle: ProjectHandle | null): boolean {
+  // Addresses are a host's own business: a project on another host shares no
+  // hub with this one, so only this host's projects can make `claude#3`
+  // ambiguous.
+  const host = handle == null ? 0 : slotOf(handle);
   return [...get(projects).values()].some(
-    (p) => p.handle !== handle && p.sessions.some((s) => s.kind === "claude"),
+    (p) => p.handle !== handle && slotOf(p.handle) === host && p.sessions.some((s) => s.kind === "claude"),
   );
 }
+
+/** The projects of the host in front — what the tab bar shows, and what ⌘1–9
+ *  and ⌘⇧[ / ⌘⇧] walk. */
+export const hostProjects = derived([projects, activeHost], ([$p, $h]) =>
+  [...$p.values()].filter((p) => slotOf(p.handle) === $h),
+);
+
+/** Each host's red/green badge counts, summed over its projects — the host
+ *  switcher's badges, so a remote claude waiting on you shows from anywhere. */
+export const hostBadges = derived(projects, ($p) => {
+  const out = new Map<number, { needs: number; ready: number }>();
+  for (const p of $p.values()) {
+    const slot = slotOf(p.handle);
+    const b = out.get(slot) ?? { needs: 0, ready: 0 };
+    b.needs += needsCount(p);
+    b.ready += readyCount(p);
+    out.set(slot, b);
+  }
+  return out;
+});
 
 /**
  * Claudes blocked on the user across **every** open project — the dock badge.

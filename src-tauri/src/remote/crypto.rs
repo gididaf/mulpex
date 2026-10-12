@@ -69,8 +69,8 @@ fn dh(secret: &Key32, public: &Key32) -> Option<Key32> {
     shared.was_contributory().then(|| shared.to_bytes())
 }
 
-/// What the phone computes; the Mac only ever checks one (`pair_proof_ok`).
-#[cfg(test)]
+/// What the phone computes — and a Mulpex pairing to another as its remote
+/// desktop (`client.rs`); the host only ever checks one (`pair_proof_ok`).
 pub fn pair_proof(secret: &Key32, device: &str, device_pub: &Key32) -> Key32 {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("any key length");
     mac.update(device.as_bytes());
@@ -176,12 +176,18 @@ fn host_handshake_with(
     Some((eph_pub, Channel::new(&h2p, &p2h)))
 }
 
+/// The phone's half — run by a Mulpex connecting to another as its remote
+/// desktop (`client.rs`), which pairs and connects exactly like a phone.
+pub fn client_handshake(eph: &Key32, dev: &Key32, host_pub: &Key32, host_eph: &Key32) -> Option<Channel> {
+    let dhs = [dh(eph, host_eph)?, dh(eph, host_pub)?, dh(dev, host_eph)?];
+    let (p2h, h2p) = derive(dhs, &public_of(eph), host_eph);
+    Some(Channel::new(&p2h, &h2p))
+}
+
 /// The phone's half, for tests that play a phone against the Mac.
 #[cfg(test)]
 pub fn tests_phone_channel(eph: &Key32, dev: &Key32, host_pub: &Key32, host_eph: &Key32) -> Channel {
-    let dhs = [dh(eph, host_eph).unwrap(), dh(eph, host_pub).unwrap(), dh(dev, host_eph).unwrap()];
-    let (p2h, h2p) = derive(dhs, &public_of(eph), host_eph);
-    Channel::new(&p2h, &h2p)
+    client_handshake(eph, dev, host_pub, host_eph).unwrap()
 }
 
 #[cfg(test)]

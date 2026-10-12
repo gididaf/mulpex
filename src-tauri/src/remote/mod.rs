@@ -24,9 +24,12 @@
 //! it is open.
 
 mod chat;
+pub mod client;
 mod crypto;
+mod desktop;
 mod dialog;
 mod push;
+mod rpc;
 
 use std::collections::HashMap;
 use std::net::TcpStream;
@@ -48,6 +51,9 @@ use crypto::{b64, Channel, Key32};
 const DEFAULT_RELAY: &str = "https://mulpex.dreamvps.com";
 /// How long one read waits before the loop goes round to send.
 const READ_TICK: Duration = Duration::from_millis(100);
+/// The same, while a remote desktop is connected (`desktop.rs`): its
+/// keystrokes and their echoes must not wait out a phone's tick.
+const DESK_TICK: Duration = Duration::from_millis(4);
 /// Keeps an idle connection from being dropped by anything in between.
 const PING_EVERY: Duration = Duration::from_secs(20);
 /// How long a pairing QR code stays good. One use, then a fresh one.
@@ -86,6 +92,14 @@ pub struct Device {
     /// Where to send this phone notifications, once it allowed them.
     #[serde(default)]
     pub push: Option<push::Subscription>,
+    /// `phone`, or `desktop` for another Mulpex that paired to drive this one
+    /// (`desktop.rs`). Older files have no field: they are phones.
+    #[serde(default = "phone_kind")]
+    pub kind: String,
+}
+
+fn phone_kind() -> String {
+    "phone".into()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +130,8 @@ pub struct DeviceStatus {
     pub online: bool,
     /// Gets notifications.
     pub push: bool,
+    /// `phone` or `desktop`.
+    pub kind: String,
 }
 
 /// What the Remote Control dialog shows (`remote-changed` carries it too).
@@ -326,6 +342,7 @@ fn status_of(g: &mut Inner) -> RemoteStatus {
                 added: d.added,
                 online: g.online.contains(&d.id),
                 push: d.push.is_some(),
+                kind: d.kind.clone(),
             })
             .collect(),
     }
@@ -343,6 +360,7 @@ fn emit_changed() {
 }
 
 pub fn init(app: AppHandle) {
+    desktop::init_events(&app);
     let was_on = {
         let mut g = inner().lock().unwrap();
         g.app = Some(app);
@@ -742,13 +760,21 @@ fn connect_error(e: &tungstenite::Error) -> String {
 }
 
 fn set_read_timeout(ws: &mut Ws) {
-    let t = Some(READ_TICK);
+    set_read_tick(ws, READ_TICK);
+}
+
+/// How long the next read may wait; also turns Nagle off, so a keystroke's
+/// echo goes out as soon as it is written rather than in a later batch.
+pub(crate) fn set_read_tick(ws: &mut Ws, tick: Duration) {
+    let t = Some(tick);
     match ws.get_mut() {
         MaybeTlsStream::Plain(s) => {
             let _ = s.set_read_timeout(t);
+            let _ = s.set_nodelay(true);
         }
         MaybeTlsStream::Rustls(s) => {
             let _ = s.get_mut().set_read_timeout(t);
+            let _ = s.get_mut().set_nodelay(true);
         }
         _ => {}
     }
@@ -761,10 +787,13 @@ fn send(ws: &mut Ws, to: u64, data: &Value) -> Result<(), String> {
     ws.send(Message::Text(text.into())).map_err(|e| e.to_string())
 }
 
-/// A handshaken phone on this connection.
+/// A handshaken phone (or remote desktop) on this connection.
 struct Session {
     device: String,
     ch: Channel,
+    /// Set once it said `hello` as a remote desktop (`desktop.rs`). It then
+    /// gets no phone view and no notifications.
+    desk: Option<desktop::Desk>,
     /// The claude whose chat this phone has open, if any.
     watch: Option<Watch>,
     /// The terminal this phone has open, if any.
@@ -936,13 +965,18 @@ impl Server {
                 .map(|(c, _)| *c)
                 .collect();
             for cid in revoked {
-                self.sessions.remove(&cid);
+                if let Some(s) = self.sessions.remove(&cid) {
+                    if s.desk.is_some() {
+                        self.desk_gone(&s.device);
+                    }
+                }
                 send(ws, cid, &json!({"t": "denied", "why": "revoked"}))?;
                 self.report();
             }
             if seq != self.sent_seq {
                 if let Some(v) = &view {
-                    let cids: Vec<u64> = self.sessions.keys().copied().collect();
+                    let cids: Vec<u64> =
+                        self.sessions.iter().filter(|(_, s)| s.desk.is_none()).map(|(c, _)| *c).collect();
                     for cid in cids {
                         self.send_sealed(ws, cid, v)?;
                     }
@@ -959,6 +993,7 @@ impl Server {
                 self.poll_chat(ws, cid)?;
             }
             self.pump_terminals(ws)?;
+            self.pump_desktops(ws)?;
             self.sync_viewing();
             let replies: Vec<(u64, String)> = {
                 let mut g = inner().lock().unwrap();
@@ -975,6 +1010,7 @@ impl Server {
                     .map_err(|e| e.to_string())?;
                 last_ping = Instant::now();
             }
+            set_read_tick(ws, if self.desktops_online() { DESK_TICK } else { READ_TICK });
             match ws.read() {
                 Ok(Message::Text(t)) => self.on_relay(ws, t.as_str())?,
                 Ok(Message::Close(_)) => return Err("the relay closed the connection".into()),
@@ -1034,7 +1070,10 @@ impl Server {
         let Ok(msg) = serde_json::from_str::<Value>(text) else { return Ok(()) };
         if msg.get("event").and_then(Value::as_str) == Some("leave") {
             if let Some(cid) = msg.get("cid").and_then(Value::as_u64) {
-                if self.sessions.remove(&cid).is_some() {
+                if let Some(s) = self.sessions.remove(&cid) {
+                    if s.desk.is_some() {
+                        self.desk_gone(&s.device);
+                    }
                     self.report();
                 }
             }
@@ -1073,7 +1112,7 @@ impl Server {
         let Some((eh, ch)) = crypto::host_handshake(&secret, &device_pub, &eph) else {
             return json!({"t": "denied", "why": "bad handshake"});
         };
-        self.sessions.insert(cid, Session { device, ch, watch: None, term: None, visible: true });
+        self.sessions.insert(cid, Session { device, ch, desk: None, watch: None, term: None, visible: true });
         self.report();
         json!({"t": "hs", "eh": b64(&eh)})
     }
@@ -1089,6 +1128,13 @@ impl Server {
             return send(ws, cid, &json!({"t": "denied", "why": "bad frame"}));
         };
         let Ok(req) = serde_json::from_slice::<Value>(&plain) else { return Ok(()) };
+        let t = req.get("t").and_then(Value::as_str).unwrap_or("");
+        if t == "hello" && req.get("kind").and_then(Value::as_str) == Some("desktop") {
+            return self.desk_hello(ws, cid, &req);
+        }
+        if self.desk_request(ws, cid, t, &req)? {
+            return Ok(());
+        }
         match req.get("t").and_then(Value::as_str) {
             Some("hello") => {
                 let view = inner().lock().unwrap().view.clone();
@@ -1453,11 +1499,17 @@ fn on_pair(data: &Value) -> Value {
             public: b64(&device_pub),
             added,
             push: None,
+            kind: if str_of("kind") == "desktop" { "desktop".into() } else { "phone".into() },
         });
         write_json("devices.json", &g.devices);
     }
     emit_changed();
     json!({"t": "paired"})
+}
+
+/// This window's xterm answering a `host-serialize` (`desktop.rs`).
+pub fn snapshot_reply(rid: &str, data: Option<String>, offset: u64, cols: u16, rows: u16) {
+    desktop::snapshot_reply(rid, data, offset, cols, rows);
 }
 
 #[tauri::command]
@@ -1525,8 +1577,12 @@ mod tests {
     /// pair with the QR secret, handshake, say hello, get the view sealed; get
     /// the next view too; a reused QR is refused; revoking cuts the session;
     /// turning off closes the socket. Nothing readable is ever sent.
+    /// The tests below drive the one global connection state; one at a time.
+    pub(super) static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_phone_pairs_handshakes_and_gets_sealed_views() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("mulpex-remote-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("MULPEX_HOME", &home);
@@ -1586,7 +1642,8 @@ mod tests {
         let eh = crypto::unb64_32(hs["eh"].as_str().unwrap()).unwrap();
         let mut ch = crypto::tests_phone_channel(&eph, &dev, &host_pub, &eh);
         assert_eq!(remote_status().clients, 1);
-        assert!(remote_status().devices[0].online);
+        // The tests share one global state: another may have paired first.
+        assert!(remote_status().devices.iter().any(|d| d.id == "d1" && d.online));
 
         say(&mut ws, json!({"t": "sealed", "c": ch.seal(br#"{"t":"hello"}"#)}));
         let sealed = read(&mut ws);
@@ -1628,6 +1685,155 @@ mod tests {
 
     /// What would have been typed, while there is no desktop frontend.
     pub(super) static TYPED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    /// Stand-ins for the workspace while a remote desktop is tested: the
+    /// geometry and its owner (`Some` turns the fakes on), and claude#1 of
+    /// project 1, whose input echoes back as output.
+    pub(super) static FAKE_GEO: Mutex<Option<((u16, u16), Option<(String, String)>)>> = Mutex::new(None);
+    pub(super) static FAKE_SINK: Mutex<Option<std::sync::Arc<crate::pty::OutputSink>>> = Mutex::new(None);
+
+    pub(super) fn fake_desktop_tap(h: ProjectHandle, id: usize) -> Option<crate::pty::DesktopTap> {
+        FAKE_GEO.lock().unwrap().as_ref()?;
+        let sink = FAKE_SINK.lock().unwrap().clone()?;
+        ((h, id) == (1, 1)).then(|| sink.desktop_tap())
+    }
+
+    pub(super) fn fake_input(h: ProjectHandle, id: usize, bytes: &[u8]) -> bool {
+        if FAKE_GEO.lock().unwrap().is_none() {
+            return false;
+        }
+        if let (Some(sink), (1, 1)) = (FAKE_SINK.lock().unwrap().clone(), (h, id)) {
+            sink.push(format!("<{}>", String::from_utf8_lossy(bytes)).as_bytes());
+        }
+        true
+    }
+
+    /// A remote desktop against the real connection thread and a stand-in
+    /// relay: pairs from the link as a desktop, is refused on a version
+    /// mismatch, gets `welcome`, mirrors a session (raw replay of a ring that
+    /// holds everything, then live bytes and resizes in order), types into it,
+    /// claims the geometry, and is told a denied command is denied.
+    #[test]
+    fn a_desktop_pairs_mirrors_and_drives() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("mulpex-desk-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("MULPEX_HOME", &home);
+        *FAKE_GEO.lock().unwrap() = Some(((100, 30), None));
+        let sink = std::sync::Arc::new(crate::pty::OutputSink::new(false, (100, 30)));
+        sink.push(b"hello");
+        *FAKE_SINK.lock().unwrap() = Some(sink.clone());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        set_relay_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        set_enabled(true);
+        let frag = remote_status().pair_url.split_once("#p=").unwrap().1.to_string();
+        let parts: Vec<&str> = frag.split('.').collect();
+        let host_pub = crypto::unb64_32(parts[1]).unwrap();
+        let pair_secret = crypto::unb64_32(parts[2]).unwrap();
+
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ws = tungstenite::accept(tcp).unwrap();
+        let read = |ws: &mut tungstenite::WebSocket<TcpStream>, cid: u64| loop {
+            if let Message::Text(t) = ws.read().unwrap() {
+                let v = serde_json::from_str::<Value>(t.as_str()).unwrap();
+                if v["to"] == cid {
+                    return v["data"].clone();
+                }
+            }
+        };
+        let say = |ws: &mut tungstenite::WebSocket<TcpStream>, cid: u64, data: Value| {
+            ws.send(Message::Text(json!({"from": cid, "data": data}).to_string().into())).unwrap();
+        };
+
+        let dev = crypto::random32();
+        let dp = crypto::public_of(&dev);
+        let proof = crypto::pair_proof(&pair_secret, "mac1", &dp);
+        say(&mut ws, 7, json!({"t": "pair", "dev": "mac1", "dp": b64(&dp), "name": "MacBook", "proof": b64(&proof), "kind": "desktop"}));
+        assert_eq!(read(&mut ws, 7)["t"], "paired");
+        let st = remote_status();
+        let mac = st.devices.iter().find(|d| d.id == "mac1").unwrap();
+        assert_eq!((mac.kind.as_str(), mac.name.as_str()), ("desktop", "MacBook"));
+
+        let connect = |ws: &mut tungstenite::WebSocket<TcpStream>, cid: u64| {
+            let eph = crypto::random32();
+            say(ws, cid, json!({"t": "hs", "dev": "mac1", "ep": b64(&crypto::public_of(&eph))}));
+            let hs = read(ws, cid);
+            let eh = crypto::unb64_32(hs["eh"].as_str().unwrap()).unwrap();
+            crypto::client_handshake(&eph, &dev, &host_pub, &eh).unwrap()
+        };
+        let next = |ws: &mut tungstenite::WebSocket<TcpStream>, ch: &mut Channel, cid: u64| -> Value {
+            let d = read(ws, cid);
+            assert_eq!(d["t"], "sealed", "{d}");
+            serde_json::from_slice(&ch.open(d["c"].as_str().unwrap()).unwrap()).unwrap()
+        };
+
+        // Another version is refused, with ours.
+        let mut old = connect(&mut ws, 8);
+        say(&mut ws, 8, json!({"t": "sealed", "c": old.seal(json!({"t": "hello", "kind": "desktop", "proto": 1, "app": "0.0.1"}).to_string().as_bytes())}));
+        let r = next(&mut ws, &mut old, 8);
+        assert_eq!((r["t"].as_str(), r["app"].as_str()), (Some("refused"), Some(env!("CARGO_PKG_VERSION"))));
+
+        let mut ch = connect(&mut ws, 9);
+        let tell = |ws: &mut tungstenite::WebSocket<TcpStream>, ch: &mut Channel, m: Value| {
+            say(ws, 9, json!({"t": "sealed", "c": ch.seal(m.to_string().as_bytes())}));
+        };
+        tell(&mut ws, &mut ch, json!({"t": "hello", "kind": "desktop", "proto": desktop::PROTO, "app": env!("CARGO_PKG_VERSION"), "name": "MacBook"}));
+        let w = next(&mut ws, &mut ch, 9);
+        assert_eq!(w["t"], "welcome");
+        assert_eq!((w["geo"]["cols"].as_u64(), w["device"].as_str()), (Some(100), Some("mac1")));
+        assert!(!w["boot"].as_str().unwrap().is_empty());
+
+        // Every message after this is in stream order; skip the geometry note.
+        let until = |ws: &mut tungstenite::WebSocket<TcpStream>, ch: &mut Channel, t: &str| loop {
+            let m = next(ws, ch, 9);
+            if m["t"] == t {
+                return m;
+            }
+        };
+        let g = until(&mut ws, &mut ch, "geo");
+        assert_eq!((g["cols"].as_u64(), g["mine"].as_bool()), (Some(100), Some(false)));
+
+        tell(&mut ws, &mut ch, json!({"t": "sub", "h": 1, "id": 1}));
+        let s = until(&mut ws, &mut ch, "snap");
+        assert_eq!((s["cols"].as_u64(), s["rows"].as_u64(), s["partial"].as_bool()), (Some(100), Some(30), Some(false)));
+        let o = until(&mut ws, &mut ch, "o");
+        assert_eq!(crypto::unb64(o["d"].as_str().unwrap()).unwrap(), b"hello");
+
+        sink.resized(90, 20);
+        sink.push(b" world");
+        let r = until(&mut ws, &mut ch, "r");
+        assert_eq!((r["cols"].as_u64(), r["rows"].as_u64()), (Some(90), Some(20)));
+        let o = until(&mut ws, &mut ch, "o");
+        assert_eq!(crypto::unb64(o["d"].as_str().unwrap()).unwrap(), b" world");
+
+        tell(&mut ws, &mut ch, json!({"t": "in", "h": 1, "id": 1, "d": b64(b"ls\r")}));
+        let o = until(&mut ws, &mut ch, "o");
+        assert_eq!(crypto::unb64(o["d"].as_str().unwrap()).unwrap(), b"<ls\r>");
+
+        tell(&mut ws, &mut ch, json!({"t": "geo", "cols": 132, "rows": 41}));
+        let g = until(&mut ws, &mut ch, "geo");
+        assert_eq!((g["cols"].as_u64(), g["owner"].as_str(), g["mine"].as_bool()), (Some(132), Some("MacBook"), Some(true)));
+
+        tell(&mut ws, &mut ch, json!({"t": "rpc", "rid": "r1", "cmd": "switch_project", "args": {}}));
+        let res = until(&mut ws, &mut ch, "res");
+        assert_eq!((res["rid"].as_str(), res["ok"].as_bool()), (Some("r1"), Some(false)));
+
+        // Leaving gives the geometry back.
+        ws.send(Message::Text(json!({"event": "leave", "cid": 9}).to_string().into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while FAKE_GEO.lock().unwrap().as_ref().unwrap().1.is_some() {
+            assert!(Instant::now() < deadline, "the lease was not released");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        set_enabled(false);
+        *FAKE_GEO.lock().unwrap() = None;
+        *FAKE_SINK.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     #[ignore]

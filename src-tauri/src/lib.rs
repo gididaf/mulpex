@@ -74,6 +74,9 @@ fn is_forwarded(id: &str) -> bool {
             | "remote_control"
             | "full_disk_access"
             | "checkpoint_quit"
+            | "connect_host"
+            | "next_host"
+            | "prev_host"
     ) || id.starts_with("project_")
 }
 
@@ -136,6 +139,12 @@ pub fn run() {
             commands::set_mute_menu_checked,
             commands::send_bytes,
             commands::resize_terminals,
+            commands::geometry_take_back,
+            commands::browse_dir,
+            commands::remote_snapshot_reply,
+            commands::debug_dump_enabled,
+            commands::debug_dump,
+            commands::debug_drive_take,
             commands::focus_session,
             commands::get_hub_snapshot,
             commands::save_check,
@@ -174,6 +183,20 @@ pub fn run() {
             remote::remote_set_relay_url,
             remote::remote_revoke_device,
             remote::remote_reply,
+            remote::client::host_list,
+            remote::client::host_pair,
+            remote::client::host_remove,
+            remote::client::host_rename,
+            remote::client::host_connect,
+            remote::client::host_cache_layout,
+            remote::client::host_invoke,
+            remote::client::host_attach,
+            remote::client::host_detach,
+            remote::client::host_input,
+            remote::client::host_geo,
+            remote::client::host_frontend_action,
+            remote::client::host_upload,
+            remote::client::host_clipboard_image,
             fda::has_full_disk_access,
             fda::open_full_disk_access_settings,
         ])
@@ -224,6 +247,7 @@ pub fn run() {
                 ws.persist_open();
             }
             remote::init(app.handle().clone());
+            remote::client::init(app.handle().clone());
             hub::start(app.handle().clone());
             Ok(())
         })

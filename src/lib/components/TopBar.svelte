@@ -9,6 +9,16 @@
   let { onremote }: { onremote: () => void } = $props();
 
   let remote = $state<RemoteStatus | null>(null);
+  // Who is connected: phones, and other Mulpexes driving this one.
+  const who = $derived.by(() => {
+    const on = remote?.devices.filter((d) => d.online) ?? [];
+    const phones = on.filter((d) => d.kind !== "desktop").length;
+    const macs = on.length - phones;
+    const parts = [];
+    if (phones || !macs) parts.push(`${phones} ${phones === 1 ? "phone" : "phones"}`);
+    if (macs) parts.push(`${macs} ${macs === 1 ? "computer" : "computers"}`);
+    return parts.join(", ");
+  });
   $effect(() => {
     remoteStatus().then((s) => (remote = s));
     const un = listen<RemoteStatus>("remote-changed", (e) => (remote = e.payload));
@@ -26,7 +36,7 @@
     <button class="remote {remote.state}" onclick={onremote} title="Remote Control (⌘⇧O)">
       <span class="dot"></span>
       Remote{#if remote.state === "connected"}
-        · {remote.clients} {remote.clients === 1 ? "phone" : "phones"}{:else if remote.state === "error"}
+        · {who}{:else if remote.state === "error"}
         · offline{/if}
     </button>
   {/if}

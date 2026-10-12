@@ -123,6 +123,12 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 - **Keep awake** — `caffeinate -i -w <mulpex pid>` while on: the Mac doesn't idle-sleep, the
   display still does, and a closed lid still sleeps.
 
+## Another Mulpex as the client
+
+A second Mulpex can pair the same way (the dialog's **Copy link**) and drive this one as a remote
+desktop — real terminal mirrors and the whole command surface instead of a phone's view. Shown in
+the device list with 💻; same on/off switch. → [remote-hosts.md](remote-hosts.md)
+
 ## The relay VM
 
 `mulpex.dreamvps.com`: Caddy (auto TLS) → `mulpex-relay` on `127.0.0.1:8787`, systemd unit

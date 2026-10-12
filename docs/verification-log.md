@@ -5,6 +5,40 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
 "verified live" from "compiles clean". Nothing here is a rule; the rules live in
 [CLAUDE.md](../CLAUDE.md) and the subsystem docs.
 
+- **Remote Hosts, measured 2026-10-12** (`docs/remote-hosts.md`):
+  - **Unit tests:** `cargo test -p mulpex --lib` passes 166 tests, including the stand-in-relay
+    desktop test.
+  - **The real relay binary, `client.rs` and `desktop.rs` in one process**
+    (`live_through_a_real_relay`):
+    - pairing from the link, and a link that refuses a second use;
+    - a denied command;
+    - a mirrored session;
+    - 50 keystroke echoes: **p50 6.3 ms, p95 6.4 ms** over localhost;
+    - the lease;
+    - a 600 KB folder upload.
+  - **Two real apps, windows hidden** (`scripts/test-remote-hosts.sh`), each pane compared line by
+    line with the dump. All **IDENTICAL**:
+    - the snapshot path (8 KB ring forced, so the host's xterm serialized the screen);
+    - live output, and replay from spawn;
+    - a real `claude` 2.1.296 TUI;
+    - the relay killed and restarted;
+    - the Mac restarted;
+    - the host restarted (new boot, tabs rebuilt).
+  - **Visible windows, side by side:** the host switcher, the remote tab, the colors and the Hebrew
+    matched, and the host showed its "driving this Mulpex · Take back" banner.
+  - **One false lead, kept so nobody chases it again:** a Mac copy whose window was moved between
+    monitors right after launch showed a pane cut off mid-snapshot. The same scenario run headless
+    was exact, and the serialize round trip in headless Chrome was exact (199/199 lines). The cause
+    was never pinned down.
+  - **Two real measurements from that run:**
+    - a hidden macOS webview pauses the timers xterm uses to finish a large write. Hence
+      `backgroundThrottling: disabled` (macOS 14+).
+    - moving a window to another monitor changes the claimed geometry for real (203 → 71 columns).
+  - **NOT verified:**
+    - Linux WebKitGTK throttling while the VM window is minimized or RDP is disconnected (Tauri
+      has no switch there). That case falls back to a `partial` snapshot plus a repaint nudge.
+    - Keystrokes typed into the real Mac UI, and every command run from a remote tab. The command
+      path is the same `ipc.ts` call either way, but no click was driven.
 - Both crates + the Tauri app compile clean; `svelte-check` + `vite build` clean.
 - **Sidebar kind-split + context menu driven in a real browser (headless Chrome, 2026-08-22).** The
   actual `stores.ts` bundle was exercised for the ordering (kind split, mute sinking, all four

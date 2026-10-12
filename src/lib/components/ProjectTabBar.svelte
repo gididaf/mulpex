@@ -1,25 +1,34 @@
 <script lang="ts">
   import {
-    projects,
+    hostProjects,
     activeProjectHandle,
     needsCount,
     readyCount,
     type ProjectHandle,
   } from "../stores";
+  import { activeHost, activeHostOnline, hosts } from "../hosts";
+  import HostSwitcher from "./HostSwitcher.svelte";
 
   let {
     onselect,
     onclose,
     onadd,
     onreorder,
+    onhost,
+    onhostmenu,
   }: {
     onselect: (h: ProjectHandle) => void;
     onclose: (h: ProjectHandle) => void;
     onadd: () => void;
     onreorder: (order: ProjectHandle[]) => void;
+    onhost: (slot: number) => void;
+    onhostmenu: (e: MouseEvent, slot: number) => void;
   } = $props();
 
-  const list = $derived([...$projects.values()]);
+  // Only the host in front's projects (`hosts.ts`): with several machines'
+  // worth of projects, one strip of every tab would be unreadable.
+  const list = $derived($hostProjects);
+  const offline = $derived(!$activeHostOnline);
 
   // ---- drag to reorder ----
   //
@@ -91,7 +100,10 @@
   }
 </script>
 
-<div class="tabs">
+<div class="tabs" class:offline>
+  {#if $hosts.size > 0}
+    <HostSwitcher onselect={onhost} oncontext={onhostmenu} />
+  {/if}
   {#each list as p, i (p.handle)}
     <!-- Both badge counts exclude muted sessions (stores.ts) — muting is meant to
          quiet a project you're deliberately not watching, so a muted instance
@@ -138,7 +150,7 @@
           </span>
         {/if}
       </button>
-      <button
+      {#if !offline}<button
         class="x"
         aria-label="Close project"
         title="Close project (⌘⇧W)"
@@ -146,10 +158,12 @@
           e.stopPropagation();
           onclose(p.handle);
         }}>✕</button
-      >
+      >{/if}
     </div>
   {/each}
-  <button class="add" aria-label="Open project" title="Open project (⌘O)" onclick={onadd}>+</button>
+  {#if !offline}
+    <button class="add" aria-label="Open project" title="Open project{$activeHost ? ' on this host' : ''} (⌘O)" onclick={onadd}>+</button>
+  {/if}
 </div>
 
 <style>
@@ -163,6 +177,10 @@
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
     white-space: nowrap;
+  }
+  /* A host that can't be reached: its tabs stay, greyed. */
+  .offline .tab {
+    opacity: 0.55;
   }
   .tab {
     display: flex;

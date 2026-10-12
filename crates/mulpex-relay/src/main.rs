@@ -330,7 +330,15 @@ async fn main() {
         .layer(axum::middleware::from_fn(cache_headers))
         .with_state(relay);
 
-    let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
+    // Nagle off: a remote desktop's keystrokes and their echoes are tiny
+    // frames, and each would otherwise wait for the previous one's ACK.
+    use axum::serve::ListenerExt;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .expect("bind")
+        .tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
     eprintln!("mulpex-relay: listening on {listen}, serving {}", static_dir.display());
     axum::serve(listener, app).await.expect("serve");
 }

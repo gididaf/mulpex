@@ -31,6 +31,7 @@ reasoning in `docs/`.
 | [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion). ⌘L Load (Saves / Guides tabs, continue-the-conversation links in `~/.mulpex/save-links.tsv`). File ▸ Import Docs (Sonnet sorts a repo's `.md` into save / guide / stale / skip; Apply commits once and fixes links) | `saves.rs`, `docs_import.rs`, `save_prompts/*`, `LoadDialog`/`ImportDialog.svelte`, the save row status in `InstanceList.svelte` |
 | [docs/secrets.md](docs/secrets.md) | ⌘K Secrets: KEY=VALUE rows → a 0600 `.env`; only `🔑 KEY` is typed, and the path + rules ride every turn as hidden hook context; one-off (scratch dir, gone when the claude closes) vs saved (`<mulpex home>/secrets/`, global or project-only, refs); the shared file format | `secrets.rs` (both crates), `SecretsDialog.svelte`, `commands.rs` `secrets_*`, the `userpromptsubmit` note |
 | [docs/remote-control.md](docs/remote-control.md) | ⌘⇧O Remote Control: a phone PWA drives every project through a relay (`mulpex.dreamvps.com`); QR pairing + end-to-end encryption (the relay reads nothing); chat from transcripts; typing via the desktop's prompt check (>900 B → a file); dialogs as buttons → measured keys; terminals as readable text over a hidden same-geometry xterm; start/close; Web Push sent by the Mac; keep-awake; on/off persists | `src-tauri/src/remote/*`, `crates/mulpex-relay`, `remote/`, `RemoteDialog.svelte`, the `remote-*` handlers in `App.svelte`, `OutputSink::tap`, the `dialog/` hook file, `scripts/deploy-relay.sh` |
+| [docs/remote-hosts.md](docs/remote-hosts.md) | File ▸ Connect to Remote Mulpex…: this Mulpex drives another (a Linux VM) over the Remote Control relay — host switcher, handles `slot·2^32+h`, real terminal mirrors (ring + resize markers, xterm-serialized snapshot at an exact stream offset), the geometry lease, the command allowlist, uploads, headless two-app test | `remote/client.rs`, `remote/desktop.rs`, `remote/rpc.rs` (classify every new command!), `hosts.ts`, `remoteHosts.ts`, `HostSwitcher.svelte`, `OutputSink` taps, `scripts/test-remote-hosts.sh` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/linux.md](docs/linux.md) | The Linux port: Super = ⌘, no native menu (the webview claims every shortcut via `lib/linuxKeys.ts`), Super+C/V clipboard, `/proc` process sweeps, title-bar badge, AppImage + deb signed on the Mac | `menu.rs` (every new shortcut also goes in `linuxKeys.ts`), `pty.rs` process sweeps, `platform.ts`, `tauri.linux.conf.json`, `scripts/release-linux.sh` |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
@@ -86,7 +87,8 @@ src-tauri/            the Tauri app (Rust backend)
   src/pins.rs         ⌘⇧P pins, one per instance, saved per project — docs/frontend.md
   src/docs_import.rs  File ▸ Import Docs: Sonnet sorts a repo's `.md`, Apply commits once
   src/remote/         ⌘⇧O Remote Control, the Mac side: connection, crypto, chat, dialogs,
-                      push — docs/remote-control.md
+                      push — docs/remote-control.md; and Remote Hosts (client.rs drives
+                      another Mulpex, desktop.rs + rpc.rs serve one) — docs/remote-hosts.md
   src/checkpoint.rs   ⌘⇧Q Checkpoint & Quit + the wake after relaunch — docs/sessions.md
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
@@ -236,7 +238,8 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧K** request compact/**⌘⇧Q** checkpoint & quit/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
-**⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row) are intercepted
+**⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row, **⌘⌥[ / ⌘⌥]** previous/next remote host —
+claimed in the webview by `e.code` too, since Option changes the bracket's character) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
 quick-switcher) is *not* a menu accelerator — it's handled in the webview (`svelte:window` keydown,
 `preventDefault` stops the print dialog). That arm excludes Shift, since ⌘⇧P is Pin Selection
@@ -436,6 +439,9 @@ and cost real time; each links to the measurement that settled it.
   `nudges_welcome` — the arm nudge landing there is what made every instance open itself after an
   app update. The peer snapshot is the one deliberate exception, because a hub wake *is* a
   task-notification. → [docs/hub.md](docs/hub.md)
+- **Every command in `lib.rs`'s `generate_handler!` is classified in `remote/rpc.rs`** (allowed from a
+  remote desktop, or denied with a reason) — a test fails otherwise. An unclassified command is a
+  button that silently does nothing on a remote host's tab. → [docs/remote-hosts.md](docs/remote-hosts.md)
 - **`to: "all"` and locks stay project-local**, and `hub_spawn`/`hub_close` only create and close
   instances in their own project. Only `hub_send`/`hub_inbox`/`hub_instances` cross the boundary.
   → [docs/hub.md](docs/hub.md)

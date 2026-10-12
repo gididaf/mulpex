@@ -40,6 +40,9 @@ hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# Remote Hosts (`remote/desktop.rs`, `client.rs`): screens and big output go
+# deflated through the relay.
+flate2 = "1"
 # Web Push from the Mac straight to a paired phone (`remote/push.rs`): VAPID
 # signing and the RFC 8291 payload encryption, sent with a small blocking client.
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }

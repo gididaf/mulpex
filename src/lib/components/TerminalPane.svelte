@@ -7,6 +7,9 @@
   import { pinsPanel } from "../pins";
   import ExplainPanel from "./ExplainPanel.svelte";
   import SaveOverlay from "./SaveOverlay.svelte";
+  import { activeHost, activeHostOnline, geometryDriver, hostName, hosts } from "../hosts";
+  import { claimHost } from "../remoteHosts";
+  import { geometryTakeBack } from "../ipc";
 
   let {
     onsaveclose,
@@ -36,6 +39,9 @@
     ),
   );
   const activeEmpty = $derived(($activeProject?.sessions.length ?? 0) === 0);
+  // Remote Hosts: who sizes the panes in front, and whether their host is up.
+  const hostSt = $derived($activeHost ? $hosts.get($activeHost) : undefined);
+  const notMine = $derived(!!hostSt && hostSt.state === "connected" && !!hostSt.geo && !hostSt.geo.mine);
 
   onMount(() => {
     // Refit whenever the pane's size changes: initial layout, window resize,
@@ -62,9 +68,34 @@
         onretry={() => onsaveretry(id)}
       />
     {/if}
-    {#if activeEmpty}
+    {#if !$activeProject}
+      <div class="empty">
+        {#if !$activeHost}
+          No projects open on this Mac — press ⌘O to open one
+        {:else if $activeHostOnline}
+          No projects open on ◆ {hostName($activeHost)} — press ⌘O to open one
+        {:else}
+          ◆ {hostName($activeHost)} is {hostSt?.state === "connecting" ? "connecting…" : "not reachable"}{hostSt?.error ? ` — ${hostSt.error}` : ""}
+        {/if}
+      </div>
+    {:else if activeEmpty}
       <div class="empty">
         Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
+      </div>
+    {/if}
+    {#if $activeProject && $activeHost && !$activeHostOnline}
+      <div class="banner">
+        ◆ {hostName($activeHost)} is {hostSt?.state === "connecting" ? "reconnecting…" : "offline"} — these panes are frozen{hostSt?.error ? ` (${hostSt.error})` : ""}
+      </div>
+    {:else if notMine}
+      <div class="banner">
+        ◆ {hostName($activeHost)}'s panes are sized by {hostSt?.geo?.owner ?? "its own window"}
+        <button onclick={() => claimHost($activeHost)}>Take over</button>
+      </div>
+    {:else if !$activeHost && $geometryDriver}
+      <div class="banner">
+        {$geometryDriver} is driving this Mulpex — panes are shown at its size
+        <button onclick={() => geometryTakeBack()}>Take back</button>
       </div>
     {/if}
     {#if $toast}
@@ -107,6 +138,34 @@
     height: 100%;
     color: var(--text-faint);
     font-size: 0.9rem;
+  }
+  .banner {
+    position: absolute;
+    bottom: 0.6rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    max-width: calc(100% - 2rem);
+    padding: 0.35rem 0.5rem 0.35rem 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-elev);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    white-space: nowrap;
+  }
+  .banner button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border-focus);
+    border-radius: 5px;
+    font: inherit;
+    padding: 0.15rem 0.6rem;
+    cursor: pointer;
   }
   .toast {
     position: absolute;

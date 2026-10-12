@@ -204,6 +204,9 @@ pub struct WorkspaceInfo {
     /// permanently, not transiently — see `terminals.ts::create`.
     pub cols: u16,
     pub rows: u16,
+    /// The remote desktop driving that geometry, by name, or `None` when this
+    /// window does (`Workspace::geometry_owner`).
+    pub geometry_owner: Option<String>,
 }
 
 /// Result of the startup `claude_status` probe: whether the user's `claude` CLI

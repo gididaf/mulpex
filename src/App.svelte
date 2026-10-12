@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
   import { open as openFolder, confirm } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -31,7 +32,9 @@
     reparentSession,
     setMuteMenuChecked,
     quitApp,
+    remoteSnapshotReply,
     type BootstrapInfo,
+    type WorkspaceInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
     type SaveProgressEvent,
@@ -44,7 +47,6 @@
   import {
     projects,
     activeProjectHandle,
-    project,
     sessions,
     activeId,
     showMessages,
@@ -78,10 +80,23 @@
     reorderProjects as reorderProjectsLocal,
     reorderSessions as reorderSessionsLocal,
   } from "./lib/stores";
-  import { findByDir } from "./lib/stores";
+  import { hostProjects } from "./lib/stores";
   import { terminals } from "./lib/terminals";
+  import {
+    activeHost,
+    geometryDriver,
+    hostFrontendAction,
+    hostName,
+    hostOnline,
+    hostUpload,
+    hosts,
+    isRemote,
+    slotOf,
+  } from "./lib/hosts";
+  import { applyWorkspace, connectHost, initHosts, landingProject, removeHost, renameHost } from "./lib/remoteHosts";
+  import { pastePaths } from "./lib/paths";
   import { IS_LINUX } from "./lib/platform";
-  import { addPin, dropPins, loadPins, setPanelOpen, togglePanel } from "./lib/pins";
+  import { addPin, dropPins, loadPins, reloadPins, setPanelOpen, togglePanel } from "./lib/pins";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
@@ -107,6 +122,8 @@
   import SecretsDialog from "./lib/components/SecretsDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
   import RemoteDialog from "./lib/components/RemoteDialog.svelte";
+  import ConnectHostDialog from "./lib/components/ConnectHostDialog.svelte";
+  import RemoteProjectPicker from "./lib/components/RemoteProjectPicker.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
   import type { CtxItem } from "./lib/components/ContextMenu.svelte";
 
@@ -117,6 +134,12 @@
 
   /** Build one project's UI state + xterms, then activate it if asked. */
   async function bootstrapProject(info: BootstrapInfo, makeActive: boolean) {
+    // Built already — `projects-changed` (this Mulpex's, or a host's) and the
+    // call that opened it can both get here; the second only selects.
+    if (get(projects).has(info.handle)) {
+      if (makeActive) selectProject(info.handle);
+      return;
+    }
     addProject({
       handle: info.handle,
       dir: info.project_dir,
@@ -131,13 +154,20 @@
     });
     void loadPins(info.handle);
     await tick(); // let TerminalView children mount + create their terminals
-    const snap = await getHubSnapshot(info.handle);
+    const snap = await getHubSnapshot(info.handle).catch(() => null);
     if (snap) applyHubFor(info.handle, snap);
     if (makeActive) selectProject(info.handle);
   }
 
-  /** Switch which project is front-most: visible terminal, WebGL, backend active. */
+  /** The project last in front on each host, to come back to (`selectHost`). */
+  const lastProject = new Map<number, ProjectHandle>();
+
+  /** Switch which project is front-most: visible terminal, WebGL, backend active.
+   *  Its host comes to the front with it (the tab bar shows that host's tabs). */
   function selectProject(handle: ProjectHandle) {
+    const slot = slotOf(handle);
+    activeHost.set(slot);
+    lastProject.set(slot, handle);
     setActiveProject(handle);
     switchProject(handle);
     const p = get(projects).get(handle);
@@ -149,6 +179,85 @@
       // Project with no sessions: hide every terminal (no key matches).
       terminals.focus(handle, -1);
     }
+  }
+
+  /**
+   * Bring host `slot` to the front (the host switcher, ⌘⌥[ / ⌘⌥]): the first of
+   * its projects with a claude that needs you, else the one last in front there.
+   * A host with no project (or none known yet) shows its empty state.
+   */
+  function selectHost(slot: number) {
+    activeHost.set(slot);
+    const h = landingProject(slot, lastProject.get(slot));
+    if (h != null) {
+      selectProject(h);
+    } else {
+      setActiveProject(null);
+      terminals.focus(-1, -1);
+    }
+  }
+
+  /** ⌘⌥] / ⌘⌥[: the next/previous host, Local first. */
+  function cycleHost(delta: number) {
+    const slots = [0, ...[...get(hosts).keys()].sort((a, b) => a - b)];
+    if (slots.length < 2) return;
+    const at = slots.indexOf(get(activeHost));
+    selectHost(slots[(at + delta + slots.length) % slots.length]);
+  }
+
+  /** Forget one project's UI (it closed, or its host's tabs are being rebuilt). */
+  function dropProject(handle: ProjectHandle) {
+    terminals.disposeProject(handle);
+    dropPins(handle);
+    dropExplains(handle);
+    removeProject(handle);
+  }
+
+  /** After a host's tabs changed: if the host in front lost the project in
+   *  front, land on another of ITS projects — never jump to another host. */
+  function afterHostChange(slot: number) {
+    if (get(activeHost) !== slot) return;
+    const cur = get(activeProjectHandle);
+    if (cur != null && slotOf(cur) === slot && get(projects).has(cur)) return;
+    const next = landingProject(slot, lastProject.get(slot));
+    if (next != null) selectProject(next);
+    else {
+      setActiveProject(null);
+      terminals.focus(-1, -1);
+    }
+  }
+
+  /** The host switcher's right-click menu. */
+  function openHostMenu(e: MouseEvent, slot: number) {
+    const st = get(hosts).get(slot);
+    if (!st) return;
+    const connected = st.state === "connected";
+    ctx = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: "Rename…", run: () => (renameHostFor = { slot, value: st.name }) },
+        st.enabled
+          ? { label: "Disconnect", run: () => void connectHost(slot, false) }
+          : { label: "Connect", run: () => void connectHost(slot, true) },
+        ...(st.enabled && !connected
+          ? [{ label: "Reconnect now", run: () => void connectHost(slot, true) }]
+          : []),
+        { sep: true },
+        {
+          label: "Remove…",
+          danger: true,
+          run: async () => {
+            const ok = await confirm(
+              `Remove ${st.name}? Its projects keep running there; this Mac just stops showing them. ` +
+                `Connecting again needs a new pairing link.`,
+              { title: "Remove Remote Mulpex", kind: "warning", okLabel: "Remove", cancelLabel: "Cancel" },
+            );
+            if (ok) await removeHost(slot);
+          },
+        },
+      ],
+    };
   }
 
   /** Focus a session within the active project. */
@@ -244,6 +353,12 @@
   let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
   /** ⌘⇧O: the Remote Control dialog is open. */
   let showRemote = $state(false);
+  /** File ▸ Connect to Remote Mulpex…: the pairing dialog is open. */
+  let showConnect = $state(false);
+  /** ⌘O on a remote host: the host whose folders the picker browses. */
+  let pickerHost = $state<number | null>(null);
+  /** The host switcher's Rename…: which host, and the name being typed. */
+  let renameHostFor = $state<{ slot: number; value: string } | null>(null);
   let ctx = $state<{ x: number; y: number; items: CtxItem[] } | null>(null);
 
   /** Copy without a plugin: `navigator.clipboard` where the webview allows it,
@@ -493,49 +608,24 @@
   });
 
   /** Open a project by path, or focus it if already open (picker/+/palette/drop). */
-  async function openOrFocusProject(path: string) {
-    const existing = findByDir(path);
+  async function openOrFocusProject(path: string, host: number = 0) {
+    const existing = [...get(projects).values()].find((p) => p.dir === path && slotOf(p.handle) === host);
     if (existing) {
       selectProject(existing.handle);
       return;
     }
     try {
       openError = null;
-      const info = await openProject(path);
+      const info = await openProject(path, host);
       await bootstrapProject(info, true);
     } catch (e) {
       // Surfaced in the picker: this is how a missing `claude` used to present
       // itself as the app silently ignoring the click.
       openError = e instanceof Error ? e.message : String(e);
+      // The picker isn't on screen once anything is open.
+      if (host || get(projects).size > 0) flashNotice(`Could not open ${path}: ${openError}`, 8000);
       console.error("open project failed:", e);
     }
-  }
-
-  // Wire form of a dropped path: backslash-escape everything a shell would act
-  // on. This is what Terminal.app/iTerm insert when you drag a file in, so the
-  // prompt reads `/Users/me/My\ File.csv` — matching stock Claude Code — rather
-  // than a quote-wrapped path. Characters ≥ U+0080 are left bare; real
-  // terminals don't escape unicode and a backslash there just reads as noise.
-  //
-  // Control characters take the other branch: they have no printable backslash
-  // form, and a literal \n or \r on the wire would submit the message halfway
-  // through the path. ANSI-C `$'…'` keeps the bytes CR/LF-free while still
-  // round-tripping to the real name.
-  function escapePath(path: string): string {
-    if (!/[\x00-\x1f\x7f]/.test(path))
-      return path.replace(/[^\w@%+:,./=-]/g, (c) =>
-        c.charCodeAt(0) < 0x80 ? "\\" + c : c,
-      );
-    const esc = path
-      .replace(/\\/g, "\\\\")
-      .replace(/'/g, "\\'")
-      .replace(/\n/g, "\\n")
-      .replace(/\r/g, "\\r")
-      .replace(/\t/g, "\\t")
-      .replace(/[\x00-\x1f\x7f]/g, (c) =>
-        "\\" + c.charCodeAt(0).toString(8).padStart(3, "0"),
-      );
-    return `$'${esc}'`;
   }
 
   /**
@@ -561,35 +651,63 @@
    * sessions) a drop falls back to opening the path as a project; the backend
    * rejects non-directories.
    */
-  function dropPaths(paths: string[]) {
+  async function dropPaths(paths: string[]) {
     if (!paths.length) return;
     const h = get(activeProjectHandle);
     const id = h == null ? null : (get(projects).get(h)?.activeSessionId ?? null);
     if (h == null || id == null) {
+      if (get(activeHost)) {
+        flashToast("Drop files onto a claude or a terminal");
+        return;
+      }
       for (const path of paths) openOrFocusProject(path);
       return;
     }
-    const body = paths.map(escapePath).join(" ");
+    // A remote host's claude can't read this Mac's disk: the files (folders
+    // too) go there first, and their paths THERE are what get pasted.
+    if (isRemote(h)) {
+      const slot = slotOf(h);
+      flashNotice(`Uploading to ${hostName(slot)}…`, 30000);
+      try {
+        paths = await hostUpload(slot, paths);
+        flashNotice(`Uploaded to ${hostName(slot)}`, 1500);
+      } catch (e) {
+        flashNotice(`Upload failed: ${e}`, 8000);
+        return;
+      }
+    }
     // One write: split across reads, Claude can consume a lone ESC and lose
     // the paste framing (same hazard as the Shift+Enter carve-out).
-    sendBytes(h, id, new TextEncoder().encode(`\x1b[200~${body} \x1b[201~`));
+    sendBytes(h, id, pastePaths(paths));
     terminals.refocus();
   }
 
   async function pickAndOpen() {
+    // A remote host's disk has no native dialog: its own picker browses it.
+    const slot = get(activeHost);
+    if (slot) {
+      if (!hostOnline(slot)) {
+        flashToast(`${hostName(slot)} is offline`);
+        return;
+      }
+      pickerHost = slot;
+      return;
+    }
     const dir = await openFolder({ directory: true, title: "Open Project" });
     if (typeof dir === "string") await openOrFocusProject(dir);
   }
 
   async function closeProjectHandle(handle: ProjectHandle) {
-    await closeProject(handle);
-    terminals.disposeProject(handle);
-    dropPins(handle);
-    dropExplains(handle);
-    removeProject(handle); // re-picks the active handle (neighbor / null)
-    const next = get(activeProjectHandle);
-    if (next != null) selectProject(next);
-    else recents = await listRecentProjects(); // none left → picker
+    try {
+      await closeProject(handle);
+    } catch (e) {
+      flashToast(String(e));
+      return;
+    }
+    dropProject(handle);
+    afterHostChange(slotOf(handle));
+    // None left anywhere → the picker.
+    if (get(projects).size === 0 && get(hosts).size === 0) recents = await listRecentProjects();
   }
 
   async function newSession() {
@@ -691,10 +809,9 @@
       terminals.refocus();
       return;
     }
-    // Same row, different process: the pane has to be wiped and bound to the new
-    // PTY, which the backend is buffering until we do.
-    dropCompact(handle, id);
-    terminals.reattach(handle, id);
+    // Same row, different process: the pane is rebound to the new PTY by the
+    // `session-restarted` the backend just emitted (every window holding the
+    // row hears it — a remote desktop's restart included).
     terminals.refocus();
   }
 
@@ -988,7 +1105,7 @@
 
   /** Cycle between open projects (⌘⇧[ / ⌘⇧]). */
   function cycleProject(delta: number) {
-    const keys = [...get(projects).keys()];
+    const keys = get(hostProjects).map((p) => p.handle);
     if (keys.length < 2) return;
     const cur = get(activeProjectHandle);
     const idx = keys.findIndex((h) => h === cur);
@@ -1006,7 +1123,7 @@
    * the tab you just moved has to stay where your eye left it.
    */
   function moveProject(delta: number) {
-    const order = [...get(projects).keys()];
+    const order = get(hostProjects).map((p) => p.handle);
     const cur = get(activeProjectHandle);
     const from = order.findIndex((h) => h === cur);
     const to = from + delta;
@@ -1084,6 +1201,15 @@
       case "remote_control":
         showRemote = true;
         break;
+      case "connect_host":
+        showConnect = true;
+        break;
+      case "next_host":
+        cycleHost(1);
+        break;
+      case "prev_host":
+        cycleHost(-1);
+        break;
       case "save_session": {
         const cur = get(activeId);
         if (h != null && cur != null) await saveInstance(h, cur);
@@ -1127,6 +1253,11 @@
       case "request_compact": {
         const cur = get(activeId);
         if (h == null || cur == null) break;
+        if (isRemote(h)) {
+          // ⌘⇧K's state machine runs in the host's own window.
+          hostFrontendAction(slotOf(h), h, cur, "compact").catch((e) => flashToast(String(e)));
+          break;
+        }
         const why = saveStatusOf(h, cur) ? "That claude was saved and stopped" : toggleCompact(h, cur);
         if (why) flashToast(why);
         break;
@@ -1171,7 +1302,7 @@
         // insertion order, which is what ProjectTabBar renders).
         if (id.startsWith("project_")) {
           const n = parseInt(id.slice("project_".length), 10);
-          const h2 = [...get(projects).keys()][n - 1];
+          const h2 = get(hostProjects)[n - 1]?.handle;
           if (h2 != null && h2 !== h) selectProject(h2);
         }
     }
@@ -1188,7 +1319,7 @@
    * `messages` open their own focus-taking UI, and `open_project` opens a native
    * folder dialog. Refocusing the terminal after those would fight them.
    */
-  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project", "remote_control"]);
+  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project", "remote_control", "connect_host"]);
   async function runPaletteAction(id: string) {
     showPalette.set(false);
     await handleMenu(id);
@@ -1203,7 +1334,7 @@
     // the shell's previous-history key.
     if (!IS_LINUX && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
-      if (get(projects).size > 0) showPalette.update((v) => !v);
+      if (get(projects).size > 0 || get(hosts).size > 0) showPalette.update((v) => !v);
       return;
     }
     // ⌘⇧[ / ⌘⇧] — Next/Previous Project. These ARE declared as menu accelerators
@@ -1219,6 +1350,17 @@
     // advertised shortcut true, and is safe either way: a key equivalent AppKit
     // *does* match is consumed by the menu and never reaches the webview, so this
     // arm cannot double-fire — it simply stops seeing the key.
+    // ⌘⌥[ / ⌘⌥] — Previous/Next Host. Declared in the menu too; Option turns
+    // the bracket into another character (“ / ‘), so the physical key decides,
+    // as for ⌘⇧[ / ⌘⇧] below.
+    if (e.metaKey && e.altKey && !e.shiftKey && !e.ctrlKey) {
+      const back = e.code === "BracketLeft";
+      if (back || e.code === "BracketRight") {
+        e.preventDefault();
+        cycleHost(back ? -1 : 1);
+        return;
+      }
+    }
     if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
       // ⌘⇧P — Pin Selection. Declared in the menu too; if the menu takes the
       // key it never reaches here, so this cannot double-fire (see below).
@@ -1304,6 +1446,28 @@
         autoCompactTick(e.payload.handle);
       }),
       listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
+      // Every window holding a restarted row rebinds it from this one event:
+      // this Mulpex's own panes reattach to the new PTY; a remote host's mirror
+      // is re-snapshotted by its host instead.
+      listen<SessionExitedEvent>("session-restarted", (e) => {
+        dropCompact(e.payload.handle, e.payload.id);
+        if (!isRemote(e.payload.handle)) terminals.reattach(e.payload.handle, e.payload.id);
+      }),
+      listen<SessionExitedEvent>("pins-changed", (e) => void reloadPins(e.payload.handle, e.payload.id)),
+      // A remote desktop opened, closed or reordered a project here.
+      listen<WorkspaceInfo>("projects-changed", (e) => void applyWorkspace(0, e.payload)),
+      // A remote desktop starting to mirror one of this Mulpex's panes.
+      listen<{ rid: string; handle: ProjectHandle; id: number }>("host-serialize", async (e) => {
+        const { rid, handle, id } = e.payload;
+        const r = await terminals.serialize(handle, id);
+        void remoteSnapshotReply(rid, r?.data ?? null, r?.offset ?? 0, r?.cols ?? 0, r?.rows ?? 0);
+      }),
+      // A remote desktop took (or gave back) this Mulpex's geometry.
+      listen<{ cols: number; rows: number; owner: string | null }>("geometry-changed", (e) => {
+        const { cols, rows, owner } = e.payload;
+        geometryDriver.set(owner);
+        terminals.setLock(owner ? { cols, rows } : null);
+      }),
       listen<ExplainProgressEvent>("explain-progress", (e) => applyExplainProgress(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
@@ -1339,6 +1503,75 @@
       }),
     );
 
+    // Headless testing only (`MULPEX_DEBUG_DUMP`): every pane's buffer to disk.
+    let dumpTimer: ReturnType<typeof setInterval> | undefined;
+    const driveLog: string[] = [];
+    void invoke<boolean>("debug_dump_enabled").then((on) => {
+      if (!on) return;
+      dumpTimer = setInterval(async () => {
+        for (const d of terminals.dumpAll()) void invoke("debug_dump", { name: d.key, text: d.text });
+        // What the window shows, for a test that can't look at it.
+        const ui = {
+          activeHost: get(activeHost),
+          activeProject: get(activeProjectHandle),
+          activeSession: get(activeId),
+          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo })),
+          projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
+          text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
+          dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },
+        };
+        void invoke("debug_dump", { name: "ui", text: JSON.stringify(ui, null, 1) });
+        // One queued action per tick: a click (by selector and text), a menu
+        // id, or text typed into the focused field.
+        const raw = await invoke<string | null>("debug_drive_take");
+        if (!raw) return;
+        const a = JSON.parse(raw);
+        try {
+          await drive(a);
+          driveLog.push(`ok ${raw}`);
+          void invoke("debug_dump", { name: "drive-log", text: driveLog.join("\n") });
+        } catch (e) {
+          void invoke("debug_dump", { name: "drive-error", text: String((e as Error)?.stack ?? e) });
+        }
+      }, 700);
+    });
+    async function drive(a: any) {
+        if (a.menu) await handleMenu(a.menu);
+        if (a.click) {
+          const el = [...document.querySelectorAll<HTMLElement>(a.click)].find((e) => !a.text || e.textContent?.includes(a.text));
+          if (a.context) el?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 10, clientY: 10 }));
+          else el?.click();
+        }
+        if (a.type != null) {
+          const el = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
+          if (el && "value" in el) {
+            el.value = a.type;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+        }
+        if (a.invoke) {
+          const r = await Promise.race([
+            invoke(a.invoke, a.args ?? {}).then((v) => `ok ${JSON.stringify(v)}`, (e) => `err ${e}`),
+            new Promise((res) => setTimeout(() => res("timeout 3s"), 3000)),
+          ]);
+          driveLog.push(`invoke ${a.invoke} → ${r}`);
+        }
+        if (a.termInput != null) terminals.inputActive(a.termInput);
+        if (a.rawInput != null) {
+          const h = get(activeProjectHandle);
+          const id = get(activeId);
+          driveLog.push(`rawInput h=${h} id=${id}`);
+          if (h != null && id != null) {
+            const r = await Promise.race([
+              sendBytes(h, id, new TextEncoder().encode(a.rawInput)).then(() => "ok", (e) => `err ${e}`),
+              new Promise((res) => setTimeout(() => res("timeout 3s"), 3000)),
+            ]);
+            driveLog.push(`sendBytes → ${r}`);
+          }
+        }
+        if (a.key) (document.activeElement ?? window).dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...a.key }));
+    }
+
     const onResize = () => terminals.refit();
     window.addEventListener("resize", onResize);
 
@@ -1351,6 +1584,7 @@
     // through the same select path as clicking the sidebar row, so it lands on
     // the pane with the question rather than merely raising the window.
     let stopAttention: (() => void) | null = null;
+    let stopHosts: (() => void) | null = null;
     initAttention(focusInstance).then((stop) => {
       stopAttention = stop;
     });
@@ -1363,7 +1597,7 @@
         stopLinuxKeys = installLinuxKeys(
           (id) => void handleMenu(id),
           () => {
-            if (get(projects).size > 0) showPalette.update((v) => !v);
+            if (get(projects).size > 0 || get(hosts).size > 0) showPalette.update((v) => !v);
           },
         );
       });
@@ -1377,6 +1611,10 @@
       // rendered for. Building at xterm's 80x24 default and resizing afterwards
       // corrupts the pane permanently; see `terminals.ts::create`.
       terminals.setGeometry(ws.cols, ws.rows);
+      if (ws.geometry_owner) {
+        geometryDriver.set(ws.geometry_owner);
+        terminals.setLock({ cols: ws.cols, rows: ws.rows });
+      }
       if (ws.projects.length) {
         for (const info of ws.projects) {
           await bootstrapProject(info, info.handle === ws.active);
@@ -1384,6 +1622,9 @@
       } else {
         recents = await listRecentProjects();
       }
+      // Remote hosts: their cached tabs now, each one's live ones as it connects.
+      stopHosts = await initHosts({ bootstrapProject, dropProject, afterChange: afterHostChange });
+      if (!ws.projects.length && get(hosts).size > 0) selectHost([...get(hosts).keys()].sort((a, b) => a - b)[0]);
       ready = true;
       // After a ⌘⇧Q Checkpoint & Quit: offer to wake the claudes that stopped.
       void checkResume();
@@ -1394,8 +1635,10 @@
 
     return () => {
       window.removeEventListener("resize", onResize);
+      clearInterval(dumpTimer);
       stopUpdateChecks();
       stopAttention?.();
+      stopHosts?.();
       stopLinuxKeys?.();
       unlisteners.forEach((p) => p.then((f) => f()));
     };
@@ -1404,13 +1647,15 @@
 
 <svelte:window onkeydown={onGlobalKey} />
 
-{#if ready && $project}
+{#if ready && ($projects.size > 0 || $hosts.size > 0)}
   <div class="shell">
     <ProjectTabBar
       onselect={selectProject}
       onclose={closeProjectHandle}
       onadd={pickAndOpen}
       onreorder={applyProjectOrder}
+      onhost={selectHost}
+      onhostmenu={openHostMenu}
     />
     <TopBar onremote={() => (showRemote = true)} />
     <aside class="sidebar">
@@ -1488,11 +1733,58 @@
       }}
     />
   {/if}
+  {#if pickerHost != null}
+    <RemoteProjectPicker
+      host={pickerHost}
+      onclose={() => {
+        pickerHost = null;
+        terminals.refocus();
+      }}
+      onopen={(path, host) => {
+        // The host comes from the picker itself: closing it first would
+        // leave nothing to read it from, and the project opened on this Mac.
+        pickerHost = null;
+        void openOrFocusProject(path, host);
+      }}
+    />
+  {/if}
+  {#if renameHostFor}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="host-rename" onclick={() => (renameHostFor = null)}>
+      <!-- svelte-ignore a11y_autofocus -->
+      <input
+        autofocus
+        value={renameHostFor.value}
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+          const t = renameHostFor;
+          if (e.key === "Escape") renameHostFor = null;
+          if (e.key === "Enter" && t) {
+            void renameHost(t.slot, (e.currentTarget as HTMLInputElement).value);
+            renameHostFor = null;
+            terminals.refocus();
+          }
+        }}
+      />
+    </div>
+  {/if}
   {#if showRemote}
     <RemoteDialog
       onclose={() => {
         showRemote = false;
         terminals.refocus();
+      }}
+    />
+  {/if}
+  {#if showConnect}
+    <ConnectHostDialog
+      onclose={() => {
+        showConnect = false;
+        terminals.refocus();
+      }}
+      onpaired={(st) => {
+        showConnect = false;
+        selectHost(st.slot);
       }}
     />
   {/if}
@@ -1538,6 +1830,15 @@
     <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onclose={closeContextMenu} />
   {/if}
 {:else if ready}
+  {#if showConnect}
+    <ConnectHostDialog
+      onclose={() => (showConnect = false)}
+      onpaired={(st) => {
+        showConnect = false;
+        selectHost(st.slot);
+      }}
+    />
+  {/if}
   <ProjectPicker
     {recents}
     {claude}
@@ -1594,6 +1895,24 @@
      `overflow-y: auto` inside InstanceList/HubPanel never engages. */
   .sidebar > :global(*) {
     min-height: 0;
+  }
+  .host-rename {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: grid;
+    place-items: start center;
+    padding-top: 4rem;
+    background: rgba(0, 0, 0, 0.4);
+  }
+  .host-rename input {
+    width: min(20rem, 80vw);
+    padding: 0.5rem 0.6rem;
+    background: var(--bg-elev);
+    color: var(--text);
+    border: 1px solid var(--border-focus);
+    border-radius: 6px;
+    font: inherit;
   }
   .pane {
     grid-area: pane;

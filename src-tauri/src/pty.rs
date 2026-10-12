@@ -181,20 +181,72 @@ fn delivery_settled(state_dir: &Path, id: usize) -> bool {
 /// `Serialize` payload that survives Tauri IPC without ArrayBuffer plumbing).
 pub struct OutputSink {
     state: Mutex<SinkState>,
-    /// Shell terminals only: the last `TAIL_BYTES` of output and the Remote
-    /// Control phones watching it. A phone opening a terminal gets the tail to
-    /// paint from, then every byte after it — the same bytes, at the same one
-    /// geometry, the desktop xterm got.
-    tail: Option<Mutex<Tail>>,
+    /// The last stretch of output and whoever is watching it live: Remote
+    /// Control phones (shell terminals only) and remote desktops (every kind —
+    /// `remote/desktop.rs`). A watcher gets the tail to paint from, then every
+    /// byte after it — the same bytes, at the same one geometry, the desktop
+    /// xterm got. Taken BEFORE `state` in `push`, so a tap can never see a byte
+    /// the channel hasn't been handed, or miss one it has.
+    tail: Mutex<Tail>,
 }
 
 /// How much of a terminal's recent output a phone repaints from.
 const TAIL_BYTES: usize = 256 * 1024;
+/// A claude's tail: what a remote desktop catches up from between the screen
+/// snapshot it was sent and the live stream (`remote/desktop.rs`).
+const CLAUDE_TAIL_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Default)]
+fn tail_cap(shell: bool) -> usize {
+    // A debug build can shrink the tail, so a remote desktop's snapshot path
+    // (`remote/desktop.rs::compose`, the serialized-screen branch) is reached
+    // without first printing megabytes.
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("MULPEX_DEBUG_TAIL_BYTES").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    if shell {
+        TAIL_BYTES
+    } else {
+        CLAUDE_TAIL_BYTES
+    }
+}
+
+/// One event in a session's output, for a remote desktop mirroring it: bytes,
+/// or the PTY changing size at that point in the stream (its xterm must resize
+/// right there, between the bytes drawn for the old size and the new).
+#[derive(Debug, PartialEq)]
+pub enum TapMsg {
+    Bytes(Vec<u8>),
+    Resize(u16, u16),
+}
+
+/// What a remote desktop starts mirroring a session from: the ring as it is
+/// now, at absolute stream offsets, then every event after `total` on `rx`.
+pub struct DesktopTap {
+    /// Absolute offset of `ring[0]` in the session's output since spawn.
+    pub start: u64,
+    pub ring: Vec<u8>,
+    /// Resizes inside the ring: (absolute offset, cols, rows).
+    pub resizes: Vec<(u64, u16, u16)>,
+    /// The PTY's size at spawn — meaningful when `start == 0`, i.e. the ring
+    /// still holds everything since, so replaying it from this size is exact.
+    pub init: (u16, u16),
+    /// `start + ring.len()`: where `rx` picks up.
+    pub total: u64,
+    pub rx: std::sync::mpsc::Receiver<TapMsg>,
+}
+
 struct Tail {
+    cap: usize,
+    /// Phones may watch shells only — what reaches a claude from a phone goes
+    /// through the desktop's prompt checks instead.
+    shell: bool,
     ring: std::collections::VecDeque<u8>,
+    start: u64,
+    resizes: std::collections::VecDeque<(u64, u16, u16)>,
+    init: (u16, u16),
     taps: Vec<std::sync::mpsc::Sender<Vec<u8>>>,
+    dtaps: Vec<std::sync::mpsc::Sender<TapMsg>>,
 }
 
 enum SinkState {
@@ -203,15 +255,36 @@ enum SinkState {
 }
 
 impl OutputSink {
-    fn new(keep_tail: bool) -> Self {
+    pub(crate) fn new(shell: bool, init: (u16, u16)) -> Self {
         Self {
             state: Mutex::new(SinkState::Buffering(Vec::new())),
-            tail: keep_tail.then(|| Mutex::new(Tail::default())),
+            tail: Mutex::new(Tail {
+                cap: tail_cap(shell),
+                shell,
+                ring: Default::default(),
+                start: 0,
+                resizes: Default::default(),
+                init,
+                taps: Vec::new(),
+                dtaps: Vec::new(),
+            }),
         }
     }
 
     /// Called from the reader thread for every chunk of PTY output.
-    fn push(&self, bytes: &[u8]) {
+    pub(crate) fn push(&self, bytes: &[u8]) {
+        let mut t = self.tail.lock().unwrap();
+        t.ring.extend(bytes);
+        let over = t.ring.len().saturating_sub(t.cap);
+        t.ring.drain(..over);
+        t.start += over as u64;
+        let start = t.start;
+        while t.resizes.front().is_some_and(|r| r.0 < start) {
+            t.resizes.pop_front();
+        }
+        // A watcher that went away dropped its receiver; forget it.
+        t.taps.retain(|tx| tx.send(bytes.to_vec()).is_ok());
+        t.dtaps.retain(|tx| tx.send(TapMsg::Bytes(bytes.to_vec())).is_ok());
         let mut st = self.state.lock().unwrap();
         match &mut *st {
             SinkState::Attached(ch) => {
@@ -219,24 +292,42 @@ impl OutputSink {
             }
             SinkState::Buffering(buf) => buf.extend_from_slice(bytes),
         }
-        drop(st);
-        if let Some(tail) = &self.tail {
-            let mut t = tail.lock().unwrap();
-            t.ring.extend(bytes);
-            let over = t.ring.len().saturating_sub(TAIL_BYTES);
-            t.ring.drain(..over);
-            // A phone that went away dropped its receiver; forget it.
-            t.taps.retain(|tx| tx.send(bytes.to_vec()).is_ok());
-        }
+    }
+
+    /// The PTY changed size here in the stream.
+    pub(crate) fn resized(&self, cols: u16, rows: u16) {
+        let mut t = self.tail.lock().unwrap();
+        let at = t.start + t.ring.len() as u64;
+        t.resizes.push_back((at, cols, rows));
+        t.dtaps.retain(|tx| tx.send(TapMsg::Resize(cols, rows)).is_ok());
     }
 
     /// Watch this terminal: its recent output now, every new byte after. Under
     /// the one lock, so nothing falls between the two. `None` for a claude.
     pub fn tap(&self) -> Option<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
-        let mut t = self.tail.as_ref()?.lock().unwrap();
+        let mut t = self.tail.lock().unwrap();
+        if !t.shell {
+            return None;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         t.taps.push(tx);
         Some((t.ring.iter().copied().collect(), rx))
+    }
+
+    /// Mirror this session on a remote desktop: the ring and its resizes now,
+    /// and every byte and resize after, under the one lock.
+    pub fn desktop_tap(&self) -> DesktopTap {
+        let mut t = self.tail.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        t.dtaps.push(tx);
+        DesktopTap {
+            start: t.start,
+            ring: t.ring.iter().copied().collect(),
+            resizes: t.resizes.iter().copied().collect(),
+            init: t.init,
+            total: t.start + t.ring.len() as u64,
+            rx,
+        }
     }
 
     /// Bind the frontend channel: flush anything buffered, then stream live.
@@ -433,7 +524,7 @@ impl Session {
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let master = pair.master;
 
-        let sink = Arc::new(OutputSink::new(kind == SessionKind::Shell));
+        let sink = Arc::new(OutputSink::new(kind == SessionKind::Shell, (cols, rows)));
         let alive = Arc::new(AtomicBool::new(true));
         // Latched by the reader thread on first output. It can't be read here:
         // `spawn_command` has returned from the fork, but the child sets its
@@ -613,6 +704,11 @@ impl Session {
         self.sink.tap()
     }
 
+    /// A remote desktop mirroring this session (`OutputSink::desktop_tap`).
+    pub fn desktop_tap(&self) -> DesktopTap {
+        self.sink.desktop_tap()
+    }
+
     pub fn send(&mut self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(bytes);
@@ -635,6 +731,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
+        self.sink.resized(cols, rows);
         // The recorder's grid has to track the child's idea of the screen, or
         // cursor-addressed redraws land on the wrong rows.
         if let Some(rec) = &self.recorder {
@@ -1481,7 +1578,7 @@ mod tests {
     /// keeps no tail at all.
     #[test]
     fn a_terminal_tap_gets_the_tail_then_the_stream() {
-        let sink = OutputSink::new(true);
+        let sink = OutputSink::new(true, (80, 24));
         sink.push(b"before ");
         let (tail, rx) = sink.tap().unwrap();
         assert_eq!(tail, b"before ");
@@ -1494,9 +1591,33 @@ mod tests {
 
         drop(rx);
         sink.push(b"!");
-        assert_eq!(sink.tail.as_ref().unwrap().lock().unwrap().taps.len(), 1, "the dropped tap is gone");
+        assert_eq!(sink.tail.lock().unwrap().taps.len(), 1, "the dropped tap is gone");
 
-        assert!(OutputSink::new(false).tap().is_none());
+        assert!(OutputSink::new(false, (80, 24)).tap().is_none());
+    }
+
+    /// A desktop tap: the ring at absolute offsets with its resizes, then bytes
+    /// and resizes in stream order; a ring that rolled over says where it starts.
+    #[test]
+    fn a_desktop_tap_carries_offsets_and_resizes() {
+        let sink = OutputSink::new(false, (100, 30));
+        sink.push(b"abc");
+        sink.resized(120, 40);
+        sink.push(b"de");
+        let t = sink.desktop_tap();
+        assert_eq!((t.start, t.total, t.init), (0, 5, (100, 30)));
+        assert_eq!(t.ring, b"abcde");
+        assert_eq!(t.resizes, vec![(3, 120, 40)]);
+        sink.push(b"f");
+        sink.resized(90, 20);
+        assert_eq!(t.rx.recv().unwrap(), TapMsg::Bytes(b"f".to_vec()));
+        assert_eq!(t.rx.recv().unwrap(), TapMsg::Resize(90, 20));
+
+        sink.push(&vec![b'y'; CLAUDE_TAIL_BYTES]);
+        let t2 = sink.desktop_tap();
+        assert_eq!(t2.start, 6, "the six bytes before rolled off");
+        assert_eq!(t2.resizes, vec![(6, 90, 20)], "the resize inside them went too");
+        assert_eq!(t2.total, 6 + CLAUDE_TAIL_BYTES as u64);
     }
 
     /// The selection behind the one cleanup nothing else in this file can do —

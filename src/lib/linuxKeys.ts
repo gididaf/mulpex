@@ -14,7 +14,7 @@ import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { isSuper } from "./platform";
 import { terminals } from "./terminals";
 
-/** `${shift ? "S-" : ""}${e.code}` → menu id. Super is implied. */
+/** `${alt ? "A-" : ""}${shift ? "S-" : ""}${e.code}` → menu id. Super is implied. */
 const CHORDS: Record<string, string> = {
   KeyO: "open_project",
   "S-KeyW": "close_project",
@@ -42,6 +42,8 @@ const CHORDS: Record<string, string> = {
   "S-ArrowDown": "move_instance_down",
   "S-KeyQ": "checkpoint_quit",
   KeyQ: "quit",
+  "A-BracketRight": "next_host",
+  "A-BracketLeft": "prev_host",
 };
 for (let n = 1; n <= 9; n++) CHORDS[`Digit${n}`] = `project_${n}`;
 
@@ -50,9 +52,10 @@ for (let n = 1; n <= 9; n++) CHORDS[`Digit${n}`] = `project_${n}`;
 const SELECTION_CHORDS = new Set(["S-ArrowLeft", "S-ArrowRight", "S-ArrowUp", "S-ArrowDown"]);
 
 /** The menu id a key event maps to, or null. Pure, for the table's sake. */
-export function chordId(e: Pick<KeyboardEvent, "code" | "shiftKey" | "ctrlKey">): string | null {
+export function chordId(e: Pick<KeyboardEvent, "code" | "shiftKey" | "ctrlKey" | "altKey">): string | null {
   if (e.ctrlKey) return null;
-  return CHORDS[`${e.shiftKey ? "S-" : ""}${e.code}`] ?? null;
+  // Alt is part of the chord: without it, Super+Alt+[ read as Super+[.
+  return CHORDS[`${e.altKey ? "A-" : ""}${e.shiftKey ? "S-" : ""}${e.code}`] ?? null;
 }
 
 /** An editable field that is not xterm's own hidden textarea. */
@@ -110,7 +113,7 @@ export function installLinuxKeys(
       e.preventDefault();
       e.stopPropagation();
     };
-    if (!e.shiftKey && !e.ctrlKey) {
+    if (!e.shiftKey && !e.ctrlKey && !e.altKey) {
       switch (e.code) {
         case "KeyC":
           claim();

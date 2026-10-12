@@ -110,6 +110,16 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let remote_control = MenuItemBuilder::with_id("remote_control", "Remote Control…")
         .accelerator("Cmd+Shift+O")
         .build(app)?;
+    // Remote Hosts (`remote/client.rs`): pair with another Mulpex from its
+    // ⌘⇧O link, and walk the host switcher. ⌥ because ⌘⇧[ ⌘⇧] are projects and
+    // ⌘[ ⌘] instances; claimed in the webview too (App.svelte::onGlobalKey).
+    let connect_host = MenuItemBuilder::with_id("connect_host", "Connect to Remote Mulpex…").build(app)?;
+    let next_host = MenuItemBuilder::with_id("next_host", "Next Host")
+        .accelerator("Cmd+Alt+]")
+        .build(app)?;
+    let prev_host = MenuItemBuilder::with_id("prev_host", "Previous Host")
+        .accelerator("Cmd+Alt+[")
+        .build(app)?;
     let mut file_builder = SubmenuBuilder::new(app, "File")
         .item(&open_project)
         .item(&close_project)
@@ -135,6 +145,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&import_docs)
         .item(&remote_control)
+        .item(&connect_host)
+        .separator()
+        .item(&next_host)
+        .item(&prev_host)
         .build()?;
 
     // Edit: the predefined items macOS routes to the focused xterm textarea.

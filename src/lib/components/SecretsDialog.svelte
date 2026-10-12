@@ -49,7 +49,7 @@
   async function startEdit(set: SavedSet) {
     error = "";
     try {
-      const d = await secretsGet(set.name);
+      const d = await secretsGet(set.name, handle);
       rows = d.rows.map((r) => ({ ...r, shown: false }));
       projectOnly = d.project_only;
       editing = set.name;
@@ -81,7 +81,7 @@
     sheet?.focus();
     if (!ok) return;
     try {
-      await secretsDelete(set.name);
+      await secretsDelete(set.name, handle);
       if (editing === set.name) stopEdit();
       await reload(handle);
     } catch (e) {
