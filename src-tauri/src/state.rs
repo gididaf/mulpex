@@ -4772,7 +4772,7 @@ mod tests {
     /// shell's own (`pbi_pgid`) IS a command running. Driven here against a real
     /// shell on a real PTY, because that disagreement is the entire claim.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn a_terminal_reports_whether_a_command_is_running_and_where_it_sits() {
         let (_env, root, mut core) = scratch_core("term-fg-test");
         let info = core.spawn_terminal(None, None, true).unwrap();

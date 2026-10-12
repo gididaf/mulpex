@@ -30,6 +30,7 @@
     setAutoCompact,
     reparentSession,
     setMuteMenuChecked,
+    quitApp,
     type BootstrapInfo,
     type ClaudeStatus,
     type HubUpdateEvent,
@@ -79,6 +80,7 @@
   } from "./lib/stores";
   import { findByDir } from "./lib/stores";
   import { terminals } from "./lib/terminals";
+  import { IS_LINUX } from "./lib/platform";
   import { addPin, dropPins, loadPins, setPanelOpen, togglePanel } from "./lib/pins";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
@@ -1136,6 +1138,11 @@
         // Custom item (muda hard-binds the predefined one to ⌘M, which is Mute).
         await getCurrentWindow().minimize();
         break;
+      case "quit":
+        // Linux Super+Q (lib/linuxKeys.ts). On macOS ⌘Q is the predefined menu
+        // item and never reaches here.
+        await quitApp();
+        break;
       case "check_updates":
         // Manual: reports "up to date" and network errors too, unlike the
         // periodic check which stays silent on both.
@@ -1192,7 +1199,9 @@
     // ⌘P / Ctrl+P toggles the command palette (projects, sessions, commands). Not a
     // menu accelerator, so it reaches the webview; preventDefault stops the print
     // dialog.
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
+    // Not on Linux: Super+P is claimed in lib/linuxKeys.ts, and Ctrl+P there is
+    // the shell's previous-history key.
+    if (!IS_LINUX && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
       e.preventDefault();
       if (get(projects).size > 0) showPalette.update((v) => !v);
       return;
@@ -1346,6 +1355,20 @@
       stopAttention = stop;
     });
 
+    // Linux has no native menu: the webview claims the Super shortcuts itself.
+    // Loaded only there, so macOS never even fetches the module.
+    let stopLinuxKeys: (() => void) | undefined;
+    if (IS_LINUX) {
+      void import("./lib/linuxKeys").then(({ installLinuxKeys }) => {
+        stopLinuxKeys = installLinuxKeys(
+          (id) => void handleMenu(id),
+          () => {
+            if (get(projects).size > 0) showPalette.update((v) => !v);
+          },
+        );
+      });
+    }
+
     (async () => {
       const ws = await bootstrap();
       // BEFORE any TerminalView mounts. Restored sessions' PTYs have been running
@@ -1373,6 +1396,7 @@
       window.removeEventListener("resize", onResize);
       stopUpdateChecks();
       stopAttention?.();
+      stopLinuxKeys?.();
       unlisteners.forEach((p) => p.then((f) => f()));
     };
   });

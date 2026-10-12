@@ -25,6 +25,7 @@ import type { SessionKind } from "./ipc";
 import { readPromptBox } from "./promptbox";
 import type { PromptBox } from "./promptbox";
 import { captureSelection, plainText } from "./pins";
+import { IS_LINUX, isSuper } from "./platform";
 import type { PinRun } from "./pins";
 
 export const THEME: ITheme = {
@@ -51,7 +52,7 @@ export const THEME: ITheme = {
 };
 
 export const FONT_FAMILY =
-  'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Monaco, "Cascadia Code", monospace';
+  'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Monaco, "Cascadia Code", "DejaVu Sans Mono", "Noto Sans Mono", monospace';
 
 export const FONT_SIZE = 13;
 export const LINE_HEIGHT = 1.1;
@@ -176,8 +177,13 @@ class TerminalManager {
     // which bash/zsh bind to something else entirely.
     const isNewlineKey = (e: KeyboardEvent): boolean =>
       e.key === "Enter" && (e.shiftKey || e.altKey);
-    if (kind === "claude") {
+    //
+    // On Linux every kind gets a handler as well: a Super chord is a Mulpex
+    // shortcut there (lib/linuxKeys.ts), never input, so xterm must not encode it.
+    if (kind === "claude" || IS_LINUX) {
       term.attachCustomKeyEventHandler((e) => {
+        if (IS_LINUX && isSuper(e)) return false;
+        if (kind !== "claude") return true;
         if (e.type === "keydown" && isNewlineKey(e)) {
           e.preventDefault();
           e.stopPropagation();
@@ -350,6 +356,27 @@ class TerminalManager {
     e.term.clearSelection();
     const text = plainText(lines);
     return text.trim() ? text : null;
+  }
+
+  /** The focused terminal's selection as plain text, left selected — Linux
+   *  Super+C, where no native Edit menu does it. */
+  activeSelection(): string | null {
+    const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
+    if (!e || !e.term.hasSelection()) return null;
+    return e.term.getSelection();
+  }
+
+  /** Paste into the focused terminal as a real paste (bracketed when the app
+   *  asked for it) — Linux Super+V. */
+  pasteActive(text: string): void {
+    const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
+    e?.term.paste(text);
+  }
+
+  /** Select the focused terminal's whole buffer — Linux Super+A. */
+  selectAllActive(): void {
+    const e = this.activeKey ? this.entries.get(this.activeKey) : undefined;
+    e?.term.selectAll();
   }
 
   /** Re-focus the active terminal (after a dialog/menu action steals focus). */

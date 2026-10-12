@@ -715,11 +715,19 @@ pub fn dir_access_error(dir: &Path) -> Option<String> {
     match std::fs::read_dir(dir) {
         Ok(_) => None,
         Err(e) => Some(match e.kind() {
+            #[cfg(target_os = "macos")]
             std::io::ErrorKind::PermissionDenied => format!(
                 "macOS is blocking access to {}.\n\
                  Open System Settings ▸ Privacy & Security ▸ Files and Folders, \
                  find Mulpex, and turn on the folder this project lives in \
                  (or grant Full Disk Access), then try again.",
+                dir.display()
+            ),
+            // No TCC off macOS: a denial here is plain Unix permissions.
+            #[cfg(not(target_os = "macos"))]
+            std::io::ErrorKind::PermissionDenied => format!(
+                "Permission denied: you are not allowed to read {}.\n\
+                 Check the folder's owner and mode (`ls -ld`), then try again.",
                 dir.display()
             ),
             std::io::ErrorKind::NotFound => {
@@ -836,7 +844,7 @@ fn shell_state_of(pid: libc::pid_t) -> Option<ShellState> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn shell_state_of(_pid: libc::pid_t) -> Option<ShellState> {
     None
 }
@@ -893,7 +901,7 @@ fn tty_dev_of(pid: libc::pid_t) -> Option<u32> {
 /// Deliberately excludes this process: Mulpex launched from a terminal has a
 /// controlling tty of its own, and while that can never be one of our PTYs, the
 /// check costs nothing and makes the blast radius obvious.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn kill_tty_session(dev: u32) {
     let me = std::process::id() as libc::pid_t;
     for pid in all_pids() {
@@ -917,7 +925,7 @@ fn kill_tty_session(dev: u32) {
 /// claude's group nor `kill_tty_session` reaches them, and closing a claude
 /// left them running forever. Children in the claude's own group (its MCP
 /// servers) are left to that `killpg`; Mulpex's own group is never touched.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn kill_child_groups(parent: libc::pid_t) {
     let theirs = unsafe { libc::getpgid(parent) };
     let mine = unsafe { libc::getpgid(0) };
@@ -937,7 +945,7 @@ fn kill_child_groups(parent: libc::pid_t) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn kill_child_groups(_parent: libc::pid_t) {}
 
 /// `PROC_ALL_PIDS` from `<sys/proc_info.h>`; the `libc` crate exposes
@@ -1055,6 +1063,13 @@ fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     (n == size).then_some(info.pbi_ppid as libc::pid_t)
 }
 
+/// Whether `pid` has lost the parent that started it. On macOS every orphan is
+/// reparented to launchd, pid 1.
+#[cfg(target_os = "macos")]
+fn is_orphaned(pid: libc::pid_t) -> bool {
+    ppid_of(pid) == Some(1)
+}
+
 /// SIGKILL every **orphaned** hub listener on this machine, and report how many.
 ///
 /// This is the one cleanup no other code path can do. A listener runs in its own
@@ -1077,12 +1092,12 @@ fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// another one or under `mpx`, and is therefore never matched.
 /// Split out from the kill so the selection can be tested without a test run
 /// SIGKILLing whatever orphans happen to be on the developer's machine.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn orphaned_listener_pids() -> Vec<libc::pid_t> {
     let me = std::process::id() as libc::pid_t;
     all_pids()
         .into_iter()
-        .filter(|&pid| pid != me && pid > 1 && ppid_of(pid) == Some(1))
+        .filter(|&pid| pid != me && pid > 1 && is_orphaned(pid))
         .filter(|&pid| {
             // One matcher, shared with the hook that excuses a listener from the
             // "still working" count — two spellings of "this is a listener" is how
@@ -1092,7 +1107,7 @@ fn orphaned_listener_pids() -> Vec<libc::pid_t> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn reap_orphaned_listeners() -> usize {
     let pids = orphaned_listener_pids();
     for pid in &pids {
@@ -1101,17 +1116,139 @@ pub fn reap_orphaned_listeners() -> usize {
     pids.len()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn reap_orphaned_listeners() -> usize {
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+// ---- Linux: the same questions as above, answered from /proc ----
+//
+// Each `/proc/<pid>/…` file is read whole and handed to a pure parser, so the
+// parsing is unit-tested on every platform against fixture strings, and the
+// Linux wrappers are only the file reads.
+
+#[cfg(any(target_os = "linux", test))]
+/// The fields of `/proc/<pid>/stat` the process sweeps need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcStat {
+    /// The executable name, at most 15 bytes, as the kernel truncates it.
+    comm: String,
+    ppid: i32,
+    pgrp: i32,
+    /// Controlling terminal's device number; 0 means none.
+    tty_nr: i32,
+    /// The tty's FOREGROUND process group; -1 with no controlling terminal.
+    tpgid: i32,
+}
+
+#[cfg(any(target_os = "linux", test))]
+/// Parse one `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp session
+/// tty_nr tpgid …`. `comm` may itself hold spaces and parentheses, so it ends
+/// at the LAST `)` — never split the whole line on whitespace.
+fn parse_proc_stat(line: &str) -> Option<ProcStat> {
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    let comm = line.get(open + 1..close)?.to_owned();
+    let mut rest = line.get(close + 1..)?.split_whitespace();
+    let _state = rest.next()?;
+    let mut num = || rest.next()?.parse::<i32>().ok();
+    let ppid = num()?;
+    let pgrp = num()?;
+    let _session = num()?;
+    let tty_nr = num()?;
+    let tpgid = num()?;
+    Some(ProcStat { comm, ppid, pgrp, tty_nr, tpgid })
+}
+
+#[cfg(any(target_os = "linux", test))]
+/// A shell's foreground job, from its stat: the tty's foreground group differs
+/// from the shell's own — the same test as `e_tpgid != pbi_pgid` on macOS. No
+/// controlling terminal reports -1 (0 on some kernels), which is not a job.
+fn foreground_job_running(st: &ProcStat) -> bool {
+    st.tpgid > 0 && st.tpgid != st.pgrp
+}
+
+#[cfg(any(target_os = "linux", test))]
+/// `/proc/<pid>/cmdline` as one searchable string, NUL turned into newline —
+/// the same shape `argv_of` returns on macOS.
+fn cmdline_text(raw: &[u8]) -> String {
+    let joined: Vec<u8> = raw.iter().map(|&b| if b == 0 { b'\n' } else { b }).collect();
+    String::from_utf8_lossy(&joined).into_owned()
+}
+
+#[cfg(any(target_os = "linux", test))]
+/// Whether a process with this parent has lost the one that started it.
+///
+/// On macOS that is simply "parent is launchd". Linux reparents an orphan to
+/// the nearest **child subreaper** instead of pid 1 when one exists — on a
+/// desktop that is the user's `systemd --user` manager — so a parent named
+/// `systemd` counts too. Never matches a live listener: that one's parent is
+/// its `claude`.
+fn parent_means_orphaned(ppid: i32, parent_comm: Option<&str>) -> bool {
+    ppid == 1 || parent_comm == Some("systemd")
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
+    parse_proc_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn shell_state_of(pid: libc::pid_t) -> Option<ShellState> {
+    let st = proc_stat(pid)?;
+    Some(ShellState {
+        command_running: foreground_job_running(&st),
+        cwd: cwd_of(pid),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cwd_of(pid: libc::pid_t) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let path = path.to_str()?;
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn tty_dev_of(pid: libc::pid_t) -> Option<u32> {
+    let st = proc_stat(pid)?;
+    (st.tty_nr != 0).then_some(st.tty_nr as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn all_pids() -> Vec<libc::pid_t> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn argv_of(pid: libc::pid_t) -> Option<String> {
+    Some(cmdline_text(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?))
+}
+
+#[cfg(target_os = "linux")]
+fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    proc_stat(pid).map(|st| st.ppid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_orphaned(pid: libc::pid_t) -> bool {
+    let Some(ppid) = ppid_of(pid) else {
+        return false;
+    };
+    let parent = proc_stat(ppid);
+    parent_means_orphaned(ppid, parent.as_ref().map(|p| p.comm.as_str()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn tty_dev_of(_pid: libc::pid_t) -> Option<u32> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn kill_tty_session(_dev: u32) {}
 
 impl Drop for Session {
@@ -1203,7 +1340,7 @@ fn shell_command() -> anyhow::Result<CommandBuilder> {
         .filter(|s| !s.trim().is_empty())
         // A Finder-launched bundle has no SHELL either; same fallback the PATH
         // probe uses.
-        .unwrap_or_else(|| "/bin/zsh".to_string());
+        .unwrap_or_else(|| claude_bin::DEFAULT_SHELL.to_string());
     let mut cmd = CommandBuilder::new(&shell);
     // `-l` alone is login-but-not-interactive: zsh would skip `.zshrc`, print no
     // prompt, and treat the PTY as a script. Both flags are required.
@@ -1256,7 +1393,7 @@ mod tests {
     /// A claude's background command runs in a process group of its own, which
     /// `killpg` on the claude misses; `kill_child_groups` reaches it, and leaves
     /// a child in the parent's own group alone.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn background_groups_of_a_child_are_killed() {
         use std::io::BufRead as _;
@@ -1292,6 +1429,51 @@ mod tests {
 
         unsafe { libc::killpg(sh.id() as libc::pid_t, libc::SIGKILL) };
         let _ = sh.wait();
+    }
+
+
+    /// `/proc/<pid>/stat` as Linux writes it, including a `comm` that holds a
+    /// space and a `)` — the reason the parser anchors on the LAST `)`.
+    #[test]
+    fn proc_stat_lines_parse() {
+        let shell = "4242 (bash) S 4100 4242 4242 34817 4300 4194560 1 0 0 0 2 1 0 0 20 0 1 0 9 1 2 3";
+        let st = parse_proc_stat(shell).unwrap();
+        assert_eq!(st, ProcStat { comm: "bash".into(), ppid: 4100, pgrp: 4242, tty_nr: 34817, tpgid: 4300 });
+        assert!(foreground_job_running(&st), "the tty's foreground group is a job, not the shell");
+
+        let idle = "4242 (zsh) S 4100 4242 4242 34817 4242 0";
+        assert!(!foreground_job_running(&parse_proc_stat(idle).unwrap()));
+
+        // A daemon: no controlling terminal, tpgid -1.
+        let daemon = "77 (we ird) proc)) S 1 77 77 0 -1 4194304 0";
+        let st = parse_proc_stat(daemon).unwrap();
+        assert_eq!(st.comm, "we ird) proc)");
+        assert_eq!((st.ppid, st.tty_nr, st.tpgid), (1, 0, -1));
+        assert!(!foreground_job_running(&st));
+
+        assert!(parse_proc_stat("").is_none());
+        assert!(parse_proc_stat("12 (cut").is_none());
+        assert!(parse_proc_stat("12 (short) S 1").is_none());
+    }
+
+    #[test]
+    fn cmdline_reads_as_one_line_per_argument() {
+        let raw = b"/opt/Mulpex/mulpex-helper\0listen\0";
+        assert_eq!(cmdline_text(raw), "/opt/Mulpex/mulpex-helper\nlisten\n");
+        assert!(mulpex_core::hook::command_is_hub_listener(&cmdline_text(raw)));
+    }
+
+    /// Linux hands an orphan to a subreaper (`systemd --user`) when there is
+    /// one, so "parent is pid 1" alone would never reap on a desktop — but a
+    /// listener whose `claude` is alive must never qualify.
+    #[test]
+    fn an_orphan_is_parented_by_init_or_a_systemd_subreaper() {
+        assert!(parent_means_orphaned(1, Some("systemd")));
+        assert!(parent_means_orphaned(1, None));
+        assert!(parent_means_orphaned(1834, Some("systemd")));
+        assert!(!parent_means_orphaned(5120, Some("claude")));
+        assert!(!parent_means_orphaned(5120, Some("node")));
+        assert!(!parent_means_orphaned(5120, None));
     }
 
     /// A Remote Control tap gets the recent output, then every byte after it;
@@ -1330,7 +1512,7 @@ mod tests {
     /// absent and cannot be added: a legacy listener's argv spells its state dir
     /// as the literal `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return
     /// the environment that would expand it (measured — see `argv_of`).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn only_a_parentless_listener_is_reaped() {
         const MARK: &str = "\"/x/mulpex-helper\" listen";
@@ -1369,7 +1551,7 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        assert_eq!(ppid_of(orphan), Some(1), "the test's orphan must be parentless");
+        assert!(is_orphaned(orphan), "the test's orphan must be parentless");
 
         let reapable = orphaned_listener_pids();
         assert!(reapable.contains(&orphan), "a parentless listener is reapable");
@@ -1457,6 +1639,12 @@ mod tests {
         let is_root = unsafe { libc::geteuid() } == 0;
         if !is_root {
             let reason = reason.expect("an unreadable directory was reported as usable");
+            #[cfg(not(target_os = "macos"))]
+            assert!(
+                reason.contains("Permission denied") && reason.contains("ls -ld"),
+                "the reason gives the user nothing to do about it: {reason}"
+            );
+            #[cfg(target_os = "macos")]
             assert!(
                 reason.contains("blocking access") && reason.contains("Privacy & Security"),
                 "the reason gives the user nothing to do about it: {reason}"

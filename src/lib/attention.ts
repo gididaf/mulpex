@@ -21,6 +21,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { projects, blockedTotal, type ProjectState } from "./stores";
 import type { ProjectHandle } from "./ipc";
+import { IS_LINUX } from "./platform";
 
 /** Jump the UI to one claude — App.svelte passes its own select path in. */
 export type Reveal = (handle: ProjectHandle, id: number) => void;
@@ -98,7 +99,12 @@ export async function initAttention(reveal: Reveal): Promise<() => void> {
   // Clicking a banner: raise Mulpex, then jump to the claude that sent it. The
   // window may be hidden or minimised, so `show`/`unminimize` both run before
   // `setFocus` — `setFocus` alone won't restore a minimised window.
-  const action = await onAction((n) => {
+  //
+  // Not on Linux: there `onAction` never settles (measured, WebKitGTK build of
+  // this plugin — the desktop side has no action listener to register), and
+  // awaiting it held up everything below, so neither the title badge nor any
+  // banner ever started. Banners still show there; clicking one does nothing.
+  const action = IS_LINUX ? null : await onAction((n) => {
     const extra = n.extra as { handle?: number; id?: number } | undefined;
     if (extra?.handle == null || extra.id == null) return;
     void (async () => {
@@ -111,7 +117,14 @@ export async function initAttention(reveal: Reveal): Promise<() => void> {
 
   // macOS clears the badge when passed no count, so 0 must become `undefined`
   // rather than a literal 0 — otherwise the dock shows a permanent "0".
+  //
+  // Linux has no dock badge (XFCE ignores it), so there the count goes in the
+  // window title instead, which the taskbar shows: "(3) Mulpex".
   const stopBadge = blockedTotal.subscribe((n) => {
+    if (IS_LINUX) {
+      void win.setTitle(n > 0 ? `(${n}) Mulpex` : "Mulpex").catch(() => {});
+      return;
+    }
     void win.setBadgeCount(n > 0 ? n : undefined).catch(() => {});
   });
 
@@ -137,6 +150,6 @@ export async function initAttention(reveal: Reveal): Promise<() => void> {
   return () => {
     stopBadge();
     stopNotify();
-    void action.unregister().catch(() => {});
+    void action?.unregister().catch(() => {});
   };
 }

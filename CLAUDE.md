@@ -32,6 +32,7 @@ reasoning in `docs/`.
 | [docs/secrets.md](docs/secrets.md) | ⌘K Secrets: KEY=VALUE rows → a 0600 `.env`; only `🔑 KEY` is typed, and the path + rules ride every turn as hidden hook context; one-off (scratch dir, gone when the claude closes) vs saved (`<mulpex home>/secrets/`, global or project-only, refs); the shared file format | `secrets.rs` (both crates), `SecretsDialog.svelte`, `commands.rs` `secrets_*`, the `userpromptsubmit` note |
 | [docs/remote-control.md](docs/remote-control.md) | ⌘⇧O Remote Control: a phone PWA drives every project through a relay (`mulpex.dreamvps.com`); QR pairing + end-to-end encryption (the relay reads nothing); chat from transcripts; typing via the desktop's prompt check (>900 B → a file); dialogs as buttons → measured keys; terminals as readable text over a hidden same-geometry xterm; start/close; Web Push sent by the Mac; keep-awake; on/off persists | `src-tauri/src/remote/*`, `crates/mulpex-relay`, `remote/`, `RemoteDialog.svelte`, the `remote-*` handlers in `App.svelte`, `OutputSink::tap`, the `dialog/` hook file, `scripts/deploy-relay.sh` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
+| [docs/linux.md](docs/linux.md) | The Linux port: Super = ⌘, no native menu (the webview claims every shortcut via `lib/linuxKeys.ts`), Super+C/V clipboard, `/proc` process sweeps, title-bar badge, AppImage + deb signed on the Mac | `menu.rs` (every new shortcut also goes in `linuxKeys.ts`), `pty.rs` process sweeps, `platform.ts`, `tauri.linux.conf.json`, `scripts/release-linux.sh` |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
 ## The key idea
@@ -291,6 +292,9 @@ Projects are the top-level thing you switch between — sessions have ⌘[ / ⌘
 ⌘N-selects-a-tab is the browser/terminal convention the tab bar already implies. The index is the
 `projects` Map's insertion order, which is exactly what `ProjectTabBar` renders, so ⌘3 is always
 the third visible tab.
+
+**On Linux there is no native menu**: `src/lib/linuxKeys.ts` maps Super chords to the same menu
+ids, so a shortcut added to `menu.rs` must be added there too → [docs/linux.md](docs/linux.md).
 
 Everything else (arrows, Ctrl+C, Esc, Shift+Enter) flows straight to the focused terminal.
 Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused xterm textarea.

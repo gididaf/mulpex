@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "linux",
+  "description": "Linux only: clipboard access for Super+C / Super+V, which the webview handles itself there (macOS uses the native Edit menu), and the window title that carries the attention count in place of a dock badge.",
+  "platforms": [
+    "linux"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
+    "core:window:allow-set-title"
+  ]
+}

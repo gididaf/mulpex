@@ -45,3 +45,8 @@ base64 = "0.22"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 aes-gcm = "0.10"
 ureq = "3"
+
+# Linux only: Super+C / Super+V go through the webview there (no native Edit
+# menu), and WebKitGTK cannot be relied on to let script read the clipboard.
+[target.'cfg(target_os = "linux")'.dependencies]
+tauri-plugin-clipboard-manager = "~2.3"

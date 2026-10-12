@@ -571,6 +571,7 @@ fn start_thread(g: &mut Inner) {
 /// Hold off idle sleep while remote control is on: a sleeping Mac answers no
 /// phone. `-i` only — the display still sleeps, and closing the lid still
 /// sleeps the Mac. `-w` ties it to this process, so it can't outlive Mulpex.
+#[cfg(target_os = "macos")]
 fn keep_awake() -> Option<std::process::Child> {
     std::process::Command::new("/usr/bin/caffeinate")
         .args(["-i", "-w", &std::process::id().to_string()])
@@ -579,6 +580,34 @@ fn keep_awake() -> Option<std::process::Child> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()
+}
+
+/// Linux: a systemd-logind inhibitor, held for as long as its command runs.
+/// `idle:sleep` is `caffeinate -i`'s scope — the screen may still blank — and
+/// `tail --pid` is `-w`: it exits when Mulpex does, releasing the lock.
+#[cfg(target_os = "linux")]
+fn keep_awake() -> Option<std::process::Child> {
+    std::process::Command::new("systemd-inhibit")
+        .args([
+            "--what=idle:sleep",
+            "--who=Mulpex",
+            "--why=Remote Control is on",
+            "--mode=block",
+            "tail",
+            "-f",
+            "/dev/null",
+            &format!("--pid={}", std::process::id()),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keep_awake() -> Option<std::process::Child> {
+    None
 }
 
 /// Turn remote control on or off.

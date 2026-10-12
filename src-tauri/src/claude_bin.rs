@@ -130,6 +130,13 @@ fn expand_tilde(dir: &str) -> Option<PathBuf> {
     }
 }
 
+/// The shell to assume when `$SHELL` is unset (a Finder- or desktop-launched
+/// app): each platform's own default login shell.
+#[cfg(target_os = "macos")]
+pub(crate) const DEFAULT_SHELL: &str = "/bin/zsh";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const DEFAULT_SHELL: &str = "/bin/bash";
+
 /// One `KEY=VALUE` pair as the login shell reported it.
 pub type EnvPair = (String, String);
 
@@ -162,7 +169,7 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// shell that exports its own `-c` script text (`ZSH_EXECUTION_STRING`) would
 /// otherwise plant a copy of it in the middle of the dump.
 pub(crate) fn probe_login_shell_env() -> Option<Vec<EnvPair>> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL.to_string());
     let script =
         format!("printf '%s' '{MARK_BEGIN}'; /usr/bin/env -0; printf '%s' '{MARK_END}'");
 

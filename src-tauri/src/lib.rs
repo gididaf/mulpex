@@ -5,6 +5,7 @@ mod checkpoint;
 mod claude_bin;
 mod commands;
 mod hub;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menu;
 mod project;
 mod pins;
@@ -22,7 +23,9 @@ mod vtgrid;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use tauri::{Emitter, Manager, RunEvent, WindowEvent};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
+use tauri::{Manager, RunEvent, WindowEvent};
 
 use state::{AppState, Workspace};
 
@@ -38,6 +41,7 @@ fn resolve_helper_path() -> PathBuf {
 
 /// Forward a custom menu item id to the frontend (predefined items handle
 /// themselves and aren't matched here).
+#[cfg(target_os = "macos")]
 fn is_forwarded(id: &str) -> bool {
     matches!(
         id,
@@ -82,7 +86,7 @@ fn teardown(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -90,14 +94,23 @@ pub fn run() {
         .manage(AppState {
             ws: Mutex::new(Workspace::new()),
             helper_path: resolve_helper_path(),
-        })
-        .menu(menu::build)
-        .on_menu_event(|app, event| {
-            let id = event.id().0.as_str();
-            if is_forwarded(id) {
-                let _ = app.emit("menu", id.to_string());
-            }
-        })
+        });
+    // The native menu is macOS-only. Linux has no global menu bar, and a GTK
+    // strip in the window was declined: there the webview claims every
+    // shortcut itself (`lib/linuxKeys.ts`) and feeds the same ids into the same
+    // `handleMenu`, so no command has a second implementation.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(menu::build).on_menu_event(|app, event| {
+        let id = event.id().0.as_str();
+        if is_forwarded(id) {
+            let _ = app.emit("menu", id.to_string());
+        }
+    });
+    // Linux copy/paste goes through the webview too (Super+C / Super+V), and
+    // WebKitGTK's own clipboard API is not reliably readable from script.
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::list_recent_projects,

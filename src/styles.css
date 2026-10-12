@@ -15,7 +15,7 @@
   --dot-needs: #e06c75;
   --sidebar-w: 20rem;
 
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Noto Sans Hebrew", "DejaVu Sans", sans-serif;
   font-size: 13px;
   color: var(--text);
   color-scheme: dark;
