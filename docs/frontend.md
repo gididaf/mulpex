@@ -331,6 +331,10 @@ the `Map`, since insertion order *is* tab order) and the `reorder_projects` comm
 order is also what ⌘1–9 index into, so a drag remaps them by design. Handles missing from the
 submitted order are appended rather than dropped, so a stale caller can't make a project vanish.
 
+**With a remote host paired, the tab bar shows only the host in front's projects** (`stores.ts::
+hostProjects`), behind the host switcher at its left; ⌘1–9, ⌘⇧[ / ⌘⇧] and ⌘⇧← / ⌘⇧→ all act within
+that host. → [remote-hosts.md](remote-hosts.md)
+
 **⌘⇧← / ⌘⇧→ are the keyboard route to the same thing** (File ▸ Move Project Left/Right, and the
 palette). `App.svelte::moveProject` splices the active handle one slot and commits through
 `applyProjectOrder` — the identical path a drop takes — so persistence and the ⌘1–9 remap come for

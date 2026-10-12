@@ -17,6 +17,15 @@ Everything else about this directory — dropped paths (bracketed paste, and why
 ordering, drag-to-reorder clamping, the two tab badges, the dock badge and notifications, and why
 the hub panel is Messages-only — is in [../docs/frontend.md](../docs/frontend.md).
 
+**Linux** has no native menu: `lib/linuxKeys.ts` maps Super chords to the menu ids (`platform.ts`
+says which OS). → [../docs/linux.md](../docs/linux.md)
+
+**Remote Hosts** (driving another Mulpex): a remote project's handle is `slot · 2^32 + its handle`
+(`hosts.ts`), so every store keyed by handle works unchanged; `ipc.ts::call` is the one router that
+sends a remote project's command to its host; `remoteHosts.ts` keeps the host's tabs in step. A
+mirror's xterm is sized only by its host's stream, never by `refit`.
+→ [../docs/remote-hosts.md](../docs/remote-hosts.md)
+
 Several behaviors here were removed *deliberately* and are documented as such: the
 drag-a-folder-to-open-a-project gesture, and the hub panel's Waiting/Locks sections. Don't restore
 them without asking.

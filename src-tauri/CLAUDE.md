@@ -14,7 +14,8 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `explain.rs`, `explain_prompt.md` (⌘E: a Sonnet `--fork-session` explains a selection; follow-ups `--resume` that fork; Mulpex deletes it) | [../docs/explain.md](../docs/explain.md) — why follow-ups resume instead of re-fork (measured cache cost), why it is gated on the transcript file |
 | `secrets.rs` (⌘K) | [../docs/secrets.md](../docs/secrets.md) |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
-| `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md) |
+| `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts` → [../docs/linux.md](../docs/linux.md) |
+| `pty.rs` process sweeps (`/proc` on Linux), `tauri.linux.conf.json`, `capabilities/linux.json`, `scripts/release-linux.sh` | [../docs/linux.md](../docs/linux.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 
 Traps that live in this directory specifically:
