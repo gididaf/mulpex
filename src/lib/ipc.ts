@@ -569,6 +569,8 @@ export const checkpointDismiss = () => invoke<void>("checkpoint_dismiss");
 export interface RemoteStatus {
   enabled: boolean;
   relay_url: string;
+  /** What the dialog's Reset button puts back. */
+  default_relay_url: string;
   state: "off" | "connecting" | "connected" | "error";
   error: string | null;
   /** Phones connected right now. */

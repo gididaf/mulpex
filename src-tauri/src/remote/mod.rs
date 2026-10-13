@@ -139,6 +139,8 @@ pub struct DeviceStatus {
 pub struct RemoteStatus {
     pub enabled: bool,
     pub relay_url: String,
+    /// What the dialog's Reset button puts back.
+    pub default_relay_url: String,
     /// `off` / `connecting` / `connected` / `error`.
     pub state: String,
     /// The last connection failure, while `state` is `error`.
@@ -328,6 +330,7 @@ fn status_of(g: &mut Inner) -> RemoteStatus {
     RemoteStatus {
         enabled: g.enabled,
         relay_url: g.cfg.relay_url.clone(),
+        default_relay_url: DEFAULT_RELAY.into(),
         state: g.conn.word().into(),
         error: g.error.clone(),
         clients: g.online.len(),

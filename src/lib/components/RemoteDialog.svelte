@@ -84,6 +84,12 @@
     }
   }
 
+  function resetUrl() {
+    if (!st) return;
+    url = st.default_relay_url;
+    saveUrl();
+  }
+
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -160,6 +166,9 @@
           }}
           onblur={saveUrl}
         />
+        {#if st.relay_url !== st.default_relay_url}
+          <button onclick={resetUrl} title={st.default_relay_url}>Reset</button>
+        {/if}
       </div>
     {/if}
     {#if error}<div class="error">{error}</div>{/if}
