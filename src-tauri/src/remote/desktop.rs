@@ -53,6 +53,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "explain-progress",
     "import-update",
     "pins-changed",
+    "asks-changed",
 ];
 
 /// The most terminal output in one frame.

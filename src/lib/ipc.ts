@@ -51,6 +51,10 @@ export interface SessionInfo {
    *  before falling back to a status dot — the unknown-id default is "ready",
    *  which would paint a dead session green. */
   failed: string | null;
+  /** "For me" (`asks.ts`): open items on this claude's list, and how many of
+   *  the user's edits wait for UPDATE. 0 for a terminal. */
+  asks_open: number;
+  asks_pending: number;
 }
 export interface StatusEntry {
   id: number;
@@ -285,6 +289,79 @@ export const getPins = (projectHandle: ProjectHandle) =>
 export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | null) =>
   call<void>("set_pin", { projectHandle, id, pin });
 
+// ── "For me" lists (src-tauri/src/asks.rs) ─────────────────────────────────
+
+export type AskKind = "action" | "decision" | "question";
+
+export interface AskItem {
+  n: number;
+  kind: AskKind;
+  title: string;
+  detail: string | null;
+  choices: string[];
+  status: "open" | "done";
+  done_by: "claude" | "user" | null;
+  author: "claude" | "user";
+  note: string | null;
+  chosen: string | null;
+  created: number;
+  updated: number;
+  rev: number;
+}
+
+/** The user's draft over item `n` — what it should become at UPDATE. */
+export interface AskDraft {
+  done: boolean | null;
+  note: string | null;
+  chosen: string | null;
+  delete: boolean;
+  base_rev: number;
+  /** Set when the claude removed the item while this draft had words on it. */
+  orphan: { kind: AskKind; title: string } | null;
+}
+
+export interface AskAdded {
+  tmp: string;
+  kind: AskKind;
+  title: string;
+  detail: string | null;
+}
+
+export interface AskList {
+  next: number;
+  items: AskItem[];
+  drafts: { edits: Record<string, AskDraft>; added: AskAdded[] };
+  /** An UPDATE is queued, waiting for the claude to be able to hear it. */
+  sending: boolean;
+}
+
+export type AskEdit =
+  | { op: "done"; n: number; done: boolean }
+  | { op: "note"; n: number; note: string }
+  | { op: "choose"; n: number; choice: string | null }
+  | { op: "dismiss"; n: number; on: boolean }
+  | { op: "add"; kind: AskKind; title: string; detail?: string | null }
+  | { op: "edit_added"; tmp: string; kind?: AskKind; title?: string; detail?: string }
+  | { op: "remove_added"; tmp: string }
+  | { op: "discard"; n: number }
+  | { op: "discard_all" }
+  | { op: "clear_done" };
+
+export interface AskSend {
+  id: number;
+  state: "queued" | "refused";
+  why: string | null;
+}
+
+export const asksGet = (projectHandle: ProjectHandle) =>
+  call<Record<string, AskList>>("asks_get", { projectHandle });
+
+export const asksEdit = (projectHandle: ProjectHandle, id: number, edit: AskEdit) =>
+  call<AskList>("asks_edit", { projectHandle, id, edit });
+
+export const asksUpdate = (projectHandle: ProjectHandle, ids: number[]) =>
+  call<AskSend[]>("asks_update", { projectHandle, ids });
+
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>
   invoke<void>("set_mute_menu_checked", { checked });
@@ -392,7 +469,7 @@ export const saveCheck = (projectHandle: ProjectHandle, id: number) =>
 export const saveSession = (projectHandle: ProjectHandle, id: number) =>
   call<void>("save_session", { projectHandle, id });
 
-/** ⌘E: explain `selection` from claude#id's pane in the side panel, in a fresh
+/** ⌘⇧E: explain `selection` from claude#id's pane in the side panel, in a fresh
  *  fork of its conversation (`explain.rs`). Resolves once the fork is running;
  *  the answer streams as `explain-progress` events carrying `reqId`. Rejects
  *  when there is no conversation to fork yet. */

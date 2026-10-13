@@ -1,5 +1,5 @@
-// Pins: a selection lifted off a claude's pane (⌘⇧P) and kept in the pins
-// panel, a column to the right of the terminal, so an important block — a QA
+// Pins: a selection lifted off a claude's pane (⌘⇧P) and kept in the side
+// panel's Pins tab (`rightPanel.ts`), so an important block — a QA
 // checklist, a command — stays in view while the conversation scrolls on.
 //
 // A pin keeps claude's own colors. It is captured cell by cell from the xterm
@@ -253,46 +253,3 @@ export function dropPins(handle: number, id?: number) {
     return next;
   });
 }
-
-// ── panel ──────────────────────────────────────────────────────────────────
-
-/** The pins panel is one switch for the whole app, not per instance: every PTY
- *  shares one geometry (docs/rendering.md), so a column that came and went with
- *  the focused instance would resize every claude on each switch. `frac` is its
- *  share of the pane's width. Remembered in localStorage — a per-viewer nicety. */
-export interface PinsPanel {
-  open: boolean;
-  frac: number;
-}
-
-const PANEL_KEY = "mulpex.pinsPanel";
-export const PANEL_MIN_FRAC = 0.15;
-export const PANEL_MAX_FRAC = 0.6;
-export const clampFrac = (f: number) => Math.min(PANEL_MAX_FRAC, Math.max(PANEL_MIN_FRAC, f));
-
-function loadPanel(): PinsPanel {
-  const def = { open: false, frac: 0.3 };
-  try {
-    const v = JSON.parse(localStorage.getItem(PANEL_KEY) ?? "null");
-    if (v && typeof v.open === "boolean" && typeof v.frac === "number") {
-      return { open: v.open, frac: clampFrac(v.frac) };
-    }
-  } catch {
-    /* no storage: defaults */
-  }
-  return def;
-}
-
-export const pinsPanel = writable<PinsPanel>(loadPanel());
-pinsPanel.subscribe((v) => {
-  try {
-    localStorage.setItem(PANEL_KEY, JSON.stringify(v));
-  } catch {
-    /* not remembered, still works */
-  }
-});
-
-export const setPanelOpen = (open: boolean) => pinsPanel.update((p) => ({ ...p, open }));
-export const togglePanel = () => pinsPanel.update((p) => ({ ...p, open: !p.open }));
-export const setPanelFrac = (frac: number) =>
-  pinsPanel.update((p) => ({ ...p, frac: clampFrac(frac) }));

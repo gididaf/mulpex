@@ -44,7 +44,8 @@ A remote project is `slot · 2^32 + its handle there`:
 - 0 is this Mulpex;
 - the sum is exact in JS.
 
-So `projects`, `terminals.ts`'s keys, pins, explain, attention and save states all work on remote
+So `projects`, `terminals.ts`'s keys, pins, For-me lists (`asks-changed` is forwarded like
+`pins-changed`), explain, attention and save states all work on remote
 projects unchanged.
 
 `client.rs` is the only place a handle crosses the boundary:
@@ -128,7 +129,7 @@ The rest of the lease:
   through `fa` → `remote-action`. On the Mac, `setCompactPhase` and `autoCompactTick` are no-ops
   for remote handles, and `compactLines` shows the phase the host's hub reports. The auto-compact
   rules are enforced only by the host.
-- **Selections** (⌘E, ⌘⇧P, ⌘K's prompt read) are read from the Mac's mirror.
+- **Selections** (⌘⇧E, ⌘⇧P, ⌘K's prompt read) are read from the Mac's mirror.
 - **Never sent to the host:** `switch_project`, `focus_session`, and the host's lifecycle commands
   (`rpc.rs::DENIED`, with reasons). Driving the host never moves its own window around.
 - **Files:** a drop, and Ctrl+V with an image in a remote claude, upload over the channel. They

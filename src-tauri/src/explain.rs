@@ -1,4 +1,4 @@
-//! ⌘E Explain Selection: the user selects part of a claude's pane they don't
+//! ⌘⇧E Explain Selection: the user selects part of a claude's pane they don't
 //! understand, and a side panel explains it in simple Hebrew.
 //!
 //! The selection is only the target. The context is the whole conversation:
@@ -17,7 +17,7 @@
 //! of the previous request, and a re-fork's last message is not that.
 //! So the first ask keeps its transcript (no `--no-session-persistence`), and
 //! Mulpex deletes that file itself when the panel closes, the instance or project
-//! goes, or the app quits ([`discard`], [`discard_all`]) — otherwise every ⌘E
+//! goes, or the app quits ([`discard`], [`discard_all`]) — otherwise every ⌘⇧E
 //! would leave a conversation in the project's `claude --resume` list.
 //!
 //! The answer streams: `--output-format stream-json --include-partial-messages`
@@ -25,7 +25,7 @@
 //! prints a stale `result` line first** (the old conversation's, `num_turns: 0`),
 //! so only the last `result` counts.
 //!
-//! One explain per instance: a new ⌘E, or closing the panel, kills the old child.
+//! One explain per instance: a new ⌘⇧E, or closing the panel, kills the old child.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
@@ -65,7 +65,7 @@ type Running = HashMap<(ProjectHandle, usize), (String, Arc<Mutex<Child>>)>;
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
 /// Each panel's fork session, so a follow-up can resume it and a close can
-/// delete it: the project dir it lives under, the ⌘E request that created it,
+/// delete it: the project dir it lives under, the ⌘⇧E request that created it,
 /// and its uuid once that request's child has reported it.
 struct Fork {
     dir: PathBuf,
@@ -84,7 +84,7 @@ pub fn cancel(handle: ProjectHandle, id: usize) {
     }
 }
 
-/// The prompt for a fresh ⌘E.
+/// The prompt for a fresh ⌘⇧E.
 fn prompt_for(selection: &str) -> String {
     PROMPT.replace("{{SELECTION}}", selection.trim())
 }
@@ -126,7 +126,7 @@ pub fn discard_all() {
     }
 }
 
-/// A fresh ⌘E: explain `selection` for claude#id in a new fork of its
+/// A fresh ⌘⇧E: explain `selection` for claude#id in a new fork of its
 /// conversation `uuid`, replacing the panel's previous fork. `dir` is the
 /// project dir — `--resume` finds a conversation by its cwd.
 pub fn start(
@@ -161,7 +161,7 @@ pub fn followup(
         .and_then(|m| m.get(&(handle, id)))
         .and_then(|f| Some((f.dir.clone(), f.uuid.clone()?)));
     let Some((dir, fork)) = fork else {
-        return Err("Nothing to follow up on — select the text and press ⌘E again".into());
+        return Err("Nothing to follow up on — select the text and press ⌘⇧E again".into());
     };
     run(app, handle, id, req_id, dir, &["--resume", &fork], false, followup_prompt(&question))
 }

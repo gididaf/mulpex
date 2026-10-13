@@ -1,11 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { projects, activeProject, activeProjectHandle, activeId, saves, toast } from "../stores";
+  import { projects, activeProject, activeId, saves, toast } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
-  import PinPanel from "./PinPanel.svelte";
-  import { pinsPanel } from "../pins";
-  import ExplainPanel from "./ExplainPanel.svelte";
+  import RightPanel from "./RightPanel.svelte";
+  import { rightPanel } from "../rightPanel";
   import SaveOverlay from "./SaveOverlay.svelte";
   import { activeHost, activeHostOnline, geometryDriver, hostName, hosts } from "../hosts";
   import { claimHost } from "../remoteHosts";
@@ -52,8 +51,8 @@
   });
 </script>
 
-<!-- The terminals and, when open, the pins column beside them. ⌘E's panel
-     spans the row's right edge, over the pins. -->
+<!-- The terminals and, when shown, the side panel (For me · Pins · Explain)
+     beside them. -->
 <div class="pane-row" bind:this={rowEl}>
   <div class="pane-inner" bind:this={paneEl}>
     {#each all as e (e.handle + " " + e.id)}
@@ -102,13 +101,10 @@
       <div class="toast" role="status">{$toast}</div>
     {/if}
   </div>
-  {#if $pinsPanel.open}
-    <div class="pin-col" style="width:{$pinsPanel.frac * 100}%">
-      <PinPanel row={rowEl} />
+  {#if $rightPanel.open}
+    <div class="side-col" style="width:{$rightPanel.frac * 100}%">
+      <RightPanel row={rowEl} />
     </div>
-  {/if}
-  {#if $activeProjectHandle != null && $activeId != null}
-    <ExplainPanel handle={$activeProjectHandle} id={$activeId} />
   {/if}
 </div>
 
@@ -127,9 +123,9 @@
     height: 100%;
     overflow: hidden;
   }
-  .pin-col {
+  .side-col {
     flex: none;
-    min-width: min(14rem, 50%);
+    min-width: min(16rem, 50%);
     height: 100%;
   }
   .empty {

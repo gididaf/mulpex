@@ -21,6 +21,8 @@
 //! - `hub_spawn` — start new instances, each seeded with a task, and get their ids
 //! - `hub_terminal_open` / `_send` / `_read` / `_close` — create and drive plain
 //!   shell terminals in this project, and read their output incrementally
+//! - `hub_user_asks` — *my* "For me" list: what I need from the user, shown in
+//!   Mulpex's side panel (the app owns the list; this only forwards the call)
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -131,7 +133,7 @@ fn err(id: &Value, code: i64, message: &str) -> Value {
 const MAX_SPAWN_PER_CALL: usize = 8;
 
 /// The hub tools, as MCP tool definitions.
-fn tool_defs() -> Value {
+pub(crate) fn tool_defs() -> Value {
     let empty = json!({ "type": "object", "properties": {} });
     json!([
         {
@@ -213,6 +215,37 @@ fn tool_defs() -> Value {
                     },
                 },
                 "required": ["to"],
+            },
+        },
+        {
+            "name": "hub_user_asks",
+            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"For me\" side panel and as a count on your sidebar row. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`. Use it INSTEAD of repeating requests in chat: add the item, mention it ONCE in your reply, then carry on — the list is the reminder, so do not keep writing \"still waiting on you for X\" in later turns. Keep it current: update an item rather than adding a duplicate, mark it `done` the moment it no longer applies (it stays visible, greyed), `remove` one that was a mistake. Write titles in the user's language, one line each; put context in `detail`. The user checks items, answers, picks choices and adds requests of their own, then presses UPDATE — that reaches you as a message from \"Mulpex\" listing exactly what changed. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's (e.g. an orchestrator checking what a worker already asked, before asking the same thing).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "add", "update", "done", "reopen", "remove"], "description": "What to do." },
+                    "items": {
+                        "type": "array",
+                        "description": "For `add`: the new items.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["action", "decision", "question"] },
+                                "title": { "type": "string", "description": "One line, in the user's language." },
+                                "detail": { "type": "string", "description": "Optional longer context, shown collapsed under the title." },
+                                "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision: the options (at most 8)." },
+                            },
+                            "required": ["kind", "title"],
+                        },
+                    },
+                    "id": { "description": "For update/done/reopen/remove: an item number `n`, or an array of them (update takes one)." },
+                    "kind": { "type": "string", "enum": ["action", "decision", "question"], "description": "For `update`." },
+                    "title": { "type": "string", "description": "For `update`." },
+                    "detail": { "type": "string", "description": "For `update` (empty string clears it)." },
+                    "choices": { "type": "array", "items": { "type": "string" }, "description": "For `update`." },
+                    "of": { "description": "For `list` only: another instance in this project (\"4\" or \"claude#4\") whose list to READ." },
+                },
+                "required": ["action"],
             },
         },
         {
@@ -312,6 +345,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_spawn" => hub_spawn(ctx, &args),
         "hub_close" => hub_close(ctx, &args),
         "hub_remote_open" => hub_remote_open(ctx, &args),
+        "hub_user_asks" => hub_user_asks(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
@@ -1240,6 +1274,38 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
         "note": note,
     })
     .to_string())
+}
+
+/// `hub_user_asks` — forwarded whole to the app, which owns the list (`asks.rs`
+/// in the app) and validates the call; only `of` is resolved here, and `from`
+/// is always this instance, so nothing can write another instance's list.
+fn hub_user_asks(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
+    if action.is_empty() {
+        return Err("missing `action` (list, add, update, done, reopen, remove)".into());
+    }
+    let mut body = args.clone();
+    let obj = body.as_object_mut().ok_or("arguments must be an object")?;
+    if let Some(of) = args.get("of") {
+        let n = match of {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.trim().trim_start_matches("claude#").trim_start_matches('#').parse().ok(),
+            _ => None,
+        }
+        .ok_or("`of` must be an instance in this project, like \"4\" or \"claude#4\"")?;
+        obj.insert("of".into(), json!(n));
+    }
+    obj.insert("op".into(), json!("asks"));
+    obj.insert("from".into(), json!(ctx.instance));
+    let reply = app_request(ctx, body)?;
+    let mut out = json!({ "list": reply.get("list").cloned().unwrap_or(json!([])) });
+    if let Some(note) = reply.get("note").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        out["done"] = json!(note);
+    }
+    if let Some(of) = reply.get("of").and_then(|x| x.as_u64()).filter(|&o| o != ctx.instance as u64) {
+        out["of"] = json!(format!("claude#{of} (read-only)"));
+    }
+    Ok(out.to_string())
 }
 
 /// Resolve `hub_close`'s `to` into the local ids to ask Mulpex about, or the one
@@ -3807,6 +3873,55 @@ mod tests {
             .filter_map(|t| t["name"].as_str().map(str::to_owned))
             .collect();
         assert!(listed.contains(&"hub_terminal_name".to_string()), "{listed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `hub_user_asks` forwards the call with the CALLER's identity stamped on it
+    /// (so nothing can write another instance's list), resolves `of`, and is
+    /// both listed and dispatched.
+    #[test]
+    fn user_asks_forwards_as_the_caller() {
+        let dir = tmpdir("user-asks");
+        let ctx = test_ctx(&dir, 3);
+        assert!(hub_user_asks(&ctx, &json!({})).unwrap_err().contains("action"));
+        assert!(hub_user_asks(&ctx, &json!({"action": "list", "of": "nobody"}))
+            .unwrap_err()
+            .contains("`of`"));
+
+        // Play the app: answer the one request that appears.
+        let req_dir = dir.join("termreq");
+        let app = std::thread::spawn(move || {
+            for _ in 0..100 {
+                if let Some(req) = std::fs::read_dir(&req_dir).ok().and_then(|mut d| {
+                    d.find_map(|e| e.ok().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")))
+                }) {
+                    let body: Value = serde_json::from_str(&std::fs::read_to_string(&req).unwrap()).unwrap();
+                    std::fs::remove_file(&req).unwrap();
+                    std::fs::write(
+                        req.with_extension("done"),
+                        json!({"ok": true, "of": 4, "list": [{"n": 1}]}).to_string(),
+                    )
+                    .unwrap();
+                    return body;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("no request");
+        });
+        let out = hub_user_asks(&ctx, &json!({"action": "list", "of": "claude#4", "from": 9})).unwrap();
+        let sent = app.join().unwrap();
+        assert_eq!(sent["op"], "asks");
+        assert_eq!(sent["from"], 3, "the caller's identity, never its own claim");
+        assert_eq!(sent["of"], 4);
+        assert!(out.contains("claude#4 (read-only)"), "{out}");
+
+        let listed: Vec<String> = tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(listed.contains(&"hub_user_asks".to_string()), "{listed:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

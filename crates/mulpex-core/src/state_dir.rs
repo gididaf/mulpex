@@ -58,7 +58,7 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
         plugin.join("monitors/monitors.json"),
         PLUGIN_MONITORS_JSON.replace("__MULPEX_BIN__", &helper),
     )?;
-    // The `/explain` skill this plugin carried until ⌘E became Explain Selection
+    // The `/explain` skill this plugin carried until ⌘⇧E became Explain Selection
     // (an app-side fork, `src-tauri/src/explain.rs`). A scratch dir written by an
     // older build still has it, and a claude would keep offering it.
     let _ = std::fs::remove_dir_all(plugin.join("skills"));

@@ -1,9 +1,9 @@
-// ⌘E Explain Selection: per-instance side-panel state. The explanation itself
+// ⌘⇧E Explain Selection: per-instance side-panel state. The explanation itself
 // is written by a hidden Sonnet fork of the instance's conversation
 // (`src-tauri/src/explain.rs`) and streams in as `explain-progress` events.
 //
 // Memory only: gone on quit, instance close, or project close. One thread per
-// instance — a new ⌘E replaces it, and the old fork is killed backend-side.
+// instance — a new ⌘⇧E replaces it, and the old fork is killed backend-side.
 // Follow-ups extend the thread by resuming that fork (the conversation is then
 // read back from the prompt cache). Closing the panel deletes the fork.
 

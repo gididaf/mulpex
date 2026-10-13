@@ -96,7 +96,9 @@
   import { applyWorkspace, connectHost, initHosts, landingProject, removeHost, renameHost } from "./lib/remoteHosts";
   import { pastePaths } from "./lib/paths";
   import { IS_LINUX } from "./lib/platform";
-  import { addPin, dropPins, loadPins, reloadPins, setPanelOpen, togglePanel } from "./lib/pins";
+  import { addPin, dropPins, loadPins, reloadPins } from "./lib/pins";
+  import { openPanel, togglePanel, toggleTab } from "./lib/rightPanel";
+  import { dropAsks, loadAsks, reloadAsks } from "./lib/asks";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
@@ -153,6 +155,7 @@
       activeSessionId: info.sessions[info.active]?.id ?? null,
     });
     void loadPins(info.handle);
+    void loadAsks(info.handle);
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle).catch(() => null);
     if (snap) applyHubFor(info.handle, snap);
@@ -209,6 +212,7 @@
   function dropProject(handle: ProjectHandle) {
     terminals.disposeProject(handle);
     dropPins(handle);
+    dropAsks(handle);
     dropExplains(handle);
     removeProject(handle);
   }
@@ -977,7 +981,7 @@
     if (b) sendBytes(handle, id, new TextEncoder().encode(b));
   }
 
-  /** ⌘E: explain the focused claude's selection in a side panel, in simple
+  /** ⌘⇧E: explain the focused claude's selection in the side panel's Explain tab, in simple
    *  Hebrew (`lib/explain.ts`, `explain.rs`). A hidden fork of the conversation
    *  writes it, so nothing is typed and mid-turn is fine. Claudes only — a shell
    *  has no conversation to explain from. */
@@ -994,13 +998,14 @@
       return;
     }
     startExplain(handle, id, text);
+    openPanel("explain");
     terminals.refocus();
   }
 
   /** ⌘⇧P: add the focused claude's selection to its pins (`pins.ts`), shown in
-   *  the pins panel right of the terminal, opening the panel; with nothing
-   *  selected, open or close the panel. Claudes only — a shell's rows are never
-   *  restored, so a pin there could not outlive the app. */
+   *  the side panel's Pins tab, opening it there; with nothing selected, show
+   *  that tab — or hide the panel if it already shows it. Claudes only — a
+   *  shell's rows are never restored, so a pin there could not outlive the app. */
   function pinSelection(handle: ProjectHandle, id: number) {
     const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
     if (!s) return;
@@ -1010,12 +1015,12 @@
         flashToast("Pins work on claudes only");
         return;
       }
-      togglePanel();
+      toggleTab("pins");
       terminals.refocus();
       return;
     }
     addPin(handle, id, lines);
-    setPanelOpen(true);
+    openPanel("pins");
     terminals.refocus();
   }
 
@@ -1250,6 +1255,11 @@
         if (h != null && cur != null) pinSelection(h, cur);
         break;
       }
+      // ⌘⇧L: show/hide the side panel (For me · Pins · Explain).
+      case "toggle_panel":
+        togglePanel();
+        terminals.refocus();
+        break;
       case "request_compact": {
         const cur = get(activeId);
         if (h == null || cur == null) break;
@@ -1369,6 +1379,18 @@
         void handleMenu("pin_selection");
         return;
       }
+      // ⌘⇧E — Explain Selection, claimed here for the same reason.
+      if (e.code === "KeyE") {
+        e.preventDefault();
+        void handleMenu("explain");
+        return;
+      }
+      // ⌘⇧L — Show/Hide Side Panel, claimed here for the same reason.
+      if (e.code === "KeyL") {
+        e.preventDefault();
+        void handleMenu("toggle_panel");
+        return;
+      }
       // ⌘⇧K — Request Compact, claimed here for the same reason.
       if (e.code === "KeyK") {
         e.preventDefault();
@@ -1454,6 +1476,8 @@
         if (!isRemote(e.payload.handle)) terminals.reattach(e.payload.handle, e.payload.id);
       }),
       listen<SessionExitedEvent>("pins-changed", (e) => void reloadPins(e.payload.handle, e.payload.id)),
+      // A For-me list changed — by its claude, a remote desktop, the phone, or an UPDATE landing.
+      listen<SessionExitedEvent>("asks-changed", (e) => void reloadAsks(e.payload.handle, e.payload.id)),
       // A remote desktop opened, closed or reordered a project here.
       listen<WorkspaceInfo>("projects-changed", (e) => void applyWorkspace(0, e.payload)),
       // A remote desktop starting to mirror one of this Mulpex's panes.
@@ -1473,6 +1497,7 @@
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
         dropPins(e.payload.handle, e.payload.id);
+        dropAsks(e.payload.handle, e.payload.id);
         dropExplains(e.payload.handle, e.payload.id);
         dropCompact(e.payload.handle, e.payload.id);
       }),

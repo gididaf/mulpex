@@ -690,6 +690,34 @@ run against a live daemon.
 it to `messages.log` as sent by `Mulpex` (`mcp::APP_SENDER`). `sender_label` turns `from_app` into
 "Mulpex" — without it `from: 0` would read as a "claude#0" to reply to — and `HUB_RULES` says a
 message from "Mulpex" is the app: do what it asks, never `hub_send` a reply. `bounce_dead_inbox`
-already skips `from: 0`, so an app message to a claude that dies is dropped, not bounced. The only
-sender today is ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)); each body also
-says "do not reply" itself, because a claude spawned before this shipped has the old `HUB_RULES`.
+already skips `from: 0`, so an app message to a claude that dies is dropped, not bounced. Two
+senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), and the For-me UPDATE
+(below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
+the old `HUB_RULES`.
+
+## The user's list (`hub_user_asks`)
+
+A claude's "For me" list: what it needs from the USER (action / decision with choices / question),
+shown in the side panel ([frontend.md](frontend.md)) and as a count on its row. `HUB_RULES` tells
+every claude to put asks there, mention them once, and not repeat "still waiting on you".
+
+- **The app is the only writer.** The tool rides `app_request`'s `termreq/` channel as `op: "asks"`
+  with `from` stamped from the env identity, so an instance can only change its own list; the
+  helper does shape checks only (no serde derive in `mulpex-core` — the helper stays tiny). The
+  model, drafts, commit and message body are `src-tauri/src/asks.rs`; the store is
+  `<mulpex home>/asks/<key>.json` beside the session store, pruned with it like pins (⌘W loses a
+  list, a quit keeps it; a live claude not yet in `worked` is kept too).
+- **`list` with `of: <n>` reads another instance's list, read-only** — an orchestrator checking what
+  a worker already asked before asking twice. Any other action with a foreign `of` is refused.
+- **Items are numbered per claude, monotonically, never reused**, so "#3" means one thing for the
+  list's life; an action on a removed number says so rather than "not on your list".
+- **UPDATE is queued, then delivered** (`Core::drain_asks_outbox`, on the poll loop): once the
+  claude's listener is ready, or its status is `working` (the Stop hook catches mail mid-turn), or
+  after 180 s regardless — the listener only announces mail that arrives after it starts, the same
+  reason as `checkpoint.rs::drain_wake_queue`. The drafts are committed at delivery, not at the
+  click, so a quit before delivery leaves them pending rather than half-sent.
+- **The body lists the diff by section** (done / reopened / decisions / notes / added / dismissed),
+  then "Act on this now … Do NOT hub_send a reply". Self-contained, so a claude spawned before the
+  tool existed can still act on it.
+- **Every change marks the id dirty**; the poll loop emits `asks-changed {handle,id}` once per tick
+  (forwarded to remote desktops) and bumps the project's `asks_rev` in the phone's view.

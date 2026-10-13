@@ -15,7 +15,8 @@ doc *before* the code:
 Everything else about this directory — dropped paths (bracketed paste, and why the trailing space is
 *inside* the markers), the sidebar's claudes-then-terminals split and its right-click menu, mute
 ordering, drag-to-reorder clamping, the two tab badges, the dock badge and notifications, and why
-the hub panel is Messages-only — is in [../docs/frontend.md](../docs/frontend.md).
+the hub panel is Messages-only, and the ⌘⇧L side panel (For me · Pins · Explain) — is in
+[../docs/frontend.md](../docs/frontend.md).
 
 **Linux** has no native menu: `lib/linuxKeys.ts` maps Super chords to the menu ids (`platform.ts`
 says which OS). → [../docs/linux.md](../docs/linux.md)
@@ -41,6 +42,6 @@ the rule above the box, 2.1.296) — see `promptbox.ts`'s header and the
 Keep it refusing (with a toast) on anything it does not recognize; typing onto a draft or into an
 open dialog is the failure.
 
-⌘E's panel (`ExplainPanel.svelte`) renders model output through `{@html}` — only ever via
+⌘⇧E's tab (`ExplainTab.svelte`) renders model output through `{@html}` — only ever via
 `lib/markdown.ts`'s sanitizer, since this webview can invoke Tauri commands.
 → [../docs/explain.md](../docs/explain.md)

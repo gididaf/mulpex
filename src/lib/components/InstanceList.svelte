@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { openPanel } from "../rightPanel";
   import {
     sessions,
     statuses,
@@ -389,6 +390,17 @@
               >⟳ {s.auto_compact}%</span
             >
           {/if}
+          {#if !shell && (s.asks_open || s.asks_pending)}
+            <!-- "For me": what this claude needs from you. A click also selects
+                 the row (it bubbles to the row button) and shows the tab. -->
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
+              class="asks"
+              class:pending={s.asks_pending > 0}
+              title="{s.asks_open} open for you{s.asks_pending ? ` · ${s.asks_pending} edit(s) not sent yet — press UPDATE` : ''}"
+              onclick={() => openPanel("forme")}>☐ {s.asks_open}{#if s.asks_pending}<span class="pdot"></span>{/if}</span
+            >
+          {/if}
         </div>
         {#if s.name || (!shell && $tasks.get(s.id)) || pct != null}
           <!-- Name/task on the left, context % under the status word. -->
@@ -629,6 +641,25 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  .asks {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    margin-left: 0.3rem;
+    padding: 0 0.35rem;
+    border-radius: 0.6rem;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--text);
+    font-size: 0.68rem;
+    line-height: 1.05rem;
+    cursor: pointer;
+  }
+  .asks .pdot {
+    width: 0.35rem;
+    height: 0.35rem;
+    border-radius: 50%;
+    background: var(--accent);
   }
   .auto {
     flex-shrink: 0;

@@ -1,4 +1,4 @@
-// Markdown → safe HTML, for the ⌘E Explain panel.
+// Markdown → safe HTML, for the ⌘⇧E Explain panel.
 //
 // The text comes from a model that read the whole conversation, and a
 // conversation can hold anything (web pages, file contents), so the HTML is

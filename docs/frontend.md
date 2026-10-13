@@ -366,30 +366,60 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 > **with nothing of its own still running** — see **`needs` must mean "needs YOU"** in
 > [sessions.md](sessions.md).
 
-## Pins (⌘⇧P)
+## The side panel (⌘⇧L): For me · Pins · Explain
 
-Select text in a claude's pane and ⌘⇧P adds it to the **pins panel**, a column right of the
-terminal, so a QA list or a command stays in view while the conversation scrolls. Many pins per
-instance, oldest on top; each has copy / collapse / ✕, and the header has **Clear all** and a close
-✕. ⌘⇧P with nothing selected opens or closes the panel; a new pin opens it. Claudes only — a
-shell's row is never restored, so its pin could not outlive the app (the panel says so on a shell).
+One column right of the terminal with **three fixed tabs** — For me, Pins, Explain (in that order).
+Tabs never close; only the whole panel shows or hides (⌘⇧L, or the ✕ in its header). Each tab shows
+the focused instance's content; For me can also show the whole project. Shell: `RightPanel.svelte`;
+state: `lib/rightPanel.ts` (`open`, `frac`, `tab`, in localStorage as `mulpex.rightPanel`, migrated
+once from the old `mulpex.pinsPanel`). ⌘⇧P with a selection pins and opens the Pins tab; with none it
+shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and opens the Explain tab.
 
 - **One switch for the whole app, not per instance.** The panel is a real column (the terminal
   narrows instead of being covered), and every PTY shares one geometry (docs/rendering.md) — a
   column that came and went with the focused instance would resize every claude on each switch.
-  So it stays open across instances and shows "No pins for claude#N" on one without any. Its
-  open state and width (`frac` of the pane) live in localStorage (`pins.ts::pinsPanel`).
+  So it stays open across instances and each tab says "nothing for claude#N" on one without any.
 - **Dragging its left edge moves a ghost line; the width commits on release**, so the PTYs resize
-  once, not on every pointer move. Clamped to 15–60% (`clampFrac`), min 14rem.
-- **⌘E's panel still overlays**, now anchored to the whole row (`TerminalPane`'s `.pane-row`), so
-  it covers the pins column while open — the user's choice over stacking the two.
+  once, not on every pointer move. Clamped to 15–60% (`clampFrac`), min 16rem.
+- **Explain used to be an overlay** so it would never resize a PTY. The column is global now, so
+  that reason is gone, and it became a tab (the user's ask: one right panel, not several).
+
+### For me (`hub_user_asks`)
+
+What each claude needs from the user — an **action**, a **decision** (with choices to click) or a
+**question** — so a claude says it once instead of repeating "still waiting on you for X" as it keeps
+working. The claude writes the list with `mcp__mulpex__hub_user_asks` (backend: [hub.md](hub.md));
+`ForMeTab.svelte` renders it; `lib/asks.ts` mirrors the backend (`src-tauri/src/asks.rs`).
+
+- **The user's edits are drafts until UPDATE.** Check, note, pick a choice, dismiss, add a request:
+  each is a draft (marked *pending*) laid over the claude's item, and the claude never sees it.
+  UPDATE folds the drafts in and sends that claude one message from "Mulpex" listing exactly what
+  changed. In **All** view one UPDATE sends to every claude with changes, each its own diff.
+- **The drafts live on the backend**, not in the webview, so the desktop, a remote desktop and the
+  phone show the same pending set and any of them can send it. Last write wins per field.
+- **Conflicts:** the claude edits the base at once. A draft on an item it changed is kept and marked
+  "changed since your edit" (`rev > base_rev`). A draft with words on an item it removed becomes an
+  orphan, still sent as "re: removed #n"; a bare tick on one is dropped. Clear done is immediate.
+- **Badge**: a claude row shows `☐ n` (open items) and a dot while edits wait for UPDATE, from
+  `SessionInfo.asks_open/asks_pending` — so remote desktops and the phone get it for free. No
+  attention signal and nothing auto-opens: the user asked for a quiet list.
+- **Plain text only.** Titles, details and notes come from a model or the user; nothing goes through
+  `{@html}`. `dir="auto"` + `unicode-bidi: plaintext`, since items are often Hebrew.
+
+### Pins
+
+Select text in a claude's pane and ⌘⇧P adds it to the Pins tab, so a QA list or a command stays in
+view while the conversation scrolls. Many pins per instance, oldest on top; each has copy / collapse
+/ ✕, and the tab has **Clear all**. Claudes only — a shell's row is never restored, so its pin
+could not outlive the app (the tab says so on a shell).
+
 - **Pins wrap** to the panel's width (`pre-wrap`, collapsed ones clip to one line) — they come off
   a terminal much wider than the column.
 - **Captured cell by cell** off the xterm buffer (`pins.ts::captureSelection`), not
   `getSelection()`, so claude's colors survive. Colors resolve to CSS at capture time (bold 0–7 →
   bright, like xterm), so a pin is self-contained. `getSelectionPosition()` is **0-based with
   `end.x` exclusive** in xterm 5.5, whatever its typings say — measured against `@xterm/headless`.
-- **Rendered** by `PinPanel.svelte`, beside `.pane-inner` (never inside an xterm), with the
+- **Rendered** by `PinsTab.svelte`, beside `.pane-inner` (never inside an xterm), with the
   terminal's own font/size/theme and the same two RTL rules as `.xterm-rows`.
 - **Saved** to `<mulpex home>/pins/<session-store key>.json`, keyed by instance number
   (`src-tauri/src/pins.rs`, which stores each instance's value as opaque JSON — the whole list;

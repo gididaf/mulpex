@@ -2453,3 +2453,35 @@ QA'd by the user in a dev build, not driven by me: phase 1 (panel, toasts, switc
 then rendering, follow-ups, and the `/resume` fix together. Not tested: deleting forks on crash
 (it doesn't happen — a known residue), and the DOMPurify strip of `<script>`/links; `marked` was seen
 to pass both through in node, and the sanitizer was not run outside the webview.
+
+## 2026-10-13 — the side panel and "For me" (`hub_user_asks`)
+
+Design in [frontend.md](frontend.md) and [hub.md](hub.md).
+
+Driven headless (the worktree's hidden-window build, `MULPEX_DEBUG_DUMP`, sandbox `MULPEX_HOME`,
+scrubbed env + the OAuth token, and an isolated `CLAUDE_CONFIG_DIR` with the folder trust
+pre-answered — without it the spawned claude sat on the trust prompt), with a real `claude` spawned
+through a `spawn/` request:
+- **The claude added three items with the tool** (a decision with choices, a Hebrew question, an
+  action); they landed in `<home>/asks/<key>.json` intact, Hebrew included.
+- **The real frontend got them live**: a `drive/` click on the `.chip` "SQLite" in the rendered For
+  me tab recorded the draft. (The first click found nothing because the panel opened on Pins: the
+  shared webview localStorage still held `mulpex.pinsPanel`, and the migration took its tab. That is
+  the intended migration, not a bug.)
+- **Drafts via `asks_edit`** (a done, a Hebrew note, a new request), then **a click on the real
+  UPDATE button**: `messages.log` shows the exact sectioned diff from "Mulpex"; the idle claude was
+  woken by its listener, read it, marked #1 and #2 done through the tool, left #4 open with a reason
+  (empty project), and did not `hub_send` a reply. Drafts were empty afterwards.
+
+Tests: `asks.rs` (ops, numbering, limits, drafts hidden from the claude, commit/diff, orphans,
+stale drafts, Clear done, store round trip/prune/foreign project), `state.rs` (only the caller's
+list, `of` read-only, refused UPDATE keeps drafts, prune on save), `mcp.rs` (identity stamped by
+the helper, `of` resolved, tool listed), `rules.rs` (every tool `HUB_RULES` names exists).
+
+Not verified: the phone screen against a deployed relay (built and type-checked only), a remote
+desktop editing a host's list, and the 180 s delivery fallback for a claude whose listener never
+comes up. Noticed, not caused here: the spawned claude also armed a Monitor of its own beside the
+plugin one ("2 monitors").
+
+Same day: Explain Selection moved from ⌘E to **⌘⇧E**, beside ⌘⇧P and ⌘⇧L (the user's ask); plain
+⌘E is now unbound. Claimed in the webview like the other ⌘⇧ keys.

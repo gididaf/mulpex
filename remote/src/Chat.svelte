@@ -30,6 +30,8 @@
     onclose,
     compact = null,
     oncompact,
+    asks = 0,
+    onforme,
   }: {
     title: string;
     status: string | null;
@@ -51,6 +53,10 @@
     compact?: "requested" | "compacting" | "resume" | null;
     /** Start or cancel that request. */
     oncompact: () => void;
+    /** Open items on this claude's For-me list. */
+    asks?: number;
+    /** Open the For-me screen for this claude. */
+    onforme: () => void;
   } = $props();
 
   let draft = $state("");
@@ -136,6 +142,7 @@
     <span class="title" dir="auto">{title}</span>
     {#if status}<span class="st {status}">{status === "needs" ? "needs you" : status}</span>{/if}
     {#if ctx}<span class="ctx {ctx.level}">{ctx.pct}%</span>{/if}
+    <button class="compact" onclick={onforme}>For me{asks ? ` (${asks})` : ""}</button>
     <button class="compact" onclick={oncompact} disabled={gone}>
       {compact ? "Cancel compact" : "Compact"}
     </button>

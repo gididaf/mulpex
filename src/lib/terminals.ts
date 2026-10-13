@@ -502,7 +502,7 @@ class TerminalManager {
     return this.entries.get(keyOf(handle, id))?.term.hasSelection() ?? false;
   }
 
-  /** (handle, id)'s selection as plain text, for ⌘E — read the same way a pin
+  /** (handle, id)'s selection as plain text, for ⌘⇧E — read the same way a pin
    *  is (soft wraps joined, blank edges trimmed), then cleared. */
   selectionText(handle: number, id: number): string | null {
     const e = this.entries.get(keyOf(handle, id));

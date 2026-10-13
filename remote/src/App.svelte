@@ -3,6 +3,7 @@
   import Chat, { type Item } from "./Chat.svelte";
   import type { DialogView } from "./Dialog.svelte";
   import Term from "./Term.svelte";
+  import ForMe, { type AskList } from "./ForMe.svelte";
   import { unb64 } from "./crypto";
   import { dragSort, moveTo } from "./order";
   import { swipePages } from "./swipe";
@@ -27,12 +28,21 @@
     failed: string | null;
     /** The open question or plan, while the claude waits on it. */
     dialog: DialogView | null;
+    /** "For me": open items on its list, and edits waiting for UPDATE. */
+    asks_open?: number;
+    asks_pending?: number;
   };
-  type Project = { handle: number; name: string; sessions: Row[] };
+  /** `asks_rev` changes whenever any For-me list in the project does. */
+  type Project = { handle: number; name: string; sessions: Row[]; asks_rev?: number };
   type View = { t: "state"; active: number | null; projects: Project[] };
 
   /** The claude whose conversation is open, if any. */
   let chat = $state<{ handle: number; id: number; items: Item[]; gone: boolean; loading: boolean } | null>(
+    null,
+  );
+
+  /** The For-me screen, if open: one project's lists, focused on one claude. */
+  let forme = $state<{ handle: number; focus: number | null; lists: Record<string, AskList>; loading: boolean } | null>(
     null,
   );
 
@@ -80,6 +90,7 @@
         l.send({ t: "open", handle: chat.handle, id: chat.id });
       }
       if (l.state === "online" && term) l.send({ t: "term-open", handle: term.handle, id: term.id });
+      if (l.state === "online" && forme) l.send({ t: "asks-get", handle: forme.handle });
       // The Mac skips a notification for the claude open here only while
       // the app is actually in front; a minimized app can stay connected.
       if (l.state === "online") l.send({ t: "visible", on: document.visibilityState === "visible" });
@@ -96,6 +107,10 @@
       else if (msg.t === "typed") {
         typing.get(msg.rid)?.({ ok: msg.ok, why: msg.why ?? null, id: msg.id ?? null });
         typing.delete(msg.rid);
+      }
+      else if (msg.t === "asks" && forme && msg.handle === forme.handle) {
+        forme.lists = msg.lists ?? {};
+        forme.loading = false;
       }
       else if (msg.t === "chat" && chat && msg.handle === chat.handle && msg.id === chat.id) {
         chat.items = msg.reset ? msg.items : [...chat.items, ...msg.items];
@@ -275,7 +290,29 @@
     history.pushState({ term: true }, "");
   }
 
+  function openForMe(handle: number, focus: number | null) {
+    forme = { handle, focus, lists: {}, loading: true };
+    conn.send({ t: "asks-get", handle });
+    history.pushState({ forme: true }, "");
+  }
+
+  // Re-read the lists whenever the Mac says one of them changed.
+  let formeRev: number | undefined;
+  $effect(() => {
+    const rev = forme ? view?.projects.find((p) => p.handle === forme!.handle)?.asks_rev : undefined;
+    if (forme && rev !== undefined && rev !== formeRev && link === "online") {
+      if (formeRev !== undefined) conn.send({ t: "asks-get", handle: forme.handle });
+      formeRev = rev;
+    }
+    if (!forme) formeRev = undefined;
+  });
+
   function closeChat() {
+    // For me sits on top of whatever opened it: Back closes only it.
+    if (forme) {
+      forme = null;
+      return;
+    }
     if (term) {
       term = null;
       termView = undefined;
@@ -290,7 +327,7 @@
   // A reload (pull-to-refresh, or Android killing the app in the background)
   // starts on the list, but the history still holds the entry an open chat or
   // terminal pushed: the first Back would pop it and do nothing visible. Drop it.
-  if (history.state?.chat || history.state?.term) history.back();
+  if (history.state?.chat || history.state?.term || history.state?.forme) history.back();
   document.addEventListener("visibilitychange", () => {
     conn.send({ t: "visible", on: document.visibilityState === "visible" });
     clearNotifications();
@@ -462,6 +499,17 @@
       {#if refusal}<p class="refusal">{refusals[refusal] ?? refusal}</p>{/if}
       Open Remote Control on your Mac (⌘⇧O) and scan its QR code.
     </div>
+  {:else if forme}
+    {@const fp = view?.projects.find((p) => p.handle === forme!.handle)}
+    <ForMe
+      claudes={ordered(fp?.sessions ?? []).filter((r) => r.row.kind === "claude").map((r) => ({ id: r.row.id, name: r.row.name ?? r.row.task }))}
+      lists={forme.lists}
+      focus={forme.focus}
+      loading={forme.loading}
+      onback={() => history.back()}
+      onedit={(id, edit) => request({ t: "asks-edit", handle: forme!.handle, id, edit })}
+      onupdate={(ids) => request({ t: "asks-update", handle: forme!.handle, ids })}
+    />
   {:else if term}
     <Term
       bind:this={termView}
@@ -488,6 +536,8 @@
       onkey={sendKey}
       dialog={chatRow?.status === "needs" ? (chatRow.dialog ?? null) : null}
       onanswer={sendAnswer}
+      asks={chatRow?.asks_open ?? 0}
+      onforme={() => chat && openForMe(chat.handle, chat.id)}
     />
   {:else}
     <header>
@@ -560,6 +610,17 @@
                 <div class="top">
                   <span class="id">{label(row)}</span>
                   <span class="st {row.status ?? ''}">{statusWord(row)}</span>
+                  {#if row.asks_open || row.asks_pending}
+                    <button
+                      class="asks"
+                      class:pending={!!row.asks_pending}
+                      aria-label="For me"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        openForMe(shown.handle, row.id);
+                      }}>☐ {row.asks_open ?? 0}</button
+                    >
+                  {/if}
                   {#if row.ctx_pct != null}<span class="ctx {ctxLevel(row)}">{row.ctx_pct}%</span>{/if}
                 </div>
                 {#if row.name || row.task}
@@ -824,6 +885,19 @@
   }
   .st.needs {
     color: var(--red);
+  }
+  .asks {
+    padding: 0.05rem 0.5rem;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--bg);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+  .asks.pending {
+    box-shadow: 0 0 0 2px var(--yellow);
   }
   .ctx {
     margin-inline-start: auto;

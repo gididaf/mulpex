@@ -3,14 +3,16 @@
   import { explains, explainKey, closeExplain, askFollowup, isStreaming } from "../explain";
   import { terminals } from "../terminals";
   import { renderMarkdown } from "../markdown";
+  import { activeProjectHandle, activeId, sessions } from "../stores";
 
-  // ⌘E: the active claude's explanation, floating over the right of its pane.
-  // An overlay, not a column: narrowing the terminal would resize every PTY in
-  // the workspace (one geometry — docs/rendering.md) each time it opened, closed,
-  // or you switched to an instance without a panel.
-  let { handle, id }: { handle: number; id: number } = $props();
+  // The side panel's Explain tab (⌘⇧E): the active claude's explanation. A tab,
+  // so it never closes — Clear discards the thread (and its fork); hiding the
+  // panel keeps it.
+  const handle = $derived($activeProjectHandle);
+  const id = $derived($activeId);
+  const kind = $derived(id != null ? $sessions.find((s) => s.id === id)?.kind : undefined);
 
-  const ex = $derived($explains.get(explainKey(handle, id)));
+  const ex = $derived(handle != null && id != null ? $explains.get(explainKey(handle, id)) : undefined);
   const busy = $derived(ex ? isStreaming(ex) : false);
 
   let draft = $state("");
@@ -28,7 +30,7 @@
   });
 
   function ask() {
-    if (busy || !draft.trim()) return;
+    if (busy || !draft.trim() || handle == null || id == null) return;
     askFollowup(handle, id, draft);
     draft = "";
     pinned = true;
@@ -42,27 +44,30 @@
     }
   }
 
-  function close() {
-    closeExplain(handle, id);
+  function clear() {
+    if (handle != null && id != null) closeExplain(handle, id);
     terminals.refocus();
   }
 
-  // Esc only while focus is in the panel: in the terminal, Esc belongs to claude.
+  // Esc while focus is in the tab hands it back to the terminal; it discards
+  // nothing (Clear does). In the terminal, Esc belongs to claude.
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
-      close();
+      terminals.refocus();
     }
   }
 </script>
 
 {#if ex}
-  <div class="panel" role="dialog" tabindex="-1" {onkeydown} aria-label="Explanation">
-    <header>
-      <span class="title">Explain</span>
-      <button class="x" title="Close (Esc)" onclick={close}>✕</button>
-    </header>
+  <!-- Esc here hands focus back to the terminal. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div class="panel" role="region" tabindex="-1" {onkeydown} aria-label="Explanation">
+    <div class="bar">
+      <span class="who">claude#{id}</span>
+      <button class="clear" title="Discard this explanation" onclick={clear}>Clear</button>
+    </div>
     <blockquote dir="auto">{ex.quote}</blockquote>
     <div class="body" dir="rtl" bind:this={bodyEl} {onscroll}>
       {#each ex.turns as t, i (i)}
@@ -88,48 +93,55 @@
       <button class="send" disabled={busy || !draft.trim()} onclick={ask} title="Ask (Enter)">שאל</button>
     </div>
   </div>
+{:else}
+  <div class="empty">
+    {#if id == null}
+      No instance selected.
+    {:else if kind === "shell"}
+      Explain works on claudes only.
+    {:else}
+      Nothing explained for claude#{id}.<br />Select text in the conversation and press ⌘⇧E.
+    {/if}
+  </div>
 {/if}
 
 <style>
   .panel {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: min(40%, 34rem);
-    min-width: min(20rem, 100%);
-    z-index: 6;
+    flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg-elev);
-    color: var(--text);
-    border-left: 1px solid var(--border);
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
     outline: none;
   }
-  header {
+  .bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.45rem 0.6rem 0.45rem 0.9rem;
+    min-height: 1.9rem;
+    padding: 0.2rem 0.6rem 0.2rem 0.9rem;
     border-bottom: 1px solid var(--border);
   }
-  .title {
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: var(--text-dim);
+  .who {
+    font-size: 0.75rem;
+    color: var(--text-faint);
   }
-  .x {
+  .clear {
     border: none;
     background: none;
     color: var(--text-dim);
-    font-size: 0.9rem;
+    font-size: 0.75rem;
     padding: 0.1rem 0.35rem;
     border-radius: 4px;
   }
-  .x:hover {
+  .clear:hover {
     background: var(--border);
     color: var(--text);
+  }
+  .empty {
+    padding: 1.2rem 0.9rem;
+    color: var(--text-faint);
+    font-size: 0.85rem;
+    line-height: 1.5;
   }
   blockquote {
     margin: 0.7rem 0.9rem 0;

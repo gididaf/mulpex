@@ -542,6 +542,7 @@ pub fn project_view(
     state_dir: &std::path::Path,
     sessions: &[SessionInfo],
     snap: &HubSnapshot,
+    asks_rev: u64,
 ) -> Value {
     let rows: Vec<Value> = sessions
         .iter()
@@ -570,10 +571,13 @@ pub fn project_view(
                 "parent": s.parent,
                 "exited": s.exited,
                 "failed": s.failed,
+                // "For me": the badge, and whether UPDATE has anything to send.
+                "asks_open": s.asks_open,
+                "asks_pending": s.asks_pending,
             })
         })
         .collect();
-    json!({ "handle": handle, "name": name, "sessions": rows })
+    json!({ "handle": handle, "name": name, "sessions": rows, "asks_rev": asks_rev })
 }
 
 pub fn workspace_view(active: Option<ProjectHandle>, projects: Vec<Value>) -> Value {
@@ -847,6 +851,16 @@ fn geometry() -> (u16, u16) {
 
 /// Type into a shell terminal. Never a claude: what reaches a claude goes
 /// through the desktop's prompt checks (`on_type`).
+/// Run `f` on one project's `Core`, under the workspace lock. `None` when the
+/// desktop isn't up or the project is closed.
+fn with_core<R>(handle: ProjectHandle, f: impl FnOnce(&mut crate::state::Core) -> R) -> Option<R> {
+    use tauri::Manager;
+    let app = inner().lock().unwrap().app.clone()?;
+    let state = app.state::<crate::state::AppState>();
+    let mut ws = state.ws.lock().unwrap();
+    ws.project_mut(handle).map(f)
+}
+
 fn write_terminal(handle: ProjectHandle, id: usize, bytes: &[u8]) -> bool {
     use tauri::Manager;
     #[cfg(test)]
@@ -1283,6 +1297,44 @@ impl Server {
                 if let Some(s) = self.sessions.get_mut(&cid) {
                     s.watch = None;
                 }
+            }
+            // "For me" (`asks.rs`): the lists, a draft edit, UPDATE — the same
+            // `Core` methods the desktop's commands call, so drafts are shared.
+            Some("asks-get") => {
+                let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
+                let lists = with_core(handle, |c| c.asks_views()).unwrap_or_default();
+                let msg = json!({"t": "asks", "handle": handle, "lists": lists});
+                self.send_sealed(ws, cid, &msg.to_string())?;
+            }
+            Some(t @ ("asks-edit" | "asks-update")) => {
+                let rid = req.get("rid").and_then(Value::as_str).unwrap_or("").chars().take(64).collect::<String>();
+                let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
+                let result: Result<Option<String>, String> = if t == "asks-edit" {
+                    let id = req.get("id").and_then(Value::as_u64).map(|i| i as usize);
+                    match (id, serde_json::from_value::<crate::asks::AskEdit>(req["edit"].clone())) {
+                        (Some(id), Ok(edit)) => with_core(handle, |c| c.asks_edit(id, edit).map(|_| None))
+                            .unwrap_or_else(|| Err("That project is closed".into())),
+                        _ => Err("Bad request".into()),
+                    }
+                } else {
+                    let ids: Vec<usize> = serde_json::from_value(req["ids"].clone()).unwrap_or_default();
+                    with_core(handle, |c| {
+                        let refused: Vec<String> = c
+                            .asks_update(&ids)
+                            .into_iter()
+                            .filter(|s| s.state == "refused")
+                            .filter_map(|s| s.why)
+                            .collect();
+                        Ok((!refused.is_empty()).then(|| refused.join("; ")))
+                    })
+                    .unwrap_or_else(|| Err("That project is closed".into()))
+                };
+                let (ok, why) = match result {
+                    Ok(why) => (true, why),
+                    Err(e) => (false, Some(e)),
+                };
+                let msg = json!({"t": "typed", "rid": rid, "ok": ok, "why": why});
+                self.send_sealed(ws, cid, &msg.to_string())?;
             }
             Some("visible") => {
                 let on = req.get("on").and_then(Value::as_bool).unwrap_or(true);
@@ -1968,6 +2020,8 @@ mod tests {
             kind,
             exited: false,
             failed: failed.map(String::from),
+            asks_open: 0,
+            asks_pending: 0,
         };
         let sessions = vec![
             mk(1, SessionKind::Claude, None),
@@ -1990,7 +2044,7 @@ mod tests {
             pending_messages: 0,
             pending: vec![],
         };
-        let v = project_view(7, "p", std::path::Path::new("/nonexistent"), &sessions, &snap);
+        let v = project_view(7, "p", std::path::Path::new("/nonexistent"), &sessions, &snap, 0);
         assert_eq!(v["sessions"][0]["status"], "needs");
         assert_eq!(v["sessions"][0]["ctx_pct"], 40);
         assert!(v["sessions"][1]["status"].is_null());

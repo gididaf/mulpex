@@ -69,6 +69,14 @@ close it rather than leaving a dead row for the user to tidy by hand. Pass to: \
 killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
 close YOURSELF (the call would never return), and you cannot close a row in another project. \
 Terminals are not instances: hub_terminal_close closes those.\n\
+- mcp__mulpex__hub_user_asks — YOUR list of what you need from the USER (an action they must \
+take, a decision — give the options as choices — or a question), shown in Mulpex's \"For me\" \
+side panel. Whenever you need something from the user, put it on that list and mention it ONCE \
+in your reply; do not keep repeating \"still waiting on you for X\" in later turns — the list is \
+the reminder. Keep it current: mark an item done as soon as it no longer applies. Put only your \
+own asks there; to avoid asking twice, an orchestrator can read a worker's list with action: \
+\"list\", of: <n>. When a message from \"Mulpex\" says the user pressed UPDATE, it lists exactly \
+what they changed on your list (checked, answered, chose, added, dismissed): act on it right away.\n\
 OTHER PROJECTS — Mulpex can have several projects open at once, and the instances in them are \
 reachable by message. hub_instances lists them under other_projects with the exact address of \
 each one; address them <project>#<n> (e.g. \"central-one#3\") in hub_send's `to`, and a message \
@@ -351,6 +359,28 @@ mod tests {
     #[test]
     fn hub_rules_name_the_app_sender() {
         assert!(HUB_RULES.contains(&format!("\"{}\"", crate::mcp::APP_SENDER)));
+    }
+
+    /// Every `mcp__mulpex__<tool>` the rules tell an instance to call exists —
+    /// a rule naming a tool the server never lists sends the model after nothing.
+    #[test]
+    fn every_tool_the_rules_name_exists() {
+        let listed: Vec<String> = crate::mcp::tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        let named: Vec<&str> = HUB_RULES
+            .split("mcp__mulpex__")
+            .skip(1)
+            .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap())
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert!(named.contains(&"hub_user_asks"), "{named:?}");
+        for n in named {
+            assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
+        }
     }
 
     /// A spawned child's prompt must carry the sentinel, or the

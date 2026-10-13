@@ -193,20 +193,26 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let messages = MenuItemBuilder::with_id("messages", "Messages")
         .accelerator("Cmd+Shift+M")
         .build(app)?;
-    // Explains the focused claude's selection in a side panel, in Hebrew
-    // (`explain.rs`, `ExplainPanel.svelte`).
+    // Explains the focused claude's selection in the side panel's Explain tab,
+    // in Hebrew (`explain.rs`, `ExplainTab.svelte`).
+    // ⌘⇧E, beside ⌘⇧P and ⌘⇧L (the side panel's other keys); claimed in the webview too.
     let explain = MenuItemBuilder::with_id("explain", "Explain Selection")
-        .accelerator("Cmd+E")
+        .accelerator("Cmd+Shift+E")
         .build(app)?;
     // Hands the focused claude a 0600 .env and types its path (`secrets.rs`).
     let secrets = MenuItemBuilder::with_id("secrets", "Secrets…")
         .accelerator("Cmd+K")
         .build(app)?;
-    // ⌘⇧P: add the selection to the focused claude's pins panel, or with
-    // nothing selected open/close it (`pins.ts`). Also claimed in the webview (`App.svelte::onGlobalKey`),
+    // ⌘⇧P: add the selection to the focused claude's pins (the side panel's
+    // Pins tab), or with nothing selected show/hide that tab (`pins.ts`). Also claimed in the webview (`App.svelte::onGlobalKey`),
     // whose ⌘P palette arm would otherwise take it.
     let pin = MenuItemBuilder::with_id("pin_selection", "Pin Selection")
         .accelerator("Cmd+Shift+P")
+        .build(app)?;
+    // ⌘⇧L: show/hide the side panel (For me · Pins · Explain — `rightPanel.ts`).
+    // Also claimed in the webview, like ⌘⇧P, so a focused terminal can't swallow it.
+    let side_panel = MenuItemBuilder::with_id("toggle_panel", "Show/Hide Side Panel")
+        .accelerator("Cmd+Shift+L")
         .build(app)?;
     // ⌘⇧K: ask the focused claude to stop at a checkpoint, then /compact it and
     // tell it to continue (`lib/compact.ts`). Pressed again, it cancels. Also
@@ -242,6 +248,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&explain)
         .item(&secrets)
         .item(&pin)
+        .item(&side_panel)
         .item(&compact)
         .separator()
         .item(&next)

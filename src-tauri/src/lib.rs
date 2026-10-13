@@ -9,6 +9,7 @@ mod hub;
 mod menu;
 mod project;
 mod pins;
+mod asks;
 mod pty;
 mod remote;
 mod docs_import;
@@ -64,6 +65,7 @@ fn is_forwarded(id: &str) -> bool {
             | "explain"
             | "secrets"
             | "pin_selection"
+            | "toggle_panel"
             | "request_compact"
             | "minimize"
             | "next"
@@ -134,6 +136,9 @@ pub fn run() {
             commands::set_session_muted,
             commands::get_pins,
             commands::set_pin,
+            commands::asks_get,
+            commands::asks_edit,
+            commands::asks_update,
             commands::set_session_collapsed,
             commands::set_auto_compact,
             commands::set_mute_menu_checked,

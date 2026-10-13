@@ -39,6 +39,9 @@ pub const ALLOWED: &[&str] = &[
     "set_session_muted",
     "get_pins",
     "set_pin",
+    "asks_get",
+    "asks_edit",
+    "asks_update",
     "set_session_collapsed",
     "set_auto_compact",
     "get_hub_snapshot",
@@ -162,6 +165,9 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value) -> Result<Value, Strin
         "set_session_muted" => out(c::set_session_muted(st(), h()?, id()?, arg(args, "muted")?)),
         "get_pins" => out(c::get_pins(st(), h()?)),
         "set_pin" => out(c::set_pin(st(), app.clone(), h()?, id()?, arg(args, "pin")?)),
+        "asks_get" => out(c::asks_get(st(), h()?)),
+        "asks_edit" => out(c::asks_edit(st(), h()?, id()?, arg(args, "edit")?)?),
+        "asks_update" => out(c::asks_update(st(), h()?, arg(args, "ids")?)),
         "set_session_collapsed" => {
             out(c::set_session_collapsed(st(), h()?, id()?, arg(args, "collapsed")?))
         }

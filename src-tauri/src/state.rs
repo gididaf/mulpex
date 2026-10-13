@@ -365,6 +365,11 @@ pub struct Core {
     /// When the last child was launched, so the drip-feed can pace itself without
     /// ever sleeping inside the poll loop.
     last_spawn_at: Option<Instant>,
+    /// The "For me" lists (`asks.rs`), cached; the app is their only writer.
+    pub asks: crate::asks::AskStore,
+    /// Claudes with an UPDATE waiting to be delivered, and since when — see
+    /// `drain_asks_outbox`.
+    asks_outbox: HashMap<usize, Instant>,
 }
 
 /// Minimum gap between launching two `hub_spawn` children. Each `claude` cold
@@ -372,6 +377,10 @@ pub struct Core {
 /// batch at once made them contend badly enough that none was ready to be typed
 /// into in time. Spacing them keeps each start fast enough to be usable.
 const SPAWN_STAGGER: Duration = Duration::from_millis(500);
+
+/// How long a queued For-me UPDATE waits for its claude's listener before it is
+/// left in the inbox regardless — `checkpoint.rs`'s `WAKE_WAIT`, for the same reason.
+const ASKS_WAIT: Duration = Duration::from_secs(180);
 
 /// How long an unread `<token>.done` reply sticks around before being collected.
 /// One is orphaned whenever a caller gives up waiting for it.
@@ -535,6 +544,7 @@ impl Core {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| project_dir.display().to_string());
 
+        let asks = crate::asks::AskStore::beside(store.path(), &project_dir);
         let mut core = Self {
             handle,
             project_dir,
@@ -545,6 +555,8 @@ impl Core {
             state_dir,
             settings_path,
             helper_path: helper_path.to_path_buf(),
+            asks,
+            asks_outbox: HashMap::new(),
             store,
             // A name that survived a restart is treated as the user's, so the
             // instance is neither nudged to rename itself nor allowed to.
@@ -608,6 +620,8 @@ impl Core {
                 kind: kind_of(s),
                 exited: s.is_shell() && !s.is_alive(),
                 failed: self.failed.get(&s.id).cloned(),
+                asks_open: self.asks.counts(s.id).0,
+                asks_pending: self.asks.counts(s.id).1,
             })
             .collect()
     }
@@ -795,6 +809,8 @@ impl Core {
             kind: SessionKind::Claude,
             exited: false,
             failed: None,
+            asks_open: 0,
+            asks_pending: 0,
         })
     }
 
@@ -846,6 +862,8 @@ impl Core {
             kind: SessionKind::Shell,
             exited: false,
             failed: None,
+            asks_open: 0,
+            asks_pending: 0,
         })
     }
 
@@ -1126,6 +1144,9 @@ impl Core {
                     ),
                 }
             }
+            // `hub_user_asks` — a claude editing its own For-me list (`asks.rs`).
+            // Routed through here so the app is the list's only writer.
+            "asks" => (self.apply_asks_request(&v), false),
             // `hub_close` — close claude rows, the inverse of `hub_spawn`. Ids are
             // decided one at a time and reported individually: a batch cleaning up
             // six workers must not lose the five it can close because the sixth is
@@ -1580,7 +1601,7 @@ impl Core {
         Ok((self.project_dir.clone(), uuid))
     }
 
-    /// ⌘E: the project dir and conversation uuid an explain forks. Unlike
+    /// ⌘⇧E: the project dir and conversation uuid an explain forks. Unlike
     /// `begin_save` it touches nothing — the fork only reads the transcript, so
     /// mid-turn and over an open question are both fine.
     ///
@@ -2140,6 +2161,117 @@ impl Core {
         });
     }
 
+    /// One `hub_user_asks` call. `from` is the caller's env identity, so a claude
+    /// can only ever change its own list; `of` reads another's, read-only (an
+    /// orchestrator checking what a worker already asked).
+    fn apply_asks_request(&self, v: &serde_json::Value) -> serde_json::Value {
+        let Some(from) = v.get("from").and_then(|x| x.as_u64()).map(|n| n as usize) else {
+            return serde_json::json!({ "ok": false, "error": "missing 'from'" });
+        };
+        let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+        if action == "list" {
+            let of = v.get("of").and_then(|x| x.as_u64()).map(|n| n as usize).unwrap_or(from);
+            if of != from && !self.sessions.iter().any(|s| s.id == of && !s.is_shell()) {
+                return serde_json::json!({ "ok": false, "error": format!("no claude#{of} in this project") });
+            }
+            let list = self.asks.get(of).unwrap_or_default();
+            return serde_json::json!({ "ok": true, "of": of, "list": list.claude_view() });
+        }
+        if v.get("of").is_some_and(|x| x.as_u64() != Some(from as u64)) {
+            return serde_json::json!({
+                "ok": false,
+                "error": "you can only change your own list — `of` is for reading (action: list)",
+            });
+        }
+        let now = crate::asks::now();
+        match self.asks.mutate(from, |l| l.apply_claude(v, now)) {
+            Ok(note) => serde_json::json!({
+                "ok": true,
+                "note": note,
+                "list": self.asks.get(from).unwrap_or_default().claude_view(),
+            }),
+            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// Every claude's For-me list with its "sending" flag, for the panel.
+    pub fn asks_views(&self) -> std::collections::BTreeMap<usize, serde_json::Value> {
+        self.asks
+            .all()
+            .iter()
+            .map(|(id, list)| {
+                let view = crate::asks::ListView { list, sending: self.asks_outbox.contains_key(id) };
+                (*id, serde_json::to_value(view).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// The user's edit to `claude#id`'s list (drafts, or Clear done).
+    pub fn asks_edit(&self, id: usize, edit: crate::asks::AskEdit) -> Result<serde_json::Value, String> {
+        if !self.sessions.iter().any(|s| s.id == id && !s.is_shell()) {
+            return Err(format!("no claude#{id}"));
+        }
+        self.asks.mutate(id, |l| l.apply_user(edit))?;
+        let list = self.asks.get(id).unwrap_or_default();
+        let view = crate::asks::ListView { list: &list, sending: self.asks_outbox.contains_key(&id) };
+        serde_json::to_value(view).map_err(|e| e.to_string())
+    }
+
+    /// UPDATE: queue each claude's pending drafts for delivery. The commit and
+    /// the message happen in `drain_asks_outbox`, once the claude can hear it —
+    /// so a quit before then leaves the drafts pending rather than half-sent.
+    pub fn asks_update(&mut self, ids: &[usize]) -> Vec<crate::asks::AskSend> {
+        let live = self.live_claude_ids();
+        ids.iter()
+            .map(|&id| {
+                let pending = self.asks.counts(id).1;
+                let (state, why) = if !live.contains(&id) {
+                    ("refused", Some(format!("claude#{id} is not running — your edits are kept")))
+                } else if pending == 0 {
+                    ("refused", Some(format!("nothing to send to claude#{id}")))
+                } else {
+                    self.asks_outbox.entry(id).or_insert_with(Instant::now);
+                    self.asks.mark_dirty(id);
+                    ("queued", None)
+                };
+                crate::asks::AskSend { id, state: state.to_string(), why }
+            })
+            .collect()
+    }
+
+    /// Deliver queued UPDATEs. A claude hears one when its listener is up, or —
+    /// if it is mid-turn — when the Stop hook finds the unread mail; anything
+    /// else waits up to `ASKS_WAIT` and is then dropped into the inbox anyway,
+    /// for its next turn. Same reasoning as `checkpoint.rs::drain_wake_queue`:
+    /// the listener announces only mail that arrives after it starts.
+    pub fn drain_asks_outbox(&mut self) {
+        if self.asks_outbox.is_empty() {
+            return;
+        }
+        let live = self.live_claude_ids();
+        let queued: Vec<(usize, Instant)> = self.asks_outbox.iter().map(|(k, v)| (*k, *v)).collect();
+        for (id, since) in queued {
+            if !live.contains(&id) {
+                // Gone before it could hear it; the drafts stay pending.
+                self.asks_outbox.remove(&id);
+                self.asks.mark_dirty(id);
+                continue;
+            }
+            let working = std::fs::read_to_string(self.state_dir.join(id.to_string()))
+                .is_ok_and(|w| w.trim() == "working");
+            if !(self.listener_ready(id) || working || since.elapsed() >= ASKS_WAIT) {
+                continue;
+            }
+            self.asks_outbox.remove(&id);
+            let now = crate::asks::now();
+            let diff = self.asks.mutate(id, |l| Ok(l.commit(now))).ok().flatten();
+            if let Some(diff) = diff {
+                self.send_app_message(id, &crate::asks::render_update(id, &diff));
+            }
+            self.asks.mark_dirty(id);
+        }
+    }
+
     /// Drop a message into `claude#to`'s inbox **as the app itself** — sender
     /// "Mulpex" (`from_app`), which `HUB_RULES` says not to reply to. Logged to
     /// `messages.log` like a peer's `hub_send`, so the hub panel shows it.
@@ -2584,8 +2716,13 @@ impl Core {
         }
         self.store.save(&sessions);
         // A pin lives as long as its row in the store (`pins.rs`).
-        self.pin_store()
-            .retain(&sessions.iter().filter_map(|s| s.id).collect());
+        let saved: HashSet<usize> = sessions.iter().filter_map(|s| s.id).collect();
+        self.pin_store().retain(&saved);
+        // So does a For-me list — plus any live claude not yet in `worked`, which
+        // can already have one and must not lose it to the next save.
+        let mut keep = saved;
+        keep.extend(self.live_claude_ids());
+        self.asks.retain(&keep);
     }
 
     /// This project's ⌘⇧P pins, stored beside its session store.
@@ -3476,6 +3613,47 @@ mod tests {
         )
         .unwrap();
         (root, core)
+    }
+
+    /// `hub_user_asks` lands in the CALLER's list only, `of` is read-only, and an
+    /// UPDATE to a claude that is not running is refused with its drafts kept.
+    #[test]
+    fn asks_requests_touch_only_the_callers_list() {
+        let (_g, root, mut core) = scratch_core("asks");
+        let req = |core: &mut Core, body: serde_json::Value| core.apply_terminal_request(&body.to_string()).0;
+
+        let r = req(&mut core, serde_json::json!({
+            "op": "asks", "from": 3, "action": "add",
+            "items": [{"kind": "question", "title": "which port?"}],
+        }));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["list"][0]["n"], 1);
+        assert!(core.asks.get(3).is_some() && core.asks.get(4).is_none());
+
+        // Writing someone else's list is refused, reading needs a real claude.
+        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 4, "of": 3, "action": "done", "id": 1}));
+        assert_eq!(r["ok"], false);
+        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 4, "of": 3, "action": "list"}));
+        assert_eq!(r["ok"], false, "claude#3 has no row here");
+        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 3, "action": "list"}));
+        assert_eq!(r["list"][0]["title"], "which port?");
+        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 3, "action": "bogus"}));
+        assert_eq!(r["ok"], false);
+
+        // No row → no user edits, and UPDATE is refused without losing anything.
+        assert!(core.asks_edit(3, crate::asks::AskEdit::Note { n: 1, note: "x".into() }).is_err());
+        core.asks.mutate(3, |l| l.apply_user(crate::asks::AskEdit::Note { n: 1, note: "5173".into() })).unwrap();
+        let sent = core.asks_update(&[3]);
+        assert_eq!(sent[0].state, "refused");
+        assert_eq!(core.asks.counts(3), (1, 1), "the draft is still pending");
+        core.drain_asks_outbox();
+        assert!(!core.state_dir.join("inbox/3").exists(), "nothing was sent");
+
+        // A list belongs to a row in the store: one that is neither saved nor
+        // live goes on the next save (⌘W), as a pin does.
+        core.persist_sessions();
+        assert!(core.asks.get(3).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// END-TO-END: the task a spawner hands `hub_spawn` must reach the child's

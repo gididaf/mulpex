@@ -42,6 +42,9 @@ pub fn start(app: AppHandle) {
             // Collect everything under the lock, then drop it before emitting.
             let mut batch: Vec<(ProjectHandle, Vec<usize>, HubSnapshot, Vec<SessionInfo>)> =
                 Vec::new();
+            // For-me lists that changed this tick, by whoever: a claude's
+            // `hub_user_asks`, a desktop/phone edit, a delivered UPDATE.
+            let mut asks_changed: Vec<(ProjectHandle, usize)> = Vec::new();
             // What every project publishes about itself to the others. This loop
             // is the only context that holds every `Core` at once, so it is the
             // only thing that can describe the workspace honestly.
@@ -64,6 +67,8 @@ pub fn start(app: AppHandle) {
                 // diff below publishes.
                 core.process_spawn_requests();
                 core.process_terminal_requests();
+                // For-me UPDATEs waiting for their claude to be able to hear them.
+                core.drain_asks_outbox();
                 // hub_set_name: an instance labelling its own sidebar row. Cheap
                 // (an empty dir read) and it changes `session_infos`, so the diff
                 // below is what actually repaints the row.
@@ -108,8 +113,10 @@ pub fn start(app: AppHandle) {
                         &core.state_dir,
                         &sessions,
                         &snap,
+                        core.asks.rev(),
                     ));
                 }
+                asks_changed.extend(core.asks.take_dirty().into_iter().map(|id| (core.handle, id)));
                 batch.push((core.handle, removed, snap, sessions));
             }
             drop(ws);
@@ -122,6 +129,9 @@ pub fn start(app: AppHandle) {
             // string compare — and a closed project simply stops appearing.
             Registry::write_if_changed(&state_root, &reg);
 
+            for (handle, id) in asks_changed {
+                let _ = app.emit("asks-changed", SessionExited { handle, id });
+            }
             for (handle, removed, snap, sessions) in batch {
                 for id in &removed {
                     let _ = app.emit("session-exited", SessionExited { handle, id: *id });

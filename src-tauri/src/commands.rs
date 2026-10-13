@@ -279,6 +279,47 @@ pub fn set_pin(
     let _ = app.emit("pins-changed", crate::snapshot::SessionExited { handle: project_handle, id });
 }
 
+/// Every claude's "For me" list in the project, with its drafts (`asks.rs`).
+#[tauri::command]
+pub fn asks_get(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+) -> std::collections::BTreeMap<usize, serde_json::Value> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.asks_views(),
+        None => Default::default(),
+    }
+}
+
+/// The user's edit to one claude's list — a draft, or Clear done. Returns the
+/// list as it now stands; `asks-changed` follows from the poll loop, which is
+/// what reaches a remote desktop and the phone.
+#[tauri::command]
+pub fn asks_edit(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    edit: crate::asks::AskEdit,
+) -> Result<serde_json::Value, String> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.asks_edit(id, edit),
+        None => Err("that project is closed".into()),
+    }
+}
+
+/// UPDATE: send each listed claude its pending edits.
+#[tauri::command]
+pub fn asks_update(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    ids: Vec<usize>,
+) -> Vec<crate::asks::AskSend> {
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.asks_update(&ids),
+        None => Vec::new(),
+    }
+}
+
 /// Mute or unmute a session (⌘M / the sidebar's 🔇). Presentation only — the
 /// instance is untouched; only how the sidebar and tab badges treat it changes.
 #[tauri::command]
@@ -569,7 +610,7 @@ pub fn save_session(
     crate::saves::start(app, project_handle, id, dir, uuid)
 }
 
-/// ⌘E: explain `selection` from claude#`id`'s pane in a side panel
+/// ⌘⇧E: explain `selection` from claude#`id`'s pane in a side panel
 /// (`explain.rs`), in a fresh fork that replaces the panel's last one. The
 /// answer streams as `explain-progress` events tagged with the caller's `req_id`.
 #[tauri::command]

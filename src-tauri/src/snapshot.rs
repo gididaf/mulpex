@@ -88,6 +88,10 @@ pub struct SessionInfo {
     /// back to the unknown-id default and paint a green "ready" dot on a
     /// session that is dead.
     pub failed: Option<String>,
+    /// "For me" (`asks.rs`): this claude's open items, and how many of the
+    /// user's edits are pending an UPDATE. The sidebar badge; 0 for a terminal.
+    pub asks_open: u32,
+    pub asks_pending: u32,
 }
 
 /// A locked file → holder, for the hub panel's Locks view.

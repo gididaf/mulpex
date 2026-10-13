@@ -1,7 +1,7 @@
-# ⌘E Explain Selection
+# ⌘⇧E Explain Selection
 
 The user works in Hebrew and is not always following the technical detail. **Select the part you
-don't understand in a claude's pane, press ⌘E**, and a side panel explains it in simple Hebrew. The
+don't understand in a claude's pane, press ⌘⇧E**, and a side panel explains it in simple Hebrew. The
 selection is only the target; the context is the whole conversation. A box under the answer takes
 follow-up questions.
 
@@ -10,7 +10,7 @@ follow-up questions.
 - **The Explainer** (until 2026-09-28): a third column that summarized every turn through a
   headless Sonnet side conversation fed by the hooks. Gone; [verification-log.md](verification-log.md)
   keeps what was measured about it.
-- **`/explain`** (2026-09-28 → 2026-10-08): a plugin skill, typed by ⌘E, that made the claude explain
+- **`/explain`** (2026-09-28 → 2026-10-08): a plugin skill, typed by ⌘⇧E, that made the claude explain
   "my last response" in four fixed one-line parts. It did not help. "Last response" was often a
   monitor tick or a hub wake rather than the long answer the user meant, and four one-liners were too thin
   for a dense reply. The user asked for something they could *aim*. The skill is deleted, and
@@ -47,7 +47,7 @@ Measured on a 233 k-token conversation (2026-10-08):
 
 | | cache read | cache written | cost | time |
 | --- | --- | --- | --- | --- |
-| first ⌘E | 0 | 233 k | $0.92–0.95 | 12–22 s |
+| first ⌘⇧E | 0 | 233 k | $0.92–0.95 | 12–22 s |
 | follow-up as a **re-fork**, exchange carried in a longer prompt | 8 k | 226 k | $0.91 | 15 s |
 | follow-up as **`--resume <fork>`** | 467 k | 1.5 k | $0.12 | 7 s |
 
@@ -57,21 +57,23 @@ transcript (no `--no-session-persistence`), its uuid is taken from the child's `
 (`init_session`; it equals the `.jsonl` name, measured), and a follow-up runs `--resume <fork>`
 with only the question in its prompt.
 
-**Mulpex deletes that fork itself** (`explain::discard`). Without that, every ⌘E would leave a
-conversation in the project's `claude --resume` list. Deleted on: panel ✕/Esc, a new ⌘E on the same
+**Mulpex deletes that fork itself** (`explain::discard`). Without that, every ⌘⇧E would leave a
+conversation in the project's `claude --resume` list. Deleted on: panel ✕/Esc, a new ⌘⇧E on the same
 instance, instance exit, project close (`dropExplains` → `explain_close`), and app teardown
 (`discard_all`, in `lib.rs::teardown`). The fork slot carries the request id that created it, so a
 replaced request's late `init` line is deleted instead of recorded (`note_fork`). A crash can leave
 one stray fork. That is the known residue.
 
-## The panel (`ExplainPanel.svelte`)
+## The panel (`ExplainTab.svelte`)
 
-- **An overlay on the right of the pane, not a column.** Narrowing the terminal would resize every PTY
-  in the workspace ([rendering.md](rendering.md), one geometry) on each open, close, and switch
-  between an instance with a panel and one without.
-- **Per instance, memory only.** Kept while you switch away; gone on quit, instance or project
-  close. A new ⌘E replaces the thread.
-- **Esc closes it only while focus is inside it.** In the terminal, Esc belongs to claude.
+- **A tab of the side panel** ([frontend.md](frontend.md)), since 2026-10-13. It was an overlay so
+  that opening it would never resize a PTY; the side panel is one global column now, so that reason
+  is gone. ⌘⇧E opens the panel on this tab.
+- **Per instance, memory only.** Kept while you switch away or hide the panel; gone on quit,
+  instance or project close. A new ⌘⇧E replaces the thread. **Clear** discards it and deletes the
+  fork (what ✕ used to do) — a tab has no ✕.
+- **Esc inside the tab hands focus back to the terminal** and discards nothing. In the terminal,
+  Esc belongs to claude.
 - **Markdown via `marked`, sanitized with `dompurify`** (`lib/markdown.ts`). The answer can quote
   anything the conversation held, and this webview can invoke Tauri commands. Links and images are
   dropped and their text kept: a link click would navigate the app's only window away.

@@ -19,7 +19,7 @@
 // The history also contains "❯ " rows (each past prompt is echoed that way),
 // which is why the rule row above is required and the scan runs bottom-up.
 // A box that can't be found at all — a question or plan dialog replaces it,
-// claude is still starting — is "none", and ⌘E does nothing.
+// claude is still starting — is "none", and ⌘⇧E does nothing.
 
 import type { IBuffer } from "@xterm/xterm";
 

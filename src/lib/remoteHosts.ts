@@ -48,6 +48,7 @@ import {
 import { bootstrap, getHubSnapshot, type BootstrapInfo, type WorkspaceInfo } from "./ipc";
 import { terminals } from "./terminals";
 import { loadPins } from "./pins";
+import { loadAsks } from "./asks";
 import { quietHost } from "./attention";
 
 /** What only App.svelte can do: build a project's UI (xterms, pins, hub), and
@@ -141,6 +142,7 @@ async function syncHost(slot: number) {
         .then((snap) => snap && applyHubFor(p.handle, snap))
         .catch(() => {});
       void loadPins(p.handle);
+      void loadAsks(p.handle);
     }
     claim(slot);
     cacheLayout(slot);
