@@ -2483,5 +2483,15 @@ desktop editing a host's list, and the 180 s delivery fallback for a claude whos
 comes up. Noticed, not caused here: the spawned claude also armed a Monitor of its own beside the
 plugin one ("2 monitors").
 
+Same day, the list became opt-in per row (right-click → For me list), its rule moved out of
+`HUB_RULES` into the hook, and items got `for`. Driven headless with a real claude: with the list
+off its call was refused and it told the user to right-click the row; with the row's store `asks`
+column set and the app relaunched, `asks_on/1` was rewritten, the claude's transcript carried
+`ASKS_RULE`, and an app message saying "worker claude#7 needs Redis or Memcached" became a decision
+item with both choices and `for: 7` (it also added the ask refused earlier). NOT driven: the
+context-menu click itself — the hidden window's webview stopped running its timers after ~2 min
+(App Nap, most likely), so the `drive/` queue went unread; the toggle path is the store + flag + the
+command's own code.
+
 Same day: Explain Selection moved from ⌘E to **⌘⇧E**, beside ⌘⇧P and ⌘⇧L (the user's ask); plain
 ⌘E is now unbound. Claimed in the webview like the other ⌘⇧ keys.

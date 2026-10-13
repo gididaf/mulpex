@@ -90,6 +90,8 @@ pub struct SessionInfo {
     pub failed: Option<String>,
     /// "For me" (`asks.rs`): this claude's open items, and how many of the
     /// user's edits are pending an UPDATE. The sidebar badge; 0 for a terminal.
+    /// The For-me list is on for this claude (context menu; off by default).
+    pub asks_on: bool,
     pub asks_open: u32,
     pub asks_pending: u32,
 }

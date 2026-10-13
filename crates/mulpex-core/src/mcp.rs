@@ -219,7 +219,7 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "hub_user_asks",
-            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"For me\" side panel and as a count on your sidebar row. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`. Use it INSTEAD of repeating requests in chat: add the item, mention it ONCE in your reply, then carry on — the list is the reminder, so do not keep writing \"still waiting on you for X\" in later turns. Keep it current: update an item rather than adding a duplicate, mark it `done` the moment it no longer applies (it stays visible, greyed), `remove` one that was a mistake. Write titles in the user's language, one line each; put context in `detail`. The user checks items, answers, picks choices and adds requests of their own, then presses UPDATE — that reaches you as a message from \"Mulpex\" listing exactly what changed. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's (e.g. an orchestrator checking what a worker already asked, before asking the same thing).",
+            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"For me\" side panel and as a count on your sidebar row. OFF by default: it works only for an instance the user turned it on for (right-click its row → \"For me list\"), and while it is on Mulpex reminds you of it every turn. When it is off, do not use it — a call is refused; if the user asked you to use it, tell them how to turn it on. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`; `for` names the instance it is really for, when you collect a worker's ask onto your own list. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -234,6 +234,7 @@ pub(crate) fn tool_defs() -> Value {
                                 "title": { "type": "string", "description": "One line, in the user's language." },
                                 "detail": { "type": "string", "description": "Optional longer context, shown collapsed under the title." },
                                 "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision: the options (at most 8)." },
+                                "for": { "description": "Optional: the instance this ask is really for (\"7\" or \"claude#7\") — a worker of yours whose need you are relaying." },
                             },
                             "required": ["kind", "title"],
                         },
@@ -243,6 +244,7 @@ pub(crate) fn tool_defs() -> Value {
                     "title": { "type": "string", "description": "For `update`." },
                     "detail": { "type": "string", "description": "For `update` (empty string clears it)." },
                     "choices": { "type": "array", "items": { "type": "string" }, "description": "For `update`." },
+                    "for": { "description": "For `update`: the instance it is for, or null to clear." },
                     "of": { "description": "For `list` only: another instance in this project (\"4\" or \"claude#4\") whose list to READ." },
                 },
                 "required": ["action"],

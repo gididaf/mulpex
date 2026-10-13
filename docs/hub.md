@@ -698,8 +698,21 @@ the old `HUB_RULES`.
 ## The user's list (`hub_user_asks`)
 
 A claude's "For me" list: what it needs from the USER (action / decision with choices / question),
-shown in the side panel ([frontend.md](frontend.md)) and as a count on its row. `HUB_RULES` tells
-every claude to put asks there, mention them once, and not repeat "still waiting on you".
+shown in the side panel ([frontend.md](frontend.md)) and as a count on its row.
+
+- **Off by default, per row, user-only.** Right-click → "For me list" → On (`Core::set_asks_enabled`,
+  persisted as the store's `asks` column, mirrored to `asks_on/<id>`). Shipped first as a
+  `HUB_RULES` rule for every claude; changed the same day because a coworker's claudes, or a calm
+  one-on-one, must not start keeping a list unasked. So `HUB_RULES` only says it exists, is off, and
+  must never be started unasked — that line is needed because MCP tools load lazily (only the name
+  is visible), and without it a claude told "add this to the FOR ME list" searched the folder for a
+  file instead (seen in QA). How to use it is `rules::ASKS_RULE`, carried by `userpromptsubmit` on every turn of an enabled claude (every
+  turn, like the secrets note — an UPDATE arrives as a hub wake, and following the rule creates no
+  `asks_on/` file, so it cannot feed itself). A call from a claude whose list is off is refused with
+  the way to turn it on. Toggling tells the claude at once (an app message).
+- **One row, not its family.** The user talks to the orchestrator, so the orchestrator is the one
+  list: `ASKS_RULE` tells an enabled coordinator to collect its workers' asks onto its own list with
+  `for: <worker>` (shown as a "for claude#7" tag, and in the UPDATE body) and relay the answers.
 
 - **The app is the only writer.** The tool rides `app_request`'s `termreq/` channel as `op: "asks"`
   with `from` stamped from the env identity, so an instance can only change its own list; the

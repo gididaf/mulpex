@@ -572,6 +572,7 @@ pub fn project_view(
                 "exited": s.exited,
                 "failed": s.failed,
                 // "For me": the badge, and whether UPDATE has anything to send.
+                "asks_on": s.asks_on,
                 "asks_open": s.asks_open,
                 "asks_pending": s.asks_pending,
             })
@@ -2020,6 +2021,7 @@ mod tests {
             kind,
             exited: false,
             failed: failed.map(String::from),
+            asks_on: false,
             asks_open: 0,
             asks_pending: 0,
         };

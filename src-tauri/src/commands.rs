@@ -307,6 +307,20 @@ pub fn asks_edit(
     }
 }
 
+/// Turn a claude's For-me list on or off (context menu). False if nothing changed.
+#[tauri::command]
+pub fn set_asks_enabled(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    on: bool,
+) -> bool {
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.set_asks_enabled(id, on),
+        None => false,
+    }
+}
+
 /// UPDATE: send each listed claude its pending edits.
 #[tauri::command]
 pub fn asks_update(

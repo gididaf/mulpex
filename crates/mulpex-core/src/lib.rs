@@ -215,6 +215,11 @@ pub const WATCHING_DIR: &str = "watching";
 /// (`context_window.used_percentage`). Written by `statusline::run`.
 pub const CTX_DIR: &str = "ctx";
 
+/// `asks_on/<id>` exists while that claude's "For me" list is ON — set by the
+/// user from the row's context menu, written by the app (`Core::sync_asks_flags`),
+/// read by `hook::userpromptsubmit`, which then carries `rules::ASKS_RULE`.
+pub const ASKS_ON_DIR: &str = "asks_on";
+
 /// `compactreq/<id>` = where that instance's ⌘⇧K compact request stands, one
 /// word: `requested` (the hook tells claude to stop at a checkpoint on every tool
 /// call), `compacting` (the app typed `/compact`), `resume` (the compaction's

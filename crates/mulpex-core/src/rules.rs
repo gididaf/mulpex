@@ -69,14 +69,10 @@ close it rather than leaving a dead row for the user to tidy by hand. Pass to: \
 killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
 close YOURSELF (the call would never return), and you cannot close a row in another project. \
 Terminals are not instances: hub_terminal_close closes those.\n\
-- mcp__mulpex__hub_user_asks — YOUR list of what you need from the USER (an action they must \
-take, a decision — give the options as choices — or a question), shown in Mulpex's \"For me\" \
-side panel. Whenever you need something from the user, put it on that list and mention it ONCE \
-in your reply; do not keep repeating \"still waiting on you for X\" in later turns — the list is \
-the reminder. Keep it current: mark an item done as soon as it no longer applies. Put only your \
-own asks there; to avoid asking twice, an orchestrator can read a worker's list with action: \
-\"list\", of: <n>. When a message from \"Mulpex\" says the user pressed UPDATE, it lists exactly \
-what they changed on your list (checked, answered, chose, added, dismissed): act on it right away.\n\
+- mcp__mulpex__hub_user_asks — Mulpex's \"For me\" list (the user may call it \"FOR ME\", \"my \
+list\" or \"the list\"). It is OFF unless the user turns it on for you; while it is on, Mulpex says \
+so on every turn. Never start using it on your own. If the user asks you to put something on it, \
+call the tool — if your list is off, the reply tells you how the user turns it on.\n\
 OTHER PROJECTS — Mulpex can have several projects open at once, and the instances in them are \
 reachable by message. hub_instances lists them under other_projects with the exact address of \
 each one; address them <project>#<n> (e.g. \"central-one#3\") in hub_send's `to`, and a message \
@@ -198,6 +194,22 @@ here, central-one#3 for one in another project) — so that when I look at your 
 you acted on a hub message rather than on my prompt, and from whom. A message whose sender is \
 \"Mulpex\" comes from the Mulpex app itself, not from an instance: do what it asks, and never \
 hub_send a reply to it — there is no instance there to receive one.";
+
+/// Carried on every turn of a claude whose "For me" list the user turned ON
+/// (`asks_on/<id>`, `hook::userpromptsubmit`) — never in `HUB_RULES`, because
+/// the list is opt-in per row: a claude in a quiet one-on-one, or a coworker's,
+/// must not start keeping one by itself.
+pub const ASKS_RULE: &str = "[Mulpex] The user turned ON your \"For me\" list \
+(mcp__mulpex__hub_user_asks), shown in Mulpex's side panel. Whenever you need something from \
+the user — an action they must take, a decision (give the options as choices), or a question — \
+put it on that list and mention it ONCE in your reply; do not keep repeating \"still waiting on \
+you for X\" in later turns, the list is the reminder. Keep it current: mark an item done as soon \
+as it no longer applies. If you coordinate other instances (you hub_spawned workers), you are \
+the user's one list: when a worker tells you it needs something from the user, add it to YOUR \
+list with for: <that worker's number>, and when the user answers it, pass the answer on to that \
+worker with hub_send. When a message from \"Mulpex\" says the user pressed UPDATE, it lists \
+exactly what they changed on your list (checked, answered, chose, added, dismissed): act on it \
+right away.";
 
 /// User-mandated zero-assumptions planning discipline (see old term_session.rs).
 const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
@@ -377,7 +389,13 @@ mod tests {
             .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap())
             .filter(|n| !n.is_empty())
             .collect();
+        assert!(named.contains(&"hub_send"), "{named:?}");
+        // The For-me list is opt-in per row: every claude is told it exists
+        // and is off (MCP tools load lazily, so a name alone doesn't say what
+        // "the FOR ME list" means), while how to USE it rides the hook.
         assert!(named.contains(&"hub_user_asks"), "{named:?}");
+        assert!(HUB_RULES.contains("Never start using it on your own"));
+        assert!(ASKS_RULE.contains("mcp__mulpex__hub_user_asks"));
         for n in named {
             assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
         }

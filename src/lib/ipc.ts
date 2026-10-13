@@ -51,6 +51,8 @@ export interface SessionInfo {
    *  before falling back to a status dot — the unknown-id default is "ready",
    *  which would paint a dead session green. */
   failed: string | null;
+  /** The For-me list is ON for this claude (right-click toggle; off by default). */
+  asks_on: boolean;
   /** "For me" (`asks.ts`): open items on this claude's list, and how many of
    *  the user's edits wait for UPDATE. 0 for a terminal. */
   asks_open: number;
@@ -307,6 +309,9 @@ export interface AskItem {
   created: number;
   updated: number;
   rev: number;
+  /** The instance this ask is really for — a worker whose need an orchestrator
+   *  collected onto its own list. */
+  for: number | null;
 }
 
 /** The user's draft over item `n` — what it should become at UPDATE. */
@@ -358,6 +363,9 @@ export const asksGet = (projectHandle: ProjectHandle) =>
 
 export const asksEdit = (projectHandle: ProjectHandle, id: number, edit: AskEdit) =>
   call<AskList>("asks_edit", { projectHandle, id, edit });
+
+export const setAsksEnabled = (projectHandle: ProjectHandle, id: number, on: boolean) =>
+  call<boolean>("set_asks_enabled", { projectHandle, id, on });
 
 export const asksUpdate = (projectHandle: ProjectHandle, ids: number[]) =>
   call<AskSend[]>("asks_update", { projectHandle, ids });

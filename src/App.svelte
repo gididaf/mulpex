@@ -29,6 +29,7 @@
     setSessionMuted,
     setSessionCollapsed,
     setAutoCompact,
+    setAsksEnabled,
     reparentSession,
     setMuteMenuChecked,
     quitApp,
@@ -60,6 +61,7 @@
     setSessionMutedLocal,
     setSessionCollapsedLocal,
     setAutoCompactLocal,
+    setAsksOnLocal,
     hiddenIds,
     collapsedAncestors,
     descendantsOf,
@@ -431,6 +433,18 @@
     }
   }
 
+  async function applyAsksEnabled(h: ProjectHandle, id: number, on: boolean) {
+    try {
+      if (await setAsksEnabled(h, id, on)) {
+        setAsksOnLocal(h, id, on);
+        if (on) openPanel("forme");
+        flashToast(`For me list ${on ? "on" : "off"} for claude#${id}`);
+      }
+    } catch (e) {
+      flashToast(String(e));
+    }
+  }
+
   function openRowMenu(e: MouseEvent, s: SessionInfo) {
     const h = get(activeProjectHandle);
     if (h == null) return;
@@ -484,6 +498,17 @@
             // Auto-compact this row's claudes (`compact.ts`). Only ever set here,
             // by the user — no model can turn it on. A submenu; the current
             // choice carries a ✓.
+            // The For-me list (`asks.ts`) is off until the user turns it on here,
+            // for this row only — an orchestrator collects its workers' asks.
+            {
+              label: "For me list",
+              hint: s.asks_on ? "on" : undefined,
+              sub: [true, false].map((on) => ({
+                label: on ? "On" : "Off",
+                checked: s.asks_on === on,
+                run: () => void applyAsksEnabled(h, s.id, on),
+              })),
+            },
             {
               label: "Auto-compact its claudes",
               hint: s.auto_compact != null ? `${s.auto_compact}%` : undefined,

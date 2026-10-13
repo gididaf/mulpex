@@ -386,9 +386,11 @@ shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and 
 
 ### For me (`hub_user_asks`)
 
-What each claude needs from the user — an **action**, a **decision** (with choices to click) or a
-**question** — so a claude says it once instead of repeating "still waiting on you for X" as it keeps
-working. The claude writes the list with `mcp__mulpex__hub_user_asks` (backend: [hub.md](hub.md));
+What a claude needs from the user — an **action**, a **decision** (with choices to click) or a
+**question** — so it says it once instead of repeating "still waiting on you for X" as it keeps
+working. **Off by default**: right-click a claude's row → For me list → On, for that row only (an
+orchestrator collects its workers' asks, tagged "for claude#N"; [hub.md](hub.md)). The tab says how
+to turn it on for a claude whose list is off. The claude writes the list with `mcp__mulpex__hub_user_asks` (backend: [hub.md](hub.md));
 `ForMeTab.svelte` renders it; `lib/asks.ts` mirrors the backend (`src-tauri/src/asks.rs`).
 
 - **The user's edits are drafts until UPDATE.** Check, note, pick a choice, dismiss, add a request:

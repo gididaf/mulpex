@@ -18,6 +18,7 @@
     note: string | null;
     chosen: string | null;
     rev: number;
+    for: number | null;
   };
   type Draft = {
     done: boolean | null;
@@ -136,6 +137,7 @@
           <div class="main">
             <div class="head"><span class="kind">{ICON[i.kind]}</span><span class="t" dir="auto">{i.title}</span></div>
             <div class="meta">
+              {#if i.for != null}<span class="for">for claude#{i.for}</span>{/if}
               #{i.n}{#if i.author === "user"} · yours{/if}{#if d} · <b>pending</b>{/if}{#if d && i.rev > d.base_rev} · changed since your edit{/if}
             </div>
             {#if i.detail}<details><summary>more</summary><div class="detail" dir="auto">{i.detail}</div></details>{/if}
@@ -318,6 +320,13 @@
   .meta {
     font-size: 0.75rem;
     color: var(--label);
+  }
+  .for {
+    padding: 0 0.35rem;
+    margin-inline-end: 0.3rem;
+    border-radius: 4px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
   }
   .meta b {
     color: var(--accent);

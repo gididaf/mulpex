@@ -138,7 +138,12 @@
         {#if $asksAll}
           Nothing open for you in this project.
         {:else}
-          Nothing open for you from claude#{id}.<br />When it needs something from you, it lands here.
+          {#if !$sessions.find((s) => s.id === id)?.asks_on}
+            The For me list is off for claude#{id}.<br />Right-click its row → For me list → On, and it
+            puts what it needs from you here.
+          {:else}
+            Nothing open for you from claude#{id}.<br />When it needs something from you, it lands here.
+          {/if}
         {/if}
       </div>
     {/if}
@@ -168,6 +173,7 @@
               <span class="kind k-{i.kind}" title={KIND_NAME[i.kind]}>{KIND_ICON[i.kind]}</span>
               <span class="title" dir="auto">{i.title}</span>
             </div>
+            {#if i.for != null}<span class="for" title="A worker's ask, collected by claude#{g.id}">for claude#{i.for}</span>{/if}
             <div class="meta">
               <span>#{i.n}</span>
               {#if i.author === "user"}<span>· yours</span>{/if}
@@ -421,6 +427,15 @@
     line-height: 1.4;
     overflow-wrap: anywhere;
     unicode-bidi: plaintext;
+  }
+  .for {
+    display: inline-block;
+    margin: 0.1rem 0 0 1.3rem;
+    padding: 0 0.35rem;
+    border-radius: 3px;
+    background: var(--border);
+    color: var(--text-dim);
+    font-size: 0.66rem;
   }
   .meta {
     display: flex;

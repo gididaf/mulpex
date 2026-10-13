@@ -42,6 +42,7 @@ pub const ALLOWED: &[&str] = &[
     "asks_get",
     "asks_edit",
     "asks_update",
+    "set_asks_enabled",
     "set_session_collapsed",
     "set_auto_compact",
     "get_hub_snapshot",
@@ -168,6 +169,7 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value) -> Result<Value, Strin
         "asks_get" => out(c::asks_get(st(), h()?)),
         "asks_edit" => out(c::asks_edit(st(), h()?, id()?, arg(args, "edit")?)?),
         "asks_update" => out(c::asks_update(st(), h()?, arg(args, "ids")?)),
+        "set_asks_enabled" => out(c::set_asks_enabled(st(), h()?, id()?, arg(args, "on")?)),
         "set_session_collapsed" => {
             out(c::set_session_collapsed(st(), h()?, id()?, arg(args, "collapsed")?))
         }

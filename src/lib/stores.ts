@@ -613,6 +613,14 @@ export function setAutoCompactLocal(handle: ProjectHandle, id: number, pct: numb
   });
 }
 
+export function setAsksOnLocal(handle: ProjectHandle, id: number, on: boolean): void {
+  const p = get(projects).get(handle);
+  if (!p) return;
+  patchProject(handle, {
+    sessions: p.sessions.map((s) => (s.id === id ? { ...s, asks_on: on } : s)),
+  });
+}
+
 /** Apply a hub snapshot to one project (also derives its statuses + tasks maps). */
 export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
   patchProject(handle, {

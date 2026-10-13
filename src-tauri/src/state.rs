@@ -310,6 +310,11 @@ pub struct Core {
     /// sidebar subtree is compacted (`lib/compact.ts` enforces it). Set only by
     /// the user, from the row's context menu. Persisted.
     pub auto_compact: HashMap<usize, u8>,
+    /// Rows whose "For me" list is ON (`asks.rs`). Off by default; set only by
+    /// the user, from the row's context menu, for that one row. Persisted, and
+    /// mirrored to `asks_on/<id>` for the hook, which then carries the list's
+    /// rule on every turn.
+    pub asks_on: HashSet<usize>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -449,6 +454,7 @@ impl Core {
         let mut parents: HashMap<usize, usize> = HashMap::new();
         let mut collapsed: HashSet<usize> = HashSet::new();
         let mut auto_compact: HashMap<usize, u8> = HashMap::new();
+        let mut asks_on: HashSet<usize> = HashSet::new();
         let mut restored: HashMap<usize, Instant> = HashMap::new();
         let mut started: HashMap<usize, Instant> = HashMap::new();
         // Records whose session could not even be spawned. Nothing will be in
@@ -516,6 +522,9 @@ impl Core {
                 if let Some(pct) = saved.auto_compact {
                     auto_compact.insert(id, pct);
                 }
+                if saved.asks {
+                    asks_on.insert(id);
+                }
                 sessions.push(session);
             } else {
                 // Keep the record AND where it sat: appending it would move that
@@ -568,6 +577,7 @@ impl Core {
             parents,
             collapsed,
             auto_compact,
+            asks_on,
             worked,
             closing: HashSet::new(),
             saving: HashSet::new(),
@@ -583,6 +593,7 @@ impl Core {
             last_spawn_at: None,
         };
         core.persist_sessions();
+        core.sync_asks_flags();
         core.write_live_instances();
         core.sync_terminal_index();
         // `state_dir` is fresh every launch, so unlike the `armed` flag these have
@@ -620,6 +631,7 @@ impl Core {
                 kind: kind_of(s),
                 exited: s.is_shell() && !s.is_alive(),
                 failed: self.failed.get(&s.id).cloned(),
+                asks_on: self.asks_on.contains(&s.id),
                 asks_open: self.asks.counts(s.id).0,
                 asks_pending: self.asks.counts(s.id).1,
             })
@@ -809,6 +821,7 @@ impl Core {
             kind: SessionKind::Claude,
             exited: false,
             failed: None,
+            asks_on: false,
             asks_open: 0,
             asks_pending: 0,
         })
@@ -862,6 +875,7 @@ impl Core {
             kind: SessionKind::Shell,
             exited: false,
             failed: None,
+            asks_on: false,
             asks_open: 0,
             asks_pending: 0,
         })
@@ -1453,6 +1467,44 @@ impl Core {
         true
     }
 
+    /// Turn `claude#id`'s For-me list on or off (context menu). For that row
+    /// only — an orchestrator collects its workers' asks onto its own list, so
+    /// the user has one list to read. Persisted, mirrored for the hook, and the
+    /// claude is told at once. False if nothing changed.
+    pub fn set_asks_enabled(&mut self, id: usize, on: bool) -> bool {
+        if !self.instances().any(|s| s.id == id) || self.asks_on.contains(&id) == on {
+            return false;
+        }
+        if on {
+            self.asks_on.insert(id);
+        } else {
+            self.asks_on.remove(&id);
+        }
+        self.persist_sessions();
+        self.sync_asks_flags();
+        self.send_app_message(id, &crate::asks::toggle_message(on));
+        true
+    }
+
+    /// `asks_on/<id>` exists exactly for the rows whose list is on — the hook
+    /// reads it to carry the list's rule on each turn (`hook::userpromptsubmit`).
+    pub fn sync_asks_flags(&self) {
+        let dir = self.state_dir.join(mulpex_core::ASKS_ON_DIR);
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let keep = e.file_name().to_str().and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|id| self.asks_on.contains(&id));
+                if !keep {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        for id in &self.asks_on {
+            let _ = std::fs::write(dir.join(id.to_string()), "on");
+        }
+    }
+
     /// Move `id` (with its whole family) under `parent`, or to the top level
     /// with `None` — the sidebar's drag-to-nest. Presentation only, like
     /// folding: the hub never reads `parents`. `ids` is the sidebar order to
@@ -1887,6 +1939,7 @@ impl Core {
                         collapsed: self.collapsed.contains(&session.id),
                         auto_compact: self.auto_compact.get(&session.id).copied(),
                         name_by: self.name_by.get(&session.id).copied(),
+                        asks: self.asks_on.contains(&session.id),
                     };
                     if !self
                         .sticky
@@ -1942,6 +1995,7 @@ impl Core {
         self.parents.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.collapsed.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.auto_compact.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
+        self.asks_on.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.saving.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
@@ -2168,6 +2222,16 @@ impl Core {
         let Some(from) = v.get("from").and_then(|x| x.as_u64()).map(|n| n as usize) else {
             return serde_json::json!({ "ok": false, "error": "missing 'from'" });
         };
+        if !self.asks_on.contains(&from) {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "The For me list is OFF for claude#{from}, so it can't be used. Don't retry. If \
+                     the user asked you to use it, tell them to turn it on: right-click this \
+                     instance's row in Mulpex's sidebar → \"For me list\"."
+                ),
+            });
+        }
         let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
         if action == "list" {
             let of = v.get("of").and_then(|x| x.as_u64()).map(|n| n as usize).unwrap_or(from);
@@ -2698,6 +2762,7 @@ impl Core {
                 parent: self.parents.get(&s.id).copied(),
                 collapsed: self.collapsed.contains(&s.id),
                 auto_compact: self.auto_compact.get(&s.id).copied(),
+                asks: self.asks_on.contains(&s.id),
                 name_by: self.name_by.get(&s.id).copied(),
             })
             .collect();
@@ -3622,6 +3687,16 @@ mod tests {
         let (_g, root, mut core) = scratch_core("asks");
         let req = |core: &mut Core, body: serde_json::Value| core.apply_terminal_request(&body.to_string()).0;
 
+        // Off by default: refused, with the way to turn it on, and nothing saved.
+        let r = req(&mut core, serde_json::json!({
+            "op": "asks", "from": 3, "action": "add", "items": [{"kind": "action", "title": "x"}],
+        }));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("right-click"), "{r}");
+        assert!(core.asks.get(3).is_none());
+        core.asks_on.insert(3);
+        core.asks_on.insert(4);
+
         let r = req(&mut core, serde_json::json!({
             "op": "asks", "from": 3, "action": "add",
             "items": [{"kind": "question", "title": "which port?"}],
@@ -3872,6 +3947,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }
     }
 
@@ -3931,6 +4007,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -3979,6 +4056,7 @@ mod tests {
                 collapsed: false,
                 auto_compact: None,
                 name_by: None,
+                asks: false,
             },
             record("copycat", Some(2)),
         ];
@@ -4255,6 +4333,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }]);
         let mut core = Core::open(
             1,
@@ -5106,6 +5185,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }]);
 
         let mut core = Core::open(
@@ -5514,6 +5594,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -5574,6 +5655,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
+            asks: false,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");

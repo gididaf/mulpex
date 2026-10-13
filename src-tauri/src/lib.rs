@@ -139,6 +139,7 @@ pub fn run() {
             commands::asks_get,
             commands::asks_edit,
             commands::asks_update,
+            commands::set_asks_enabled,
             commands::set_session_collapsed,
             commands::set_auto_compact,
             commands::set_mute_menu_checked,

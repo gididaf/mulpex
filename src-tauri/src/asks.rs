@@ -95,6 +95,10 @@ pub struct Item {
     /// written against an older version of the item.
     #[serde(default)]
     pub rev: u32,
+    /// The instance this ask is really for — a worker whose need an orchestrator
+    /// collected onto its own list, so the user has one list to read.
+    #[serde(default, rename = "for")]
+    pub for_id: Option<usize>,
 }
 
 /// The title and kind of an item the claude removed while the user had typed
@@ -263,6 +267,21 @@ fn clean_choices(v: Option<&Value>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// `for`: an instance number, `"7"` or `"claude#7"`; `null` clears.
+fn for_of(v: Option<&Value>) -> Result<Option<Option<usize>>, String> {
+    let Some(v) = v else { return Ok(None) };
+    let n = match v {
+        Value::Null => return Ok(Some(None)),
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().trim_start_matches("claude#").trim_start_matches('#').parse().ok(),
+        _ => None,
+    };
+    match n {
+        Some(n) if n >= 1 => Ok(Some(Some(n as usize))),
+        _ => Err("`for` must be an instance number, like 7 or \"claude#7\"".into()),
+    }
+}
+
 /// `id` as one number or an array of them.
 fn ids_of(v: &Value) -> Result<Vec<u32>, String> {
     let one = |x: &Value| x.as_u64().map(|n| n as u32);
@@ -275,8 +294,11 @@ fn ids_of(v: &Value) -> Result<Vec<u32>, String> {
     }
 }
 
-fn label(n: u32, kind: Kind, title: &str) -> String {
-    format!("#{n} [{}] {title}", kind.word())
+fn label(n: u32, kind: Kind, title: &str, for_id: Option<usize>) -> String {
+    match for_id {
+        Some(f) => format!("#{n} [{}] (for claude#{f}) {title}", kind.word()),
+        None => format!("#{n} [{}] {title}", kind.word()),
+    }
 }
 
 impl List {
@@ -331,7 +353,8 @@ impl List {
                     }
                     let detail = clean_detail(it.get("detail").and_then(|x| x.as_str()));
                     let choices = clean_choices(it.get("choices"))?;
-                    fresh.push((kind, title, detail, choices));
+                    let for_id = for_of(it.get("for"))?.flatten();
+                    fresh.push((kind, title, detail, choices, for_id));
                 }
                 if self.open_count() + fresh.len() > MAX_OPEN {
                     return Err(format!(
@@ -339,7 +362,7 @@ impl List {
                     ));
                 }
                 let mut added = Vec::new();
-                for (kind, title, detail, choices) in fresh {
+                for (kind, title, detail, choices, for_id) in fresh {
                     self.next += 1;
                     let n = self.next;
                     self.items.push(Item {
@@ -356,6 +379,7 @@ impl List {
                         created: now,
                         updated: now,
                         rev: 0,
+                        for_id,
                     });
                     added.push(format!("#{n}"));
                 }
@@ -374,8 +398,9 @@ impl List {
                     .filter(|t| !t.is_empty());
                 let detail = v.get("detail").map(|d| clean_detail(d.as_str()));
                 let choices = v.get("choices").map(|c| clean_choices(Some(c))).transpose()?;
-                if kind.is_none() && title.is_none() && detail.is_none() && choices.is_none() {
-                    return Err("`update` needs at least one of kind, title, detail, choices".into());
+                let for_id = for_of(v.get("for"))?;
+                if kind.is_none() && title.is_none() && detail.is_none() && choices.is_none() && for_id.is_none() {
+                    return Err("`update` needs at least one of kind, title, detail, choices, for".into());
                 }
                 let item = self.item_mut(n)?;
                 if let Some(k) = kind {
@@ -389,6 +414,9 @@ impl List {
                 }
                 if let Some(c) = choices {
                     item.choices = c;
+                }
+                if let Some(f) = for_id {
+                    item.for_id = f;
                 }
                 item.updated = now;
                 item.rev += 1;
@@ -564,11 +592,11 @@ impl List {
             let Some(pos) = self.items.iter().position(|i| i.n == n) else { continue };
             if e.delete {
                 let item = self.items.remove(pos);
-                d.dismissed.push(label(n, item.kind, &item.title));
+                d.dismissed.push(label(n, item.kind, &item.title, item.for_id));
                 continue;
             }
             let item = &mut self.items[pos];
-            let lbl = label(n, item.kind, &item.title);
+            let lbl = label(n, item.kind, &item.title, item.for_id);
             match e.done {
                 Some(true) if item.status != Status::Done => {
                     item.status = Status::Done;
@@ -600,7 +628,7 @@ impl List {
         for a in drafts.added {
             self.next += 1;
             let n = self.next;
-            let mut line = label(n, a.kind, &a.title);
+            let mut line = label(n, a.kind, &a.title, None);
             if let Some(det) = &a.detail {
                 for l in det.lines() {
                     line.push_str("\n    ");
@@ -622,6 +650,7 @@ impl List {
                 created: now,
                 updated: now,
                 rev: 0,
+                for_id: None,
             });
         }
         (!d.is_empty()).then_some(d)
@@ -655,6 +684,9 @@ impl List {
                 }
                 if let Some(c) = &i.chosen {
                     m.insert("user_chose".into(), json!(c));
+                }
+                if let Some(f) = i.for_id {
+                    m.insert("for".into(), json!(format!("claude#{f}")));
                 }
                 o
             })
@@ -693,6 +725,21 @@ pub fn render_update(id: usize, d: &Diff) -> String {
          add new asks). Do NOT hub_send a reply — the list and your normal reply are where you answer.",
     );
     out
+}
+
+/// What a claude is told when the user turns its list on or off (context menu).
+pub fn toggle_message(on: bool) -> String {
+    if on {
+        "The user turned ON your \"For me\" list in Mulpex (the side panel). From now on, put \
+         anything you need from them on it with mcp__mulpex__hub_user_asks — including anything \
+         you are waiting on them for right now — and mention each item once instead of repeating \
+         it. Mulpex reminds you of the details every turn. Do NOT hub_send a reply."
+            .to_string()
+    } else {
+        "The user turned OFF your \"For me\" list in Mulpex. Stop using mcp__mulpex__hub_user_asks \
+         and ask them in your replies as usual. Do NOT hub_send a reply."
+            .to_string()
+    }
 }
 
 /// A list plus whether an UPDATE is waiting to be delivered — what the panel draws.
@@ -877,6 +924,11 @@ mod tests {
         assert_eq!(l.counts(), (0, 0));
         l.apply_claude(&json!({"action":"reopen","id":1}), 4).unwrap();
         assert_eq!(l.counts(), (1, 0));
+        // `for` tags a worker's ask an orchestrator collected.
+        add(&mut l, json!([{"kind":"question","title":"token?","for":"claude#7"}])).unwrap();
+        assert_eq!(l.items.last().unwrap().for_id, Some(7));
+        assert!(l.claude_view().to_string().contains("\"for\":\"claude#7\""));
+        assert!(add(&mut l, json!([{"kind":"question","title":"x","for":"bob"}])).is_err());
         // Duplicate open title is refused with a pointer.
         let e = add(&mut l, json!([{"kind":"action","title":"deploy the thing"}])).unwrap_err();
         assert!(e.contains("#1"), "{e}");
