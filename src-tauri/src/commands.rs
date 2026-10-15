@@ -279,57 +279,57 @@ pub fn set_pin(
     let _ = app.emit("pins-changed", crate::snapshot::SessionExited { handle: project_handle, id });
 }
 
-/// Every claude's "For me" list in the project, with its drafts (`asks.rs`).
+/// Every claude's "To Do" list in the project, with its drafts (`todos.rs`).
 #[tauri::command]
-pub fn asks_get(
+pub fn todos_get(
     state: State<AppState>,
     project_handle: ProjectHandle,
 ) -> std::collections::BTreeMap<usize, serde_json::Value> {
     match state.ws.lock().unwrap().project(project_handle) {
-        Some(core) => core.asks_views(),
+        Some(core) => core.todos_views(),
         None => Default::default(),
     }
 }
 
 /// The user's edit to one claude's list — a draft, or Clear done. Returns the
-/// list as it now stands; `asks-changed` follows from the poll loop, which is
+/// list as it now stands; `todos-changed` follows from the poll loop, which is
 /// what reaches a remote desktop and the phone.
 #[tauri::command]
-pub fn asks_edit(
+pub fn todos_edit(
     state: State<AppState>,
     project_handle: ProjectHandle,
     id: usize,
-    edit: crate::asks::AskEdit,
+    edit: crate::todos::TodoEdit,
 ) -> Result<serde_json::Value, String> {
     match state.ws.lock().unwrap().project(project_handle) {
-        Some(core) => core.asks_edit(id, edit),
+        Some(core) => core.todos_edit(id, edit),
         None => Err("that project is closed".into()),
     }
 }
 
-/// Turn a claude's For-me list on or off (context menu). False if nothing changed.
+/// Turn a claude's To Do list on or off (context menu). False if nothing changed.
 #[tauri::command]
-pub fn set_asks_enabled(
+pub fn set_todos_enabled(
     state: State<AppState>,
     project_handle: ProjectHandle,
     id: usize,
     on: bool,
 ) -> bool {
     match state.ws.lock().unwrap().project_mut(project_handle) {
-        Some(core) => core.set_asks_enabled(id, on),
+        Some(core) => core.set_todos_enabled(id, on),
         None => false,
     }
 }
 
 /// UPDATE: send each listed claude its pending edits.
 #[tauri::command]
-pub fn asks_update(
+pub fn todos_update(
     state: State<AppState>,
     project_handle: ProjectHandle,
     ids: Vec<usize>,
-) -> Vec<crate::asks::AskSend> {
+) -> Vec<crate::todos::TodoSend> {
     match state.ws.lock().unwrap().project_mut(project_handle) {
-        Some(core) => core.asks_update(&ids),
+        Some(core) => core.todos_update(&ids),
         None => Vec::new(),
     }
 }

@@ -21,7 +21,7 @@
 //! - `hub_spawn` — start new instances, each seeded with a task, and get their ids
 //! - `hub_terminal_open` / `_send` / `_read` / `_close` — create and drive plain
 //!   shell terminals in this project, and read their output incrementally
-//! - `hub_user_asks` — *my* "For me" list: what I need from the user, shown in
+//! - `hub_todo` — *my* "To Do" list: what I need from the user, shown in
 //!   Mulpex's side panel (the app owns the list; this only forwards the call)
 
 use std::collections::HashMap;
@@ -218,33 +218,36 @@ pub(crate) fn tool_defs() -> Value {
             },
         },
         {
-            "name": "hub_user_asks",
-            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"For me\" side panel and as a count on your sidebar row. OFF by default: it works only for an instance the user turned it on for (right-click its row → \"For me list\"), and while it is on Mulpex reminds you of it every turn. When it is off, do not use it — a call is refused; if the user asked you to use it, tell them how to turn it on. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`; `for` names the instance it is really for, when you collect a worker's ask onto your own list. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's.",
+            "name": "hub_todo",
+            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"To Do\" side panel and as a count on your sidebar row. OFF by default: it works only for an instance the user turned it on for (right-click its row → \"To Do list\"), and while it is on Mulpex reminds you of it every turn. When it is off, do not use it — a call is refused; if the user asked you to use it, tell them how to turn it on. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`; `for` names the instance it is really for, when you collect a worker's ask onto your own list. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "add", "update", "done", "reopen", "remove"], "description": "What to do." },
+                    "action": { "type": "string", "enum": ["list", "add", "update", "comment", "done", "remove"], "description": "What to do. `comment` adds to an item's follow-up thread (with `id` and `text`) — where you answer the user's comments and ask follow-ups. `done` takes the item off the list (there is no reopen — add it again if needed)." },
                     "items": {
                         "type": "array",
-                        "description": "For `add`: the new items.",
+                        "description": "For `add`: the new items. One item per THING the user must do or answer — a QA pass is ONE item (\"QA the login flow\") with all its steps and questions in its `detail`, never one item per step.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "kind": { "type": "string", "enum": ["action", "decision", "question"] },
                                 "title": { "type": "string", "description": "One line, in the user's language." },
-                                "detail": { "type": "string", "description": "Optional longer context, shown collapsed under the title." },
+                                "detail": { "type": "string", "description": "Optional. Markdown (headings, lists, code, tables), up to 20,000 characters, shown under the item's \"more\". Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
                                 "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision: the options (at most 8)." },
                                 "for": { "description": "Optional: the instance this ask is really for (\"7\" or \"claude#7\") — a worker of yours whose need you are relaying." },
+                                "urgent": { "type": "boolean", "description": "Optional, default false. Mark URGENT only when the user's attention is really needed as soon as possible (you are blocked on it right now, or something breaks or is lost if they wait) — not for ordinary asks. Urgent items show on top, in red." },
                             },
                             "required": ["kind", "title"],
                         },
                     },
-                    "id": { "description": "For update/done/reopen/remove: an item number `n`, or an array of them (update takes one)." },
+                    "id": { "description": "For update/comment/done/remove: an item number `n`, or an array of them (update and comment take one). For `list`: one item number to read IN FULL — the list otherwise previews long text and shows only the latest comments." },
                     "kind": { "type": "string", "enum": ["action", "decision", "question"], "description": "For `update`." },
                     "title": { "type": "string", "description": "For `update`." },
-                    "detail": { "type": "string", "description": "For `update` (empty string clears it)." },
+                    "detail": { "type": "string", "description": "For `update` (empty string clears it). Markdown (headings, lists, code, tables), up to 20,000 characters, shown under the item's \"more\". Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
                     "choices": { "type": "array", "items": { "type": "string" }, "description": "For `update`." },
                     "for": { "description": "For `update`: the instance it is for, or null to clear." },
+                    "urgent": { "type": "boolean", "description": "For `update`: set or clear URGENT. Mark URGENT only when the user's attention is really needed as soon as possible (you are blocked on it right now, or something breaks or is lost if they wait) — not for ordinary asks. Urgent items show on top, in red." },
+                    "text": { "type": "string", "description": "For `comment`: what to say, in the user's language. Markdown, up to 20,000 characters." },
                     "of": { "description": "For `list` only: another instance in this project (\"4\" or \"claude#4\") whose list to READ." },
                 },
                 "required": ["action"],
@@ -347,7 +350,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_spawn" => hub_spawn(ctx, &args),
         "hub_close" => hub_close(ctx, &args),
         "hub_remote_open" => hub_remote_open(ctx, &args),
-        "hub_user_asks" => hub_user_asks(ctx, &args),
+        "hub_todo" => hub_todo(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
@@ -1298,13 +1301,13 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
     .to_string())
 }
 
-/// `hub_user_asks` — forwarded whole to the app, which owns the list (`asks.rs`
+/// `hub_todo` — forwarded whole to the app, which owns the list (`todos.rs`
 /// in the app) and validates the call; only `of` is resolved here, and `from`
 /// is always this instance, so nothing can write another instance's list.
-fn hub_user_asks(ctx: &Ctx, args: &Value) -> Result<String, String> {
+fn hub_todo(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
     if action.is_empty() {
-        return Err("missing `action` (list, add, update, done, reopen, remove)".into());
+        return Err("missing `action` (list, add, update, comment, done, remove)".into());
     }
     let mut body = args.clone();
     let obj = body.as_object_mut().ok_or("arguments must be an object")?;
@@ -1317,7 +1320,7 @@ fn hub_user_asks(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .ok_or("`of` must be an instance in this project, like \"4\" or \"claude#4\"")?;
         obj.insert("of".into(), json!(n));
     }
-    obj.insert("op".into(), json!("asks"));
+    obj.insert("op".into(), json!("todos"));
     obj.insert("from".into(), json!(ctx.instance));
     let reply = app_request(ctx, body)?;
     let mut out = json!({ "list": reply.get("list").cloned().unwrap_or(json!([])) });
@@ -3920,15 +3923,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `hub_user_asks` forwards the call with the CALLER's identity stamped on it
+    /// `hub_todo` forwards the call with the CALLER's identity stamped on it
     /// (so nothing can write another instance's list), resolves `of`, and is
     /// both listed and dispatched.
     #[test]
-    fn user_asks_forwards_as_the_caller() {
-        let dir = tmpdir("user-asks");
+    fn todo_forwards_as_the_caller() {
+        let dir = tmpdir("todo");
         let ctx = test_ctx(&dir, 3);
-        assert!(hub_user_asks(&ctx, &json!({})).unwrap_err().contains("action"));
-        assert!(hub_user_asks(&ctx, &json!({"action": "list", "of": "nobody"}))
+        assert!(hub_todo(&ctx, &json!({})).unwrap_err().contains("action"));
+        assert!(hub_todo(&ctx, &json!({"action": "list", "of": "nobody"}))
             .unwrap_err()
             .contains("`of`"));
 
@@ -3952,9 +3955,9 @@ mod tests {
             }
             panic!("no request");
         });
-        let out = hub_user_asks(&ctx, &json!({"action": "list", "of": "claude#4", "from": 9})).unwrap();
+        let out = hub_todo(&ctx, &json!({"action": "list", "of": "claude#4", "from": 9})).unwrap();
         let sent = app.join().unwrap();
-        assert_eq!(sent["op"], "asks");
+        assert_eq!(sent["op"], "todos");
         assert_eq!(sent["from"], 3, "the caller's identity, never its own claim");
         assert_eq!(sent["of"], 4);
         assert!(out.contains("claude#4 (read-only)"), "{out}");
@@ -3965,7 +3968,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_owned))
             .collect();
-        assert!(listed.contains(&"hub_user_asks".to_string()), "{listed:?}");
+        assert!(listed.contains(&"hub_todo".to_string()), "{listed:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

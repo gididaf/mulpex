@@ -542,7 +542,7 @@ pub fn project_view(
     state_dir: &std::path::Path,
     sessions: &[SessionInfo],
     snap: &HubSnapshot,
-    asks_rev: u64,
+    todos_rev: u64,
 ) -> Value {
     let rows: Vec<Value> = sessions
         .iter()
@@ -571,14 +571,16 @@ pub fn project_view(
                 "parent": s.parent,
                 "exited": s.exited,
                 "failed": s.failed,
-                // "For me": the badge, and whether UPDATE has anything to send.
-                "asks_on": s.asks_on,
-                "asks_open": s.asks_open,
-                "asks_pending": s.asks_pending,
+                // "To Do": the badge, and whether UPDATE has anything to send.
+                "todos_on": s.todos_on,
+                "todos_open": s.todos_open,
+                "todos_pending": s.todos_pending,
+                "todos_unread": s.todos_unread,
+                "todos_urgent": s.todos_urgent,
             })
         })
         .collect();
-    json!({ "handle": handle, "name": name, "sessions": rows, "asks_rev": asks_rev })
+    json!({ "handle": handle, "name": name, "sessions": rows, "todos_rev": todos_rev })
 }
 
 pub fn workspace_view(active: Option<ProjectHandle>, projects: Vec<Value>) -> Value {
@@ -1299,21 +1301,21 @@ impl Server {
                     s.watch = None;
                 }
             }
-            // "For me" (`asks.rs`): the lists, a draft edit, UPDATE — the same
+            // "To Do" (`todos.rs`): the lists, a draft edit, UPDATE — the same
             // `Core` methods the desktop's commands call, so drafts are shared.
-            Some("asks-get") => {
+            Some("todos-get") => {
                 let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
-                let lists = with_core(handle, |c| c.asks_views()).unwrap_or_default();
-                let msg = json!({"t": "asks", "handle": handle, "lists": lists});
+                let lists = with_core(handle, |c| c.todos_views()).unwrap_or_default();
+                let msg = json!({"t": "todos", "handle": handle, "lists": lists});
                 self.send_sealed(ws, cid, &msg.to_string())?;
             }
-            Some(t @ ("asks-edit" | "asks-update")) => {
+            Some(t @ ("todos-edit" | "todos-update")) => {
                 let rid = req.get("rid").and_then(Value::as_str).unwrap_or("").chars().take(64).collect::<String>();
                 let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
-                let result: Result<Option<String>, String> = if t == "asks-edit" {
+                let result: Result<Option<String>, String> = if t == "todos-edit" {
                     let id = req.get("id").and_then(Value::as_u64).map(|i| i as usize);
-                    match (id, serde_json::from_value::<crate::asks::AskEdit>(req["edit"].clone())) {
-                        (Some(id), Ok(edit)) => with_core(handle, |c| c.asks_edit(id, edit).map(|_| None))
+                    match (id, serde_json::from_value::<crate::todos::TodoEdit>(req["edit"].clone())) {
+                        (Some(id), Ok(edit)) => with_core(handle, |c| c.todos_edit(id, edit).map(|_| None))
                             .unwrap_or_else(|| Err("That project is closed".into())),
                         _ => Err("Bad request".into()),
                     }
@@ -1321,7 +1323,7 @@ impl Server {
                     let ids: Vec<usize> = serde_json::from_value(req["ids"].clone()).unwrap_or_default();
                     with_core(handle, |c| {
                         let refused: Vec<String> = c
-                            .asks_update(&ids)
+                            .todos_update(&ids)
                             .into_iter()
                             .filter(|s| s.state == "refused")
                             .filter_map(|s| s.why)
@@ -2021,9 +2023,11 @@ mod tests {
             kind,
             exited: false,
             failed: failed.map(String::from),
-            asks_on: false,
-            asks_open: 0,
-            asks_pending: 0,
+            todos_on: false,
+            todos_open: 0,
+            todos_pending: 0,
+            todos_unread: 0,
+            todos_urgent: 0,
         };
         let sessions = vec![
             mk(1, SessionKind::Claude, None),

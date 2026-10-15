@@ -1,9 +1,9 @@
-//! The "For me" list: per claude, what it needs from the USER — an action they
+//! The "To Do" list: per claude, what it needs from the USER — an action they
 //! must take, a decision (with choices to click), or a question.
 //!
 //! Two writers, never at once on the same layer:
 //!
-//! - **The claude** edits the BASE through `hub_user_asks` (`mcp.rs`), which
+//! - **The claude** edits the BASE through `hub_todo` (`mcp.rs`), which
 //!   rides the `termreq/` app-request channel — so every write happens here, in
 //!   the app, under the `Workspace` lock. The helper only checks the call's shape.
 //! - **The user** edits DRAFTS laid over the base (`Drafts`). The claude never
@@ -11,7 +11,7 @@
 //!   base (`List::commit`) and the returned `Diff` becomes a hub message from
 //!   "Mulpex" (`render_update`), so the claude can act without a tool call.
 //!
-//! Stored like the ⌘⇧P pins (`pins.rs`): `<mulpex home>/asks/<key>.json`, keyed
+//! Stored like the ⌘⇧P pins (`pins.rs`): `<mulpex home>/todos/<key>.json`, keyed
 //! by instance NUMBER, pruned by `Core::persist_sessions` — so ⌘W loses a list
 //! and a quit keeps it. Drafts are stored too, so the desktop, a remote desktop
 //! and the phone all see the same "pending" state and any of them can send it.
@@ -82,9 +82,18 @@ pub struct Item {
     #[serde(default)]
     pub done_by: Option<Author>,
     pub author: Author,
-    /// The user's committed answer/note.
-    #[serde(default)]
+    /// The single note an item had before comments replaced it. Read only to
+    /// migrate it into `comments` on load (`List::migrate`), never written.
+    #[serde(default, skip_serializing)]
     pub note: Option<String>,
+    /// The follow-up thread, both authors, oldest first. Append-only: it goes
+    /// when the item does.
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    /// How many of `comments` the user has seen (opened the thread) — the
+    /// claude's comments past it are unread. One count for every viewer.
+    #[serde(default)]
+    pub seen: usize,
     /// The choice the user committed, as its TEXT — survives the claude
     /// reordering its choices.
     #[serde(default)]
@@ -99,6 +108,25 @@ pub struct Item {
     /// collected onto its own list, so the user has one list to read.
     #[serde(default, rename = "for")]
     pub for_id: Option<usize>,
+    /// Set by the claude only when the user's attention is needed as soon as
+    /// possible: shown on top, in red, and turns the row badge red.
+    #[serde(default)]
+    pub urgent: bool,
+}
+
+impl Item {
+    /// A claude comment past what the user has seen.
+    pub fn unread(&self) -> bool {
+        self.comments.iter().skip(self.seen).any(|c| c.by == Author::Claude)
+    }
+}
+
+/// One comment on an item's thread.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Comment {
+    pub by: Author,
+    pub text: String,
+    pub at: u64,
 }
 
 /// The title and kind of an item the claude removed while the user had typed
@@ -115,8 +143,10 @@ pub struct Orphan {
 pub struct Edit {
     #[serde(default)]
     pub done: Option<bool>,
-    #[serde(default)]
-    pub note: Option<String>,
+    /// The user's reply, one per item, appended to the thread at UPDATE.
+    /// (`note` is the name drafts were saved under before comments.)
+    #[serde(default, alias = "note")]
+    pub comment: Option<String>,
     #[serde(default)]
     pub chosen: Option<String>,
     #[serde(default)]
@@ -129,11 +159,11 @@ pub struct Edit {
 
 impl Edit {
     fn is_empty(&self) -> bool {
-        self.done.is_none() && self.note.is_none() && self.chosen.is_none() && !self.delete
+        self.done.is_none() && self.comment.is_none() && self.chosen.is_none() && !self.delete
     }
     /// Text the user typed or picked — the part that must never be dropped silently.
     fn has_words(&self) -> bool {
-        self.note.as_deref().is_some_and(|s| !s.trim().is_empty()) || self.chosen.is_some()
+        self.comment.as_deref().is_some_and(|s| !s.trim().is_empty()) || self.chosen.is_some()
     }
 }
 
@@ -174,9 +204,12 @@ pub struct List {
 /// One edit from the user (desktop panel, remote desktop, phone), tagged by `op`.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
-pub enum AskEdit {
+pub enum TodoEdit {
     Done { n: u32, done: bool },
-    Note { n: u32, note: String },
+    Comment { n: u32, text: String },
+    /// The user opened item `n`'s thread: everything on it is now read. Not a
+    /// draft — it changes the base at once.
+    Seen { n: u32 },
     Choose { n: u32, choice: Option<String> },
     Dismiss { n: u32, on: bool },
     Add { kind: Kind, title: String, #[serde(default)] detail: Option<String> },
@@ -192,16 +225,14 @@ pub enum AskEdit {
     RemoveAdded { tmp: String },
     Discard { n: u32 },
     DiscardAll,
-    ClearDone,
 }
 
 /// What one UPDATE changed, for `render_update`.
 #[derive(Default, Debug, PartialEq)]
 pub struct Diff {
     pub done: Vec<String>,
-    pub reopened: Vec<String>,
     pub chosen: Vec<String>,
-    pub notes: Vec<String>,
+    pub comments: Vec<String>,
     pub added: Vec<String>,
     pub dismissed: Vec<String>,
 }
@@ -209,12 +240,21 @@ pub struct Diff {
 impl Diff {
     fn is_empty(&self) -> bool {
         self.done.is_empty()
-            && self.reopened.is_empty()
             && self.chosen.is_empty()
-            && self.notes.is_empty()
+            && self.comments.is_empty()
             && self.added.is_empty()
             && self.dismissed.is_empty()
     }
+}
+
+/// One list's numbers for the sidebar badge: open items, the user's pending
+/// drafts, items with an unread claude comment, and open urgent items.
+#[derive(Default, Debug, PartialEq, Clone, Copy)]
+pub struct Counts {
+    pub open: u32,
+    pub pending: u32,
+    pub unread: u32,
+    pub urgent: u32,
 }
 
 /// Unix seconds, for the items' timestamps.
@@ -227,8 +267,17 @@ pub fn now() -> u64 {
 
 pub const MAX_OPEN: usize = 50;
 const MAX_TITLE: usize = 200;
-const MAX_DETAIL: usize = 4000;
-const MAX_NOTE: usize = 4000;
+/// Details and comments are Markdown, and details are where long content goes
+/// (QA steps, results, options compared) instead of the conversation.
+const MAX_DETAIL: usize = 20_000;
+const MAX_COMMENT: usize = 20_000;
+/// In the list a claude gets back on every call, longer text is cut to this
+/// and only the latest comments are shown — `list` with `id` reads one item in
+/// full. Otherwise each call would re-send every long detail into its context.
+const PREVIEW: usize = 300;
+const PREVIEW_COMMENTS: usize = 3;
+/// Per item. A thread this long has stopped being a follow-up.
+const MAX_COMMENTS: usize = 100;
 const MAX_CHOICES: usize = 8;
 const MAX_CHOICE: usize = 120;
 
@@ -282,6 +331,15 @@ fn for_of(v: Option<&Value>) -> Result<Option<Option<usize>>, String> {
     }
 }
 
+/// `urgent`: a boolean, when given.
+fn urgent_of(v: Option<&Value>) -> Result<Option<bool>, String> {
+    match v {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err("`urgent` must be true or false".into()),
+    }
+}
+
 /// `id` as one number or an array of them.
 fn ids_of(v: &Value) -> Result<Vec<u32>, String> {
     let one = |x: &Value| x.as_u64().map(|n| n as u32);
@@ -313,16 +371,54 @@ impl List {
         })
     }
 
+    /// Take items `ids` off the list. What the user typed or picked on one is
+    /// kept as an orphan draft, so it is still sent at UPDATE; a bare tick or
+    /// dismiss on an item that no longer exists carries nothing worth sending.
+    fn drop_items(&mut self, ids: &[u32]) {
+        for n in ids {
+            let Some(pos) = self.items.iter().position(|i| i.n == *n) else { continue };
+            let item = self.items.remove(pos);
+            match self.drafts.edits.remove(n) {
+                Some(mut e) if e.has_words() => {
+                    e.done = None;
+                    e.delete = false;
+                    e.orphan = Some(Orphan { kind: item.kind, title: item.title });
+                    self.drafts.edits.insert(*n, e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Bring a list saved by an older Mulpex up to date: done items used to stay
+    /// until "Clear done", and an item used to carry one `note` instead of a
+    /// thread (it becomes the user's first comment).
+    fn migrate(&mut self) {
+        let done: Vec<u32> = self.items.iter().filter(|i| i.status == Status::Done).map(|i| i.n).collect();
+        self.drop_items(&done);
+        for i in &mut self.items {
+            if let Some(text) = i.note.take().filter(|t| !t.trim().is_empty()) {
+                i.comments.insert(0, Comment { by: Author::User, text, at: i.updated });
+                i.seen += 1;
+            }
+        }
+    }
+
     fn open_count(&self) -> usize {
         self.items.iter().filter(|i| i.status == Status::Open).count()
     }
 
-    /// Counts for the sidebar badge: open base items, and pending drafts.
-    pub fn counts(&self) -> (u32, u32) {
-        (self.open_count() as u32, self.drafts.count() as u32)
+    /// Counts for the sidebar badge.
+    pub fn counts(&self) -> Counts {
+        Counts {
+            open: self.open_count() as u32,
+            pending: self.drafts.count() as u32,
+            unread: self.items.iter().filter(|i| i.unread()).count() as u32,
+            urgent: self.items.iter().filter(|i| i.urgent && i.status == Status::Open).count() as u32,
+        }
     }
 
-    /// The claude's change, from a `hub_user_asks` call. `list` is read-only and
+    /// The claude's change, from a `hub_todo` call. `list` is read-only and
     /// handled by the caller. Returns a one-line note on success.
     pub fn apply_claude(&mut self, v: &Value, now: u64) -> Result<String, String> {
         let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
@@ -354,7 +450,8 @@ impl List {
                     let detail = clean_detail(it.get("detail").and_then(|x| x.as_str()));
                     let choices = clean_choices(it.get("choices"))?;
                     let for_id = for_of(it.get("for"))?.flatten();
-                    fresh.push((kind, title, detail, choices, for_id));
+                    let urgent = urgent_of(it.get("urgent"))?.unwrap_or(false);
+                    fresh.push((kind, title, detail, choices, for_id, urgent));
                 }
                 if self.open_count() + fresh.len() > MAX_OPEN {
                     return Err(format!(
@@ -362,7 +459,7 @@ impl List {
                     ));
                 }
                 let mut added = Vec::new();
-                for (kind, title, detail, choices, for_id) in fresh {
+                for (kind, title, detail, choices, for_id, urgent) in fresh {
                     self.next += 1;
                     let n = self.next;
                     self.items.push(Item {
@@ -375,11 +472,14 @@ impl List {
                         done_by: None,
                         author: Author::Claude,
                         note: None,
+                        comments: Vec::new(),
+                        seen: 0,
                         chosen: None,
                         created: now,
                         updated: now,
                         rev: 0,
                         for_id,
+                        urgent,
                     });
                     added.push(format!("#{n}"));
                 }
@@ -399,8 +499,15 @@ impl List {
                 let detail = v.get("detail").map(|d| clean_detail(d.as_str()));
                 let choices = v.get("choices").map(|c| clean_choices(Some(c))).transpose()?;
                 let for_id = for_of(v.get("for"))?;
-                if kind.is_none() && title.is_none() && detail.is_none() && choices.is_none() && for_id.is_none() {
-                    return Err("`update` needs at least one of kind, title, detail, choices, for".into());
+                let urgent = urgent_of(v.get("urgent"))?;
+                if kind.is_none()
+                    && title.is_none()
+                    && detail.is_none()
+                    && choices.is_none()
+                    && for_id.is_none()
+                    && urgent.is_none()
+                {
+                    return Err("`update` needs at least one of kind, title, detail, choices, for, urgent".into());
                 }
                 let item = self.item_mut(n)?;
                 if let Some(k) = kind {
@@ -418,64 +525,46 @@ impl List {
                 if let Some(f) = for_id {
                     item.for_id = f;
                 }
+                if let Some(u) = urgent {
+                    item.urgent = u;
+                }
                 item.updated = now;
                 item.rev += 1;
                 Ok(format!("updated #{n}"))
             }
-            "done" | "reopen" => {
+            "comment" => {
                 let ids = ids_of(v)?;
-                for n in &ids {
-                    self.item_mut(*n)?;
+                let [n] = ids[..] else {
+                    return Err("`comment` takes one `id`".into());
+                };
+                let text = v.get("text").and_then(|x| x.as_str()).map(str::trim).unwrap_or("");
+                if text.is_empty() {
+                    return Err("`comment` needs `text`".into());
                 }
-                let reopen = action == "reopen";
-                if reopen && self.open_count() + ids.len() > MAX_OPEN {
-                    return Err(format!("at most {MAX_OPEN} open items"));
+                let item = self.item_mut(n)?;
+                if item.comments.len() >= MAX_COMMENTS {
+                    return Err(format!("#{n} already has {MAX_COMMENTS} comments"));
                 }
-                for n in &ids {
-                    let item = self.item_mut(*n)?;
-                    if reopen {
-                        item.status = Status::Open;
-                        item.done_by = None;
-                    } else {
-                        item.status = Status::Done;
-                        item.done_by = Some(Author::Claude);
-                    }
-                    item.updated = now;
-                    item.rev += 1;
-                }
-                let list = ids.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ");
-                Ok(format!("{} {list}", if reopen { "reopened" } else { "marked done" }))
+                item.comments.push(Comment { by: Author::Claude, text: cut(text, MAX_COMMENT), at: now });
+                item.updated = now;
+                Ok(format!("commented on #{n}"))
             }
-            "remove" => {
+            // A done item leaves the list at once — the user never has to clear it.
+            "done" | "remove" => {
                 let ids = ids_of(v)?;
                 for n in &ids {
                     self.item_mut(*n)?;
                 }
-                for n in &ids {
-                    let Some(pos) = self.items.iter().position(|i| i.n == *n) else { continue };
-                    let item = self.items.remove(pos);
-                    // Keep only what the user typed; a bare tick/delete on an item
-                    // that no longer exists carries nothing worth sending.
-                    match self.drafts.edits.remove(n) {
-                        Some(mut e) if e.has_words() => {
-                            e.done = None;
-                            e.delete = false;
-                            e.orphan = Some(Orphan { kind: item.kind, title: item.title });
-                            self.drafts.edits.insert(*n, e);
-                        }
-                        _ => {}
-                    }
-                }
+                self.drop_items(&ids);
                 let list = ids.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ");
-                Ok(format!("removed {list}"))
+                Ok(format!("{} {list}", if action == "done" { "done, removed" } else { "removed" }))
             }
             "list" => Ok(String::new()),
-            "" => Err("missing `action` (list, add, update, done, reopen, remove)".into()),
-            other => Err(format!("unknown action {other:?} — use list, add, update, done, reopen or remove")),
+            "" => Err("missing `action` (list, add, update, comment, done, remove)".into()),
+            other => Err(format!("unknown action {other:?} — use list, add, update, comment, done or remove")),
         }
     }
 
-    /// The user's edit to the drafts (or, for `clear_done`, straight to the base).
     /// The draft on item `n`, started if there is none. Must name a live item,
     /// or an orphan draft already kept for a removed one.
     fn draft_mut(&mut self, n: u32) -> Result<&mut Edit, String> {
@@ -490,20 +579,23 @@ impl List {
         }))
     }
 
-    pub fn apply_user(&mut self, edit: AskEdit) -> Result<(), String> {
+    pub fn apply_user(&mut self, edit: TodoEdit) -> Result<(), String> {
         match edit {
-            AskEdit::Done { n, done } => {
+            TodoEdit::Done { n, done } => {
                 let base_done = self.items.iter().find(|i| i.n == n).map(|i| i.status == Status::Done);
                 let e = self.draft_mut(n)?;
                 e.done = if base_done == Some(done) { None } else { Some(done) };
             }
-            AskEdit::Note { n, note } => {
-                let base = self.items.iter().find(|i| i.n == n).and_then(|i| i.note.clone()).unwrap_or_default();
-                let note = cut(note.trim_end(), MAX_NOTE);
+            TodoEdit::Comment { n, text } => {
+                let text = cut(text.trim_end(), MAX_COMMENT);
                 let e = self.draft_mut(n)?;
-                e.note = if note == base { None } else { Some(note) };
+                e.comment = if text.trim().is_empty() { None } else { Some(text) };
             }
-            AskEdit::Choose { n, choice } => {
+            TodoEdit::Seen { n } => {
+                let item = self.items.iter_mut().find(|i| i.n == n).ok_or(format!("#{n} is no longer on the list"))?;
+                item.seen = item.comments.len();
+            }
+            TodoEdit::Choose { n, choice } => {
                 let item = self.items.iter().find(|i| i.n == n).cloned();
                 if let (Some(c), Some(item)) = (&choice, &item) {
                     if !item.choices.contains(c) {
@@ -514,14 +606,14 @@ impl List {
                 let e = self.draft_mut(n)?;
                 e.chosen = if choice == base { None } else { choice };
             }
-            AskEdit::Dismiss { n, on } => {
+            TodoEdit::Dismiss { n, on } => {
                 let e = self.draft_mut(n)?;
                 if e.orphan.is_some() {
                     return Err(format!("#{n} was already removed — discard the draft instead"));
                 }
                 e.delete = on;
             }
-            AskEdit::Add { kind, title, detail } => {
+            TodoEdit::Add { kind, title, detail } => {
                 let title = one_line(&title, MAX_TITLE);
                 if title.is_empty() {
                     return Err("a title is needed".into());
@@ -533,7 +625,7 @@ impl List {
                     detail: clean_detail(detail.as_deref()),
                 });
             }
-            AskEdit::EditAdded { tmp, kind, title, detail } => {
+            TodoEdit::EditAdded { tmp, kind, title, detail } => {
                 let a = self
                     .drafts
                     .added
@@ -550,15 +642,11 @@ impl List {
                     a.detail = clean_detail(Some(&d));
                 }
             }
-            AskEdit::RemoveAdded { tmp } => self.drafts.added.retain(|a| a.tmp != tmp),
-            AskEdit::Discard { n } => {
+            TodoEdit::RemoveAdded { tmp } => self.drafts.added.retain(|a| a.tmp != tmp),
+            TodoEdit::Discard { n } => {
                 self.drafts.edits.remove(&n);
             }
-            AskEdit::DiscardAll => self.drafts = Drafts::default(),
-            AskEdit::ClearDone => {
-                let drafted: HashSet<u32> = self.drafts.edits.keys().copied().collect();
-                self.items.retain(|i| i.status != Status::Done || drafted.contains(&i.n));
-            }
+            TodoEdit::DiscardAll => self.drafts = Drafts::default(),
         }
         // A draft that no longer changes anything is not pending.
         self.drafts.edits.retain(|_, e| !e.is_empty());
@@ -576,12 +664,12 @@ impl List {
                 if let Some(c) = &e.chosen {
                     parts.push(format!("chose {c:?}"));
                 }
-                if let Some(note) = e.note.as_deref().filter(|s| !s.trim().is_empty()) {
-                    parts.push(format!("{note:?}"));
+                if let Some(c) = e.comment.as_deref().filter(|s| !s.trim().is_empty()) {
+                    parts.push(format!("{c:?}"));
                 }
                 if !parts.is_empty() {
-                    d.notes.push(format!(
-                        "(re: #{n} [{}] {:?}, which you had removed) — {}",
+                    d.comments.push(format!(
+                        "(re: #{n} [{}] {:?}, no longer on your list) — {}",
                         o.kind.word(),
                         o.title,
                         parts.join("; ")
@@ -597,33 +685,23 @@ impl List {
             }
             let item = &mut self.items[pos];
             let lbl = label(n, item.kind, &item.title, item.for_id);
-            match e.done {
-                Some(true) if item.status != Status::Done => {
-                    item.status = Status::Done;
-                    item.done_by = Some(Author::User);
-                    d.done.push(lbl.clone());
-                }
-                Some(false) if item.status != Status::Open => {
-                    item.status = Status::Open;
-                    item.done_by = None;
-                    d.reopened.push(lbl.clone());
-                }
-                _ => {}
-            }
             if let Some(c) = e.chosen {
                 let gone = if item.choices.contains(&c) { "" } else { " (no longer one of your choices)" };
                 d.chosen.push(format!("{lbl} → chose: {c:?}{gone}"));
                 item.chosen = Some(c);
             }
-            if let Some(note) = e.note {
-                if note.trim().is_empty() {
-                    item.note = None;
-                } else {
-                    d.notes.push(format!("{lbl} — {note:?}"));
-                    item.note = Some(note);
-                }
+            if let Some(text) = e.comment.filter(|t| !t.trim().is_empty()) {
+                d.comments.push(format!("{lbl} — {text:?}"));
+                item.comments.push(Comment { by: Author::User, text, at: now });
+                // Writing a reply means the thread was read.
+                item.seen = item.comments.len();
             }
             item.updated = now;
+            // Checked by the user: reported, then off the list like any done item.
+            if e.done == Some(true) {
+                d.done.push(lbl);
+                self.items.remove(pos);
+            }
         }
         for a in drafts.added {
             self.next += 1;
@@ -646,22 +724,36 @@ impl List {
                 done_by: None,
                 author: Author::User,
                 note: None,
+                comments: Vec::new(),
+                seen: 0,
                 chosen: None,
                 created: now,
                 updated: now,
                 rev: 0,
                 for_id: None,
+                urgent: false,
             });
         }
         (!d.is_empty()).then_some(d)
     }
 
-    /// What the claude sees: the base only, never a draft.
-    pub fn claude_view(&self) -> Value {
+    /// What the claude sees: the base only, never a draft. Every item is
+    /// previewed (long text cut, latest comments only) except `full`, shown whole.
+    pub fn claude_view(&self, full: Option<u32>) -> Value {
         let items: Vec<Value> = self
             .items
             .iter()
             .map(|i| {
+                let whole = full == Some(i.n);
+                let short = |t: &str| -> String {
+                    let len = t.chars().count();
+                    if whole || len <= PREVIEW {
+                        t.to_string()
+                    } else {
+                        let head: String = t.chars().take(PREVIEW).collect();
+                        format!("{head}… [{len} chars — action list with id {} for the full text]", i.n)
+                    }
+                };
                 let mut o = json!({
                     "n": i.n,
                     "kind": i.kind,
@@ -671,7 +763,7 @@ impl List {
                 });
                 let m = o.as_object_mut().unwrap();
                 if let Some(d) = &i.detail {
-                    m.insert("detail".into(), json!(d));
+                    m.insert("detail".into(), json!(short(d)));
                 }
                 if !i.choices.is_empty() {
                     m.insert("choices".into(), json!(i.choices));
@@ -679,14 +771,23 @@ impl List {
                 if let Some(b) = i.done_by {
                     m.insert("done_by".into(), json!(b));
                 }
-                if let Some(n) = &i.note {
-                    m.insert("user_note".into(), json!(n));
+                if !i.comments.is_empty() {
+                    let skip = if whole { 0 } else { i.comments.len().saturating_sub(PREVIEW_COMMENTS) };
+                    let shown: Vec<Value> =
+                        i.comments[skip..].iter().map(|c| json!({"by": c.by, "text": short(&c.text)})).collect();
+                    m.insert("comments".into(), json!(shown));
+                    if skip > 0 {
+                        m.insert("earlier_comments".into(), json!(format!("{skip} not shown — action list with id {}", i.n)));
+                    }
                 }
                 if let Some(c) = &i.chosen {
                     m.insert("user_chose".into(), json!(c));
                 }
                 if let Some(f) = i.for_id {
                     m.insert("for".into(), json!(format!("claude#{f}")));
+                }
+                if i.urgent {
+                    m.insert("urgent".into(), json!(true));
                 }
                 o
             })
@@ -696,11 +797,11 @@ impl List {
 }
 
 /// The hub message an UPDATE sends. Self-contained on purpose: a claude started
-/// before this feature existed has no `hub_user_asks` tool and no rule about it,
+/// before this feature existed has no `hub_todo` tool and no rule about it,
 /// and must still be able to act on what the user said.
 pub fn render_update(id: usize, d: &Diff) -> String {
     let mut out = format!(
-        "The user updated your For-me list (claude#{id}) in Mulpex and pressed UPDATE. What changed:\n"
+        "The user updated your To Do list (claude#{id}) in Mulpex and pressed UPDATE. What changed:\n"
     );
     let mut section = |title: &str, lines: &[String]| {
         if lines.is_empty() {
@@ -715,14 +816,15 @@ pub fn render_update(id: usize, d: &Diff) -> String {
         }
     };
     section("Done (checked by the user)", &d.done);
-    section("Reopened by the user", &d.reopened);
     section("Decisions made", &d.chosen);
-    section("Notes from the user", &d.notes);
+    section("Comments from the user (answer on that item: hub_todo action \"comment\")", &d.comments);
     section("Added by the user (new requests for you)", &d.added);
     section("Dismissed by the user (gone from your list)", &d.dismissed);
     out.push_str(
-        "Act on this now. Keep the list current with mcp__mulpex__hub_user_asks (mark items done, \
-         add new asks). Do NOT hub_send a reply — the list and your normal reply are where you answer.",
+        "Act on this now. Keep the list current with mcp__mulpex__hub_todo (mark items done — that removes them — \
+         and add new items); answer comments on their item (action \"comment\"). Don't recap this \
+         message or the list in your reply: the user sees the list in Mulpex, so just do the work. \
+         Do NOT hub_send a reply.",
     );
     out
 }
@@ -730,13 +832,13 @@ pub fn render_update(id: usize, d: &Diff) -> String {
 /// What a claude is told when the user turns its list on or off (context menu).
 pub fn toggle_message(on: bool) -> String {
     if on {
-        "The user turned ON your \"For me\" list in Mulpex (the side panel). From now on, put \
-         anything you need from them on it with mcp__mulpex__hub_user_asks — including anything \
-         you are waiting on them for right now — and mention each item once instead of repeating \
-         it. Mulpex reminds you of the details every turn. Do NOT hub_send a reply."
+        "The user turned ON your \"To Do\" list in Mulpex (the side panel). From now on, put \
+         anything you need from them on it with mcp__mulpex__hub_todo — including anything \
+         you are waiting on them for right now — and keep what is on the list out of your replies \
+         (a one-line pointer like \"Added To Do #3\" at most). Mulpex reminds you of the details every turn. Do NOT hub_send a reply."
             .to_string()
     } else {
-        "The user turned OFF your \"For me\" list in Mulpex. Stop using mcp__mulpex__hub_user_asks \
+        "The user turned OFF your \"To Do\" list in Mulpex. Stop using mcp__mulpex__hub_todo \
          and ask them in your replies as usual. Do NOT hub_send a reply."
             .to_string()
     }
@@ -753,14 +855,14 @@ pub struct ListView<'a> {
 /// What UPDATE did for one claude: `queued` (delivered once it can hear it) or
 /// `refused`, with why.
 #[derive(Serialize)]
-pub struct AskSend {
+pub struct TodoSend {
     pub id: usize,
     pub state: String,
     pub why: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct AskFile {
+struct TodoFile {
     dir: PathBuf,
     lists: BTreeMap<usize, List>,
 }
@@ -768,20 +870,20 @@ struct AskFile {
 /// The durable store, cached in memory — the poll loop reads counts every tick,
 /// and the app is the only writer, so the file is written through, never re-read.
 /// Interior mutability because `Core::persist_sessions` (which prunes) is `&self`.
-pub struct AskStore {
+pub struct TodoStore {
     path: PathBuf,
     project_dir: PathBuf,
     lists: Mutex<BTreeMap<usize, List>>,
-    /// Ids whose list changed since the poll loop last emitted `asks-changed`.
+    /// Ids whose list changed since the poll loop last emitted `todos-changed`.
     dirty: Mutex<BTreeSet<usize>>,
     /// Bumped on every change, so the phone's view can say "re-fetch" without
     /// carrying the lists themselves.
     rev: std::sync::atomic::AtomicU64,
 }
 
-impl AskStore {
+impl TodoStore {
     /// The file beside `session_store_path` (`<home>/sessions/<key>.txt` →
-    /// `<home>/asks/<key>.json`), loaded. Another project's file (a hash
+    /// `<home>/todos/<key>.json`), loaded. Another project's file (a hash
     /// collision) reads as empty, as `pins.rs` does.
     pub fn beside(session_store_path: &Path, project_dir: &Path) -> Self {
         let home = session_store_path
@@ -792,12 +894,23 @@ impl AskStore {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let path = home.join("asks").join(format!("{stem}.json"));
+        let path = home.join("todos").join(format!("{stem}.json"));
+        // Before the rename from "For me" the list lived in `<home>/asks/`;
+        // move it over once, so an upgrade keeps every list.
+        let old = home.join("asks").join(format!("{stem}.json"));
+        if !path.exists() && old.exists() {
+            let _ = std::fs::create_dir_all(home.join("todos"));
+            let _ = std::fs::rename(&old, &path);
+        }
         let lists = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|t| serde_json::from_str::<AskFile>(&t).ok())
+            .and_then(|t| serde_json::from_str::<TodoFile>(&t).ok())
             .filter(|f| f.dir == project_dir)
             .map(|f| f.lists)
+            .map(|mut lists| {
+                lists.values_mut().for_each(List::migrate);
+                lists
+            })
             .unwrap_or_default();
         Self {
             path,
@@ -816,8 +929,8 @@ impl AskStore {
         self.lists.lock().unwrap().clone()
     }
 
-    pub fn counts(&self, id: usize) -> (u32, u32) {
-        self.lists.lock().unwrap().get(&id).map(List::counts).unwrap_or((0, 0))
+    pub fn counts(&self, id: usize) -> Counts {
+        self.lists.lock().unwrap().get(&id).map(List::counts).unwrap_or_default()
     }
 
     /// Run `f` on `id`'s list (created if missing). Written through and marked
@@ -896,12 +1009,16 @@ impl AskStore {
 mod tests {
     use super::*;
 
+    fn c3(c: Counts) -> (u32, u32, u32) {
+        (c.open, c.pending, c.unread)
+    }
+
     fn add(list: &mut List, items: Value) -> Result<String, String> {
         list.apply_claude(&json!({ "action": "add", "items": items }), 1)
     }
 
     fn tempdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mulpex-asks-test-{}", mulpex_core::persist::new_uuid()));
+        let d = std::env::temp_dir().join(format!("mulpex-todos-test-{}", mulpex_core::persist::new_uuid()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -919,19 +1036,19 @@ mod tests {
         // Removed numbers say so rather than "not on your list".
         let e = l.apply_claude(&json!({"action":"done","id":2}), 3).unwrap_err();
         assert!(e.contains("no longer"), "{e}");
-        // Done keeps the item, greyed; reopen brings it back.
+        // Done takes the item off the list; there is nothing to reopen.
         l.apply_claude(&json!({"action":"done","id":[1,3]}), 3).unwrap();
-        assert_eq!(l.counts(), (0, 0));
-        l.apply_claude(&json!({"action":"reopen","id":1}), 4).unwrap();
-        assert_eq!(l.counts(), (1, 0));
+        assert!(l.items.is_empty());
+        assert!(l.apply_claude(&json!({"action":"reopen","id":1}), 4).is_err());
+        add(&mut l, json!([{"kind":"action","title":"deploy the thing"}])).unwrap();
         // `for` tags a worker's ask an orchestrator collected.
         add(&mut l, json!([{"kind":"question","title":"token?","for":"claude#7"}])).unwrap();
         assert_eq!(l.items.last().unwrap().for_id, Some(7));
-        assert!(l.claude_view().to_string().contains("\"for\":\"claude#7\""));
+        assert!(l.claude_view(None).to_string().contains("\"for\":\"claude#7\""));
         assert!(add(&mut l, json!([{"kind":"question","title":"x","for":"bob"}])).is_err());
         // Duplicate open title is refused with a pointer.
         let e = add(&mut l, json!([{"kind":"action","title":"deploy the thing"}])).unwrap_err();
-        assert!(e.contains("#1"), "{e}");
+        assert!(e.contains("#4"), "{e}");
         // Bad shapes are errors, not panics.
         assert!(l.apply_claude(&json!({"action":"update","id":1}), 5).is_err());
         assert!(l.apply_claude(&json!({"action":"nope"}), 5).is_err());
@@ -955,26 +1072,28 @@ mod tests {
             {"kind":"question","title":"מה הפורט?"},
             {"kind":"action","title":"obsolete"}
         ])).unwrap();
-        l.apply_user(AskEdit::Done { n: 1, done: true }).unwrap();
-        l.apply_user(AskEdit::Choose { n: 2, choice: Some("bar".into()) }).unwrap();
-        l.apply_user(AskEdit::Note { n: 3, note: "5173 בבקשה".into() }).unwrap();
-        l.apply_user(AskEdit::Dismiss { n: 4, on: true }).unwrap();
-        l.apply_user(AskEdit::Add { kind: Kind::Action, title: "also bump version".into(), detail: Some("to 0.41".into()) }).unwrap();
-        assert!(l.apply_user(AskEdit::Choose { n: 2, choice: Some("baz".into()) }).is_err());
-        assert_eq!(l.counts(), (4, 5));
+        l.apply_user(TodoEdit::Done { n: 1, done: true }).unwrap();
+        l.apply_user(TodoEdit::Choose { n: 2, choice: Some("bar".into()) }).unwrap();
+        l.apply_user(TodoEdit::Comment { n: 3, text: "5173 בבקשה".into() }).unwrap();
+        l.apply_user(TodoEdit::Dismiss { n: 4, on: true }).unwrap();
+        l.apply_user(TodoEdit::Add { kind: Kind::Action, title: "also bump version".into(), detail: Some("to 0.41".into()) }).unwrap();
+        assert!(l.apply_user(TodoEdit::Choose { n: 2, choice: Some("baz".into()) }).is_err());
+        assert_eq!(c3(l.counts()), (4, 5, 0));
 
-        let view = l.claude_view().to_string();
+        let view = l.claude_view(None).to_string();
         assert!(!view.contains("5173") && !view.contains("bump"), "{view}");
 
         let d = l.commit(9).unwrap();
         assert_eq!(d.done, vec!["#1 [action] run migration"]);
         assert_eq!(d.chosen, vec!["#2 [decision] pick a name → chose: \"bar\""]);
-        assert_eq!(d.notes, vec!["#3 [question] מה הפורט? — \"5173 בבקשה\""]);
+        assert_eq!(d.comments, vec!["#3 [question] מה הפורט? — \"5173 בבקשה\""]);
         assert_eq!(d.dismissed, vec!["#4 [action] obsolete"]);
         assert_eq!(d.added, vec!["#5 [action] also bump version\n    to 0.41"]);
         assert_eq!(l.drafts.count(), 0);
-        let view = l.claude_view().to_string();
+        assert!(l.items.iter().all(|i| i.n != 1), "a checked item leaves the list at UPDATE");
+        let view = l.claude_view(None).to_string();
         assert!(view.contains("5173") && view.contains("\"user_chose\":\"bar\""), "{view}");
+        assert!(view.contains("\"comments\":[{\"by\":\"user\""), "{view}");
         // Nothing pending → nothing to send.
         assert!(l.commit(10).is_none());
 
@@ -988,10 +1107,10 @@ mod tests {
     fn a_draft_that_changes_nothing_is_not_pending() {
         let mut l = List::default();
         add(&mut l, json!([{"kind":"action","title":"x"}])).unwrap();
-        l.apply_user(AskEdit::Done { n: 1, done: true }).unwrap();
-        l.apply_user(AskEdit::Done { n: 1, done: false }).unwrap();
+        l.apply_user(TodoEdit::Done { n: 1, done: true }).unwrap();
+        l.apply_user(TodoEdit::Done { n: 1, done: false }).unwrap();
         assert_eq!(l.drafts.count(), 0);
-        l.apply_user(AskEdit::Note { n: 1, note: "".into() }).unwrap();
+        l.apply_user(TodoEdit::Comment { n: 1, text: "".into() }).unwrap();
         assert_eq!(l.drafts.count(), 0);
     }
 
@@ -999,20 +1118,111 @@ mod tests {
     fn removing_an_item_keeps_only_the_users_words() {
         let mut l = List::default();
         add(&mut l, json!([{"kind":"question","title":"q1"},{"kind":"action","title":"a2"}])).unwrap();
-        l.apply_user(AskEdit::Note { n: 1, note: "my answer".into() }).unwrap();
-        l.apply_user(AskEdit::Done { n: 2, done: true }).unwrap();
+        l.apply_user(TodoEdit::Comment { n: 1, text: "my answer".into() }).unwrap();
+        l.apply_user(TodoEdit::Done { n: 2, done: true }).unwrap();
         l.apply_claude(&json!({"action":"remove","id":[1,2]}), 2).unwrap();
         assert!(l.drafts.edits[&1].orphan.is_some());
         assert!(!l.drafts.edits.contains_key(&2), "a bare tick is dropped");
         let d = l.commit(3).unwrap();
-        assert_eq!(d.notes, vec!["(re: #1 [question] \"q1\", which you had removed) — \"my answer\""]);
+        assert_eq!(d.comments, vec!["(re: #1 [question] \"q1\", no longer on your list) — \"my answer\""]);
+    }
+
+    #[test]
+    fn a_thread_grows_from_both_sides_and_tracks_unread() {
+        let mut l = List::default();
+        add(&mut l, json!([{"kind":"question","title":"which port?"}])).unwrap();
+        // The user's reply is a draft: the claude does not see it yet.
+        l.apply_user(TodoEdit::Comment { n: 1, text: "5173".into() }).unwrap();
+        assert!(!l.claude_view(None).to_string().contains("5173"));
+        // One draft per item: writing again replaces it; blank clears it.
+        l.apply_user(TodoEdit::Comment { n: 1, text: "5174".into() }).unwrap();
+        assert_eq!(l.drafts.count(), 1);
+        let d = l.commit(2).unwrap();
+        assert_eq!(d.comments, vec!["#1 [question] which port? — \"5174\""]);
+        assert!(render_update(3, &d).contains("action \"comment\""));
+        assert_eq!(l.items[0].comments.len(), 1);
+        assert_eq!(c3(l.counts()), (1, 0, 0), "your own comment is never unread");
+
+        // The claude answers on the item: unread until the thread is opened.
+        l.apply_claude(&json!({"action":"comment","id":1,"text":"taken — 5175?"}), 3).unwrap();
+        assert_eq!(c3(l.counts()), (1, 0, 1));
+        assert!(l.claude_view(None).to_string().contains("taken — 5175?"));
+        l.apply_user(TodoEdit::Seen { n: 1 }).unwrap();
+        assert_eq!(c3(l.counts()), (1, 0, 0));
+        assert_eq!(l.drafts.count(), 0, "opening a thread is not a draft");
+
+        // A reply marks the thread read too.
+        l.apply_claude(&json!({"action":"comment","id":1,"text":"or 5176"}), 4).unwrap();
+        l.apply_user(TodoEdit::Comment { n: 1, text: "5176".into() }).unwrap();
+        l.commit(5).unwrap();
+        assert_eq!(c3(l.counts()), (1, 0, 0));
+        assert_eq!(
+            l.items[0].comments.iter().map(|c| c.by).collect::<Vec<_>>(),
+            vec![Author::User, Author::Claude, Author::Claude, Author::User]
+        );
+
+        // Bad shapes.
+        assert!(l.apply_claude(&json!({"action":"comment","id":1}), 6).is_err());
+        assert!(l.apply_claude(&json!({"action":"comment","id":[1,1],"text":"x"}), 6).is_err());
+        assert!(l.apply_claude(&json!({"action":"comment","id":9,"text":"x"}), 6).is_err());
+    }
+
+    #[test]
+    fn the_list_previews_long_text_and_one_id_reads_in_full() {
+        let mut l = List::default();
+        let long = "x".repeat(5000);
+        add(&mut l, json!([{"kind":"action","title":"QA it","detail": long}])).unwrap();
+        for k in 0..5 {
+            l.apply_claude(&json!({"action":"comment","id":1,"text":format!("c{k}")}), 2).unwrap();
+        }
+        let v = l.claude_view(None).to_string();
+        assert!(v.len() < 1500, "the preview carried the whole detail: {}", v.len());
+        assert!(v.contains("5000 chars") && v.contains("2 not shown") && v.contains("c4") && !v.contains("\"c1\""));
+        let v = l.claude_view(Some(1)).to_string();
+        assert!(v.contains(&long) && v.contains("\"c0\"") && !v.contains("not shown"));
+        // 20 000 characters fit; more are cut.
+        add(&mut l, json!([{"kind":"action","title":"big","detail": "y".repeat(25_000)}])).unwrap();
+        assert_eq!(l.items[1].detail.as_ref().unwrap().chars().count(), MAX_DETAIL);
+    }
+
+    #[test]
+    fn urgent_is_set_and_cleared_by_the_claude_and_counted_for_the_badge() {
+        let mut l = List::default();
+        add(&mut l, json!([{"kind":"action","title":"a"},{"kind":"decision","title":"b","urgent":true}])).unwrap();
+        assert!(!l.items[0].urgent && l.items[1].urgent);
+        assert_eq!(l.counts().urgent, 1);
+        assert!(l.claude_view(None).to_string().contains("\"urgent\":true"));
+        l.apply_claude(&json!({"action":"update","id":1,"urgent":true}), 2).unwrap();
+        l.apply_claude(&json!({"action":"update","id":2,"urgent":false}), 2).unwrap();
+        assert!(l.items[0].urgent && !l.items[1].urgent);
+        // Done takes it off the badge with the item.
+        l.apply_claude(&json!({"action":"done","id":1}), 3).unwrap();
+        assert_eq!(l.counts().urgent, 0);
+        assert!(add(&mut l, json!([{"kind":"action","title":"c","urgent":"yes"}])).is_err());
+        assert!(l.apply_claude(&json!({"action":"update","id":2,"urgent":1}), 4).is_err());
+    }
+
+    #[test]
+    fn an_old_note_becomes_the_first_comment() {
+        let mut l: List = serde_json::from_value(json!({
+            "next": 1,
+            "items": [{"n":1,"kind":"question","title":"q","status":"open","author":"claude",
+                       "note":"my old answer","created":1,"updated":2}],
+            "drafts": {"edits": {"1": {"note": "a draft"}}}
+        }))
+        .unwrap();
+        l.migrate();
+        assert_eq!(l.items[0].comments, vec![Comment { by: Author::User, text: "my old answer".into(), at: 2 }]);
+        assert_eq!(c3(l.counts()), (1, 1, 0));
+        assert_eq!(l.drafts.edits[&1].comment.as_deref(), Some("a draft"));
+        assert!(!serde_json::to_string(&l).unwrap().contains("\"note\""), "never written back");
     }
 
     #[test]
     fn a_claude_change_marks_the_draft_stale_but_keeps_it() {
         let mut l = List::default();
         add(&mut l, json!([{"kind":"decision","title":"d","choices":["a","b"]}])).unwrap();
-        l.apply_user(AskEdit::Choose { n: 1, choice: Some("a".into()) }).unwrap();
+        l.apply_user(TodoEdit::Choose { n: 1, choice: Some("a".into()) }).unwrap();
         l.apply_claude(&json!({"action":"update","id":1,"choices":["b","c"]}), 2).unwrap();
         assert!(l.items[0].rev > l.drafts.edits[&1].base_rev);
         let d = l.commit(3).unwrap();
@@ -1020,36 +1230,71 @@ mod tests {
     }
 
     #[test]
-    fn clear_done_spares_drafted_items() {
+    fn done_by_the_claude_keeps_the_users_words() {
         let mut l = List::default();
         add(&mut l, json!([{"kind":"action","title":"a"},{"kind":"action","title":"b"}])).unwrap();
+        l.apply_user(TodoEdit::Comment { n: 2, text: "thanks".into() }).unwrap();
         l.apply_claude(&json!({"action":"done","id":[1,2]}), 2).unwrap();
-        l.apply_user(AskEdit::Note { n: 2, note: "thanks".into() }).unwrap();
-        l.apply_user(AskEdit::ClearDone).unwrap();
-        assert_eq!(l.items.iter().map(|i| i.n).collect::<Vec<_>>(), vec![2]);
+        assert!(l.items.is_empty());
+        let d = l.commit(3).unwrap();
+        assert_eq!(d.comments, vec!["(re: #2 [action] \"b\", no longer on your list) — \"thanks\""]);
+    }
+
+    #[test]
+    fn done_items_saved_before_auto_clear_are_dropped_on_load() {
+        let home = tempdir();
+        let sp = home.join("sessions").join("proj-abc.txt");
+        let s = TodoStore::beside(&sp, Path::new("/p"));
+        s.mutate(3, |l| add(l, json!([{"kind":"action","title":"a"},{"kind":"action","title":"b"}]))).unwrap();
+        s.mutate(3, |l| {
+            l.items[0].status = Status::Done;
+            Ok(())
+        })
+        .unwrap();
+        let again = TodoStore::beside(&sp, Path::new("/p"));
+        assert_eq!(again.get(3).unwrap().items.iter().map(|i| i.n).collect::<Vec<_>>(), vec![2]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn store_round_trips_prunes_and_ignores_other_projects() {
         let home = tempdir();
         let sp = home.join("sessions").join("proj-abc.txt");
-        let s = AskStore::beside(&sp, Path::new("/p"));
+        let s = TodoStore::beside(&sp, Path::new("/p"));
         s.mutate(3, |l| add(l, json!([{"kind":"action","title":"x"}]))).unwrap();
-        s.mutate(3, |l| l.apply_user(AskEdit::Note { n: 1, note: "draft".into() })).unwrap();
+        s.mutate(3, |l| l.apply_user(TodoEdit::Comment { n: 1, text: "draft".into() })).unwrap();
         s.mutate(7, |l| add(l, json!([{"kind":"action","title":"y"}]))).unwrap();
         assert_eq!(s.take_dirty(), vec![3, 7]);
         // A failed op changes nothing and dirties nothing.
         assert!(s.mutate(3, |l| l.apply_claude(&json!({"action":"bogus"}), 1)).is_err());
         assert!(s.take_dirty().is_empty());
 
-        let again = AskStore::beside(&sp, Path::new("/p"));
+        let again = TodoStore::beside(&sp, Path::new("/p"));
         assert_eq!(again.get(3).unwrap().drafts.count(), 1, "drafts persist");
-        assert!(AskStore::beside(&sp, Path::new("/other")).all().is_empty());
+        assert!(TodoStore::beside(&sp, Path::new("/other")).all().is_empty());
 
         again.retain(&HashSet::from([7]));
         assert!(again.get(3).is_none());
         assert_eq!(again.take_dirty(), vec![3]);
         again.retain(&HashSet::new());
+        assert!(!home.join("todos/proj-abc.json").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A list saved before the rename (`<home>/asks/`) is moved to `todos/`.
+    #[test]
+    fn a_list_saved_under_the_old_name_is_migrated() {
+        let home = tempdir();
+        let sp = home.join("sessions").join("proj-abc.txt");
+        TodoStore::beside(&sp, Path::new("/p"))
+            .mutate(3, |l| add(l, json!([{"kind":"action","title":"x"}])))
+            .unwrap();
+        std::fs::create_dir_all(home.join("asks")).unwrap();
+        std::fs::rename(home.join("todos/proj-abc.json"), home.join("asks/proj-abc.json")).unwrap();
+
+        let s = TodoStore::beside(&sp, Path::new("/p"));
+        assert_eq!(s.get(3).unwrap().items.len(), 1, "the old list was not read");
+        assert!(home.join("todos/proj-abc.json").exists());
         assert!(!home.join("asks/proj-abc.json").exists());
         let _ = std::fs::remove_dir_all(&home);
     }

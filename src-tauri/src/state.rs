@@ -310,11 +310,11 @@ pub struct Core {
     /// sidebar subtree is compacted (`lib/compact.ts` enforces it). Set only by
     /// the user, from the row's context menu. Persisted.
     pub auto_compact: HashMap<usize, u8>,
-    /// Rows whose "For me" list is ON (`asks.rs`). Off by default; set only by
+    /// Rows whose "To Do" list is ON (`todos.rs`). Off by default; set only by
     /// the user, from the row's context menu, for that one row. Persisted, and
-    /// mirrored to `asks_on/<id>` for the hook, which then carries the list's
+    /// mirrored to `todos_on/<id>` for the hook, which then carries the list's
     /// rule on every turn.
-    pub asks_on: HashSet<usize>,
+    pub todos_on: HashSet<usize>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
     /// run). Only these are persisted for restore.
     pub worked: HashSet<usize>,
@@ -370,11 +370,11 @@ pub struct Core {
     /// When the last child was launched, so the drip-feed can pace itself without
     /// ever sleeping inside the poll loop.
     last_spawn_at: Option<Instant>,
-    /// The "For me" lists (`asks.rs`), cached; the app is their only writer.
-    pub asks: crate::asks::AskStore,
+    /// The "To Do" lists (`todos.rs`), cached; the app is their only writer.
+    pub todos: crate::todos::TodoStore,
     /// Claudes with an UPDATE waiting to be delivered, and since when — see
-    /// `drain_asks_outbox`.
-    asks_outbox: HashMap<usize, Instant>,
+    /// `drain_todos_outbox`.
+    todos_outbox: HashMap<usize, Instant>,
 }
 
 /// Minimum gap between launching two `hub_spawn` children. Each `claude` cold
@@ -383,9 +383,9 @@ pub struct Core {
 /// into in time. Spacing them keeps each start fast enough to be usable.
 const SPAWN_STAGGER: Duration = Duration::from_millis(500);
 
-/// How long a queued For-me UPDATE waits for its claude's listener before it is
+/// How long a queued To Do UPDATE waits for its claude's listener before it is
 /// left in the inbox regardless — `checkpoint.rs`'s `WAKE_WAIT`, for the same reason.
-const ASKS_WAIT: Duration = Duration::from_secs(180);
+const TODOS_WAIT: Duration = Duration::from_secs(180);
 
 /// How long an unread `<token>.done` reply sticks around before being collected.
 /// One is orphaned whenever a caller gives up waiting for it.
@@ -454,7 +454,7 @@ impl Core {
         let mut parents: HashMap<usize, usize> = HashMap::new();
         let mut collapsed: HashSet<usize> = HashSet::new();
         let mut auto_compact: HashMap<usize, u8> = HashMap::new();
-        let mut asks_on: HashSet<usize> = HashSet::new();
+        let mut todos_on: HashSet<usize> = HashSet::new();
         let mut restored: HashMap<usize, Instant> = HashMap::new();
         let mut started: HashMap<usize, Instant> = HashMap::new();
         // Records whose session could not even be spawned. Nothing will be in
@@ -522,8 +522,8 @@ impl Core {
                 if let Some(pct) = saved.auto_compact {
                     auto_compact.insert(id, pct);
                 }
-                if saved.asks {
-                    asks_on.insert(id);
+                if saved.todos {
+                    todos_on.insert(id);
                 }
                 sessions.push(session);
             } else {
@@ -553,7 +553,7 @@ impl Core {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| project_dir.display().to_string());
 
-        let asks = crate::asks::AskStore::beside(store.path(), &project_dir);
+        let todos = crate::todos::TodoStore::beside(store.path(), &project_dir);
         let mut core = Self {
             handle,
             project_dir,
@@ -564,8 +564,8 @@ impl Core {
             state_dir,
             settings_path,
             helper_path: helper_path.to_path_buf(),
-            asks,
-            asks_outbox: HashMap::new(),
+            todos,
+            todos_outbox: HashMap::new(),
             store,
             // A restored name the USER set (⌘R, a save's title — or one from a
             // store too old to say who set it) stays the user's, so the instance
@@ -585,7 +585,7 @@ impl Core {
             parents,
             collapsed,
             auto_compact,
-            asks_on,
+            todos_on,
             worked,
             closing: HashSet::new(),
             saving: HashSet::new(),
@@ -601,7 +601,7 @@ impl Core {
             last_spawn_at: None,
         };
         core.persist_sessions();
-        core.sync_asks_flags();
+        core.sync_todos_flags();
         core.write_live_instances();
         core.sync_terminal_index();
         // `state_dir` is fresh every launch, so unlike the `armed` flag these have
@@ -629,19 +629,24 @@ impl Core {
     pub fn session_infos(&self) -> Vec<SessionInfo> {
         self.sessions
             .iter()
-            .map(|s| SessionInfo {
-                id: s.id,
-                name: self.display_name(s.id),
-                muted: self.muted.contains(&s.id),
-                parent: self.parents.get(&s.id).copied(),
-                collapsed: self.collapsed.contains(&s.id),
-                auto_compact: self.auto_compact.get(&s.id).copied(),
-                kind: kind_of(s),
-                exited: s.is_shell() && !s.is_alive(),
-                failed: self.failed.get(&s.id).cloned(),
-                asks_on: self.asks_on.contains(&s.id),
-                asks_open: self.asks.counts(s.id).0,
-                asks_pending: self.asks.counts(s.id).1,
+            .map(|s| {
+                let todo_counts = self.todos.counts(s.id);
+                SessionInfo {
+                    id: s.id,
+                    name: self.display_name(s.id),
+                    muted: self.muted.contains(&s.id),
+                    parent: self.parents.get(&s.id).copied(),
+                    collapsed: self.collapsed.contains(&s.id),
+                    auto_compact: self.auto_compact.get(&s.id).copied(),
+                    kind: kind_of(s),
+                    exited: s.is_shell() && !s.is_alive(),
+                    failed: self.failed.get(&s.id).cloned(),
+                    todos_on: self.todos_on.contains(&s.id),
+                    todos_open: todo_counts.open,
+                    todos_pending: todo_counts.pending,
+                    todos_unread: todo_counts.unread,
+                    todos_urgent: todo_counts.urgent,
+                }
             })
             .collect()
     }
@@ -829,9 +834,11 @@ impl Core {
             kind: SessionKind::Claude,
             exited: false,
             failed: None,
-            asks_on: false,
-            asks_open: 0,
-            asks_pending: 0,
+            todos_on: false,
+            todos_open: 0,
+            todos_pending: 0,
+            todos_unread: 0,
+            todos_urgent: 0,
         })
     }
 
@@ -883,9 +890,11 @@ impl Core {
             kind: SessionKind::Shell,
             exited: false,
             failed: None,
-            asks_on: false,
-            asks_open: 0,
-            asks_pending: 0,
+            todos_on: false,
+            todos_open: 0,
+            todos_pending: 0,
+            todos_unread: 0,
+            todos_urgent: 0,
         })
     }
 
@@ -1166,9 +1175,9 @@ impl Core {
                     ),
                 }
             }
-            // `hub_user_asks` — a claude editing its own For-me list (`asks.rs`).
+            // `hub_todo` — a claude editing its own To Do list (`todos.rs`).
             // Routed through here so the app is the list's only writer.
-            "asks" => (self.apply_asks_request(&v), false),
+            "todos" => (self.apply_todos_request(&v), false),
             // `hub_close` — close claude rows, the inverse of `hub_spawn`. Ids are
             // decided one at a time and reported individually: a batch cleaning up
             // six workers must not lose the five it can close because the sixth is
@@ -1475,40 +1484,40 @@ impl Core {
         true
     }
 
-    /// Turn `claude#id`'s For-me list on or off (context menu). For that row
+    /// Turn `claude#id`'s To Do list on or off (context menu). For that row
     /// only — an orchestrator collects its workers' asks onto its own list, so
     /// the user has one list to read. Persisted, mirrored for the hook, and the
     /// claude is told at once. False if nothing changed.
-    pub fn set_asks_enabled(&mut self, id: usize, on: bool) -> bool {
-        if !self.instances().any(|s| s.id == id) || self.asks_on.contains(&id) == on {
+    pub fn set_todos_enabled(&mut self, id: usize, on: bool) -> bool {
+        if !self.instances().any(|s| s.id == id) || self.todos_on.contains(&id) == on {
             return false;
         }
         if on {
-            self.asks_on.insert(id);
+            self.todos_on.insert(id);
         } else {
-            self.asks_on.remove(&id);
+            self.todos_on.remove(&id);
         }
         self.persist_sessions();
-        self.sync_asks_flags();
-        self.send_app_message(id, &crate::asks::toggle_message(on));
+        self.sync_todos_flags();
+        self.send_app_message(id, &crate::todos::toggle_message(on));
         true
     }
 
-    /// `asks_on/<id>` exists exactly for the rows whose list is on — the hook
+    /// `todos_on/<id>` exists exactly for the rows whose list is on — the hook
     /// reads it to carry the list's rule on each turn (`hook::userpromptsubmit`).
-    pub fn sync_asks_flags(&self) {
-        let dir = self.state_dir.join(mulpex_core::ASKS_ON_DIR);
+    pub fn sync_todos_flags(&self) {
+        let dir = self.state_dir.join(mulpex_core::TODOS_ON_DIR);
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
                 let keep = e.file_name().to_str().and_then(|n| n.parse::<usize>().ok())
-                    .is_some_and(|id| self.asks_on.contains(&id));
+                    .is_some_and(|id| self.todos_on.contains(&id));
                 if !keep {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
         }
-        for id in &self.asks_on {
+        for id in &self.todos_on {
             let _ = std::fs::write(dir.join(id.to_string()), "on");
         }
     }
@@ -1947,7 +1956,7 @@ impl Core {
                         collapsed: self.collapsed.contains(&session.id),
                         auto_compact: self.auto_compact.get(&session.id).copied(),
                         name_by: self.name_by.get(&session.id).copied(),
-                        asks: self.asks_on.contains(&session.id),
+                        todos: self.todos_on.contains(&session.id),
                     };
                     if !self
                         .sticky
@@ -2003,7 +2012,7 @@ impl Core {
         self.parents.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
         self.collapsed.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.auto_compact.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
-        self.asks_on.retain(|id| self.sessions.iter().any(|s| s.id == *id));
+        self.todos_on.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.closing.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.saving.retain(|id| self.sessions.iter().any(|s| s.id == *id));
         self.started.retain(|id, _| self.sessions.iter().any(|s| s.id == *id));
@@ -2223,20 +2232,20 @@ impl Core {
         });
     }
 
-    /// One `hub_user_asks` call. `from` is the caller's env identity, so a claude
+    /// One `hub_todo` call. `from` is the caller's env identity, so a claude
     /// can only ever change its own list; `of` reads another's, read-only (an
     /// orchestrator checking what a worker already asked).
-    fn apply_asks_request(&self, v: &serde_json::Value) -> serde_json::Value {
+    fn apply_todos_request(&self, v: &serde_json::Value) -> serde_json::Value {
         let Some(from) = v.get("from").and_then(|x| x.as_u64()).map(|n| n as usize) else {
             return serde_json::json!({ "ok": false, "error": "missing 'from'" });
         };
-        if !self.asks_on.contains(&from) {
+        if !self.todos_on.contains(&from) {
             return serde_json::json!({
                 "ok": false,
                 "error": format!(
-                    "The For me list is OFF for claude#{from}, so it can't be used. Don't retry. If \
+                    "The To Do list is OFF for claude#{from}, so it can't be used. Don't retry. If \
                      the user asked you to use it, tell them to turn it on: right-click this \
-                     instance's row in Mulpex's sidebar → \"For me list\"."
+                     instance's row in Mulpex's sidebar → \"To Do list\"."
                 ),
             });
         }
@@ -2246,8 +2255,9 @@ impl Core {
             if of != from && !self.sessions.iter().any(|s| s.id == of && !s.is_shell()) {
                 return serde_json::json!({ "ok": false, "error": format!("no claude#{of} in this project") });
             }
-            let list = self.asks.get(of).unwrap_or_default();
-            return serde_json::json!({ "ok": true, "of": of, "list": list.claude_view() });
+            let list = self.todos.get(of).unwrap_or_default();
+            let full = v.get("id").and_then(|x| x.as_u64()).map(|n| n as u32);
+            return serde_json::json!({ "ok": true, "of": of, "list": list.claude_view(full) });
         }
         if v.get("of").is_some_and(|x| x.as_u64() != Some(from as u64)) {
             return serde_json::json!({
@@ -2255,92 +2265,92 @@ impl Core {
                 "error": "you can only change your own list — `of` is for reading (action: list)",
             });
         }
-        let now = crate::asks::now();
-        match self.asks.mutate(from, |l| l.apply_claude(v, now)) {
+        let now = crate::todos::now();
+        match self.todos.mutate(from, |l| l.apply_claude(v, now)) {
             Ok(note) => serde_json::json!({
                 "ok": true,
                 "note": note,
-                "list": self.asks.get(from).unwrap_or_default().claude_view(),
+                "list": self.todos.get(from).unwrap_or_default().claude_view(None),
             }),
             Err(e) => serde_json::json!({ "ok": false, "error": e }),
         }
     }
 
-    /// Every claude's For-me list with its "sending" flag, for the panel.
-    pub fn asks_views(&self) -> std::collections::BTreeMap<usize, serde_json::Value> {
-        self.asks
+    /// Every claude's To Do list with its "sending" flag, for the panel.
+    pub fn todos_views(&self) -> std::collections::BTreeMap<usize, serde_json::Value> {
+        self.todos
             .all()
             .iter()
             .map(|(id, list)| {
-                let view = crate::asks::ListView { list, sending: self.asks_outbox.contains_key(id) };
+                let view = crate::todos::ListView { list, sending: self.todos_outbox.contains_key(id) };
                 (*id, serde_json::to_value(view).unwrap_or_default())
             })
             .collect()
     }
 
     /// The user's edit to `claude#id`'s list (drafts, or Clear done).
-    pub fn asks_edit(&self, id: usize, edit: crate::asks::AskEdit) -> Result<serde_json::Value, String> {
+    pub fn todos_edit(&self, id: usize, edit: crate::todos::TodoEdit) -> Result<serde_json::Value, String> {
         if !self.sessions.iter().any(|s| s.id == id && !s.is_shell()) {
             return Err(format!("no claude#{id}"));
         }
-        self.asks.mutate(id, |l| l.apply_user(edit))?;
-        let list = self.asks.get(id).unwrap_or_default();
-        let view = crate::asks::ListView { list: &list, sending: self.asks_outbox.contains_key(&id) };
+        self.todos.mutate(id, |l| l.apply_user(edit))?;
+        let list = self.todos.get(id).unwrap_or_default();
+        let view = crate::todos::ListView { list: &list, sending: self.todos_outbox.contains_key(&id) };
         serde_json::to_value(view).map_err(|e| e.to_string())
     }
 
     /// UPDATE: queue each claude's pending drafts for delivery. The commit and
-    /// the message happen in `drain_asks_outbox`, once the claude can hear it —
+    /// the message happen in `drain_todos_outbox`, once the claude can hear it —
     /// so a quit before then leaves the drafts pending rather than half-sent.
-    pub fn asks_update(&mut self, ids: &[usize]) -> Vec<crate::asks::AskSend> {
+    pub fn todos_update(&mut self, ids: &[usize]) -> Vec<crate::todos::TodoSend> {
         let live = self.live_claude_ids();
         ids.iter()
             .map(|&id| {
-                let pending = self.asks.counts(id).1;
+                let pending = self.todos.counts(id).pending;
                 let (state, why) = if !live.contains(&id) {
                     ("refused", Some(format!("claude#{id} is not running — your edits are kept")))
                 } else if pending == 0 {
                     ("refused", Some(format!("nothing to send to claude#{id}")))
                 } else {
-                    self.asks_outbox.entry(id).or_insert_with(Instant::now);
-                    self.asks.mark_dirty(id);
+                    self.todos_outbox.entry(id).or_insert_with(Instant::now);
+                    self.todos.mark_dirty(id);
                     ("queued", None)
                 };
-                crate::asks::AskSend { id, state: state.to_string(), why }
+                crate::todos::TodoSend { id, state: state.to_string(), why }
             })
             .collect()
     }
 
     /// Deliver queued UPDATEs. A claude hears one when its listener is up, or —
     /// if it is mid-turn — when the Stop hook finds the unread mail; anything
-    /// else waits up to `ASKS_WAIT` and is then dropped into the inbox anyway,
+    /// else waits up to `TODOS_WAIT` and is then dropped into the inbox anyway,
     /// for its next turn. Same reasoning as `checkpoint.rs::drain_wake_queue`:
     /// the listener announces only mail that arrives after it starts.
-    pub fn drain_asks_outbox(&mut self) {
-        if self.asks_outbox.is_empty() {
+    pub fn drain_todos_outbox(&mut self) {
+        if self.todos_outbox.is_empty() {
             return;
         }
         let live = self.live_claude_ids();
-        let queued: Vec<(usize, Instant)> = self.asks_outbox.iter().map(|(k, v)| (*k, *v)).collect();
+        let queued: Vec<(usize, Instant)> = self.todos_outbox.iter().map(|(k, v)| (*k, *v)).collect();
         for (id, since) in queued {
             if !live.contains(&id) {
                 // Gone before it could hear it; the drafts stay pending.
-                self.asks_outbox.remove(&id);
-                self.asks.mark_dirty(id);
+                self.todos_outbox.remove(&id);
+                self.todos.mark_dirty(id);
                 continue;
             }
             let working = std::fs::read_to_string(self.state_dir.join(id.to_string()))
                 .is_ok_and(|w| w.trim() == "working");
-            if !(self.listener_ready(id) || working || since.elapsed() >= ASKS_WAIT) {
+            if !(self.listener_ready(id) || working || since.elapsed() >= TODOS_WAIT) {
                 continue;
             }
-            self.asks_outbox.remove(&id);
-            let now = crate::asks::now();
-            let diff = self.asks.mutate(id, |l| Ok(l.commit(now))).ok().flatten();
+            self.todos_outbox.remove(&id);
+            let now = crate::todos::now();
+            let diff = self.todos.mutate(id, |l| Ok(l.commit(now))).ok().flatten();
             if let Some(diff) = diff {
-                self.send_app_message(id, &crate::asks::render_update(id, &diff));
+                self.send_app_message(id, &crate::todos::render_update(id, &diff));
             }
-            self.asks.mark_dirty(id);
+            self.todos.mark_dirty(id);
         }
     }
 
@@ -2770,7 +2780,7 @@ impl Core {
                 parent: self.parents.get(&s.id).copied(),
                 collapsed: self.collapsed.contains(&s.id),
                 auto_compact: self.auto_compact.get(&s.id).copied(),
-                asks: self.asks_on.contains(&s.id),
+                todos: self.todos_on.contains(&s.id),
                 name_by: self.name_by.get(&s.id).copied(),
             })
             .collect();
@@ -2791,11 +2801,11 @@ impl Core {
         // A pin lives as long as its row in the store (`pins.rs`).
         let saved: HashSet<usize> = sessions.iter().filter_map(|s| s.id).collect();
         self.pin_store().retain(&saved);
-        // So does a For-me list — plus any live claude not yet in `worked`, which
+        // So does a To Do list — plus any live claude not yet in `worked`, which
         // can already have one and must not lose it to the next save.
         let mut keep = saved;
         keep.extend(self.live_claude_ids());
-        self.asks.retain(&keep);
+        self.todos.retain(&keep);
     }
 
     /// This project's ⌘⇧P pins, stored beside its session store.
@@ -3688,54 +3698,55 @@ mod tests {
         (root, core)
     }
 
-    /// `hub_user_asks` lands in the CALLER's list only, `of` is read-only, and an
+    /// `hub_todo` lands in the CALLER's list only, `of` is read-only, and an
     /// UPDATE to a claude that is not running is refused with its drafts kept.
     #[test]
-    fn asks_requests_touch_only_the_callers_list() {
-        let (_g, root, mut core) = scratch_core("asks");
+    fn todo_requests_touch_only_the_callers_list() {
+        let (_g, root, mut core) = scratch_core("todos");
         let req = |core: &mut Core, body: serde_json::Value| core.apply_terminal_request(&body.to_string()).0;
 
         // Off by default: refused, with the way to turn it on, and nothing saved.
         let r = req(&mut core, serde_json::json!({
-            "op": "asks", "from": 3, "action": "add", "items": [{"kind": "action", "title": "x"}],
+            "op": "todos", "from": 3, "action": "add", "items": [{"kind": "action", "title": "x"}],
         }));
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("right-click"), "{r}");
-        assert!(core.asks.get(3).is_none());
-        core.asks_on.insert(3);
-        core.asks_on.insert(4);
+        assert!(core.todos.get(3).is_none());
+        core.todos_on.insert(3);
+        core.todos_on.insert(4);
 
         let r = req(&mut core, serde_json::json!({
-            "op": "asks", "from": 3, "action": "add",
+            "op": "todos", "from": 3, "action": "add",
             "items": [{"kind": "question", "title": "which port?"}],
         }));
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(r["list"][0]["n"], 1);
-        assert!(core.asks.get(3).is_some() && core.asks.get(4).is_none());
+        assert!(core.todos.get(3).is_some() && core.todos.get(4).is_none());
 
         // Writing someone else's list is refused, reading needs a real claude.
-        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 4, "of": 3, "action": "done", "id": 1}));
+        let r = req(&mut core, serde_json::json!({"op": "todos", "from": 4, "of": 3, "action": "done", "id": 1}));
         assert_eq!(r["ok"], false);
-        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 4, "of": 3, "action": "list"}));
+        let r = req(&mut core, serde_json::json!({"op": "todos", "from": 4, "of": 3, "action": "list"}));
         assert_eq!(r["ok"], false, "claude#3 has no row here");
-        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 3, "action": "list"}));
+        let r = req(&mut core, serde_json::json!({"op": "todos", "from": 3, "action": "list"}));
         assert_eq!(r["list"][0]["title"], "which port?");
-        let r = req(&mut core, serde_json::json!({"op": "asks", "from": 3, "action": "bogus"}));
+        let r = req(&mut core, serde_json::json!({"op": "todos", "from": 3, "action": "bogus"}));
         assert_eq!(r["ok"], false);
 
         // No row → no user edits, and UPDATE is refused without losing anything.
-        assert!(core.asks_edit(3, crate::asks::AskEdit::Note { n: 1, note: "x".into() }).is_err());
-        core.asks.mutate(3, |l| l.apply_user(crate::asks::AskEdit::Note { n: 1, note: "5173".into() })).unwrap();
-        let sent = core.asks_update(&[3]);
+        assert!(core.todos_edit(3, crate::todos::TodoEdit::Comment { n: 1, text: "x".into() }).is_err());
+        core.todos.mutate(3, |l| l.apply_user(crate::todos::TodoEdit::Comment { n: 1, text: "5173".into() })).unwrap();
+        let sent = core.todos_update(&[3]);
         assert_eq!(sent[0].state, "refused");
-        assert_eq!(core.asks.counts(3), (1, 1), "the draft is still pending");
-        core.drain_asks_outbox();
+        let c = core.todos.counts(3);
+        assert_eq!((c.open, c.pending), (1, 1), "the draft is still pending");
+        core.drain_todos_outbox();
         assert!(!core.state_dir.join("inbox/3").exists(), "nothing was sent");
 
         // A list belongs to a row in the store: one that is neither saved nor
         // live goes on the next save (⌘W), as a pin does.
         core.persist_sessions();
-        assert!(core.asks.get(3).is_none());
+        assert!(core.todos.get(3).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3955,7 +3966,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }
     }
 
@@ -4015,7 +4026,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -4064,7 +4075,7 @@ mod tests {
                 collapsed: false,
                 auto_compact: None,
                 name_by: None,
-                asks: false,
+                todos: false,
             },
             record("copycat", Some(2)),
         ];
@@ -4341,7 +4352,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }]);
         let mut core = Core::open(
             1,
@@ -4694,7 +4705,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by,
-            asks: false,
+            todos: false,
         };
         SessionStore::new(&project_dir).save(&[
             saved(1, "Deployer", Some(NameSource::User)),
@@ -5255,7 +5266,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }]);
 
         let mut core = Core::open(
@@ -5664,7 +5675,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -5725,7 +5736,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");

@@ -9,7 +9,7 @@ mod hub;
 mod menu;
 mod project;
 mod pins;
-mod asks;
+mod todos;
 mod pty;
 mod remote;
 mod docs_import;
@@ -136,10 +136,10 @@ pub fn run() {
             commands::set_session_muted,
             commands::get_pins,
             commands::set_pin,
-            commands::asks_get,
-            commands::asks_edit,
-            commands::asks_update,
-            commands::set_asks_enabled,
+            commands::todos_get,
+            commands::todos_edit,
+            commands::todos_update,
+            commands::set_todos_enabled,
             commands::set_session_collapsed,
             commands::set_auto_compact,
             commands::set_mute_menu_checked,

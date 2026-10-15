@@ -85,7 +85,7 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
         crate::WATCHING_DIR,
         crate::CTX_DIR,
         crate::COMPACTREQ_DIR,
-        crate::ASKS_ON_DIR,
+        crate::TODOS_ON_DIR,
         "terminals",
         "terminals/cursors",
         "termreq",

@@ -44,7 +44,7 @@ A remote project is `slot · 2^32 + its handle there`:
 - 0 is this Mulpex;
 - the sum is exact in JS.
 
-So `projects`, `terminals.ts`'s keys, pins, For-me lists (`asks-changed` is forwarded like
+So `projects`, `terminals.ts`'s keys, pins, To Do lists (`todos-changed` is forwarded like
 `pins-changed`), explain, attention and save states all work on remote
 projects unchanged.
 

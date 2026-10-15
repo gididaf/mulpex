@@ -22,7 +22,7 @@ reasoning in `docs/`.
 | File | Covers | Read it before touching |
 | --- | --- | --- |
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
-| [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — For me (`hub_user_asks` lists, opt-in per row via right-click, drafts until UPDATE) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
+| [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — To Do (`hub_todo` lists, opt-in per row via right-click, drafts until UPDATE) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator's claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) or to a sidebar name (`hub_instances` shows names) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
@@ -85,7 +85,7 @@ src-tauri/            the Tauri app (Rust backend)
                       follow-ups resume it, the fork is deleted on close — docs/explain.md
   src/secrets.rs      ⌘K Secrets: writes the 0600 `.env` files — docs/secrets.md
   src/pins.rs         ⌘⇧P pins, one per instance, saved per project — docs/frontend.md
-  src/asks.rs         "For me" lists (hub_user_asks): model, drafts, UPDATE diff, store —
+  src/todos.rs        "To Do" lists (hub_todo): model, drafts, UPDATE diff, store —
                       docs/hub.md + docs/frontend.md
   src/docs_import.rs  File ▸ Import Docs: Sonnet sorts a repo's `.md`, Apply commits once
   src/remote/         ⌘⇧O Remote Control, the Mac side: connection, crypto, chat, dialogs,
@@ -102,11 +102,11 @@ src/                  Svelte/Vite frontend
   lib/stores.ts       per-project state map + derived active-project projections (PTY bytes bypass)
   lib/updater.ts      update check/download/apply + the cross-project busy-session count
   lib/pins.ts         ⌘⇧P: reads an xterm selection with its colours (also ⌘⇧E's reader)
-  lib/rightPanel.ts   ⌘⇧L side panel: open/width/tab (For me · Pins · Explain)
-  lib/asks.ts         "For me" mirror of the backend lists; edits, UPDATE
+  lib/rightPanel.ts   ⌘⇧L side panel: open/width/tab (To Do · Pins · Explain)
+  lib/todos.ts        "To Do" mirror of the backend lists; edits, UPDATE
   lib/explain.ts      ⌘⇧E panel state; lib/markdown.ts sanitizes what the panel renders
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
-                      TerminalPane/View, MessageReader, Rename, RightPanel (ForMeTab, PinsTab, ExplainTab),
+                      TerminalPane/View, MessageReader, Rename, RightPanel (TodoTab, PinsTab, ExplainTab),
                       SaveOverlay, SecretsDialog, ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
 scripts/deploy-relay.sh  Remote Control relay + phone app → the VM (docs/remote-control.md)

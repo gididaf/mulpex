@@ -390,15 +390,16 @@
               >⟳ {s.auto_compact}%</span
             >
           {/if}
-          {#if !shell && (s.asks_open || s.asks_pending)}
-            <!-- "For me": what this claude needs from you. A click also selects
+          {#if !shell && (s.todos_open || s.todos_pending)}
+            <!-- "To Do": what this claude needs from you. A click also selects
                  the row (it bubbles to the row button) and shows the tab. -->
             <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
             <span
-              class="asks"
-              class:pending={s.asks_pending > 0}
-              title="{s.asks_open} open for you{s.asks_pending ? ` · ${s.asks_pending} edit(s) not sent yet — press UPDATE` : ''}"
-              onclick={() => openPanel("forme")}>☐ {s.asks_open}{#if s.asks_pending}<span class="pdot"></span>{/if}</span
+              class="todos"
+              class:pending={s.todos_pending > 0}
+              class:urgent={s.todos_urgent > 0}
+              title="{s.todos_open} open for you{s.todos_urgent ? ` · ${s.todos_urgent} URGENT` : ''}{s.todos_unread ? ` · ${s.todos_unread} with a new reply` : ''}{s.todos_pending ? ` · ${s.todos_pending} edit(s) not sent yet — press UPDATE` : ''}"
+              onclick={() => openPanel("todo")}>☐ {s.todos_open}{#if s.todos_unread} 💬{/if}{#if s.todos_pending}<span class="pdot"></span>{/if}</span
             >
           {/if}
         </div>
@@ -642,7 +643,7 @@
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
-  .asks {
+  .todos {
     display: inline-flex;
     align-items: center;
     gap: 0.2rem;
@@ -655,7 +656,11 @@
     line-height: 1.05rem;
     cursor: pointer;
   }
-  .asks .pdot {
+  .todos.urgent {
+    background: var(--dot-needs, #e5534b);
+    color: #fff;
+  }
+  .todos .pdot {
     width: 0.35rem;
     height: 0.35rem;
     border-radius: 50%;

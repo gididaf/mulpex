@@ -51,12 +51,16 @@ export interface SessionInfo {
    *  before falling back to a status dot — the unknown-id default is "ready",
    *  which would paint a dead session green. */
   failed: string | null;
-  /** The For-me list is ON for this claude (right-click toggle; off by default). */
-  asks_on: boolean;
-  /** "For me" (`asks.ts`): open items on this claude's list, and how many of
+  /** The To Do list is ON for this claude (right-click toggle; off by default). */
+  todos_on: boolean;
+  /** "To Do" (`todos.ts`): open items on this claude's list, and how many of
    *  the user's edits wait for UPDATE. 0 for a terminal. */
-  asks_open: number;
-  asks_pending: number;
+  todos_open: number;
+  todos_pending: number;
+  /** Items with a claude comment the user has not opened yet (💬). */
+  todos_unread: number;
+  /** Open items marked urgent — the badge turns red. */
+  todos_urgent: number;
 }
 export interface StatusEntry {
   id: number;
@@ -291,20 +295,23 @@ export const getPins = (projectHandle: ProjectHandle) =>
 export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | null) =>
   call<void>("set_pin", { projectHandle, id, pin });
 
-// ── "For me" lists (src-tauri/src/asks.rs) ─────────────────────────────────
+// ── "To Do" lists (src-tauri/src/todos.rs) ─────────────────────────────────
 
-export type AskKind = "action" | "decision" | "question";
+export type TodoKind = "action" | "decision" | "question";
 
-export interface AskItem {
+export interface TodoItem {
   n: number;
-  kind: AskKind;
+  kind: TodoKind;
   title: string;
   detail: string | null;
   choices: string[];
   status: "open" | "done";
   done_by: "claude" | "user" | null;
   author: "claude" | "user";
-  note: string | null;
+  /** The follow-up thread, oldest first; append-only. */
+  comments: TodoComment[];
+  /** How many of `comments` the user has seen (opened the thread). */
+  seen: number;
   chosen: string | null;
   created: number;
   updated: number;
@@ -312,63 +319,72 @@ export interface AskItem {
   /** The instance this ask is really for — a worker whose need an orchestrator
    *  collected onto its own list. */
   for: number | null;
+  /** Set by the claude only; shown on top, in red. */
+  urgent: boolean;
+}
+
+export interface TodoComment {
+  by: "claude" | "user";
+  text: string;
+  at: number;
 }
 
 /** The user's draft over item `n` — what it should become at UPDATE. */
-export interface AskDraft {
+export interface TodoDraft {
   done: boolean | null;
-  note: string | null;
+  /** The user's reply, appended to the thread at UPDATE. One per item. */
+  comment: string | null;
   chosen: string | null;
   delete: boolean;
   base_rev: number;
   /** Set when the claude removed the item while this draft had words on it. */
-  orphan: { kind: AskKind; title: string } | null;
+  orphan: { kind: TodoKind; title: string } | null;
 }
 
-export interface AskAdded {
+export interface TodoAdded {
   tmp: string;
-  kind: AskKind;
+  kind: TodoKind;
   title: string;
   detail: string | null;
 }
 
-export interface AskList {
+export interface TodoList {
   next: number;
-  items: AskItem[];
-  drafts: { edits: Record<string, AskDraft>; added: AskAdded[] };
+  items: TodoItem[];
+  drafts: { edits: Record<string, TodoDraft>; added: TodoAdded[] };
   /** An UPDATE is queued, waiting for the claude to be able to hear it. */
   sending: boolean;
 }
 
-export type AskEdit =
+export type TodoEdit =
   | { op: "done"; n: number; done: boolean }
-  | { op: "note"; n: number; note: string }
+  | { op: "comment"; n: number; text: string }
+  | { op: "seen"; n: number }
   | { op: "choose"; n: number; choice: string | null }
   | { op: "dismiss"; n: number; on: boolean }
-  | { op: "add"; kind: AskKind; title: string; detail?: string | null }
-  | { op: "edit_added"; tmp: string; kind?: AskKind; title?: string; detail?: string }
+  | { op: "add"; kind: TodoKind; title: string; detail?: string | null }
+  | { op: "edit_added"; tmp: string; kind?: TodoKind; title?: string; detail?: string }
   | { op: "remove_added"; tmp: string }
   | { op: "discard"; n: number }
-  | { op: "discard_all" }
-  | { op: "clear_done" };
+  | { op: "discard_all" };
 
-export interface AskSend {
+export interface TodoSend {
   id: number;
   state: "queued" | "refused";
   why: string | null;
 }
 
-export const asksGet = (projectHandle: ProjectHandle) =>
-  call<Record<string, AskList>>("asks_get", { projectHandle });
+export const todosGet = (projectHandle: ProjectHandle) =>
+  call<Record<string, TodoList>>("todos_get", { projectHandle });
 
-export const asksEdit = (projectHandle: ProjectHandle, id: number, edit: AskEdit) =>
-  call<AskList>("asks_edit", { projectHandle, id, edit });
+export const todosEdit = (projectHandle: ProjectHandle, id: number, edit: TodoEdit) =>
+  call<TodoList>("todos_edit", { projectHandle, id, edit });
 
-export const setAsksEnabled = (projectHandle: ProjectHandle, id: number, on: boolean) =>
-  call<boolean>("set_asks_enabled", { projectHandle, id, on });
+export const setTodosEnabled = (projectHandle: ProjectHandle, id: number, on: boolean) =>
+  call<boolean>("set_todos_enabled", { projectHandle, id, on });
 
-export const asksUpdate = (projectHandle: ProjectHandle, ids: number[]) =>
-  call<AskSend[]>("asks_update", { projectHandle, ids });
+export const todosUpdate = (projectHandle: ProjectHandle, ids: number[]) =>
+  call<TodoSend[]>("todos_update", { projectHandle, ids });
 
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>

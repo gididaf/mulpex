@@ -698,46 +698,49 @@ it to `messages.log` as sent by `Mulpex` (`mcp::APP_SENDER`). `sender_label` tur
 "Mulpex" — without it `from: 0` would read as a "claude#0" to reply to — and `HUB_RULES` says a
 message from "Mulpex" is the app: do what it asks, never `hub_send` a reply. `bounce_dead_inbox`
 already skips `from: 0`, so an app message to a claude that dies is dropped, not bounced. Two
-senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), and the For-me UPDATE
+senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), and the To Do UPDATE
 (below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
 the old `HUB_RULES`.
 
-## The user's list (`hub_user_asks`)
+## The user's list (`hub_todo`)
 
-A claude's "For me" list: what it needs from the USER (action / decision with choices / question),
+Called "For me" (`hub_user_asks`, `asks.rs`) until 2026-10-15; the old store dir `<home>/asks/` and
+the sessions-file flag `asks` are still read and migrated on load.
+
+A claude's "To Do" list: what it needs from the USER (action / decision with choices / question),
 shown in the side panel ([frontend.md](frontend.md)) and as a count on its row.
 
-- **Off by default, per row, user-only.** Right-click → "For me list" → On (`Core::set_asks_enabled`,
-  persisted as the store's `asks` column, mirrored to `asks_on/<id>`). Shipped first as a
+- **Off by default, per row, user-only.** Right-click → "To Do list" → On (`Core::set_todos_enabled`,
+  persisted as the store's `todos` column, mirrored to `todos_on/<id>`). Shipped first as a
   `HUB_RULES` rule for every claude; changed the same day because a coworker's claudes, or a calm
   one-on-one, must not start keeping a list unasked. So `HUB_RULES` only says it exists, is off, and
   must never be started unasked — that line is needed because MCP tools load lazily (only the name
   is visible), and without it a claude told "add this to the FOR ME list" searched the folder for a
-  file instead (seen in QA). How to use it is `rules::ASKS_RULE`, carried by `userpromptsubmit` on every turn of an enabled claude (every
+  file instead (seen in QA). How to use it is `rules::TODOS_RULE`, carried by `userpromptsubmit` on every turn of an enabled claude (every
   turn, like the secrets note — an UPDATE arrives as a hub wake, and following the rule creates no
-  `asks_on/` file, so it cannot feed itself). A call from a claude whose list is off is refused with
+  `todos_on/` file, so it cannot feed itself). A call from a claude whose list is off is refused with
   the way to turn it on. Toggling tells the claude at once (an app message).
 - **One row, not its family.** The user talks to the orchestrator, so the orchestrator is the one
-  list: `ASKS_RULE` tells an enabled coordinator to collect its workers' asks onto its own list with
+  list: `TODOS_RULE` tells an enabled coordinator to collect its workers' asks onto its own list with
   `for: <worker>` (shown as a "for claude#7" tag, and in the UPDATE body) and relay the answers.
 
-- **The app is the only writer.** The tool rides `app_request`'s `termreq/` channel as `op: "asks"`
+- **The app is the only writer.** The tool rides `app_request`'s `termreq/` channel as `op: "todos"`
   with `from` stamped from the env identity, so an instance can only change its own list; the
   helper does shape checks only (no serde derive in `mulpex-core` — the helper stays tiny). The
-  model, drafts, commit and message body are `src-tauri/src/asks.rs`; the store is
-  `<mulpex home>/asks/<key>.json` beside the session store, pruned with it like pins (⌘W loses a
+  model, drafts, commit and message body are `src-tauri/src/todos.rs`; the store is
+  `<mulpex home>/todos/<key>.json` beside the session store, pruned with it like pins (⌘W loses a
   list, a quit keeps it; a live claude not yet in `worked` is kept too).
 - **`list` with `of: <n>` reads another instance's list, read-only** — an orchestrator checking what
   a worker already asked before asking twice. Any other action with a foreign `of` is refused.
 - **Items are numbered per claude, monotonically, never reused**, so "#3" means one thing for the
   list's life; an action on a removed number says so rather than "not on your list".
-- **UPDATE is queued, then delivered** (`Core::drain_asks_outbox`, on the poll loop): once the
+- **UPDATE is queued, then delivered** (`Core::drain_todos_outbox`, on the poll loop): once the
   claude's listener is ready, or its status is `working` (the Stop hook catches mail mid-turn), or
   after 180 s regardless — the listener only announces mail that arrives after it starts, the same
   reason as `checkpoint.rs::drain_wake_queue`. The drafts are committed at delivery, not at the
   click, so a quit before delivery leaves them pending rather than half-sent.
-- **The body lists the diff by section** (done / reopened / decisions / notes / added / dismissed),
+- **The body lists the diff by section** (done / decisions / comments / added / dismissed),
   then "Act on this now … Do NOT hub_send a reply". Self-contained, so a claude spawned before the
   tool existed can still act on it.
-- **Every change marks the id dirty**; the poll loop emits `asks-changed {handle,id}` once per tick
-  (forwarded to remote desktops) and bumps the project's `asks_rev` in the phone's view.
+- **Every change marks the id dirty**; the poll loop emits `todos-changed {handle,id}` once per tick
+  (forwarded to remote desktops) and bumps the project's `todos_rev` in the phone's view.

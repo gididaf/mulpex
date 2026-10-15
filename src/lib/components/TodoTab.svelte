@@ -1,18 +1,24 @@
 <script lang="ts">
-  // The side panel's "For me" tab: what each claude needs from the user, as the
-  // claude wrote it with `hub_user_asks` (`asks.ts`, `src-tauri/src/asks.rs`).
+  // The side panel's "To Do" tab: what each claude needs from the user, as the
+  // claude wrote it with `hub_todo` (`todos.ts`, `src-tauri/src/todos.rs`).
   //
-  // Everything the user does here — check, note, pick a choice, dismiss, add —
-  // is a DRAFT the claude cannot see, marked "pending", until UPDATE sends each
+  // Everything the user does here — check, comment, pick a choice, add — is a
+  // DRAFT the claude cannot see, marked "pending", until UPDATE sends each
   // claude a message listing exactly what changed. The drafts live on the
   // backend, so the phone and a remote desktop show the same ones.
   //
-  // Plain text only: titles, details and notes come from a model and the user,
-  // so nothing here goes through {@html}.
+  // Each item has a comment thread both sides write to (the claude with
+  // `hub_todo` action "comment"); the user's reply is one draft per item.
+  // Opening a thread marks the claude's comments read — not a draft.
+  //
+  // Titles are plain text. Details and comments are Markdown, rendered only
+  // through `renderMarkdownAuto` (DOMPurify; links and images dropped) — they come
+  // from a model and the user, and this webview can invoke Tauri commands.
   import { activeProjectHandle, activeId, sessions } from "../stores";
-  import { asks, askKey, asksAll, editAsk, updateAsks, openCount, pendingCount } from "../asks";
-  import type { AskDraft, AskItem, AskKind, AskList } from "../ipc";
+  import { todos, todoKey, todosAll, editTodo, updateTodos, openCount, pendingCount, unread, byUrgency } from "../todos";
+  import type { TodoDraft, TodoItem, TodoKind, TodoList } from "../ipc";
   import { terminals } from "../terminals";
+  import { renderMarkdownAuto } from "../markdown";
 
   const h = $derived($activeProjectHandle);
   const id = $derived($activeId);
@@ -20,27 +26,24 @@
 
   /** The claudes to show, in sidebar order: the focused one, or all of them. */
   const groups = $derived.by(() => {
-    if (h == null) return [] as { id: number; name: string | null; list: AskList | undefined }[];
+    if (h == null) return [] as { id: number; name: string | null; list: TodoList | undefined }[];
     const claudes = $sessions.filter((s) => s.kind === "claude");
-    const pick = $asksAll ? claudes : claudes.filter((s) => s.id === id);
+    const pick = $todosAll ? claudes : claudes.filter((s) => s.id === id);
     return pick
-      .map((s) => ({ id: s.id, name: s.name, list: $asks.get(askKey(h, s.id)) }))
-      .filter((g) => !$asksAll || (g.list && (g.list.items.length || pendingCount(g.list))));
+      .map((s) => ({ id: s.id, name: s.name, list: $todos.get(todoKey(h, s.id)) }))
+      .filter((g) => !$todosAll || (g.list && (g.list.items.length || pendingCount(g.list))));
   });
 
   const sendable = $derived(groups.filter((g) => g.list && pendingCount(g.list) && !g.list.sending));
   const sending = $derived(groups.some((g) => g.list?.sending));
   const pendingTotal = $derived(sendable.reduce((n, g) => n + pendingCount(g.list), 0));
-  const doneCount = $derived(
-    groups.reduce((n, g) => n + (g.list?.items.filter((i) => i.status === "done" && !g.list?.drafts.edits[i.n]).length ?? 0), 0),
-  );
 
-  const KIND_ICON: Record<AskKind, string> = { action: "▶", decision: "◆", question: "?" };
-  const KIND_NAME: Record<AskKind, string> = { action: "Action", decision: "Decision", question: "Question" };
+  const KIND_ICON: Record<TodoKind, string> = { action: "▶", decision: "◆", question: "?" };
+  const KIND_NAME: Record<TodoKind, string> = { action: "Action", decision: "Decision", question: "Question" };
 
-  /** Expanded details and open note editors, by `"<id>:<n>"`. Per view only. */
+  /** Expanded details and open threads, by `"<id>:<n>"`. Per view only. */
   let expanded = $state(new Set<string>());
-  let noting = $state(new Set<string>());
+  let threads = $state(new Set<string>());
   const toggle = (set: Set<string>, k: string) => {
     const next = new Set(set);
     if (next.has(k)) next.delete(k);
@@ -48,28 +51,42 @@
     return next;
   };
 
-  const draftOf = (l: AskList | undefined, n: number): AskDraft | undefined => l?.drafts.edits[String(n)];
-  const isDone = (i: AskItem, d: AskDraft | undefined) => d?.done ?? i.status === "done";
-  const chosenOf = (i: AskItem, d: AskDraft | undefined) => d?.chosen ?? i.chosen;
-  const noteOf = (i: AskItem, d: AskDraft | undefined) => d?.note ?? i.note ?? "";
-  const orphans = (l: AskList | undefined) =>
+  const draftOf = (l: TodoList | undefined, n: number): TodoDraft | undefined => l?.drafts.edits[String(n)];
+  const isDone = (i: TodoItem, d: TodoDraft | undefined) => d?.done ?? i.status === "done";
+  const chosenOf = (i: TodoItem, d: TodoDraft | undefined) => d?.chosen ?? i.chosen;
+  const replyOf = (d: TodoDraft | undefined) => d?.comment ?? "";
+  const orphans = (l: TodoList | undefined) =>
     l ? Object.entries(l.drafts.edits).filter(([, d]) => d.orphan).map(([n, d]) => ({ n: Number(n), d })) : [];
 
-  function edit(cid: number, e: Parameters<typeof editAsk>[2]) {
-    if (h != null) editAsk(h, cid, e);
+  function edit(cid: number, e: Parameters<typeof editTodo>[2]) {
+    if (h != null) editTodo(h, cid, e);
   }
 
-  function saveNote(cid: number, n: number, value: string) {
-    edit(cid, { op: "note", n, note: value });
+  function saveReply(cid: number, n: number, value: string) {
+    edit(cid, { op: "comment", n, text: value });
   }
 
-  function choose(cid: number, i: AskItem, d: AskDraft | undefined, c: string) {
+  function toggleThread(cid: number, i: TodoItem) {
+    threads = toggle(threads, `${cid}:${i.n}`);
+  }
+
+  // An open thread is being read: whatever the claude adds to it while it is
+  // open is read too, so its 💬 never lights up under the user's eyes.
+  $effect(() => {
+    for (const g of groups) {
+      for (const i of g.list?.items ?? []) {
+        if (threads.has(`${g.id}:${i.n}`) && unread(i)) edit(g.id, { op: "seen", n: i.n });
+      }
+    }
+  });
+
+  function choose(cid: number, i: TodoItem, d: TodoDraft | undefined, c: string) {
     // Clicking the picked choice again un-picks the draft.
     edit(cid, { op: "choose", n: i.n, choice: chosenOf(i, d) === c && d?.chosen ? null : c });
   }
 
   // ── add ────────────────────────────────────────────────────────────────────
-  let addKind: AskKind = $state("action");
+  let addKind: TodoKind = $state("action");
   let addTitle = $state("");
   let addDetail = $state("");
   let addOpen = $state(false);
@@ -92,54 +109,46 @@
     }
   }
 
-  function onNoteKey(e: KeyboardEvent, cid: number, n: number) {
+  function onReplyKey(e: KeyboardEvent, cid: number, n: number) {
     const el = e.currentTarget as HTMLTextAreaElement;
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      saveNote(cid, n, el.value);
-      noting = toggle(noting, `${cid}:${n}`);
+      saveReply(cid, n, el.value);
+      threads = toggle(threads, `${cid}:${n}`);
     } else if (e.key === "Escape") {
       e.preventDefault();
-      noting = toggle(noting, `${cid}:${n}`);
+      saveReply(cid, n, el.value);
+      threads = toggle(threads, `${cid}:${n}`);
     }
   }
 
   function update() {
     if (h == null) return;
-    updateAsks(h, sendable.map((g) => g.id));
+    updateTodos(h, sendable.map((g) => g.id));
     terminals.refocus();
-  }
-
-  function clearDone() {
-    for (const g of groups) {
-      if (g.list?.items.some((i) => i.status === "done")) edit(g.id, { op: "clear_done" });
-    }
   }
 </script>
 
 <div class="tab">
   <div class="bar">
     <div class="seg" role="radiogroup" aria-label="Show">
-      <button class:on={!$asksAll} onclick={() => asksAll.set(false)}>{id != null ? `${kind === "shell" ? "term" : "claude"}#${id}` : "This one"}</button>
-      <button class:on={$asksAll} onclick={() => asksAll.set(true)}>All</button>
+      <button class:on={!$todosAll} onclick={() => todosAll.set(false)}>{id != null ? `${kind === "shell" ? "term" : "claude"}#${id}` : "This one"}</button>
+      <button class:on={$todosAll} onclick={() => todosAll.set(true)}>All</button>
     </div>
-    {#if doneCount}
-      <button class="link" title="Remove items that are done" onclick={clearDone}>Clear done</button>
-    {/if}
   </div>
 
   <div class="list">
-    {#if !$asksAll && kind === "shell"}
-      <div class="empty">For me works on claudes only.</div>
-    {:else if !$asksAll && id == null}
+    {#if !$todosAll && kind === "shell"}
+      <div class="empty">To Do works on claudes only.</div>
+    {:else if !$todosAll && id == null}
       <div class="empty">No instance selected.</div>
     {:else if !groups.length || groups.every((g) => !g.list || (!g.list.items.length && !pendingCount(g.list)))}
       <div class="empty">
-        {#if $asksAll}
+        {#if $todosAll}
           Nothing open for you in this project.
         {:else}
-          {#if !$sessions.find((s) => s.id === id)?.asks_on}
-            The For me list is off for claude#{id}.<br />Right-click its row → For me list → On, and it
+          {#if !$sessions.find((s) => s.id === id)?.todos_on}
+            The To Do list is off for claude#{id}.<br />Right-click its row → To Do list → On, and it
             puts what it needs from you here.
           {:else}
             Nothing open for you from claude#{id}.<br />When it needs something from you, it lands here.
@@ -149,18 +158,18 @@
     {/if}
 
     {#each groups as g (g.id)}
-      {#if $asksAll}
+      {#if $todosAll}
         <div class="group">
           claude#{g.id}{#if g.name}<span class="gname"> · {g.name}</span>{/if}
           {#if openCount(g.list)}<span class="gcount">{openCount(g.list)}</span>{/if}
           {#if g.list?.sending}<span class="sending">sending…</span>{/if}
         </div>
       {/if}
-      {#each g.list?.items ?? [] as i (i.n)}
+      {#each byUrgency(g.list?.items ?? []) as i (i.n)}
         {@const d = draftOf(g.list, i.n)}
         {@const k = `${g.id}:${i.n}`}
         {@const done = isDone(i, d)}
-        <div class="item" class:done class:gone={d?.delete} class:pending={!!d}>
+        <div class="item" class:done class:gone={d?.delete} class:pending={!!d} class:urgent={i.urgent}>
           <input
             type="checkbox"
             checked={done}
@@ -172,12 +181,12 @@
             <div class="head">
               <span class="kind k-{i.kind}" title={KIND_NAME[i.kind]}>{KIND_ICON[i.kind]}</span>
               <span class="title" dir="auto">{i.title}</span>
+              {#if i.urgent}<span class="urgent-tag" title="The claude needs your attention on this as soon as possible">URGENT</span>{/if}
             </div>
             {#if i.for != null}<span class="for" title="A worker's ask, collected by claude#{g.id}">for claude#{i.for}</span>{/if}
             <div class="meta">
               <span>#{i.n}</span>
               {#if i.author === "user"}<span>· yours</span>{/if}
-              {#if i.status === "done" && i.done_by}<span>· done by {i.done_by === "user" ? "you" : "claude"}</span>{/if}
               {#if d}<span class="pend">· pending</span>{/if}
               {#if d && i.rev > d.base_rev}<span class="warn" title="The claude changed this item after you started editing it">· changed since your edit</span>{/if}
               {#if i.detail}
@@ -185,7 +194,8 @@
               {/if}
             </div>
             {#if i.detail && expanded.has(k)}
-              <div class="detail" dir="auto">{i.detail}</div>
+              <!-- Sanitized in renderMarkdownAuto. -->
+              <div class="detail md">{@html renderMarkdownAuto(i.detail)}</div>
             {/if}
             {#if i.choices.length}
               <div class="choices">
@@ -196,30 +206,47 @@
             {:else if i.chosen}
               <div class="note-view" dir="auto">chose: {i.chosen}</div>
             {/if}
-            {#if noting.has(k)}
-              <!-- svelte-ignore a11y_autofocus -->
-              <textarea
-                dir="auto"
-                rows="2"
-                placeholder="Your answer or note… (⌘↩ to keep)"
-                value={noteOf(i, d)}
-                autofocus
-                onchange={(e) => saveNote(g.id, i.n, (e.currentTarget as HTMLTextAreaElement).value)}
-                onkeydown={(e) => onNoteKey(e, g.id, i.n)}
-              ></textarea>
-            {:else if noteOf(i, d)}
-              <button class="note-view" dir="auto" title="Edit note" onclick={() => (noting = toggle(noting, k))}>{noteOf(i, d)}</button>
+            <!-- Like a post's action bar: the thread opens below the item. -->
+            <div class="social">
+              <button
+                class="talk"
+                class:open={threads.has(k)}
+                class:unread={unread(i)}
+                title={unread(i) ? "New reply from the claude" : threads.has(k) ? "Close the thread" : "Comments"}
+                onclick={() => toggleThread(g.id, i)}
+              ><span class="ico">💬</span><span class="lbl"
+                  >{i.comments.length ? `${i.comments.length} comment${i.comments.length === 1 ? "" : "s"}` : "Comment"}</span
+                >{#if unread(i)}<span class="udot"></span><span class="new">new</span>{/if}</button>
+            </div>
+            {#if threads.has(k)}
+              <div class="thread">
+                {#each i.comments as c, ci (ci)}
+                  <div class="comment" class:by-claude={c.by === "claude"}>
+                    <span class="who">{c.by === "claude" ? `claude#${g.id}` : "you"}</span>
+                    <!-- Sanitized in renderMarkdownAuto. -->
+                    <div class="text md">{@html renderMarkdownAuto(c.text)}</div>
+                  </div>
+                {/each}
+                {#if !d?.delete}
+                  <!-- svelte-ignore a11y_autofocus -->
+                  <textarea
+                    dir="auto"
+                    rows="2"
+                    placeholder="Reply… sent at UPDATE (⌘↩ to keep)"
+                    value={replyOf(d)}
+                    autofocus
+                    onchange={(e) => saveReply(g.id, i.n, (e.currentTarget as HTMLTextAreaElement).value)}
+                    onkeydown={(e) => onReplyKey(e, g.id, i.n)}
+                  ></textarea>
+                {/if}
+              </div>
+            {:else if replyOf(d)}
+              <button class="note-view" dir="auto" title="Edit your reply" onclick={() => toggleThread(g.id, i)}>{replyOf(d)}</button>
             {/if}
           </div>
           <div class="tools">
-            {#if !noting.has(k) && !d?.delete}
-              <button title="Add a note / answer" onclick={() => (noting = toggle(noting, k))}>✎</button>
-            {/if}
             {#if d}
               <button title="Discard your pending edit" onclick={() => edit(g.id, { op: "discard", n: i.n })}>↺</button>
-            {/if}
-            {#if !d?.delete}
-              <button title="Dismiss — remove it at UPDATE" onclick={() => edit(g.id, { op: "dismiss", n: i.n, on: true })}>✕</button>
             {/if}
           </div>
         </div>
@@ -229,8 +256,8 @@
           <span class="kind k-{o.d.orphan?.kind}">{o.d.orphan ? KIND_ICON[o.d.orphan.kind] : ""}</span>
           <div class="main">
             <div class="head"><span class="title" dir="auto">{o.d.orphan?.title}</span></div>
-            <div class="meta"><span>#{o.n} · removed by claude · your note is still sent</span></div>
-            {#if o.d.note}<div class="note-view" dir="auto">{o.d.note}</div>{/if}
+            <div class="meta"><span>#{o.n} · closed by claude · your reply is still sent</span></div>
+            {#if o.d.comment}<div class="note-view" dir="auto">{o.d.comment}</div>{/if}
             {#if o.d.chosen}<div class="note-view" dir="auto">chose: {o.d.chosen}</div>{/if}
           </div>
           <div class="tools">
@@ -244,7 +271,8 @@
           <div class="main">
             <div class="head"><span class="title" dir="auto">{a.title}</span></div>
             <div class="meta"><span>new · yours · pending</span></div>
-            {#if a.detail}<div class="detail" dir="auto">{a.detail}</div>{/if}
+            <!-- Sanitized in renderMarkdownAuto. -->
+            {#if a.detail}<div class="detail md">{@html renderMarkdownAuto(a.detail)}</div>{/if}
           </div>
           <div class="tools">
             <button title="Remove" onclick={() => edit(g.id, { op: "remove_added", tmp: a.tmp })}>✕</button>
@@ -253,9 +281,10 @@
       {/each}
     {/each}
 
-    {#if !$asksAll && kind === "claude" && id != null}
+    {#if !$todosAll && kind === "claude" && id != null}
       {#if addOpen}
         <div class="add">
+          <div class="add-head">New request for claude#{id}</div>
           <div class="add-row">
             <select bind:value={addKind} title="Kind">
               <option value="action">▶ Action</option>
@@ -386,6 +415,20 @@
     border-left-color: var(--accent);
     background: color-mix(in srgb, var(--accent) 6%, transparent);
   }
+  .item.urgent {
+    border-left-color: var(--dot-needs, #e5534b);
+  }
+  .urgent-tag {
+    flex: none;
+    padding: 0 0.3rem;
+    border-radius: 3px;
+    background: var(--dot-needs, #e5534b);
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    line-height: 1rem;
+  }
   .item.done .title,
   .item.gone .title {
     color: var(--text-faint);
@@ -440,6 +483,7 @@
   .meta {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 0.25rem;
     margin-top: 0.1rem;
     font-size: 0.68rem;
@@ -459,9 +503,7 @@
     color: var(--text-dim);
     font-size: 0.78rem;
     line-height: 1.45;
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
-    unicode-bidi: plaintext;
   }
   .choices {
     display: flex;
@@ -507,6 +549,135 @@
   button.note-view {
     cursor: text;
   }
+  /* The comments bar under each item, like a post's action bar. */
+  .social {
+    margin-top: 0.4rem;
+    padding-top: 0.3rem;
+    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  }
+  .talk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.5rem;
+    border: none;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1.3rem;
+    cursor: pointer;
+  }
+  .talk:hover,
+  .talk.open {
+    background: color-mix(in srgb, var(--text) 9%, transparent);
+    color: var(--text);
+  }
+  .talk .ico {
+    font-size: 0.9rem;
+    line-height: 1;
+  }
+  .talk.unread {
+    color: var(--accent);
+  }
+  .talk .new {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .udot {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .thread {
+    margin-top: 0.35rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .comment {
+    padding: 0.25rem 0.45rem;
+    border-inline-start: 2px solid var(--border);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+  .comment.by-claude {
+    border-inline-start-color: var(--dot-working);
+  }
+  .comment .who {
+    display: block;
+    font-size: 0.66rem;
+    color: var(--text-faint);
+  }
+  .comment .text {
+    color: var(--text-dim);
+    overflow-wrap: anywhere;
+  }
+  /* Markdown in details and comments. Each block finds its own direction
+     (Hebrew and English items sit side by side); code is always LTR. */
+  .md :global(p) {
+    margin: 0 0 0.45rem;
+  }
+  .md :global(:is(ul, ol)) {
+    margin: 0 0 0.45rem;
+    padding-inline-start: 1.2rem;
+  }
+  .md :global(li) {
+    margin-bottom: 0.15rem;
+  }
+  .md :global(:is(h1, h2, h3, h4, h5, h6)) {
+    margin: 0.55rem 0 0.3rem;
+    color: var(--text);
+    font-size: 0.86rem;
+  }
+  .md :global(strong) {
+    color: var(--text);
+  }
+  .md :global(code) {
+    direction: ltr;
+    unicode-bidi: isolate;
+    padding: 0.05rem 0.25rem;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--text) 10%, transparent);
+    font-size: 0.9em;
+  }
+  .md :global(pre) {
+    direction: ltr;
+    margin: 0 0 0.45rem;
+    overflow-x: auto;
+    padding: 0.4rem 0.5rem;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--text) 7%, transparent);
+  }
+  .md :global(pre code) {
+    padding: 0;
+    background: none;
+  }
+  .md :global(blockquote) {
+    margin: 0 0 0.45rem;
+    padding-inline-start: 0.5rem;
+    border-inline-start: 2px solid var(--border);
+  }
+  .md :global(table) {
+    margin: 0 0 0.45rem;
+    border-collapse: collapse;
+    display: block;
+    overflow-x: auto;
+  }
+  .md :global(:is(td, th)) {
+    padding: 0.15rem 0.45rem;
+    border: 1px solid var(--border);
+  }
+  .md :global(hr) {
+    border: none;
+    border-top: 1px solid var(--border);
+  }
+  .md > :global(:last-child) {
+    margin-bottom: 0;
+  }
   textarea,
   input:not([type]),
   select {
@@ -550,7 +721,7 @@
   }
   .add-open {
     display: block;
-    margin: 0.5rem 0.8rem;
+    margin: 0.8rem 0.8rem 0.5rem;
     border: 1px dashed var(--border);
     border-radius: 5px;
     background: none;
@@ -564,8 +735,21 @@
     color: var(--text-dim);
     border-color: var(--border-focus);
   }
+  /* Its own card below a divider, so the form never reads as part of the
+     last item. */
   .add {
-    margin: 0.5rem 0.8rem;
+    margin: 0.8rem 0.8rem 0.5rem;
+    padding: 0.6rem 0.65rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--text) 4%, transparent);
+  }
+  .add-head {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-dim);
   }
   .add-row {
     display: flex;

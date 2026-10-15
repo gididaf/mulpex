@@ -1,36 +1,43 @@
 <script lang="ts">
-  // "For me" on the phone: each claude's list of what it needs from you, as on
-  // the desktop's side panel (`src/lib/components/ForMeTab.svelte`). Your
-  // edits are drafts held by the Mac (`src-tauri/src/asks.rs`) — the desktop
-  // shows the same ones — until UPDATE sends each claude what changed.
-  // Plain text only: everything here was written by a model or by you.
+  // "To Do" on the phone: each claude's list of what it needs from you, as on
+  // the desktop's side panel (`src/lib/components/TodoTab.svelte`). Your
+  // edits are drafts held by the Mac (`src-tauri/src/todos.rs`) — the desktop
+  // shows the same ones — until UPDATE sends each claude what changed. Each
+  // item has a comment thread; your reply is one draft per item, and opening a
+  // thread marks the claude's comments read (on every device).
+  // Titles are plain text; details and comments are Markdown, sanitized in
+  // `renderRich` (everything here was written by a model or by you).
 
-  export type AskKind = "action" | "decision" | "question";
+  import { renderRich } from "./richmd";
+
+  export type TodoKind = "action" | "decision" | "question";
   type Item = {
     n: number;
-    kind: AskKind;
+    kind: TodoKind;
     title: string;
     detail: string | null;
     choices: string[];
     status: "open" | "done";
     done_by: "claude" | "user" | null;
     author: "claude" | "user";
-    note: string | null;
+    comments: { by: "claude" | "user"; text: string; at: number }[];
+    seen: number;
     chosen: string | null;
     rev: number;
     for: number | null;
+    urgent: boolean;
   };
   type Draft = {
     done: boolean | null;
-    note: string | null;
+    comment: string | null;
     chosen: string | null;
     delete: boolean;
     base_rev: number;
-    orphan: { kind: AskKind; title: string } | null;
+    orphan: { kind: TodoKind; title: string } | null;
   };
-  export type AskList = {
+  export type TodoList = {
     items: Item[];
-    drafts: { edits: Record<string, Draft>; added: { tmp: string; kind: AskKind; title: string; detail: string | null }[] };
+    drafts: { edits: Record<string, Draft>; added: { tmp: string; kind: TodoKind; title: string; detail: string | null }[] };
     sending: boolean;
   };
   type Reply = { ok: boolean; why: string | null };
@@ -46,7 +53,7 @@
   }: {
     /** The project's claudes, in sidebar order. */
     claudes: { id: number; name: string | null }[];
-    lists: Record<string, AskList>;
+    lists: Record<string, TodoList>;
     /** The claude it was opened for; null shows them all. */
     focus: number | null;
     loading: boolean;
@@ -61,8 +68,8 @@
   let error = $state<string | null>(null);
   let busy = $state(false);
 
-  const pending = (l: AskList | undefined) => (l ? Object.keys(l.drafts.edits).length + l.drafts.added.length : 0);
-  const open = (l: AskList | undefined) => l?.items.filter((i) => i.status === "open").length ?? 0;
+  const pending = (l: TodoList | undefined) => (l ? Object.keys(l.drafts.edits).length + l.drafts.added.length : 0);
+  const open = (l: TodoList | undefined) => l?.items.filter((i) => i.status === "open").length ?? 0;
 
   const groups = $derived(
     claudes
@@ -73,7 +80,7 @@
   const sendable = $derived(groups.filter((g) => pending(g.list) && !g.list?.sending));
   const total = $derived(sendable.reduce((n, g) => n + pending(g.list), 0));
 
-  const ICON: Record<AskKind, string> = { action: "▶", decision: "◆", question: "?" };
+  const ICON: Record<TodoKind, string> = { action: "▶", decision: "◆", question: "?" };
 
   async function edit(id: number, e: Record<string, unknown>) {
     error = null;
@@ -89,14 +96,32 @@
     if (!r.ok || r.why) error = r.why ?? "Not sent";
   }
 
-  function note(id: number, i: Item, d: Draft | undefined) {
-    const cur = d?.note ?? i.note ?? "";
-    const v = prompt(`Note for #${i.n}`, cur);
-    if (v != null && v !== cur) edit(id, { op: "note", n: i.n, note: v });
+  const unread = (i: Item) => i.comments.slice(i.seen).some((c) => c.by === "claude");
+
+  /** Open threads, by `"<id>:<n>"`. */
+  let threads = $state(new Set<string>());
+  function toggleThread(id: number, n: number) {
+    const k = `${id}:${n}`;
+    const next = new Set(threads);
+    if (next.has(k)) next.delete(k);
+    else next.add(k);
+    threads = next;
+  }
+  // An open thread is being read, including what arrives while it is open.
+  $effect(() => {
+    for (const g of groups) {
+      for (const i of g.list?.items ?? []) {
+        if (threads.has(`${g.id}:${i.n}`) && unread(i)) edit(g.id, { op: "seen", n: i.n });
+      }
+    }
+  });
+
+  function saveReply(id: number, i: Item, d: Draft | undefined, v: string) {
+    if (v !== (d?.comment ?? "")) edit(id, { op: "comment", n: i.n, text: v });
   }
 
   let addTitle = $state("");
-  let addKind = $state<AskKind>("action");
+  let addKind = $state<TodoKind>("action");
   function add() {
     if (focus == null || !addTitle.trim()) return;
     edit(focus, { op: "add", kind: addKind, title: addTitle });
@@ -104,10 +129,10 @@
   }
 </script>
 
-<div class="forme">
+<div class="todo">
   <header>
     <button class="back" onclick={onback} aria-label="Back">‹</button>
-    <span class="title">For me</span>
+    <span class="title">To Do</span>
     <div class="seg">
       {#if focus != null}<button class:on={!all} onclick={() => (all = false)}>claude#{focus}</button>{/if}
       <button class:on={all} onclick={() => (all = true)}>All</button>
@@ -127,20 +152,20 @@
           {#if g.list?.sending}<span class="sending">sending…</span>{/if}
         </div>
       {/if}
-      {#each g.list?.items ?? [] as i (i.n)}
+      {#each [...(g.list?.items ?? [])].sort((a, b) => Number(b.urgent) - Number(a.urgent)) as i (i.n)}
         {@const d = g.list?.drafts.edits[String(i.n)]}
         {@const done = d?.done ?? i.status === "done"}
         {@const chosen = d?.chosen ?? i.chosen}
-        {@const noteText = d?.note ?? i.note}
-        <div class="item" class:done class:gone={d?.delete} class:pending={!!d}>
+        {@const k = `${g.id}:${i.n}`}
+        <div class="item" class:done class:gone={d?.delete} class:pending={!!d} class:urgent={i.urgent}>
           <input type="checkbox" checked={done} disabled={d?.delete} onchange={() => edit(g.id, { op: "done", n: i.n, done: !done })} />
           <div class="main">
-            <div class="head"><span class="kind">{ICON[i.kind]}</span><span class="t" dir="auto">{i.title}</span></div>
+            <div class="head"><span class="kind">{ICON[i.kind]}</span><span class="t" dir="auto">{i.title}</span>{#if i.urgent}<span class="urgent-tag">URGENT</span>{/if}</div>
             <div class="meta">
               {#if i.for != null}<span class="for">for claude#{i.for}</span>{/if}
               #{i.n}{#if i.author === "user"} · yours{/if}{#if d} · <b>pending</b>{/if}{#if d && i.rev > d.base_rev} · changed since your edit{/if}
             </div>
-            {#if i.detail}<details><summary>more</summary><div class="detail" dir="auto">{i.detail}</div></details>{/if}
+            {#if i.detail}<details><summary>more</summary><div class="detail md">{@html renderRich(i.detail)}</div></details>{/if}
             {#if i.choices.length}
               <div class="choices">
                 {#each i.choices as c (c)}
@@ -149,11 +174,32 @@
                 {/each}
               </div>
             {/if}
-            {#if noteText}<div class="note" dir="auto">{noteText}</div>{/if}
+            {#if threads.has(k)}
+              <div class="thread">
+                {#each i.comments as c, ci (ci)}
+                  <div class="comment" class:by-claude={c.by === "claude"}>
+                    <span class="who">{c.by === "claude" ? `claude#${g.id}` : "you"}</span>
+                    <div class="ctext md">{@html renderRich(c.text)}</div>
+                  </div>
+                {/each}
+                {#if !d?.delete}
+                  <textarea
+                    dir="auto"
+                    rows="2"
+                    placeholder="Reply… sent at UPDATE"
+                    value={d?.comment ?? ""}
+                    onchange={(e) => saveReply(g.id, i, d, (e.currentTarget as HTMLTextAreaElement).value)}
+                  ></textarea>
+                {/if}
+              </div>
+            {:else if d?.comment}
+              <div class="note" dir="auto">{d.comment}</div>
+            {/if}
             <div class="tools">
-              {#if !d?.delete}<button onclick={() => note(g.id, i, d)}>✎ Note</button>{/if}
+              <button class:unread={unread(i)} onclick={() => toggleThread(g.id, i.n)}
+                >💬 {i.comments.length ? i.comments.length : "Comment"}{#if unread(i)} · new{/if}</button
+              >
               {#if d}<button onclick={() => edit(g.id, { op: "discard", n: i.n })}>↺ Undo</button>{/if}
-              {#if !d?.delete}<button onclick={() => edit(g.id, { op: "dismiss", n: i.n, on: true })}>✕ Dismiss</button>{/if}
             </div>
           </div>
         </div>
@@ -162,8 +208,8 @@
         <div class="item pending gone">
           <div class="main">
             <div class="head"><span class="t" dir="auto">{o.orphan?.title}</span></div>
-            <div class="meta">#{n} · removed by claude · your note is still sent</div>
-            {#if o.note}<div class="note" dir="auto">{o.note}</div>{/if}
+            <div class="meta">#{n} · closed by claude · your reply is still sent</div>
+            {#if o.comment}<div class="note" dir="auto">{o.comment}</div>{/if}
             <div class="tools"><button onclick={() => edit(g.id, { op: "discard", n: Number(n) })}>✕ Don't send</button></div>
           </div>
         </div>
@@ -200,7 +246,7 @@
 </div>
 
 <style>
-  .forme {
+  .todo {
     display: flex;
     flex-direction: column;
     height: 100dvh;
@@ -290,6 +336,20 @@
   .item.pending {
     border-inline-start-color: var(--accent);
   }
+  .item.urgent {
+    border-inline-start-color: var(--red);
+  }
+  .urgent-tag {
+    flex: none;
+    margin-inline-start: 0.4rem;
+    padding: 0 0.35rem;
+    border-radius: 4px;
+    background: var(--red);
+    color: #fff;
+    font-size: 0.65rem;
+    font-weight: 700;
+    line-height: 1.1rem;
+  }
   .item.done .t,
   .item.gone .t {
     color: var(--label);
@@ -348,6 +408,96 @@
   .note {
     padding-inline-start: 0.5rem;
     border-inline-start: 2px solid var(--accent);
+  }
+  .thread {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+  }
+  .comment {
+    padding-inline-start: 0.5rem;
+    border-inline-start: 2px solid var(--border);
+    font-size: 0.85rem;
+  }
+  .comment.by-claude {
+    border-inline-start-color: var(--accent);
+  }
+  .who {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--label);
+  }
+  .ctext {
+    overflow-wrap: anywhere;
+  }
+  .detail.md {
+    white-space: normal;
+    unicode-bidi: normal;
+  }
+  .md :global(p) {
+    margin: 0 0 0.5rem;
+  }
+  .md :global(:is(ul, ol)) {
+    margin: 0 0 0.5rem;
+    padding-inline-start: 1.3rem;
+  }
+  .md :global(:is(h1, h2, h3, h4, h5, h6)) {
+    margin: 0.6rem 0 0.3rem;
+    font-size: 0.95rem;
+    color: var(--text);
+  }
+  .md :global(code) {
+    direction: ltr;
+    unicode-bidi: isolate;
+    padding: 0.05rem 0.25rem;
+    border-radius: 3px;
+    background: var(--bg-elev);
+    font-size: 0.9em;
+  }
+  .md :global(pre) {
+    direction: ltr;
+    margin: 0 0 0.5rem;
+    overflow-x: auto;
+    padding: 0.45rem 0.55rem;
+    border-radius: 5px;
+    background: var(--bg-elev);
+  }
+  .md :global(pre code) {
+    padding: 0;
+    background: none;
+  }
+  .md :global(blockquote) {
+    margin: 0 0 0.5rem;
+    padding-inline-start: 0.5rem;
+    border-inline-start: 2px solid var(--border);
+  }
+  .md :global(table) {
+    display: block;
+    overflow-x: auto;
+    margin: 0 0 0.5rem;
+    border-collapse: collapse;
+  }
+  .md :global(:is(td, th)) {
+    padding: 0.2rem 0.45rem;
+    border: 1px solid var(--border);
+  }
+  .md > :global(:last-child) {
+    margin-bottom: 0;
+  }
+  .thread textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: 0.9rem;
+  }
+  .tools button.unread {
+    font-weight: 700;
   }
   .choices {
     display: flex;

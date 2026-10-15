@@ -1560,12 +1560,12 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     if let Some(context) = crate::secrets::context(&ctx.state_dir, ctx.instance) {
         parts.push(context);
     }
-    // The For-me list, only where the user turned it on. A standing rule, not
+    // The To Do list, only where the user turned it on. A standing rule, not
     // a one-off ask, so it rides every turn like the two above: an UPDATE
     // arrives as a hub wake, which is exactly the turn that needs it. It cannot
-    // feed itself — following it creates no `asks_on/` file.
-    if asks_on(&ctx.state_dir, ctx.instance) {
-        parts.push(crate::rules::ASKS_RULE.to_string());
+    // feed itself — following it creates no `todos_on/` file.
+    if todos_on(&ctx.state_dir, ctx.instance) {
+        parts.push(crate::rules::TODOS_RULE.to_string());
     }
     if !parts.is_empty() {
         let out = serde_json::json!({
@@ -1947,9 +1947,9 @@ pub(crate) fn canonical_target(ctx: &Ctx, raw: &str) -> Option<PathBuf> {
     Some(std::fs::canonicalize(parent).ok()?.join(name))
 }
 
-/// The user turned this claude's "For me" list on (`asks_on/<id>`).
-pub(crate) fn asks_on(state_dir: &Path, id: usize) -> bool {
-    state_dir.join(crate::ASKS_ON_DIR).join(id.to_string()).exists()
+/// The user turned this claude's "To Do" list on (`todos_on/<id>`).
+pub(crate) fn todos_on(state_dir: &Path, id: usize) -> bool {
+    state_dir.join(crate::TODOS_ON_DIR).join(id.to_string()).exists()
 }
 
 pub(crate) fn now() -> u64 {

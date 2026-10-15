@@ -366,11 +366,11 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 > **with nothing of its own still running** — see **`needs` must mean "needs YOU"** in
 > [sessions.md](sessions.md).
 
-## The side panel (⌘⇧L): For me · Pins · Explain
+## The side panel (⌘⇧L): To Do · Pins · Explain
 
-One column right of the terminal with **three fixed tabs** — For me, Pins, Explain (in that order).
+One column right of the terminal with **three fixed tabs** — To Do, Pins, Explain (in that order).
 Tabs never close; only the whole panel shows or hides (⌘⇧L, or the ✕ in its header). Each tab shows
-the focused instance's content; For me can also show the whole project. Shell: `RightPanel.svelte`;
+the focused instance's content; To Do can also show the whole project. Shell: `RightPanel.svelte`;
 state: `lib/rightPanel.ts` (`open`, `frac`, `tab`, in localStorage as `mulpex.rightPanel`, migrated
 once from the old `mulpex.pinsPanel`). ⌘⇧P with a selection pins and opens the Pins tab; with none it
 shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and opens the Explain tab.
@@ -384,16 +384,33 @@ shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and 
 - **Explain used to be an overlay** so it would never resize a PTY. The column is global now, so
   that reason is gone, and it became a tab (the user's ask: one right panel, not several).
 
-### For me (`hub_user_asks`)
+### To Do (`hub_todo`)
 
 What a claude needs from the user — an **action**, a **decision** (with choices to click) or a
-**question** — so it says it once instead of repeating "still waiting on you for X" as it keeps
-working. **Off by default**: right-click a claude's row → For me list → On, for that row only (an
+**question** — kept OUT of the conversation: `TODOS_RULE` forbids repeating list content in replies
+(a one-line pointer like "Added To Do #3" at most; no recap after an UPDATE), so the transcript
+doesn't carry everything twice. **Off by default**: right-click a claude's row → To Do list → On, for that row only (an
 orchestrator collects its workers' asks, tagged "for claude#N"; [hub.md](hub.md)). The tab says how
-to turn it on for a claude whose list is off. The claude writes the list with `mcp__mulpex__hub_user_asks` (backend: [hub.md](hub.md));
-`ForMeTab.svelte` renders it; `lib/asks.ts` mirrors the backend (`src-tauri/src/asks.rs`).
+to turn it on for a claude whose list is off. The claude writes the list with `mcp__mulpex__hub_todo` (backend: [hub.md](hub.md));
+`TodoTab.svelte` renders it; `lib/todos.ts` mirrors the backend (`src-tauri/src/todos.rs`).
 
-- **The user's edits are drafts until UPDATE.** Check, note, pick a choice, dismiss, add a request:
+- **Each item has a comment thread** (2026-10-15; replaced the single editable note). Append-only,
+  both authors: the claude writes with `hub_todo` action `comment`, the user's reply is ONE draft
+  per item, appended at UPDATE. The thread is collapsed behind a "💬 Comment / 2 comments" bar under the item (like a post's
+  action bar — it opens below, not to the side); a claude comment past
+  `Item.seen` is unread — a dot on the link, `💬` on the row badge (`todos_unread`). Opening the
+  thread sends `{op:"seen"}` (not a draft — it changes the base, so read on the phone is read on the
+  desktop), and an open thread keeps marking new comments read. Old notes became the user's first
+  comment on load (`List::migrate`); old drafts' `note` is read as `comment` (serde alias).
+- **URGENT** (`Item.urgent`, 2026-10-15): set and cleared by the claude only (`add`/`update` with
+  `urgent`); `TODOS_RULE` and the schema say to use it only when the user's attention is needed as
+  soon as possible. Urgent items sort first within each claude's group (stable — `byUrgency`), get a
+  red edge and an `URGENT` tag, and turn the row badge red (`todos_urgent`). Nothing louder: no
+  dock badge, attention or push.
+- **No ✕ (dismiss) on an item** (removed 2026-10-15): next to the tick it read as a second "done"
+  and confused the user. The tick is the one way to close an item; "not needed" goes in a comment.
+  The backend still accepts `{op:"dismiss"}` (an older phone app may send it).
+- **The user's edits are drafts until UPDATE.** Check, comment, pick a choice, add a request:
   each is a draft (marked *pending*) laid over the claude's item, and the claude never sees it.
   UPDATE folds the drafts in and sends that claude one message from "Mulpex" listing exactly what
   changed. In **All** view one UPDATE sends to every claude with changes, each its own diff.
@@ -401,12 +418,22 @@ to turn it on for a claude whose list is off. The claude writes the list with `m
   phone show the same pending set and any of them can send it. Last write wins per field.
 - **Conflicts:** the claude edits the base at once. A draft on an item it changed is kept and marked
   "changed since your edit" (`rev > base_rev`). A draft with words on an item it removed becomes an
-  orphan, still sent as "re: removed #n"; a bare tick on one is dropped. Clear done is immediate.
+  orphan, still sent as "re: #n, no longer on your list"; a bare tick on one is dropped.
+- **Done items leave the list on their own** (2026-10-15; there was a "Clear done" button the user
+  found annoying). The claude's `done` removes the item at once, like `remove`. The user's tick stays
+  a pending draft — still untickable — and the item goes when UPDATE delivers it. There is no
+  reopen. Done items in a list saved before this are dropped on load.
 - **Badge**: a claude row shows `☐ n` (open items) and a dot while edits wait for UPDATE, from
-  `SessionInfo.asks_open/asks_pending` — so remote desktops and the phone get it for free. No
+  `SessionInfo.todos_open/todos_pending` — so remote desktops and the phone get it for free. No
   attention signal and nothing auto-opens: the user asked for a quiet list.
-- **Plain text only.** Titles, details and notes come from a model or the user; nothing goes through
-  `{@html}`. `dir="auto"` + `unicode-bidi: plaintext`, since items are often Hebrew.
+- **Details and comments are Markdown** (2026-10-15), both authors, up to 20 000 characters — the
+  claude is told to put long content (QA steps, results, logs) in a detail instead of the
+  conversation. Rendered only through `markdown.ts::renderMarkdownAuto` (phone: `richmd.ts`):
+  DOMPurify, links/images/inputs dropped — the webview can invoke Tauri commands. Each block gets
+  `dir="auto"` so a Hebrew list takes right-side bullets (Explain keeps its hard-RTL
+  `renderMarkdown`). Titles stay plain text. The list the claude gets back on every `hub_todo` call
+  previews long text (300 chars) and the last 3 comments; `list` with `id` reads one item whole —
+  otherwise each call would re-send every long detail into its context.
 
 ### Pins
 

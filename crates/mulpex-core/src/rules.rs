@@ -69,7 +69,7 @@ close it rather than leaving a dead row for the user to tidy by hand. Pass to: \
 killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
 close YOURSELF (the call would never return), and you cannot close a row in another project. \
 Terminals are not instances: hub_terminal_close closes those.\n\
-- mcp__mulpex__hub_user_asks — Mulpex's \"For me\" list (the user may call it \"FOR ME\", \"my \
+- mcp__mulpex__hub_todo — Mulpex's \"To Do\" list (the user may call it \"todo\", \"TODO\", \"my \
 list\" or \"the list\"). It is OFF unless the user turns it on for you; while it is on, Mulpex says \
 so on every turn. Never start using it on your own. If the user asks you to put something on it, \
 call the tool — if your list is off, the reply tells you how the user turns it on.\n\
@@ -195,21 +195,37 @@ you acted on a hub message rather than on my prompt, and from whom. A message wh
 \"Mulpex\" comes from the Mulpex app itself, not from an instance: do what it asks, and never \
 hub_send a reply to it — there is no instance there to receive one.";
 
-/// Carried on every turn of a claude whose "For me" list the user turned ON
-/// (`asks_on/<id>`, `hook::userpromptsubmit`) — never in `HUB_RULES`, because
+/// Carried on every turn of a claude whose "To Do" list the user turned ON
+/// (`todos_on/<id>`, `hook::userpromptsubmit`) — never in `HUB_RULES`, because
 /// the list is opt-in per row: a claude in a quiet one-on-one, or a coworker's,
 /// must not start keeping one by itself.
-pub const ASKS_RULE: &str = "[Mulpex] The user turned ON your \"For me\" list \
-(mcp__mulpex__hub_user_asks), shown in Mulpex's side panel. Whenever you need something from \
+pub const TODOS_RULE: &str = "[Mulpex] The user turned ON your \"To Do\" list \
+(mcp__mulpex__hub_todo), shown in Mulpex's side panel. Whenever you need something from \
 the user — an action they must take, a decision (give the options as choices), or a question — \
-put it on that list and mention it ONCE in your reply; do not keep repeating \"still waiting on \
-you for X\" in later turns, the list is the reminder. Keep it current: mark an item done as soon \
+put it on that list. NO DUPLICATION: what is on the list stays OFF the conversation — the user \
+reads it in the panel, and repeating it in your replies only fills both context windows. When \
+you add an item or comment, your reply says at most a one-line pointer (\"Added To Do #3\", \
+\"Replied on #3\"), never its content, and never \"still waiting on you for X\" in later turns — \
+the list is the reminder. ONE ITEM PER THING, NEVER ONE PER STEP: one piece of work for the \
+user is ONE item — e.g. \"QA the login flow\" — with every step, check and sub-question inside its \
+detail (a Markdown checklist), never split into an item per step or per question; later \
+follow-ups on it go in its comments. LONG CONTENT GOES IN AN ITEM'S DETAIL, not the conversation: QA/test \
+steps, results, options compared, logs — write it as Markdown in the item's detail (shown \
+under \"more\", up to 20,000 characters; comments are Markdown too) and keep the reply to a \
+pointer. The list you get back previews long text; action list with id reads one item in full. \
+URGENT (urgent: true) is rare: use it ONLY when you really need the \
+user's attention as soon as possible — you are blocked on it right now, or something breaks or \
+is lost if they wait — never for an ordinary ask; clear it (update urgent: false) once that \
+stops being true. Keep it current: mark an item done as soon \
 as it no longer applies. If you coordinate other instances (you hub_spawned workers), you are \
 the user's one list: when a worker tells you it needs something from the user, add it to YOUR \
 list with for: <that worker's number>, and when the user answers it, pass the answer on to that \
-worker with hub_send. When a message from \"Mulpex\" says the user pressed UPDATE, it lists \
-exactly what they changed on your list (checked, answered, chose, added, dismissed): act on it \
-right away.";
+worker with hub_send. Each item has a comment thread: \
+follow-ups about an item go THERE (hub_todo action comment, with id and text) — answer the user's \
+comments on it, and ask your follow-up questions on it — until it is done. When a message from \
+\"Mulpex\" says the user pressed UPDATE, it lists exactly what they changed on your list \
+(checked, commented, chose, added, dismissed): act on it right away — do the work without \
+recapping their answers or choices in your reply, and answer their comments on the item.";
 
 /// User-mandated zero-assumptions planning discipline (see old term_session.rs).
 const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
@@ -390,12 +406,16 @@ mod tests {
             .filter(|n| !n.is_empty())
             .collect();
         assert!(named.contains(&"hub_send"), "{named:?}");
-        // The For-me list is opt-in per row: every claude is told it exists
+        // The To Do list is opt-in per row: every claude is told it exists
         // and is off (MCP tools load lazily, so a name alone doesn't say what
-        // "the FOR ME list" means), while how to USE it rides the hook.
-        assert!(named.contains(&"hub_user_asks"), "{named:?}");
+        // "the TO DO list" means), while how to USE it rides the hook.
+        assert!(named.contains(&"hub_todo"), "{named:?}");
         assert!(HUB_RULES.contains("Never start using it on your own"));
-        assert!(ASKS_RULE.contains("mcp__mulpex__hub_user_asks"));
+        assert!(TODOS_RULE.contains("mcp__mulpex__hub_todo"));
+        assert!(TODOS_RULE.contains("NO DUPLICATION"));
+        assert!(TODOS_RULE.contains("URGENT"));
+        assert!(TODOS_RULE.contains("ONE ITEM PER THING"));
+        assert!(TODOS_RULE.contains("LONG CONTENT GOES IN AN ITEM'S DETAIL"));
         for n in named {
             assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
         }

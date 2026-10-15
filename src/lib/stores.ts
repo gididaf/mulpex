@@ -613,11 +613,11 @@ export function setAutoCompactLocal(handle: ProjectHandle, id: number, pct: numb
   });
 }
 
-export function setAsksOnLocal(handle: ProjectHandle, id: number, on: boolean): void {
+export function setTodosOnLocal(handle: ProjectHandle, id: number, on: boolean): void {
   const p = get(projects).get(handle);
   if (!p) return;
   patchProject(handle, {
-    sessions: p.sessions.map((s) => (s.id === id ? { ...s, asks_on: on } : s)),
+    sessions: p.sessions.map((s) => (s.id === id ? { ...s, todos_on: on } : s)),
   });
 }
 

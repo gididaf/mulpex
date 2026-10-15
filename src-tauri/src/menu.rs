@@ -209,7 +209,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let pin = MenuItemBuilder::with_id("pin_selection", "Pin Selection")
         .accelerator("Cmd+Shift+P")
         .build(app)?;
-    // ⌘⇧L: show/hide the side panel (For me · Pins · Explain — `rightPanel.ts`).
+    // ⌘⇧L: show/hide the side panel (To Do · Pins · Explain — `rightPanel.ts`).
     // Also claimed in the webview, like ⌘⇧P, so a focused terminal can't swallow it.
     let side_panel = MenuItemBuilder::with_id("toggle_panel", "Show/Hide Side Panel")
         .accelerator("Cmd+Shift+L")

@@ -69,9 +69,9 @@ pub struct SavedSession {
     /// with no name); a name read back without it is reported as the user's,
     /// which is how a restored name has always been treated.
     pub name_by: Option<NameSource>,
-    /// The "For me" list is ON for this row's sidebar subtree (set by the user
+    /// The "To Do" list is ON for this row's sidebar subtree (set by the user
     /// from the row's context menu). Off by default.
-    pub asks: bool,
+    pub todos: bool,
 }
 
 /// Who set an instance's sidebar name — reported by `hub_instances` as
@@ -113,8 +113,11 @@ impl NameSource {
 
 /// The tab-separated flag marking a collapsed family in the store file.
 const COLLAPSED_FLAG: &str = "collapsed";
-/// The "For me" column's value when the list is on for the row's family.
-const ASKS_FLAG: &str = "asks";
+/// The "To Do" column's value when the list is on for the row's family.
+const TODOS_FLAG: &str = "todos";
+/// The same column as written before the list was renamed from "For me";
+/// still read, so an upgrade keeps every row's on/off setting.
+const OLD_TODOS_FLAG: &str = "asks";
 
 /// The tab-separated flag marking a muted instance in the store file.
 const MUTED_FLAG: &str = "muted";
@@ -175,7 +178,7 @@ impl SessionStore {
     /// error, if there is no store yet, or if the recorded project path doesn't
     /// match (guards against a hash collision clobbering another project).
     ///
-    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\tasks]]]]]]]]`, so every older format
+    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos]]]]]]]]`, so every older format
     /// still loads: a bare uuid (before names existed) yields no name and
     /// unmuted, a `<uuid>\t<name>` line (before mute existed) yields unmuted, and
     /// a three-column line (before ids were persisted) yields `id: None` and is
@@ -213,7 +216,7 @@ impl SessionStore {
                 let collapsed = parts.next().map(str::trim) == Some(COLLAPSED_FLAG);
                 let auto_compact = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 let name_by = parts.next().map(str::trim).and_then(NameSource::parse);
-                let asks = parts.next().map(str::trim) == Some(ASKS_FLAG);
+                let todos = matches!(parts.next().map(str::trim), Some(TODOS_FLAG | OLD_TODOS_FLAG));
                 SavedSession {
                     session_id,
                     name,
@@ -223,7 +226,7 @@ impl SessionStore {
                     collapsed,
                     auto_compact,
                     name_by,
-                    asks,
+                    todos,
                 }
             })
             .filter(|s| !s.session_id.is_empty())
@@ -231,7 +234,7 @@ impl SessionStore {
     }
 
     /// Persist `sessions` (in order) for this project as
-    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\tasks]]]]]]]]`. Trailing empty columns are dropped, so
+    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos]]]]]]]]`. Trailing empty columns are dropped, so
     /// a store with nothing new in it is written byte-identically to the older
     /// format. Best-effort: any I/O failure is silently ignored.
     pub fn save(&self, sessions: &[SavedSession]) {
@@ -265,7 +268,7 @@ impl SessionStore {
                 if s.collapsed { COLLAPSED_FLAG.into() } else { String::new() },
                 s.auto_compact.map(|p| p.to_string()).unwrap_or_default(),
                 name_by,
-                if s.asks { ASKS_FLAG.into() } else { String::new() },
+                if s.todos { TODOS_FLAG.into() } else { String::new() },
             ];
             // Positional columns, so only trailing empties can be dropped — an
             // id with no name still needs its empty name and muted fields
@@ -295,7 +298,7 @@ mod tests {
             collapsed: false,
             auto_compact: None,
             name_by: None,
-            asks: false,
+            todos: false,
         }
     }
 
@@ -353,7 +356,7 @@ mod tests {
             SavedSession { parent: Some(16), ..numbered("u7", Some("kid"), true, 17) },
             SavedSession { collapsed: true, ..numbered("u8", None, false, 18) },
             SavedSession { auto_compact: Some(70), ..numbered("u9", None, false, 19) },
-            SavedSession { asks: true, ..numbered("u10", None, false, 20) },
+            SavedSession { todos: true, ..numbered("u10", None, false, 20) },
         ];
         store.save(&rows);
         assert_eq!(store.load(), rows, "a column shape did not survive the round trip");
@@ -364,7 +367,11 @@ mod tests {
         assert!(text.contains("u6\t\t\t16\t2\n"), "columns misaligned:\n{text}");
         assert!(text.contains("u8\t\t\t18\t\tcollapsed\n"), "columns misaligned:\n{text}");
         assert!(text.contains("u9\t\t\t19\t\t\t70\n"), "columns misaligned:\n{text}");
-        assert!(text.contains("u10\t\t\t20\t\t\t\t\tasks\n"), "columns misaligned:\n{text}");
+        assert!(text.contains("u10\t\t\t20\t\t\t\t\ttodos\n"), "columns misaligned:\n{text}");
+
+        // A line written before the rename from "For me" still reads as on.
+        std::fs::write(store.path(), text.replace("\ttodos\n", "\tasks\n")).unwrap();
+        assert_eq!(store.load(), rows, "the old flag was not read");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

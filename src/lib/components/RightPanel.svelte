@@ -1,6 +1,6 @@
 <script lang="ts">
   // The side panel (⌘⇧L): a column right of the terminal with three fixed tabs,
-  // For me · Pins · Explain, each showing the focused instance's content (For me
+  // To Do · Pins · Explain, each showing the focused instance's content (To Do
   // can also show the whole project). Tabs never close — only the panel hides.
   //
   // A real column, so the terminal narrows instead of being covered. That
@@ -9,11 +9,11 @@
   // only commits its width on release.
   import { activeProjectHandle, activeId } from "../stores";
   import { rightPanel, setPanelOpen, setTab, setPanelFrac, clampFrac, type PanelTab } from "../rightPanel";
-  import { asks, askKey, asksAll, openCount } from "../asks";
+  import { todos, todoKey, todosAll, openCount } from "../todos";
   import { pins, pinKey } from "../pins";
   import { explains, explainKey, isStreaming } from "../explain";
   import { THEME, terminals } from "../terminals";
-  import ForMeTab from "./ForMeTab.svelte";
+  import TodoTab from "./TodoTab.svelte";
   import PinsTab from "./PinsTab.svelte";
   import ExplainTab from "./ExplainTab.svelte";
 
@@ -23,20 +23,20 @@
   const h = $derived($activeProjectHandle);
   const id = $derived($activeId);
 
-  const formeCount = $derived.by(() => {
+  const todoCount = $derived.by(() => {
     if (h == null) return 0;
-    if ($asksAll) {
+    if ($todosAll) {
       let n = 0;
-      for (const [k, l] of $asks) if (k.startsWith(`${h}:`)) n += openCount(l);
+      for (const [k, l] of $todos) if (k.startsWith(`${h}:`)) n += openCount(l);
       return n;
     }
-    return id != null ? openCount($asks.get(askKey(h, id))) : 0;
+    return id != null ? openCount($todos.get(todoKey(h, id))) : 0;
   });
   const pinCount = $derived(h != null && id != null ? ($pins.get(pinKey(h, id))?.length ?? 0) : 0);
   const ex = $derived(h != null && id != null ? $explains.get(explainKey(h, id)) : undefined);
 
   const TABS: { tab: PanelTab; label: string }[] = [
-    { tab: "forme", label: "For me" },
+    { tab: "todo", label: "To Do" },
     { tab: "pins", label: "Pins" },
     { tab: "explain", label: "Explain" },
   ];
@@ -98,7 +98,7 @@
           onclick={() => pick(t.tab)}
         >
           {t.label}
-          {#if t.tab === "forme" && formeCount}<span class="count">{formeCount}</span>{/if}
+          {#if t.tab === "todo" && todoCount}<span class="count">{todoCount}</span>{/if}
           {#if t.tab === "pins" && pinCount}<span class="count dim">{pinCount}</span>{/if}
           {#if t.tab === "explain" && ex}<span class="dot" class:live={isStreaming(ex)}></span>{/if}
         </button>
@@ -107,8 +107,8 @@
     <button class="x" title="Hide panel (⌘⇧L)" onclick={() => { setPanelOpen(false); terminals.refocus(); }}>✕</button>
   </header>
   <div class="body">
-    {#if $rightPanel.tab === "forme"}
-      <ForMeTab />
+    {#if $rightPanel.tab === "todo"}
+      <TodoTab />
     {:else if $rightPanel.tab === "pins"}
       <PinsTab />
     {:else}

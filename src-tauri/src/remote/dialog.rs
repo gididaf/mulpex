@@ -115,7 +115,7 @@ pub fn keys(state_dir: &Path, id: usize, answer: &Value) -> Result<Vec<String>, 
 fn keys_for(view: &Value, answer: &Value) -> Result<Vec<String>, String> {
     match view.get("kind").and_then(Value::as_str) {
         Some("plan") => plan_keys(answer),
-        Some("ask") => ask_keys(view["questions"].as_array().ok_or("bad dialog")?, answer),
+        Some("ask") => todo_keys(view["questions"].as_array().ok_or("bad dialog")?, answer),
         _ => Err("That question is no longer open".into()),
     }
 }
@@ -135,7 +135,7 @@ fn plan_keys(answer: &Value) -> Result<Vec<String>, String> {
     }
 }
 
-fn ask_keys(questions: &[Value], answer: &Value) -> Result<Vec<String>, String> {
+fn todo_keys(questions: &[Value], answer: &Value) -> Result<Vec<String>, String> {
     let answers = answer.get("answers").and_then(Value::as_array).ok_or("No answers")?;
     if answers.len() != questions.len() {
         return Err("The question changed — reopen it".into());

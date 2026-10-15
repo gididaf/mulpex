@@ -51,7 +51,7 @@
   });
 </script>
 
-<!-- The terminals and, when shown, the side panel (For me · Pins · Explain)
+<!-- The terminals and, when shown, the side panel (To Do · Pins · Explain)
      beside them. -->
 <div class="pane-row" bind:this={rowEl}>
   <div class="pane-inner" bind:this={paneEl}>

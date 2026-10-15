@@ -47,11 +47,11 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 
 - **View** — every project's sidebar rows with status, task, ctx %, and the open dialog. Built in
   `hub.rs`'s loop (only while on), sent when it changes. Each claude row also carries
-  `asks_open`/`asks_pending` (its For-me badge) and each project an `asks_rev`.
-- **For me** — `asks-get {handle}` → `{t:"asks", handle, lists}`; `asks-edit {rid, handle, id, edit}`
-  and `asks-update {rid, handle, ids}` answer as `typed`. They call the same `Core` methods as the
-  desktop's commands, so drafts are shared with it. `ForMe.svelte` re-fetches whenever `asks_rev`
-  changes while it is open; it opens from a row's `☐ n` badge or the chat header's "For me".
+  `todos_open`/`todos_pending` (its To Do badge) and each project an `todos_rev`.
+- **To Do** — `todos-get {handle}` → `{t:"todos", handle, lists}`; `todos-edit {rid, handle, id, edit}` (edit ops incl. `comment` and `seen`)
+  and `todos-update {rid, handle, ids}` answer as `typed`. They call the same `Core` methods as the
+  desktop's commands, so drafts are shared with it. `Todo.svelte` re-fetches whenever `todos_rev`
+  changes while it is open; it opens from a row's `☐ n` badge or the chat header's "To Do".
 - **Chat** — from the transcript `.jsonl` (`saves.rs::transcript_path`, re-resolved every 2 s since
   an in-TUI `/resume` moves it). Shown: human prompts (`origin.kind == "human"`), assistant text,
   tool calls collapsed with their results joined by id; task-notification wakes and interrupts as

@@ -3,7 +3,7 @@
   import Chat, { type Item } from "./Chat.svelte";
   import type { DialogView } from "./Dialog.svelte";
   import Term from "./Term.svelte";
-  import ForMe, { type AskList } from "./ForMe.svelte";
+  import Todo, { type TodoList } from "./Todo.svelte";
   import { unb64 } from "./crypto";
   import { dragSort, moveTo } from "./order";
   import { swipePages } from "./swipe";
@@ -28,12 +28,16 @@
     failed: string | null;
     /** The open question or plan, while the claude waits on it. */
     dialog: DialogView | null;
-    /** "For me": open items on its list, and edits waiting for UPDATE. */
-    asks_open?: number;
-    asks_pending?: number;
+    /** "To Do": open items on its list, and edits waiting for UPDATE. */
+    todos_open?: number;
+    todos_pending?: number;
+    /** Items with a claude comment not yet opened. */
+    todos_unread?: number;
+    /** Open items marked urgent: the badge turns red. */
+    todos_urgent?: number;
   };
-  /** `asks_rev` changes whenever any For-me list in the project does. */
-  type Project = { handle: number; name: string; sessions: Row[]; asks_rev?: number };
+  /** `todos_rev` changes whenever any To Do list in the project does. */
+  type Project = { handle: number; name: string; sessions: Row[]; todos_rev?: number };
   type View = { t: "state"; active: number | null; projects: Project[] };
 
   /** The claude whose conversation is open, if any. */
@@ -41,8 +45,8 @@
     null,
   );
 
-  /** The For-me screen, if open: one project's lists, focused on one claude. */
-  let forme = $state<{ handle: number; focus: number | null; lists: Record<string, AskList>; loading: boolean } | null>(
+  /** The To Do screen, if open: one project's lists, focused on one claude. */
+  let todo = $state<{ handle: number; focus: number | null; lists: Record<string, TodoList>; loading: boolean } | null>(
     null,
   );
 
@@ -90,7 +94,7 @@
         l.send({ t: "open", handle: chat.handle, id: chat.id });
       }
       if (l.state === "online" && term) l.send({ t: "term-open", handle: term.handle, id: term.id });
-      if (l.state === "online" && forme) l.send({ t: "asks-get", handle: forme.handle });
+      if (l.state === "online" && todo) l.send({ t: "todos-get", handle: todo.handle });
       // The Mac skips a notification for the claude open here only while
       // the app is actually in front; a minimized app can stay connected.
       if (l.state === "online") l.send({ t: "visible", on: document.visibilityState === "visible" });
@@ -108,9 +112,9 @@
         typing.get(msg.rid)?.({ ok: msg.ok, why: msg.why ?? null, id: msg.id ?? null });
         typing.delete(msg.rid);
       }
-      else if (msg.t === "asks" && forme && msg.handle === forme.handle) {
-        forme.lists = msg.lists ?? {};
-        forme.loading = false;
+      else if (msg.t === "todos" && todo && msg.handle === todo.handle) {
+        todo.lists = msg.lists ?? {};
+        todo.loading = false;
       }
       else if (msg.t === "chat" && chat && msg.handle === chat.handle && msg.id === chat.id) {
         chat.items = msg.reset ? msg.items : [...chat.items, ...msg.items];
@@ -290,27 +294,27 @@
     history.pushState({ term: true }, "");
   }
 
-  function openForMe(handle: number, focus: number | null) {
-    forme = { handle, focus, lists: {}, loading: true };
-    conn.send({ t: "asks-get", handle });
-    history.pushState({ forme: true }, "");
+  function openTodo(handle: number, focus: number | null) {
+    todo = { handle, focus, lists: {}, loading: true };
+    conn.send({ t: "todos-get", handle });
+    history.pushState({ todo: true }, "");
   }
 
   // Re-read the lists whenever the Mac says one of them changed.
-  let formeRev: number | undefined;
+  let todoRev: number | undefined;
   $effect(() => {
-    const rev = forme ? view?.projects.find((p) => p.handle === forme!.handle)?.asks_rev : undefined;
-    if (forme && rev !== undefined && rev !== formeRev && link === "online") {
-      if (formeRev !== undefined) conn.send({ t: "asks-get", handle: forme.handle });
-      formeRev = rev;
+    const rev = todo ? view?.projects.find((p) => p.handle === todo!.handle)?.todos_rev : undefined;
+    if (todo && rev !== undefined && rev !== todoRev && link === "online") {
+      if (todoRev !== undefined) conn.send({ t: "todos-get", handle: todo.handle });
+      todoRev = rev;
     }
-    if (!forme) formeRev = undefined;
+    if (!todo) todoRev = undefined;
   });
 
   function closeChat() {
-    // For me sits on top of whatever opened it: Back closes only it.
-    if (forme) {
-      forme = null;
+    // To Do sits on top of whatever opened it: Back closes only it.
+    if (todo) {
+      todo = null;
       return;
     }
     if (term) {
@@ -327,7 +331,7 @@
   // A reload (pull-to-refresh, or Android killing the app in the background)
   // starts on the list, but the history still holds the entry an open chat or
   // terminal pushed: the first Back would pop it and do nothing visible. Drop it.
-  if (history.state?.chat || history.state?.term || history.state?.forme) history.back();
+  if (history.state?.chat || history.state?.term || history.state?.todo) history.back();
   document.addEventListener("visibilitychange", () => {
     conn.send({ t: "visible", on: document.visibilityState === "visible" });
     clearNotifications();
@@ -499,16 +503,16 @@
       {#if refusal}<p class="refusal">{refusals[refusal] ?? refusal}</p>{/if}
       Open Remote Control on your Mac (⌘⇧O) and scan its QR code.
     </div>
-  {:else if forme}
-    {@const fp = view?.projects.find((p) => p.handle === forme!.handle)}
-    <ForMe
+  {:else if todo}
+    {@const fp = view?.projects.find((p) => p.handle === todo!.handle)}
+    <Todo
       claudes={ordered(fp?.sessions ?? []).filter((r) => r.row.kind === "claude").map((r) => ({ id: r.row.id, name: r.row.name ?? r.row.task }))}
-      lists={forme.lists}
-      focus={forme.focus}
-      loading={forme.loading}
+      lists={todo.lists}
+      focus={todo.focus}
+      loading={todo.loading}
       onback={() => history.back()}
-      onedit={(id, edit) => request({ t: "asks-edit", handle: forme!.handle, id, edit })}
-      onupdate={(ids) => request({ t: "asks-update", handle: forme!.handle, ids })}
+      onedit={(id, edit) => request({ t: "todos-edit", handle: todo!.handle, id, edit })}
+      onupdate={(ids) => request({ t: "todos-update", handle: todo!.handle, ids })}
     />
   {:else if term}
     <Term
@@ -536,8 +540,8 @@
       onkey={sendKey}
       dialog={chatRow?.status === "needs" ? (chatRow.dialog ?? null) : null}
       onanswer={sendAnswer}
-      asks={chatRow?.asks_open ?? 0}
-      onforme={() => chat && openForMe(chat.handle, chat.id)}
+      todos={chatRow?.todos_open ?? 0}
+      ontodo={() => chat && openTodo(chat.handle, chat.id)}
     />
   {:else}
     <header>
@@ -610,15 +614,16 @@
                 <div class="top">
                   <span class="id">{label(row)}</span>
                   <span class="st {row.status ?? ''}">{statusWord(row)}</span>
-                  {#if row.asks_open || row.asks_pending}
+                  {#if row.todos_open || row.todos_pending}
                     <button
-                      class="asks"
-                      class:pending={!!row.asks_pending}
-                      aria-label="For me"
+                      class="todos"
+                      class:pending={!!row.todos_pending}
+                      class:urgent={!!row.todos_urgent}
+                      aria-label="To Do"
                       onclick={(e) => {
                         e.stopPropagation();
-                        openForMe(shown.handle, row.id);
-                      }}>☐ {row.asks_open ?? 0}</button
+                        openTodo(shown.handle, row.id);
+                      }}>☐ {row.todos_open ?? 0}{#if row.todos_unread} 💬{/if}</button
                     >
                   {/if}
                   {#if row.ctx_pct != null}<span class="ctx {ctxLevel(row)}">{row.ctx_pct}%</span>{/if}
@@ -886,7 +891,7 @@
   .st.needs {
     color: var(--red);
   }
-  .asks {
+  .todos {
     padding: 0.05rem 0.5rem;
     border: 0;
     border-radius: 999px;
@@ -896,8 +901,12 @@
     font-size: 0.75rem;
     font-weight: 700;
   }
-  .asks.pending {
+  .todos.pending {
     box-shadow: 0 0 0 2px var(--yellow);
+  }
+  .todos.urgent {
+    background: var(--red);
+    color: #fff;
   }
   .ctx {
     margin-inline-start: auto;
