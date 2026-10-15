@@ -555,10 +555,11 @@ fn hub_set_focus(ctx: &Ctx, args: &Value) -> Result<String, String> {
 /// exactly as if the user had pressed ⌘R.
 ///
 /// **Fire-and-forget, unlike the terminal ops**, which wait for a `<token>.done`
-/// reply: nothing here depends on the outcome, and the one case where the request
-/// is *refused* — the user named this instance themselves, so their name wins —
-/// is not something the model should react to. Blocking a turn on a cosmetic
-/// rename would cost more than the answer is worth.
+/// reply: nothing here depends on the outcome, and blocking a turn on a cosmetic
+/// rename would cost more than the answer is worth. The one case where the
+/// request is *refused* — the user named this instance themselves, so their name
+/// wins — is read from the registry up front so the reply can say so: a reply
+/// of "renamed" to a refused request is how a silent lock went unnoticed.
 ///
 /// The `named/<id>` flag is written **here**, by the caller, rather than by
 /// Mulpex when it applies the rename: it records that this instance has had its
@@ -574,6 +575,25 @@ fn hub_set_name(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let name = flatten_label(raw);
     if name.is_empty() {
         return Err("'name' is empty — give a short label for this instance.".to_string());
+    }
+    // The user's name wins, and the model should hear that rather than be told
+    // the rename worked. The registry can lag a fresh ⌘R by a poll tick, so
+    // the app's own check in `name_verdict` stays the authority; this only
+    // keeps the reply honest.
+    let reg = Registry::read_for(&ctx.state_dir);
+    if let Some(row) = local_name(reg.project_for_dir(&ctx.project_dir), ctx.instance)
+        .filter(|i| i.name_by.as_deref() == Some("user"))
+    {
+        mark_named(ctx);
+        return Ok(json!({
+            "ok": false,
+            "refused": true,
+            "name": row.name,
+            "note": "Not renamed: the user named this instance themselves, and their name stays. \
+                     Don't retry; if a different name is needed, ask the user to clear or change \
+                     it (⌘R).",
+        })
+        .to_string());
     }
     // Keyed by instance id, so a second call supersedes a still-pending first
     // one instead of queueing a rename the model has already thought better of.
@@ -2999,6 +3019,28 @@ mod tests {
         assert!(hub_set_name(&ctx, &json!({})).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename the app will refuse (the user named the row) is reported as
+    /// refused, not as done — and still stops the nudge. Any other source,
+    /// including the instance's own earlier name, is renameable.
+    #[test]
+    fn naming_a_row_the_user_named_is_reported_as_refused() {
+        let (root, ctx, b_state) = two_projects("setname-refused");
+        name_project_a(&root, &ctx, &b_state, &[(1, Some("x"), "instance"), (2, Some("Deployer"), "user"), (3, None, "")]);
+
+        let v: Value = serde_json::from_str(&hub_set_name(&ctx, &json!({ "name": "my own idea" })).unwrap()).unwrap();
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["name"], "Deployer");
+        assert!(!ctx.state_dir.join("namereq").join("2").exists(), "a refused rename was still requested");
+        assert!(ctx.state_dir.join("named").join("2").exists(), "a refusal must still stop the nudge");
+
+        name_project_a(&root, &ctx, &b_state, &[(1, None, ""), (2, Some("old label"), "instance"), (3, None, "")]);
+        let v: Value = serde_json::from_str(&hub_set_name(&ctx, &json!({ "name": "new label" })).unwrap()).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(std::fs::read_to_string(ctx.state_dir.join("namereq").join("2")).unwrap(), "new label");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A spawned instance that has not been typed into yet is INDISTINGUISHABLE

@@ -349,8 +349,15 @@ Deployer existed, and shipped to production itself. Names were in the registry a
   reads them from `registry.json`; the app fills `InstanceEntry::name_by` from `Core::name_source`.
 - **The source is persisted** as an 8th store column (`persist::NameSource`), written only beside
   a name. A name without it — any store from before this — reports as `user`, matching how
-  `manual_names` has always treated a restored name. Restore *protection* is unchanged: every
-  restored name still refuses `hub_set_name`.
+  `manual_names` used to treat every restored name.
+- **Only a `user` name is locked on restore** (2026-10-15). Until then `Core::open` seeded
+  `manual_names` from *every* restored name, so after any relaunch or update an instance that had
+  named itself could never rename again — and `hub_set_name` still replied "renamed", so the
+  instance never knew. Now the seed is names whose source is `User` or missing; `instance`,
+  `spawn` and `auto` stay renameable. `hub_set_name` also reads `name_by` from `registry.json` and
+  replies `ok: false, refused: true` for a `user` row (still writing `named/<id>`). Pinned by
+  `a_restore_locks_only_the_names_the_user_set` and
+  `naming_a_row_the_user_named_is_reported_as_refused`.
 - **`hub_send` accepts a sidebar name** (`parse_target`): exact, trimmed, case-insensitive, this
   project only, alone or in a list. The address grammar is tried first, so a name can never
   shadow `all`, `3` or `claude#3`. Two rows with one name → refused with both addresses; your own

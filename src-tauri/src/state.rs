@@ -272,9 +272,9 @@ pub struct Core {
     pub store: SessionStore,
     /// Custom per-instance names (id → name), persisted alongside session ids.
     pub names: HashMap<usize, String>,
-    /// Ids whose name the **user** owns — set by ⌘R, and by a restore bringing a
-    /// name back (a persisted name can't be told apart from a hand-typed one, and
-    /// protecting it is the safe direction). An instance's own `hub_set_name` is
+    /// Ids whose name the **user** owns — set by ⌘R, and by a restore bringing
+    /// back a name saved as `User` (or with no saved source: protecting it is the
+    /// safe direction). An instance's own `hub_set_name` is
     /// refused for these: the user's label always wins. See `process_name_requests`.
     manual_names: HashSet<usize>,
     /// Provisional labels Mulpex derived from an instance's own task because it
@@ -567,9 +567,17 @@ impl Core {
             asks,
             asks_outbox: HashMap::new(),
             store,
-            // A name that survived a restart is treated as the user's, so the
-            // instance is neither nudged to rename itself nor allowed to.
-            manual_names: names.keys().copied().collect(),
+            // A restored name the USER set (⌘R, a save's title — or one from a
+            // store too old to say who set it) stays the user's, so the instance
+            // is neither nudged to rename itself nor allowed to. A name the
+            // instance gave itself, a spawn label or a guide title stays
+            // renameable: locking those made `hub_set_name` silently fail for
+            // every instance after any relaunch.
+            manual_names: names
+                .keys()
+                .filter(|id| name_by.get(id).map_or(true, |by| *by == NameSource::User))
+                .copied()
+                .collect(),
             names,
             name_by,
             fallback_names: HashMap::new(),
@@ -4661,6 +4669,68 @@ mod tests {
         core.rename(id, "  ");
         assert!(!flag.exists(), "clearing the name re-opens it to auto-naming");
         assert!(!core.manual_names.contains(&id));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// After a relaunch only a name the USER set stays locked. Seeding the lock
+    /// from every restored name made `hub_set_name` silently fail for any
+    /// instance that had named itself before the app restarted or updated.
+    #[test]
+    fn a_restore_locks_only_the_names_the_user_set() {
+        let _guard = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-restore-names-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("HOME", root.join("home"));
+
+        let saved = |id: usize, name: &str, name_by: Option<NameSource>| persist::SavedSession {
+            session_id: persist::new_uuid(),
+            name: Some(name.into()),
+            muted: false,
+            id: Some(id),
+            parent: None,
+            collapsed: false,
+            auto_compact: None,
+            name_by,
+            asks: false,
+        };
+        SessionStore::new(&project_dir).save(&[
+            saved(1, "Deployer", Some(NameSource::User)),
+            saved(2, "auth fix", Some(NameSource::Instance)),
+            // A store from before sources were saved: treated as the user's.
+            saved(3, "legacy", None),
+            saved(4, "spawned task", Some(NameSource::Spawn)),
+            saved(5, "guide title", Some(NameSource::Auto)),
+        ]);
+        let mut core = Core::open(
+            1,
+            project_dir,
+            Path::new("/nonexistent/mulpex-helper"),
+            root.join("state"),
+            TEST_GEOMETRY,
+        )
+        .unwrap();
+
+        let mut locked: Vec<usize> = core.manual_names.iter().copied().collect();
+        locked.sort();
+        assert_eq!(locked, vec![1, 3]);
+        for id in [1, 3] {
+            assert!(mulpex_core::named_flag_path(&core.state_dir, id).exists(), "claude#{id} would be nudged");
+        }
+
+        let req = core.state_dir.join("namereq");
+        for id in 1..=5 {
+            std::fs::write(req.join(id.to_string()), "renamed mid-conversation").unwrap();
+        }
+        assert!(core.process_name_requests());
+        assert_eq!(core.names[&1], "Deployer", "the user's name must win");
+        assert_eq!(core.names[&3], "legacy", "an unknown-source name must stay the user's");
+        for id in [2, 4, 5] {
+            assert_eq!(core.names[&id], "renamed mid-conversation", "claude#{id} could not rename itself");
+            assert_eq!(core.name_source(id), Some(NameSource::Instance));
+        }
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
