@@ -122,11 +122,14 @@ keep-awake inside an xrdp session.
 
 ## Releasing
 
-`scripts/release-linux.sh --host <user@linux-box>`, on the Mac, **after**
-`release.sh`. It builds `git archive HEAD` on the Linux host, copies the
+`scripts/release-linux.sh --host <user@linux-box>`, on the Mac. `release.sh` runs it
+itself while the release is still a draft, and publishes only after it succeeds (see
+docs/remote-hosts.md, "Updates"). It builds `git archive HEAD` on the Linux host, copies the
 `.AppImage` and `.deb` back, signs both with `~/.mulpex/updater.key` (the key
 never leaves the Mac), uploads them to the same release, and adds
 `linux-x86_64` (AppImage) and `linux-x86_64-deb` to `latest.json`, uploaded last.
+**A host driven from a Mac must run the AppImage.** The Mac updates it remotely,
+and the `.deb` path needs a root password dialog on the Linux screen.
 The deb key matters: on a deb install the updater looks up
 `linux-x86_64-deb` *first* and would otherwise fall back to the AppImage entry
 and hand an AppImage to dpkg.

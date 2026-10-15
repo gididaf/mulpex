@@ -11,6 +11,15 @@
 #   scripts/release.sh                       # build, publish, notes from git log
 #   scripts/release.sh --notes "what's new"  # explicit release notes
 #   scripts/release.sh --dry-run             # build + write latest.json, upload nothing
+#   scripts/release.sh --mac-only            # skip the Linux build (see below)
+#
+# The Linux build (scripts/release-linux.sh) runs as part of this, BEFORE the
+# release is published: the release is created as a draft, Linux adds itself
+# to its latest.json, and only then does it go public. A Mac that updates
+# orders its remote hosts (Linux VMs) to update to the same version first
+# (docs/remote-hosts.md), so a public latest.json without Linux in it would
+# fail every such update. --linux-host (or MULPEX_LINUX_HOST) picks the build
+# machine; it defaults to the one release-linux.sh documents.
 #
 # Version comes from src-tauri/tauri.conf.json — bump it (and Cargo.toml) first.
 set -euo pipefail
@@ -20,11 +29,15 @@ KEY="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key}"
 REPO="gididaf/mulpex"
 DRY_RUN=0
 NOTES=""
+MAC_ONLY=0
+LINUX_HOST="${MULPEX_LINUX_HOST:-gidi@89.42.24.40}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --notes) NOTES="$2"; shift 2 ;;
+    --mac-only) MAC_ONLY=1; shift ;;
+    --linux-host) LINUX_HOST="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -177,13 +190,26 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # ---- publish ---------------------------------------------------------------
-# Not a draft and not a prerelease: the endpoint is /releases/latest/download/,
-# which resolves to the newest *published, non-prerelease* release. A draft here
-# would ship an update nobody can see.
-gh release create "$TAG" -R "$REPO" \
+# A draft first: the endpoint is /releases/latest/download/, which resolves to
+# the newest *published, non-prerelease* release, so nothing sees this until
+# the Linux half is in its latest.json too. If the Linux step fails, the draft
+# stays a draft — fix it and run release-linux.sh, then publish it by hand:
+#   gh release edit <tag> -R gididaf/mulpex --draft=false --latest
+gh release create "$TAG" -R "$REPO" --draft \
   --title "Mulpex $TAG" \
   --notes "$NOTES" \
   "$DMG" "$TARBALL" "$SIGFILE" "$LATEST"
+echo "==> created draft $TAG"
 
+if [ "$MAC_ONLY" -eq 0 ]; then
+  scripts/release-linux.sh --host "$LINUX_HOST" || {
+    echo "ERROR: the Linux build failed; $TAG is still a DRAFT (nothing shipped)." >&2
+    echo "  Fix it, run scripts/release-linux.sh --host $LINUX_HOST, then:" >&2
+    echo "  gh release edit $TAG -R $REPO --draft=false --latest" >&2
+    exit 1
+  }
+fi
+
+gh release edit "$TAG" -R "$REPO" --draft=false --latest
 echo "==> published $TAG"
 echo "    updater endpoint: https://github.com/$REPO/releases/latest/download/latest.json"

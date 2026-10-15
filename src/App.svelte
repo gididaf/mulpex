@@ -1565,7 +1565,7 @@
           activeHost: get(activeHost),
           activeProject: get(activeProjectHandle),
           activeSession: get(activeId),
-          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo })),
+          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo, update: h.update })),
           projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
           text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
           dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },

@@ -852,6 +852,11 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
   project is open and whose id is a live claude again (instance numbers survive a restore), and
   deletes the file if nothing matches. "Wake all" queues "Mulpex is back — re-arm the monitors you
   noted, continue if anything is left" for each and deletes the file; "Not now" just deletes it.
+- **`auto_wake`.** An update ordered by another Mulpex (docs/remote-hosts.md, `remote_update.rs`)
+  checkpoints headless and writes `checkpoint.json` with `auto_wake: true`. Nobody is at that
+  screen to click "Wake all", so `lib.rs` setup calls `checkpoint_auto_wake` right after the
+  projects restore. That queues the wake and deletes the file before the frontend could offer it.
+  A file from before the field reads as `false`.
 - **The wake waits for the listener.** `listen.rs` seeds its count from what is already in the
   inbox, so mail that lands before the listener starts is **never announced** — a restored claude
   still booting would sit on it until its next turn. So the poll loop (`drain_wake_queue`)

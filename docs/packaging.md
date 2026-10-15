@@ -212,8 +212,12 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   release published to exercise the real path end to end.
 - **Releasing:** `npm run release` (`scripts/release.sh`) — preflights the key, the
   tauri.conf.json/Cargo.toml version agreement, a clean tree, **an upstream with nothing
-  unpushed**, and an unused tag; builds; writes `latest.json`; `gh release create`s all four
-  artifacts. The unpushed check exists because `gh release create` is called with **no
+  unpushed**, and an unused tag; builds; writes `latest.json`; `gh release create --draft`s all
+  four artifacts. It then runs `release-linux.sh` (`--linux-host`, default the VM;
+  `--mac-only` skips it), and only then makes the release public (`gh release edit --draft=false
+  --latest`). The draft is there because the Mac orders its remote hosts to update to its own new
+  version first (docs/remote-hosts.md): a public `latest.json` without Linux in it would fail every
+  such update. If the Linux step fails, the release stays a draft and nothing has shipped. The unpushed check exists because `gh release create` is called with **no
   `--target`**, so GitHub creates the tag at the *remote* default branch's HEAD: with local
   commits unpushed, the tag names code the release does not contain — **silently**, since the
   uploaded artifacts are the correct local build, so the release works while its source tag

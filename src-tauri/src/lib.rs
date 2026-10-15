@@ -2,6 +2,7 @@
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
 mod checkpoint;
+mod remote_update;
 mod claude_bin;
 mod commands;
 mod hub;
@@ -203,6 +204,9 @@ pub fn run() {
             remote::client::host_frontend_action,
             remote::client::host_upload,
             remote::client::host_clipboard_image,
+            remote::client::host_update,
+            remote::client::host_update_cancel,
+            remote::client::host_update_clear,
             fda::has_full_disk_access,
             fda::open_full_disk_access_settings,
         ])
@@ -251,6 +255,9 @@ pub fn run() {
                 ws.active = ws.projects.first().map(|c| c.handle);
                 // Drop any dirs that no longer exist / failed to open from the set.
                 ws.persist_open();
+                // An update ordered from another Mulpex checkpointed these
+                // claudes; wake them as their listeners come up, unasked.
+                ws.checkpoint_auto_wake();
             }
             remote::init(app.handle().clone());
             remote::client::init(app.handle().clone());

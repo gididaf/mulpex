@@ -954,11 +954,13 @@ struct Server {
     epoch: u64,
     sessions: HashMap<u64, Session>,
     sent_seq: u64,
+    /// The last `remote_update` progress sent (its `seq`).
+    update_seq: u64,
 }
 
 impl Server {
     fn new(epoch: u64) -> Self {
-        Server { epoch, sessions: HashMap::new(), sent_seq: 0 }
+        Server { epoch, sessions: HashMap::new(), sent_seq: 0, update_seq: 0 }
     }
 
     /// Serve one connection. `Ok` means stop for good (turned off or
@@ -1012,6 +1014,7 @@ impl Server {
             }
             self.pump_terminals(ws)?;
             self.pump_desktops(ws)?;
+            self.pump_update(ws)?;
             self.sync_viewing();
             let replies: Vec<(u64, String)> = {
                 let mut g = inner().lock().unwrap();
@@ -1041,6 +1044,25 @@ impl Server {
                 Err(e) => return Err(e.to_string()),
             }
         }
+    }
+
+    /// A remote-ordered update's progress, to every session of the device that
+    /// ordered it — a reconnect gets a new session, and must still hear it.
+    fn pump_update(&mut self, ws: &mut Ws) -> Result<(), String> {
+        let Some((seq, device, msg)) = crate::remote_update::progress() else { return Ok(()) };
+        if seq == self.update_seq {
+            return Ok(());
+        }
+        let cids: Vec<u64> = self.sessions.iter().filter(|(_, s)| s.device == device).map(|(c, _)| *c).collect();
+        if cids.is_empty() {
+            // Nobody to tell yet: keep it until the device is back.
+            return Ok(());
+        }
+        self.update_seq = seq;
+        for cid in cids {
+            self.send_sealed(ws, cid, &msg)?;
+        }
+        Ok(())
     }
 
     fn send_sealed(&mut self, ws: &mut Ws, cid: u64, plain: &str) -> Result<(), String> {
@@ -1149,6 +1171,24 @@ impl Server {
         let t = req.get("t").and_then(Value::as_str).unwrap_or("");
         if t == "hello" && req.get("kind").and_then(Value::as_str) == Some("desktop") {
             return self.desk_hello(ws, cid, &req);
+        }
+        // Before the desk check on purpose: a host one version behind refuses
+        // the desktop's `hello`, and this is how it gets updated anyway.
+        if t == "update" || t == "update-cancel" {
+            let device = self.sessions.get(&cid).map(|s| s.device.clone()).unwrap_or_default();
+            let app = inner().lock().unwrap().app.clone();
+            match (t, app) {
+                ("update", Some(app)) => {
+                    let to = req.get("to").and_then(Value::as_str).unwrap_or("");
+                    crate::remote_update::order(app, &device, to);
+                    // A re-order of a run whose progress this device already
+                    // has must still answer, or its client waits forever.
+                    self.update_seq = 0;
+                }
+                ("update-cancel", _) => crate::remote_update::cancel(),
+                _ => {}
+            }
+            return Ok(());
         }
         if self.desk_request(ws, cid, t, &req)? {
             return Ok(());

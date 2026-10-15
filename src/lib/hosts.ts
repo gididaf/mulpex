@@ -33,12 +33,36 @@ export interface HostStatus {
   name: string;
   relay_url: string;
   enabled: boolean;
-  state: "connecting" | "connected" | "offline" | "error" | "disconnected";
+  /** `updating`: it refused this version and is updating to it (`update`). */
+  state: "connecting" | "connected" | "offline" | "error" | "disconnected" | "updating";
   error: string | null;
   boot: string | null;
   cached_boot: string | null;
   geo: HostGeo | null;
   layout: HostLayout | null;
+  /** The host's app version, once it said. */
+  version: string | null;
+  /** An update this Mulpex ordered there (`client.rs::HostUpdate`). */
+  update: HostUpdate | null;
+}
+
+/** Mirrors `client.rs::HostUpdate`. */
+export interface HostUpdate {
+  to: string;
+  step:
+    | "sent"
+    | "checking"
+    | "stopping"
+    | "downloading"
+    | "installing"
+    | "restarting"
+    | "done"
+    | "error"
+    | "cancelled";
+  /** While `stopping`: the claudes there still working. */
+  pending: { project: string; id: number; name: string | null }[];
+  percent: number | null;
+  error: string | null;
 }
 
 /** What is cached of a host's tabs, to draw them greyed while unreachable. */
@@ -89,4 +113,7 @@ export const hostGeoClaim = (host: number, cols: number, rows: number) =>
 export const hostFrontendAction = (host: number, projectHandle: number, id: number, action: string) =>
   invoke<void>("host_frontend_action", { host, projectHandle, id, action });
 export const hostUpload = (host: number, paths: string[]) => invoke<string[]>("host_upload", { host, paths });
+export const hostUpdate = (host: number, version: string) => invoke<void>("host_update", { host, version });
+export const hostUpdateCancel = (host: number) => invoke<void>("host_update_cancel", { host });
+export const hostUpdateClear = (host: number) => invoke<void>("host_update_clear", { host });
 export const hostClipboardImage = (host: number) => invoke<string | null>("host_clipboard_image", { host });

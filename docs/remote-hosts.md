@@ -147,6 +147,9 @@ The rest of the lease:
     its tabs.
 - **On disconnect:** the tabs stay, greyed, with every status cleared. A claude on an unreachable
   host is not "waiting" for anyone, and must not light a badge.
+- **At launch** `initHosts` listens for `host-changed` *before* reading `host_list`, then reads
+  it once more. The connections start in the backend's setup, so a host can reach `connected`
+  before the frontend listens, and that event would otherwise be lost: "connecting" forever.
 - **Host restart:** a new `boot` id means every handle may now name something else, so that
   host's tabs are dropped and rebuilt.
 - **Attention:** remote claudes count in the dock badge and notifications, which name the host.
@@ -154,7 +157,53 @@ The rest of the lease:
   needed you there doesn't fire a burst of banners.
 - **Versions:** `hello` carries the app version, and a mismatch is refused with the other side's
   version. A host from before Remote Hosts answers with a phone view, which the Mac reports as
-  "too old".
+  "too old". The Mac keeps its hosts on its own version itself — see **Updates** below.
+
+## Updates: the hosts go first (`remote_update.rs`, `updater.ts`)
+
+Both sides must run the same version, and after the Mac restarts into an update its `hello` is
+refused. So an update order has to reach each host *before* the Mac restarts — or, for a host that
+was offline then, through the refusal itself.
+
+- **The message.** `{"t":"update","to":v}` / `{"t":"update-cancel"}`, Mac → host, sealed like
+  everything else. It is handled in `on_sealed` **before** the desk check, so a host that just
+  refused our version still accepts it. It is not an RPC and is not in `rpc.rs`'s allowlist.
+  The host answers with `update-progress` (`step`: `checking` → `stopping` (with `pending`, the
+  claudes still working) → `downloading` (`percent`) → `installing` → `restarting`, or `error` /
+  `cancelled`). `pump_update` sends the latest one to every session of the device that ordered it,
+  so a reconnect mid-run still hears it.
+- **The host runs it headless** (`remote_update.rs`), since nobody is at its screen:
+  1. `updater().check()`; the version offered must equal `to`, or it is an error. That catches
+     a latest.json the Linux build is missing from.
+  2. `checkpoint_stop` (the ⌘⇧Q messages).
+  3. Wait until `checkpoint_not_stopped` is empty for 1.5 s, which is `checkpoint.ts`'s "done" rule
+     in Rust. There is no timeout: the Mac's banner lists who is still working, and its Cancel
+     un-stops them (`checkpoint_cancel`).
+  4. `download`, then `install`.
+  5. `checkpoint_commit(auto_wake = true)`.
+  6. `request_restart`.
+
+  Any failure after step 2 un-stops the claudes. On the next launch, `lib.rs` setup calls
+  `checkpoint_auto_wake`, which queues the wake with no "Wake all" dialog (docs/sessions.md).
+- **The Mac, one click** (`updater.ts::applyUpdate`): before its own busy check and install, it
+  calls `host_update` on every *connected* host and waits on `HostStatus.update` until each says
+  `done`. Each host is `done` when its reconnect is refused with `app == to` (the Mac is still on
+  the old version, so that refusal *is* the success). Any host error or Cancel calls the rest off,
+  and the Mac does not update. Its hosts still run the old version, so the link keeps working.
+  The banner shows one line per host (`UpdateBanner.svelte`).
+- **A late host** (offline during the update, so now older than the Mac): `client.rs::on_refused`
+  sees a host strictly older by number (`version_of`, never a string compare) and orders it to the
+  Mac's version on the spot. The host's state reads `updating`, and a `restarting` ends the link
+  with `Retry`, so backoff reconnects to the updated host. A host newer than the Mac keeps the old
+  "update both" message, unless the Mac ordered that version, in which case it is `done`.
+- **A host from before this feature** ignores the unknown message. After 30 s with no answer
+  (`UPDATE_ANSWER`), the Mac says to update it by hand once.
+- **Linux hosts must run the AppImage.** The `.deb`'s updater runs `dpkg -i` as root through
+  pkexec or zenity, which is a password dialog on a screen nobody is watching. The AppImage
+  replaces its own file.
+- **Releases are drafts until Linux is in.** `release.sh` creates the release as a draft, runs
+  `release-linux.sh`, and only then publishes (docs/packaging.md). A public latest.json without
+  `linux-x86_64` would fail every remote update at step 1.
 
 ## UX
 
@@ -207,3 +256,11 @@ The rest of the lease:
   before the host was read) was replayed and its fix checked, with no window on screen. Write actions
   with `printf '%s'`, never `echo`: zsh's `echo` turns `\r` into a raw CR, the JSON stops parsing, and
   the action silently never runs (that cost an hour of chasing a typing bug that did not exist).
+- **Remote updates, end to end:** `bash scripts/test-remote-update.sh`. It builds two real `.app`
+  bundles, BASE and a made-up NEXT, both pointed at a local `latest.json` that offers NEXT
+  (`dangerousInsecureTransportProtocol`, so nothing touches GitHub). It runs two scenarios:
+  - **late host:** A is on BASE and B on NEXT, and A must update itself;
+  - **one click:** both are on BASE, and a driven click on B's "Update & Restart" must update A,
+    then B.
+
+  `CLAUDE=1` adds a busy real claude in A, which must get both the stop and the wake.
