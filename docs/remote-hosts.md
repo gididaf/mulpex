@@ -176,9 +176,15 @@ was offline then, through the refusal itself.
   1. `updater().check()`; the version offered must equal `to`, or it is an error. That catches
      a latest.json the Linux build is missing from.
   2. `checkpoint_stop` (the ⌘⇧Q messages).
-  3. Wait until `checkpoint_not_stopped` is empty for 1.5 s, which is `checkpoint.ts`'s "done" rule
-     in Rust. There is no timeout: the Mac's banner lists who is still working, and its Cancel
-     un-stops them (`checkpoint_cancel`).
+  3. Wait until `checkpoint_not_stopped` is empty for 1.5 s. That is `checkpoint.ts`'s "done" rule
+     (read it and `waiting`) plus two cases a person at the screen would wave through:
+     - **idle with a dead listener:** it can never read the message, and nothing is in progress;
+     - **read it, turn over, only background work left** (`only_background_work`): the restart
+       ends that work anyway.
+
+     Both held the first real update forever (2026-10-15, docs/verification-log.md). A `needs` or
+     a claude still mid-turn still holds it. There is no timeout: the Mac's banner lists who is
+     still working, and its Cancel un-stops them (`checkpoint_cancel`).
   4. `download`, then `install`.
   5. `checkpoint_commit(auto_wake = true)`.
   6. `request_restart`.

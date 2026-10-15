@@ -270,10 +270,19 @@ impl Workspace {
         self.checkpoint_wake()
     }
 
-    /// The claudes asked to stop this round that have not stopped yet: alive,
-    /// and either the stop message is unread or the claude is not `waiting`.
-    /// The headless twin of `checkpoint.ts`'s "done" rule (minus its settle
-    /// delay, which `remote_update.rs` applies itself).
+    /// The claudes asked to stop this round that have not stopped yet — the
+    /// headless test `remote_update.rs` waits on (it applies its own settle
+    /// delay). Nobody is at that screen to judge a stuck row, so beyond
+    /// `checkpoint.ts`'s "read it and is `waiting`" this also counts as stopped:
+    ///
+    /// - **idle with no hub listener**: it can never read the message, and has
+    ///   nothing in progress either (2026-10-15: three such claudes held a
+    ///   remote update forever, listeners dead for 52 min);
+    /// - **read it and ended its turn, with only background work left**
+    ///   (`only_background_work`): the restart ends that work anyway, and its
+    ///   checkpoint note says what it was (claude#1222 the same day).
+    ///
+    /// A claude asking a question (`needs`) or still mid-turn is not stopped.
     pub fn checkpoint_not_stopped(&self) -> Vec<Target> {
         self.checkpoint
             .sent
@@ -285,9 +294,13 @@ impl Workspace {
                 }
                 let unread = s.file.as_ref().is_some_and(|f| f.exists());
                 let word = std::fs::read_to_string(core.state_dir.join(s.id.to_string())).unwrap_or_default();
-                // A missing file is `waiting` everywhere else in Mulpex too.
-                let waiting = matches!(word.trim(), "" | "waiting");
-                (unread || !waiting).then(|| Target {
+                let stopped = stopped_rule(
+                    unread,
+                    word.trim(),
+                    core.listener_alive(s.id),
+                    mulpex_core::only_background_work(&core.state_dir, s.id),
+                );
+                (!stopped).then(|| Target {
                     handle: core.handle,
                     project: core.project_name.clone(),
                     id: s.id,
@@ -318,6 +331,18 @@ impl Workspace {
                 self.checkpoint.wake.push((handle, id, at));
             }
         }
+    }
+}
+
+/// `checkpoint_not_stopped`'s rule, on its four inputs. A missing status file
+/// (`""`) is `waiting`, as everywhere else in Mulpex.
+fn stopped_rule(unread: bool, status: &str, listener: bool, only_background: bool) -> bool {
+    let idle = matches!(status, "" | "waiting");
+    if unread {
+        // It can't read it without a listener, and it is doing nothing.
+        idle && !listener
+    } else {
+        idle || (status == "working" && only_background)
     }
 }
 
@@ -360,6 +385,29 @@ mod tests {
             auto_wake: false,
         };
         assert!(ws.match_saved(&saved).is_empty());
+    }
+
+    /// The two cases that held a remote update forever on 2026-10-15, and the
+    /// ones that must still hold it.
+    #[test]
+    fn the_stopped_rule() {
+        // read + idle: the ordinary stop
+        assert!(stopped_rule(false, "waiting", true, false));
+        assert!(stopped_rule(false, "", false, false));
+        // unread, idle, listener dead: it can never read it (claude#143/#229/#1)
+        assert!(stopped_rule(true, "", false, false));
+        assert!(stopped_rule(true, "waiting", false, false));
+        // unread, idle, listener alive: the message is on its way
+        assert!(!stopped_rule(true, "waiting", true, false));
+        // read, turn over, a background job still running (claude#1222)
+        assert!(stopped_rule(false, "working", true, true));
+        // read, still mid-turn
+        assert!(!stopped_rule(false, "working", true, false));
+        // unread and busy
+        assert!(!stopped_rule(true, "working", false, true));
+        // a question is waiting for someone
+        assert!(!stopped_rule(false, "needs", true, false));
+        assert!(!stopped_rule(true, "needs", false, false));
     }
 
     /// The bodies tell the claude the one thing it cannot know: not to reply.

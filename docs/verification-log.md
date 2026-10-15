@@ -2525,3 +2525,27 @@ Found on the way:
 
 NOT driven: a Linux host (the AppImage self-replace, on the real VM), the Cancel button mid-stop,
 and a host offered the wrong version.
+
+## 2026-10-15 — the first real remote update stuck at "checkpointing"
+
+The user's Mac (v0.44.0) updated the VM to v0.45.1, and the banner sat at "4 still working". Read
+off the VM's live scratch dir:
+
+- **claude#143, claude#229 and the Postgres claude#1:** idle, with no status file. Their
+  `armed/<id>` heartbeat was 52 minutes old, so the listener was dead and the stop message sat
+  unread in `inbox/<id>`.
+- **claude#1222:** it had read the stop and written its checkpoint note (transcript, 11:55:51).
+  The Stop hook then wrote `working`, with `bg/<id>` stamped at the same instant, because a
+  background job was still running.
+
+`checkpoint_not_stopped` wanted "read and `waiting`" from all four, so it waited forever. Unblocked
+on the user's word by taking back the three unread stop files and writing `waiting` for
+claude#1222. The VM then downloaded, installed (the AppImage was replaced at 12:01:02) and
+relaunched. All 24 claudes came back, every one got the wake, and `checkpoint.json` was consumed.
+
+Fixed by counting both cases as stopped (`checkpoint.rs::stopped_rule`, unit-tested on all
+four inputs).
+
+Also seen: the old AppImage launcher process outlived the restart, with no children (its
+`mulpex` had exited and its scratch dir was gone). It was killed by hand; it was harmless, but
+it kept the old mount alive.

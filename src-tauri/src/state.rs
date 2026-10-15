@@ -2428,6 +2428,17 @@ impl Core {
         fresh && settled
     }
 
+    /// Whether `claude#id`'s hub listener is running at all (its heartbeat is
+    /// fresh), however recently it started — unlike `listener_ready`, which also
+    /// waits out its first seconds.
+    pub fn listener_alive(&self, id: usize) -> bool {
+        std::fs::metadata(self.state_dir.join("armed").join(id.to_string()))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a < Duration::from_secs(30))
+    }
+
     /// Mark instances "worked on" once their hook state file appears (a prompt
     /// was submitted). Persists if the set grew. Ports the worked half of
     /// `App::refresh_statuses`.
