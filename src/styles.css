@@ -34,6 +34,22 @@ body,
   background: var(--bg);
 }
 
+/* Linux: room for the in-window menu bar (MenuBar.svelte), which is fixed at
+   the top. Everything else sizes against #app's content box, so the shell,
+   the picker and the terminal's geometry all lose exactly this much. */
+:root {
+  --menubar-h: 26px;
+  /* What a fixed-position card pinned near the top must add (0 off Linux). */
+  --menubar-offset: 0px;
+}
+html.has-menubar {
+  --menubar-offset: var(--menubar-h);
+}
+html.has-menubar #app {
+  padding-top: var(--menubar-h);
+  box-sizing: border-box;
+}
+
 button {
   font: inherit;
   color: inherit;

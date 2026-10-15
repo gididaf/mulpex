@@ -107,6 +107,7 @@
 
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
+  import MenuBar from "./lib/components/MenuBar.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CheckpointPanel from "./lib/components/CheckpointPanel.svelte";
@@ -1696,6 +1697,14 @@
 </script>
 
 <svelte:window onkeydown={onGlobalKey} />
+
+{#if IS_LINUX}
+  <!-- Linux has no native menu; this is the Mac's, in the window. -->
+  <MenuBar
+    onmenu={(id) => void handleMenu(id)}
+    onedit={(kind) => void import("./lib/linuxKeys").then((m) => m.editAction(kind))}
+  />
+{/if}
 
 {#if ready && ($projects.size > 0 || $hosts.size > 0)}
   <div class="shell">

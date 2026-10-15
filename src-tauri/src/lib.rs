@@ -102,7 +102,7 @@ pub fn run() {
             helper_path: resolve_helper_path(),
         });
     // The native menu is macOS-only. Linux has no global menu bar, and a GTK
-    // strip in the window was declined: there the webview claims every
+    // strip in the window was declined (the webview draws its own, `MenuBar.svelte`): there the webview claims every
     // shortcut itself (`lib/linuxKeys.ts`) and feeds the same ids into the same
     // `handleMenu`, so no command has a second implementation.
     #[cfg(target_os = "macos")]

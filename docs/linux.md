@@ -12,9 +12,40 @@ Back to [CLAUDE.md](../CLAUDE.md).
 | --- | --- |
 | ⌘ on Linux | **Super**. The Mac's ⌘ arrives as Super over RDP, so every shortcut is the same key. XFCE's own Super bindings must be off on the machine. |
 | Copy / paste | **Super+C / Super+V / Super+A / Super+X.** Ctrl+C is never touched — it stays the terminal's interrupt. No Ctrl+Shift+C/V, no middle-click paste. |
-| Menu | **None.** No GTK menu strip. The webview claims every shortcut itself; keyless commands (Check for Updates, Import Docs) are in the ⌘P palette; minimize/maximize/close are the window manager's. |
+| Menu | **An in-window menu bar** (`MenuBar.svelte`, since 2026-10-15), drawn by the webview in the app's theme. No native/GTK menu. The webview claims every shortcut itself; keyless commands (Check for Updates, Import Docs) are in the menu and the ⌘P palette. |
 | Dock badge | **Window title**: `(3) Mulpex`, which the XFCE taskbar shows. |
 | Packaging | **AppImage + .deb**, both self-updating, signed on the Mac (`scripts/release-linux.sh`). |
+
+## The menu bar (`MenuBar.svelte`)
+
+Added 2026-10-15, because the user drives the VM over Remote Desktop from the Mac
+and **⌘ did not reach the VM as Super there**: with no menu, nothing was
+reachable at all, not even Check for Updates.
+
+- A fixed 26 px strip (`--menubar-h`), shown only when `IS_LINUX`. `main.ts` adds
+  `html.has-menubar` **before mount**, which pads `#app`, so the first layout
+  (and the terminal geometry measured from it) already leaves room. Cards pinned
+  near the top add `--menubar-offset`.
+- It holds the Mac's menus (Mulpex, File, Edit, Session, Window) with the same ids,
+  run through the same `handleMenu`. **A third table to keep in step** with
+  `menu.rs` and `linuxKeys.ts`. Mac-only items (About, Services, Hide, Full Disk
+  Access, Undo/Redo) are left out. File lists the open projects by name (⌘1–⌘9).
+  Mute shows a ✓ for the focused row.
+- Labels use ⌘ symbols, since the user works from a Mac.
+- Mouse only, like a desktop menu bar: click a title, hover switches menus while
+  one is open, Esc / a click outside / losing window focus closes it. Alt belongs
+  to the terminal, so there is no Alt navigation.
+- Every title and item cancels `mousedown`, so focus never leaves the terminal or
+  field: Edit's Copy/Paste/Select All act on it through `linuxKeys.ts::editAction`,
+  the Super+C/V/A code.
+- Measured on the VM (Xvfb, a real build): every menu opens and hover-switches,
+  New Terminal and Mute run, the ✓ follows, Esc closes, Copy/Paste/Select All work
+  in a terminal.
+- **Known, older than the menu:** pasting a whole Select-All screen into a shell
+  terminal froze that xterm's *drawing*, though the shell got every byte (the
+  `terminals/<id>.log` transcript and the debug dump both had the later output).
+  A 5-line paste and a one-liner were fine. It is the same `terminals.pasteActive`
+  path Super+V uses. Not investigated further.
 
 ## Keys: the webview is the menu
 

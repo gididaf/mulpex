@@ -102,7 +102,7 @@
 <style>
   .card {
     position: fixed;
-    top: 3.2rem;
+    top: calc(3.2rem + var(--menubar-offset));
     right: 1rem;
     z-index: 60;
     width: 25rem;
