@@ -41,6 +41,9 @@ const ACK_EVERY: u64 = 256 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 const UPLOAD_CHUNK: usize = 256 * 1024;
 const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
+/// An update order with no progress back by now went to a host from before
+/// remote updates existed: it ignores a message it doesn't know.
+const UPDATE_ANSWER: Duration = Duration::from_secs(30);
 
 pub fn base_of(slot: u32) -> u64 {
     (slot as u64) << 32
@@ -95,6 +98,35 @@ pub struct HostStatus {
     pub cached_boot: Option<String>,
     pub geo: Option<Value>,
     pub layout: Option<Value>,
+    /// The host's app version, from its `welcome` or `refused`.
+    pub version: Option<String>,
+    /// An update this Mulpex ordered on the host (`remote_update.rs` there).
+    pub update: Option<HostUpdate>,
+}
+
+/// A remote-ordered update, as the host last reported it. `step`: `sent` (no
+/// answer yet), then the host's `checking` / `stopping` / `downloading` /
+/// `installing` / `restarting`, and `done` once it is back on `to` — or
+/// `error` / `cancelled`.
+#[derive(Clone, Serialize)]
+pub struct HostUpdate {
+    pub to: String,
+    pub step: String,
+    /// While `stopping`: the claudes there that have not stopped yet.
+    pub pending: Value,
+    pub percent: Option<u64>,
+    pub error: Option<String>,
+    #[serde(skip)]
+    sent_at: Instant,
+}
+
+impl HostUpdate {
+    fn new(to: &str) -> Self {
+        HostUpdate { to: to.into(), step: "sent".into(), pending: json!([]), percent: None, error: None, sent_at: Instant::now() }
+    }
+    fn ended(&self) -> bool {
+        matches!(self.step.as_str(), "done" | "error" | "cancelled")
+    }
 }
 
 struct Conn {
@@ -102,8 +134,13 @@ struct Conn {
     state: String,
     error: Option<String>,
     tx: Option<Sender<String>>,
+    /// The sealed link, from the handshake on — unlike `tx`, also while the
+    /// host refused this version, which is when an update order must go out.
+    link: Option<Sender<String>>,
     geo: Option<Value>,
     boot: Option<String>,
+    version: Option<String>,
+    update: Option<HostUpdate>,
 }
 
 struct Inner {
@@ -154,6 +191,8 @@ fn status_of(g: &Inner, h: &HostCfg) -> HostStatus {
         cached_boot: h.boot.clone(),
         geo: c.and_then(|c| c.geo.clone()),
         layout: h.layout.clone(),
+        version: c.and_then(|c| c.version.clone()),
+        update: c.and_then(|c| c.update.clone()),
     }
 }
 
@@ -193,7 +232,20 @@ fn start(slot: u32, pairing: Option<(Key32, Sender<Result<(), String>>)>) {
         let mut g = inner().lock().unwrap();
         g.epoch += 1;
         let epoch = g.epoch;
-        g.conns.insert(slot, Conn { epoch, state: "connecting".into(), error: None, tx: None, geo: None, boot: None });
+        g.conns.insert(
+            slot,
+            Conn {
+                epoch,
+                state: "connecting".into(),
+                error: None,
+                tx: None,
+                link: None,
+                geo: None,
+                boot: None,
+                version: None,
+                update: None,
+            },
+        );
         epoch
     };
     emit_host(slot);
@@ -321,6 +373,9 @@ fn serve(
         if !current(slot, epoch) {
             return End::Stop;
         }
+        if let Some(end) = update_unanswered(slot, epoch) {
+            return end;
+        }
         if let Some(c) = ch.as_mut() {
             while let Ok(plain) = rx.try_recv() {
                 let sealed = c.seal(plain.as_bytes());
@@ -429,6 +484,9 @@ fn serve(
                 ch = Some(c);
                 received = 0;
                 acked = 0;
+                if let Some(c) = inner().lock().unwrap().conns.get_mut(&slot).filter(|c| c.epoch == epoch) {
+                    c.link = Some(tx.clone());
+                }
             }
             Some("sealed") => {
                 let Some(c) = ch.as_mut() else { continue };
@@ -464,6 +522,12 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
                     c.tx = Some(tx.clone());
                     c.geo = m.get("geo").cloned();
                     c.boot = boot;
+                    c.version = m.get("app").and_then(Value::as_str).map(String::from);
+                    // A host updated after refusing us comes back on our version.
+                    if let Some(u) = c.update.as_mut().filter(|u| Some(&u.to) == c.version.as_ref()) {
+                        u.step = "done".into();
+                        u.pending = json!([]);
+                    }
                 }
                 save_hosts(&g);
                 g.channels.keys().filter(|k| k.0 == slot).map(|k| (k.1, k.2)).collect()
@@ -476,19 +540,8 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
                 let _ = tx.send(json!({"t": "sub", "h": h, "id": id}).to_string());
             }
         }
-        "refused" => {
-            let theirs = m.get("app").and_then(Value::as_str).unwrap_or("?");
-            set_state(
-                slot,
-                epoch,
-                "error",
-                Some(format!(
-                    "That Mulpex runs v{theirs}, this one v{} — update both to the same version",
-                    env!("CARGO_PKG_VERSION")
-                )),
-            );
-            return Some(End::Stop);
-        }
+        "refused" => return on_refused(slot, epoch, tx, &m),
+        "update-progress" => return on_update_progress(slot, epoch, &m),
         // A phone's view: the host is a Mulpex from before Remote Hosts.
         "state" => {
             set_state(slot, epoch, "error", Some("That Mulpex is too old to be driven from here — update it".into()));
@@ -620,6 +673,112 @@ pub fn lower(args: &mut Value, base: u64) {
 
 fn new_rid() -> String {
     b64(&crypto::random32()[..9])
+}
+
+/// `1.2.3` → `(1, 2, 3)`; anything else is not a version we can order.
+fn version_of(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.trim().split('.').map(|p| p.parse::<u64>().ok());
+    let v = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(v)
+}
+
+fn with_conn<R>(slot: u32, epoch: u64, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
+    inner().lock().unwrap().conns.get_mut(&slot).filter(|c| c.epoch == epoch).map(f)
+}
+
+/// The host refused this Mulpex's version. Older than us: order it to update
+/// to ours and stay on the link to hear how it goes. Newer: it is done, if we
+/// ordered that; otherwise this Mac is the one behind.
+fn on_refused(slot: u32, epoch: u64, tx: &Sender<String>, m: &Value) -> Option<End> {
+    let mine = env!("CARGO_PKG_VERSION");
+    let theirs = m.get("app").and_then(Value::as_str).unwrap_or("?").to_string();
+    let update = with_conn(slot, epoch, |c| {
+        c.version = Some(theirs.clone());
+        c.update.clone()
+    })
+    .flatten();
+    let older = matches!((version_of(&theirs), version_of(mine)), (Some(a), Some(b)) if a < b);
+    if older {
+        match update.filter(|u| u.to == mine) {
+            // Ordered already (we are hearing this again after its restart, or
+            // on a reconnect mid-run): keep listening — unless it ended.
+            Some(u) if u.ended() => {
+                let why = u.error.unwrap_or_else(|| "the update was cancelled".into());
+                set_state(slot, epoch, "error", Some(format!("Updating that Mulpex to v{mine} failed: {why}")));
+                return Some(End::Stop);
+            }
+            Some(_) => {}
+            None => {
+                with_conn(slot, epoch, |c| c.update = Some(HostUpdate::new(mine)));
+                let _ = tx.send(json!({"t": "update", "to": mine}).to_string());
+            }
+        }
+        set_state(slot, epoch, "updating", Some(format!("Updating that Mulpex from v{theirs} to v{mine}…")));
+        return None;
+    }
+    if update.as_ref().is_some_and(|u| u.to == theirs) {
+        with_conn(slot, epoch, |c| {
+            if let Some(u) = c.update.as_mut() {
+                u.step = "done".into();
+                u.pending = json!([]);
+            }
+        });
+        set_state(slot, epoch, "error", Some(format!("That Mulpex is on v{theirs} now — update this one to match")));
+        return Some(End::Stop);
+    }
+    set_state(
+        slot,
+        epoch,
+        "error",
+        Some(format!("That Mulpex runs v{theirs}, this one v{mine} — update both to the same version")),
+    );
+    Some(End::Stop)
+}
+
+/// `update-progress` from the host.
+fn on_update_progress(slot: u32, epoch: u64, m: &Value) -> Option<End> {
+    let step = m.get("step").and_then(Value::as_str).unwrap_or("").to_string();
+    let to = m.get("to").and_then(Value::as_str).unwrap_or("").to_string();
+    let refused = with_conn(slot, epoch, |c| {
+        let u = c.update.get_or_insert_with(|| HostUpdate::new(&to));
+        u.step = step.clone();
+        u.pending = m.get("pending").cloned().unwrap_or_else(|| json!([]));
+        u.percent = m.get("percent").and_then(Value::as_u64);
+        u.error = m.get("error").and_then(Value::as_str).map(String::from);
+        c.state == "updating"
+    })?;
+    match step.as_str() {
+        "restarting" => {
+            emit_host(slot);
+            Some(End::Retry("That Mulpex is restarting into the update".into()))
+        }
+        // A host that refused us has nothing else to offer on this link.
+        "error" | "cancelled" if refused => {
+            let why = m.get("error").and_then(Value::as_str).unwrap_or("the update was cancelled");
+            set_state(slot, epoch, "error", Some(format!("Updating that Mulpex to v{to} failed: {why}")));
+            Some(End::Stop)
+        }
+        _ => {
+            emit_host(slot);
+            None
+        }
+    }
+}
+
+/// An order nobody answered: the host predates remote updates.
+fn update_unanswered(slot: u32, epoch: u64) -> Option<End> {
+    let refused = with_conn(slot, epoch, |c| {
+        let u = c.update.as_mut().filter(|u| u.step == "sent" && u.sent_at.elapsed() >= UPDATE_ANSWER)?;
+        u.step = "error".into();
+        u.error = Some("it didn't answer — it may be older than remote updates; update it by hand once".into());
+        Some(c.state == "updating")
+    })??;
+    if refused {
+        set_state(slot, epoch, "error", Some("That Mulpex didn't answer the update order — update it by hand once".into()));
+        return Some(End::Stop);
+    }
+    emit_host(slot);
+    None
 }
 
 /// Queue one message for the host. Fails when it isn't connected.
@@ -865,6 +1024,41 @@ pub fn host_cache_layout(host: u32, boot: Option<String>, layout: Value) {
     save_hosts(&g);
 }
 
+/// Order a connected host to update to `version` (this Mac is about to update
+/// to it). Progress arrives on `host-changed` as `update`.
+#[tauri::command]
+pub fn host_update(host: u32, version: String) -> Result<(), String> {
+    {
+        let mut g = inner().lock().unwrap();
+        let c = g.conns.get_mut(&host).ok_or("that host is disconnected")?;
+        let link = c.link.clone().ok_or("that host is offline")?;
+        link.send(json!({"t": "update", "to": version}).to_string())
+            .map_err(|_| "the connection to the remote host dropped".to_string())?;
+        c.update = Some(HostUpdate::new(&version));
+    }
+    emit_host(host);
+    Ok(())
+}
+
+/// Call off a host's update; its claudes are told to carry on. Too late once it
+/// is installing — that host restarts anyway.
+#[tauri::command]
+pub fn host_update_cancel(host: u32) {
+    let link = inner().lock().unwrap().conns.get(&host).and_then(|c| c.link.clone());
+    if let Some(link) = link {
+        let _ = link.send(json!({"t": "update-cancel"}).to_string());
+    }
+}
+
+/// Forget a finished/failed update's progress, so the banner stops showing it.
+#[tauri::command]
+pub fn host_update_clear(host: u32) {
+    if let Some(c) = inner().lock().unwrap().conns.get_mut(&host) {
+        c.update = None;
+    }
+    emit_host(host);
+}
+
 /// Run one of the host's commands (`rpc.rs`) with the frontend's arguments.
 #[tauri::command]
 pub async fn host_invoke(host: u32, cmd: String, args: Value) -> Result<Value, String> {
@@ -961,6 +1155,18 @@ mod tests {
         let mut args = json!({"projectHandle": base + 5, "id": 1, "handles": [base + 2, base + 1]});
         lower(&mut args, base);
         assert_eq!(args, json!({"projectHandle": 5, "id": 1, "handles": [2, 1]}));
+    }
+
+    /// The order goes only to a host that is strictly older, by number — not
+    /// by string, where "0.9.0" > "0.10.0".
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(version_of("0.9.0") < version_of("0.10.0"));
+        assert_eq!(version_of("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(version_of("1.2"), None);
+        assert_eq!(version_of("1.2.3.4"), None);
+        assert_eq!(version_of("1.2.x"), None);
+        assert_eq!(version_of("?"), None);
     }
 
     #[test]

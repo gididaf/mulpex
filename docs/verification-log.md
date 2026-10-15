@@ -2495,3 +2495,33 @@ command's own code.
 
 Same day: Explain Selection moved from ⌘E to **⌘⇧E**, beside ⌘⇧P and ⌘⇧L (the user's ask); plain
 ⌘E is now unbound. Claimed in the webview like the other ⌘⇧ keys.
+
+## 2026-10-14 — remote hosts update with the Mac
+
+Driven headless with `CLAUDE=1 bash scripts/test-remote-update.sh`, using real `.app` bundles
+v0.42.0 and v0.42.99 and a local `latest.json`:
+
+- **Late host:** A on 0.42.0 and B on 0.42.99. B's refusal ordered A up; A installed 0.42.99,
+  relaunched, and B was connected to it again.
+- **One click:** both on 0.42.0, and a driven click on B's "Update & Restart". A updated first and
+  B second; both relaunched and reconnected.
+  - A real claude in A, mid-way through three `sleep 25`s, got the stop and wrote its checkpoint
+    note.
+  - After A's relaunch it got "Mulpex is back" with no click (`auto_wake`) and went on to runs 2
+    and 3, read from its transcript.
+
+Found on the way:
+
+- **The updater refuses a symlinked path** ("StartingBinary found current_exe() that contains a
+  symlink"). `$TMPDIR` is `/var/…` → `/private/var/…`, so the test resolves its work dir. The error
+  travelled correctly from A's driver to B's host state.
+- **A first-run dialog parks a claude forever.** A claude sitting at the folder-trust dialog never
+  reads the stop, so the update waits on it until Cancel. That is by design, since there is no
+  timeout. The test pre-answers the dialog in an isolated `CLAUDE_CONFIG_DIR`.
+- **Fixed, older than this feature:** `remoteHosts.ts::initHosts` read `host_list` *before*
+  listening for `host-changed`. A host that connected in between (a fast relay, a relaunch while
+  the host is up) stayed "connecting" in the UI for good, while the mirror underneath was live. It
+  now listens first and reads the list once more after.
+
+NOT driven: a Linux host (the AppImage self-replace, on the real VM), the Cancel button mid-stop,
+and a host offered the wrong version.

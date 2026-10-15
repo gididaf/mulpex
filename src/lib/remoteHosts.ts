@@ -220,6 +220,17 @@ function cacheLayout(slot: number) {
 
 export async function initHosts(h: HostHooks): Promise<() => void> {
   hooks = h;
+  // Listen BEFORE reading the list. The connections start in the backend's
+  // setup, so on a fast relay a host can reach `connected` before this runs;
+  // read first and that `host-changed` lands in neither, and the host shows
+  // "connecting" for good. Seen after a relaunch into an update
+  // (scripts/test-remote-update.sh). What arrives before the list is read is
+  // caught up below by reading it once more.
+  let ready = false;
+  const hostChanged = listen<HostStatus>("host-changed", (e) => {
+    if (ready) onHostChanged(e.payload);
+  });
+  await hostChanged;
   const list = await hostList().catch(() => [] as HostStatus[]);
   hosts.set(new Map(list.map((s) => [s.slot, s])));
   for (const st of list) {
@@ -228,6 +239,8 @@ export async function initHosts(h: HostHooks): Promise<() => void> {
     if (st.layout) buildCached(st);
     if (st.state === "connected") void syncHost(st.slot);
   }
+  ready = true;
+  for (const st of await hostList().catch(() => [] as HostStatus[])) onHostChanged(st);
   terminals.onGeometry = onLocalGeometry;
 
   // Re-cache a connected host's layout whenever its tabs or rows change.
@@ -244,7 +257,7 @@ export async function initHosts(h: HostHooks): Promise<() => void> {
   });
 
   const un = [
-    listen<HostStatus>("host-changed", (e) => onHostChanged(e.payload)),
+    hostChanged,
     listen<{ slot: number; ws: WorkspaceInfo }>("host-projects-changed", (e) => {
       if (get(hosts).get(e.payload.slot)?.state === "connected" && !syncing.has(e.payload.slot)) {
         void applyWorkspace(e.payload.slot, e.payload.ws);

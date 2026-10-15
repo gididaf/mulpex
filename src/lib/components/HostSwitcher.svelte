@@ -23,6 +23,7 @@
     offline: "unreachable",
     error: "refused",
     disconnected: "disconnected",
+    updating: "updating to this version…",
   };
 </script>
 
@@ -110,7 +111,8 @@
   .connected .dot {
     background: #3fb950;
   }
-  .connecting .dot {
+  .connecting .dot,
+  .updating .dot {
     background: #d29922;
   }
   .error .dot {

@@ -10,7 +10,7 @@
 // over the app's own HTTP client, so nothing sets the xattr and the extracted
 // bundle has none to inherit — no `xattr -dr` needed after the first install.
 
-import { isRemote } from "./hosts";
+import { hosts, hostUpdate, hostUpdateCancel, hostUpdateClear, isRemote } from "./hosts";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { get, writable } from "svelte/store";
 
@@ -31,6 +31,9 @@ export type UpdatePhase =
   | "available"
   /** Confirming a restart because sessions are mid-turn. */
   | "confirming"
+  /** Updating every connected remote host first (`remotes`), so they still
+   *  match this Mulpex after it restarts. */
+  | "remotes"
   /** Downloading + installing. */
   | "installing"
   /** Manual check found nothing — a transient "you're up to date". */
@@ -49,6 +52,9 @@ export interface UpdateState {
   error: string | null;
   /** How many sessions are mid-turn or waiting on the user, at confirm time. */
   busy: number;
+  /** The hosts ordered to update in the `remotes` phase, by slot. Their
+   *  progress lives on each `HostStatus.update`. */
+  remotes: number[];
 }
 
 const initial: UpdateState = {
@@ -58,6 +64,7 @@ const initial: UpdateState = {
   percent: null,
   error: null,
   busy: 0,
+  remotes: [],
 };
 
 export const updateState = writable<UpdateState>({ ...initial });
@@ -108,9 +115,10 @@ export function busySessionCount(): number {
  */
 export async function checkForUpdate(manual = false): Promise<void> {
   // Never clobber a phase the user is interacting with: `confirming` is a
-  // question on screen awaiting an answer, `installing` is a download in flight.
+  // question on screen awaiting an answer, `installing` is a download in flight,
+  // `remotes` is remote hosts updating.
   const phase = get(updateState).phase;
-  if (phase === "installing" || phase === "confirming") return;
+  if (phase === "installing" || phase === "confirming" || phase === "remotes") return;
   if (manual) patch({ phase: "checking", error: null });
   try {
     const found = await check();
@@ -138,14 +146,99 @@ export async function checkForUpdate(manual = false): Promise<void> {
   }
 }
 
+/** The version every connected remote host was brought to this run. Remote
+ * Hosts needs both sides on the same version, so a host must update BEFORE this
+ * Mulpex restarts — after it, the host refuses our hello. */
+let remotesAt: string | null = null;
+
+/** Order every connected host to update to `version`, and wait until each is
+ * back on it. Rejects with the first failure, after calling the others off. */
+function updateRemotes(version: string): Promise<void> {
+  const slots = [...get(hosts).values()].filter((h) => h.state === "connected").map((h) => h.slot);
+  if (slots.length === 0) return Promise.resolve();
+  patch({ phase: "remotes", remotes: slots, error: null });
+  return new Promise(async (resolve, reject) => {
+    let settled = false;
+    let unsub = () => {};
+    const finish = (err: string | null) => {
+      if (settled) return;
+      settled = true;
+      queueMicrotask(() => unsub());
+      if (err) {
+        for (const s of slots) void hostUpdateCancel(s).catch(() => {});
+        reject(new Error(err));
+      } else resolve();
+    };
+    try {
+      await Promise.all(slots.map((s) => hostUpdate(s, version)));
+    } catch (e) {
+      return finish(String(e));
+    }
+    // What the backend just set, so a stale `done`/`error` from an earlier
+    // round can't be read before its `host-changed` arrives.
+    hosts.update((m) => {
+      const n = new Map(m);
+      for (const s of slots) {
+        const h = n.get(s);
+        if (h) n.set(s, { ...h, update: { to: version, step: "sent", pending: [], percent: null, error: null } });
+      }
+      return n;
+    });
+    unsub = hosts.subscribe((m) => {
+      if (get(updateState).phase !== "remotes") return finish("cancelled");
+      let done = 0;
+      for (const s of slots) {
+        const h = m.get(s);
+        if (!h || h.state === "disconnected") return finish(`${h?.name ?? "a remote host"} was disconnected`);
+        // Not ordered yet: `host-changed` can land after this first look.
+        const u = h.update;
+        if (!u || u.to !== version) continue;
+        if (u.step === "error" || u.step === "cancelled") {
+          return finish(`${h.name}: ${u.error ?? "the update was cancelled"}`);
+        }
+        if (u.step === "done") done++;
+      }
+      if (done === slots.length) finish(null);
+    });
+  });
+}
+
+/** The banner's Cancel while remote hosts update: their claudes carry on, and
+ * this Mulpex does not update either. */
+export function cancelRemoteUpdates(): void {
+  const { remotes } = get(updateState);
+  for (const s of remotes) {
+    void hostUpdateCancel(s).catch(() => {});
+    void hostUpdateClear(s).catch(() => {});
+  }
+  patch({ phase: "available", remotes: [] });
+}
+
 /**
- * Download, install, and relaunch.
+ * Update every connected remote host, then download, install, and relaunch.
  *
  * With sessions mid-turn this first parks in `confirming` and returns; the
  * banner's confirm button calls back in with `force`.
  */
 export async function applyUpdate(force = false): Promise<void> {
   if (!pending) return;
+  if (remotesAt !== pending.version) {
+    const version = pending.version;
+    try {
+      await updateRemotes(version);
+    } catch (e) {
+      // Cancel already put the banner back; anything else is a failure, and
+      // this Mulpex stays on the version its hosts still run.
+      if (get(updateState).phase === "remotes") {
+        patch({
+          phase: "error",
+          error: `Remote host update failed, so this Mulpex did not update either. ${String(e).replace(/^Error: /, "")}`,
+        });
+      }
+      return;
+    }
+    remotesAt = version;
+  }
   if (!force) {
     const busy = busySessionCount();
     if (busy > 0) {

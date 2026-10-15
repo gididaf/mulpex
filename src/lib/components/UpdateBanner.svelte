@@ -5,11 +5,44 @@
   // and the sidebar, both of which carry live state you may be reading.
   import {
     applyUpdate,
+    cancelRemoteUpdates,
     dismissUpdate,
     updateState,
     type UpdateState,
   } from "../updater";
   import { startCheckpoint } from "../checkpoint";
+  import { hosts, type HostUpdate } from "../hosts";
+
+  /** One line per remote host being updated. */
+  function stepText(u: HostUpdate | null | undefined): string {
+    if (!u) return "waiting…";
+    switch (u.step) {
+      case "sent":
+        return "asking it to update…";
+      case "checking":
+        return "checking for the update…";
+      case "stopping": {
+        const n = u.pending.length;
+        return n === 0
+          ? "all claudes stopped"
+          : `checkpointing — ${n} still working: ${u.pending
+              .map((p) => (p.name ? `${p.name} (claude#${p.id})` : `claude#${p.id}`))
+              .join(", ")}`;
+      }
+      case "downloading":
+        return `downloading${u.percent != null ? ` — ${u.percent}%` : "…"}`;
+      case "installing":
+        return "installing…";
+      case "restarting":
+        return "restarting…";
+      case "done":
+        return `back on v${u.to}`;
+      case "error":
+        return `failed: ${u.error ?? "unknown error"}`;
+      case "cancelled":
+        return "cancelled";
+    }
+  }
 
   const s = $derived($updateState as UpdateState);
   // `checking` IS shown: only a manual check ever sets it (the periodic one stays
@@ -64,6 +97,21 @@
         </button>
         <button class="ghost" onclick={dismissUpdate}>Cancel</button>
       </div>
+    {:else if s.phase === "remotes"}
+      <div class="row">
+        <span class="title">Updating remote hosts to {s.version} first</span>
+        <button class="ghost" onclick={cancelRemoteUpdates}>Cancel</button>
+      </div>
+      {#each s.remotes as slot (slot)}
+        {@const h = $hosts.get(slot)}
+        <p class="notes host">
+          <b>{h?.name ?? "remote host"}</b> — {stepText(h?.update)}
+        </p>
+      {/each}
+      <p class="notes">
+        Their claudes stop at a checkpoint and wake by themselves after the restart.
+        This Mulpex updates once every host is back.
+      </p>
     {:else if s.phase === "installing"}
       <div class="row">
         <span class="title">
@@ -124,6 +172,9 @@
     max-height: 6rem;
     overflow-y: auto;
     white-space: pre-wrap;
+  }
+  .host {
+    color: var(--text);
   }
   code {
     background: rgba(255, 255, 255, 0.07);

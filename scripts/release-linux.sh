@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Add the Linux build to a Mulpex release. Runs ON THE MAC, after release.sh.
+# Add the Linux build to a Mulpex release. Runs ON THE MAC — release.sh calls it
+# while its release is still a draft, and publishes once this succeeds.
 #
 # The updater signing key never leaves this Mac: the Linux host only compiles.
 #
 #   1. ships this checkout's HEAD to the Linux host (git archive, so exactly the
 #      committed code, nothing uncommitted) and builds the .deb + .AppImage there;
 #   2. copies both back here and signs each with ~/.mulpex/updater.key;
-#   3. uploads them to the SAME GitHub release release.sh created, and adds two
+#   3. uploads them to the SAME GitHub release release.sh created (a draft until
+#      this finishes), and adds two
 #      platforms to its latest.json:
 #        linux-x86_64       → the AppImage (what an AppImage install updates from)
 #        linux-x86_64-deb   → the .deb     (the updater looks this key up FIRST on a

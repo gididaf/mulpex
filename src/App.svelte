@@ -107,6 +107,7 @@
 
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import ProjectTabBar from "./lib/components/ProjectTabBar.svelte";
+  import MenuBar from "./lib/components/MenuBar.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CheckpointPanel from "./lib/components/CheckpointPanel.svelte";
@@ -1565,7 +1566,7 @@
           activeHost: get(activeHost),
           activeProject: get(activeProjectHandle),
           activeSession: get(activeId),
-          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo })),
+          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo, update: h.update })),
           projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
           text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
           dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },
@@ -1696,6 +1697,14 @@
 </script>
 
 <svelte:window onkeydown={onGlobalKey} />
+
+{#if IS_LINUX}
+  <!-- Linux has no native menu; this is the Mac's, in the window. -->
+  <MenuBar
+    onmenu={(id) => void handleMenu(id)}
+    onedit={(kind) => void import("./lib/linuxKeys").then((m) => m.editAction(kind))}
+  />
+{/if}
 
 {#if ready && ($projects.size > 0 || $hosts.size > 0)}
   <div class="shell">

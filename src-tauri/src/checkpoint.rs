@@ -96,6 +96,11 @@ pub struct Progress {
 struct Saved {
     ts: u64,
     entries: Vec<SavedEntry>,
+    /// Wake them on the next launch without asking: the restart was ordered
+    /// from another Mulpex (`remote_update.rs`) and nobody is at this screen
+    /// to click "Wake all".
+    #[serde(default)]
+    auto_wake: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -181,7 +186,7 @@ impl Workspace {
 
     /// Record who was asked to stop, right before the quit (or the update's
     /// restart), so the next launch can offer to wake them.
-    pub fn checkpoint_commit(&self) -> anyhow::Result<()> {
+    pub fn checkpoint_commit(&self, auto_wake: bool) -> anyhow::Result<()> {
         let entries = self
             .checkpoint
             .sent
@@ -206,7 +211,7 @@ impl Workspace {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_string(&Saved { ts, entries })?)?;
+        std::fs::write(&path, serde_json::to_string(&Saved { ts, entries, auto_wake })?)?;
         Ok(())
     }
 
@@ -256,6 +261,42 @@ impl Workspace {
         targets.len()
     }
 
+    /// At launch: a checkpoint written by a remote-ordered update wakes by
+    /// itself, before the frontend could offer it. Returns how many were queued.
+    pub fn checkpoint_auto_wake(&mut self) -> usize {
+        if !read_saved().is_some_and(|s| s.auto_wake) {
+            return 0;
+        }
+        self.checkpoint_wake()
+    }
+
+    /// The claudes asked to stop this round that have not stopped yet: alive,
+    /// and either the stop message is unread or the claude is not `waiting`.
+    /// The headless twin of `checkpoint.ts`'s "done" rule (minus its settle
+    /// delay, which `remote_update.rs` applies itself).
+    pub fn checkpoint_not_stopped(&self) -> Vec<Target> {
+        self.checkpoint
+            .sent
+            .iter()
+            .filter_map(|s| {
+                let core = self.project(s.handle)?;
+                if !core.live_claude_ids().contains(&s.id) {
+                    return None;
+                }
+                let unread = s.file.as_ref().is_some_and(|f| f.exists());
+                let word = std::fs::read_to_string(core.state_dir.join(s.id.to_string())).unwrap_or_default();
+                // A missing file is `waiting` everywhere else in Mulpex too.
+                let waiting = matches!(word.trim(), "" | "waiting");
+                (unread || !waiting).then(|| Target {
+                    handle: core.handle,
+                    project: core.project_name.clone(),
+                    id: s.id,
+                    name: core.label_of(s.id),
+                })
+            })
+            .collect()
+    }
+
     /// Deliver each queued wake once that claude's listener is up. A claude that
     /// is gone is dropped; one whose listener never comes gets the message after
     /// `WAKE_WAIT` anyway. Cheap when the queue is empty, which is nearly always.
@@ -292,9 +333,17 @@ mod tests {
                 project_dir: "/tmp/x".into(),
                 id: 3,
             }],
+            auto_wake: true,
         };
         let back: Saved = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// A `checkpoint.json` written before `auto_wake` existed still reads.
+    #[test]
+    fn an_old_checkpoint_does_not_auto_wake() {
+        let s: Saved = serde_json::from_str(r#"{"ts":1,"entries":[]}"#).unwrap();
+        assert!(!s.auto_wake);
     }
 
     /// Entries for a project that is not open match nothing — that is what keeps
@@ -308,6 +357,7 @@ mod tests {
                 project_dir: "/definitely/not/open".into(),
                 id: 1,
             }],
+            auto_wake: false,
         };
         assert!(ws.match_saved(&saved).is_empty());
     }

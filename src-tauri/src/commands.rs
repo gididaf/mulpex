@@ -548,7 +548,7 @@ pub fn checkpoint_commit(state: State<AppState>) -> Result<(), String> {
         .ws
         .lock()
         .unwrap()
-        .checkpoint_commit()
+        .checkpoint_commit(false)
         .map_err(|e| e.to_string())
 }
 

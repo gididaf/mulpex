@@ -2,6 +2,7 @@
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
 mod checkpoint;
+mod remote_update;
 mod claude_bin;
 mod commands;
 mod hub;
@@ -101,7 +102,7 @@ pub fn run() {
             helper_path: resolve_helper_path(),
         });
     // The native menu is macOS-only. Linux has no global menu bar, and a GTK
-    // strip in the window was declined: there the webview claims every
+    // strip in the window was declined (the webview draws its own, `MenuBar.svelte`): there the webview claims every
     // shortcut itself (`lib/linuxKeys.ts`) and feeds the same ids into the same
     // `handleMenu`, so no command has a second implementation.
     #[cfg(target_os = "macos")]
@@ -203,6 +204,9 @@ pub fn run() {
             remote::client::host_frontend_action,
             remote::client::host_upload,
             remote::client::host_clipboard_image,
+            remote::client::host_update,
+            remote::client::host_update_cancel,
+            remote::client::host_update_clear,
             fda::has_full_disk_access,
             fda::open_full_disk_access_settings,
         ])
@@ -251,6 +255,9 @@ pub fn run() {
                 ws.active = ws.projects.first().map(|c| c.handle);
                 // Drop any dirs that no longer exist / failed to open from the set.
                 ws.persist_open();
+                // An update ordered from another Mulpex checkpointed these
+                // claudes; wake them as their listeners come up, unasked.
+                ws.checkpoint_auto_wake();
             }
             remote::init(app.handle().clone());
             remote::client::init(app.handle().clone());

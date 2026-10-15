@@ -1,4 +1,5 @@
-// Linux: the webview owns every shortcut, because there is no native menu.
+// Linux: the webview owns every shortcut, because there is no native menu (the
+// in-window MenuBar.svelte is drawn by the webview too, and runs the same ids).
 //
 // On macOS `src-tauri/src/menu.rs` declares each ⌘ accelerator and AppKit
 // consumes the key before xterm sees it. On Linux no menu is installed (a GTK
@@ -97,6 +98,16 @@ async function paste(target: EventTarget | null): Promise<void> {
   } else {
     terminals.pasteActive(text);
   }
+}
+
+/** The Edit menu's items (`MenuBar.svelte`), acting on what has focus — the
+ *  same code Super+C / X / V / A run. */
+export function editAction(kind: "copy" | "cut" | "paste" | "select_all"): void {
+  const target = document.activeElement;
+  if (kind === "copy" || kind === "cut") void copy(target, kind === "cut");
+  else if (kind === "paste") void paste(target);
+  else if (textField(target)) document.execCommand("selectAll");
+  else terminals.selectAllActive();
 }
 
 /**

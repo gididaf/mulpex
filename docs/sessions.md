@@ -544,6 +544,12 @@ Details worth not rediscovering:
   either way). Added 2026-08-30 so `tauri dev` never reopens — or rewrites the stores of — the
   live app's projects while it runs alongside. Release-script assets (`~/.mulpex/signing`,
   `updater.key`) are not read by the app and stay on the literal path.
+- **To run dev apps in several worktrees at once, use `npm run tauri:dev`** (`scripts/tauri-dev.sh`).
+  Plain `tauri dev` is pinned to Vite port 1420 (`strictPort`) and the one `~/.mulpex-dev`, so a
+  second copy fails to start or shares the first one's projects. The script picks a free port per
+  run (passed to Vite as `MULPEX_DEV_PORT` and to Tauri as `--config build.devUrl`) and, in a linked
+  worktree, sets `MULPEX_HOME=~/.mulpex-dev-<worktree folder>` — stable across runs. The main
+  checkout keeps `~/.mulpex-dev`; both env vars can be pinned by hand.
 - **Trailing empty columns are dropped on write**, so a store with no ids in it is written
   byte-identically to the old format — upgrading does not rewrite every project's file into
   something an older build would misread. Pinned by `a_store_with_no_ids_is_written_in_the_old_format`.
@@ -852,6 +858,11 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
   project is open and whose id is a live claude again (instance numbers survive a restore), and
   deletes the file if nothing matches. "Wake all" queues "Mulpex is back — re-arm the monitors you
   noted, continue if anything is left" for each and deletes the file; "Not now" just deletes it.
+- **`auto_wake`.** An update ordered by another Mulpex (docs/remote-hosts.md, `remote_update.rs`)
+  checkpoints headless and writes `checkpoint.json` with `auto_wake: true`. Nobody is at that
+  screen to click "Wake all", so `lib.rs` setup calls `checkpoint_auto_wake` right after the
+  projects restore. That queues the wake and deletes the file before the frontend could offer it.
+  A file from before the field reads as `false`.
 - **The wake waits for the listener.** `listen.rs` seeds its count from what is already in the
   inbox, so mail that lands before the listener starts is **never announced** — a restored claude
   still booting would sit on it until its next turn. So the poll loop (`drain_wake_queue`)
