@@ -230,7 +230,7 @@ pub(crate) fn tool_defs() -> Value {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "kind": { "type": "string", "enum": ["action", "decision", "question"] },
+                                "kind": { "type": "string", "enum": ["action", "decision", "question"], "description": "A `decision` or `question` here is only for what can WAIT while you keep working. Anything you would block on (planning, assumptions, which way to build) goes to the AskUserQuestion tool instead — never onto this list." },
                                 "title": { "type": "string", "description": "One line, in the user's language." },
                                 "detail": { "type": "string", "description": "Optional. Markdown (headings, lists, code, tables), up to 20,000 characters, shown under the item's \"more\". Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
                                 "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision: the options (at most 8)." },

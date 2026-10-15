@@ -407,6 +407,11 @@ to turn it on for a claude whose list is off. The claude writes the list with `m
   soon as possible. Urgent items sort first within each claude's group (stable — `byUrgency`), get a
   red edge and an `URGENT` tag, and turn the row badge red (`todos_urgent`). Nothing louder: no
   dock badge, attention or push.
+- **The list never replaces `AskUserQuestion`** (2026-10-15, the user's most important tool): a
+  question the claude would block on (planning, assumptions, which way to build) still goes through
+  `AskUserQuestion` — options with descriptions, a recommended pick, multi-select, and a real stop.
+  Decision/question items are only for what can wait. Said in `TODOS_RULE` and in `kind`'s schema
+  description.
 - **No ✕ (dismiss) on an item** (removed 2026-10-15): next to the tick it read as a second "done"
   and confused the user. The tick is the one way to close an item; "not needed" goes in a comment.
   The backend still accepts `{op:"dismiss"}` (an older phone app may send it).

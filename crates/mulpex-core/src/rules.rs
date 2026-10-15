@@ -202,7 +202,11 @@ hub_send a reply to it — there is no instance there to receive one.";
 pub const TODOS_RULE: &str = "[Mulpex] The user turned ON your \"To Do\" list \
 (mcp__mulpex__hub_todo), shown in Mulpex's side panel. Whenever you need something from \
 the user — an action they must take, a decision (give the options as choices), or a question — \
-put it on that list. NO DUPLICATION: what is on the list stays OFF the conversation — the user \
+put it on that list. BUT THE LIST NEVER REPLACES AskUserQuestion: anything you would block on — \
+planning, assumptions, which way to build something, any answer that changes what you do next \
+— you ask with the AskUserQuestion tool, exactly as you would without the list, and never move \
+such a question onto it. The list is only for what can wait while you keep working (an action \
+for the user, a QA pass, a non-blocking pick). NO DUPLICATION: what is on the list stays OFF the conversation — the user \
 reads it in the panel, and repeating it in your replies only fills both context windows. When \
 you add an item or comment, your reply says at most a one-line pointer (\"Added To Do #3\", \
 \"Replied on #3\"), never its content, and never \"still waiting on you for X\" in later turns — \
@@ -415,6 +419,7 @@ mod tests {
         assert!(TODOS_RULE.contains("NO DUPLICATION"));
         assert!(TODOS_RULE.contains("URGENT"));
         assert!(TODOS_RULE.contains("ONE ITEM PER THING"));
+        assert!(TODOS_RULE.contains("NEVER REPLACES AskUserQuestion"));
         assert!(TODOS_RULE.contains("LONG CONTENT GOES IN AN ITEM'S DETAIL"));
         for n in named {
             assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
