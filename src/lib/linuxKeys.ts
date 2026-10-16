@@ -38,6 +38,7 @@ const CHORDS: Record<string, string> = {
   "S-KeyP": "pin_selection",
   "S-KeyL": "toggle_panel",
   "S-KeyK": "request_compact",
+  "S-KeyB": "ask_all",
   BracketRight: "next",
   BracketLeft: "prev",
   "S-ArrowUp": "move_instance_up",

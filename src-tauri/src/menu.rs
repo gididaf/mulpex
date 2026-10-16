@@ -220,6 +220,11 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let compact = MenuItemBuilder::with_id("request_compact", "Request Compact")
         .accelerator("Cmd+Shift+K")
         .build(app)?;
+    // ⌘⇧B: ask every claude in every project one question (`broadcast.rs`).
+    // Also claimed in the webview, like ⌘⇧P.
+    let ask_all = MenuItemBuilder::with_id("ask_all", "Ask All Claudes…")
+        .accelerator("Cmd+Shift+B")
+        .build(app)?;
     let next = MenuItemBuilder::with_id("next", "Next Session")
         .accelerator("Cmd+]")
         .build(app)?;
@@ -250,6 +255,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&pin)
         .item(&side_panel)
         .item(&compact)
+        .item(&ask_all)
         .separator()
         .item(&next)
         .item(&prev)

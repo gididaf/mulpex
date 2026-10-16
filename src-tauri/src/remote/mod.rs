@@ -23,7 +23,7 @@
 //! `--dangerously-skip-permissions`, which is why the top bar shows it whenever
 //! it is open.
 
-mod chat;
+pub(crate) mod chat;
 pub mod client;
 mod crypto;
 mod desktop;

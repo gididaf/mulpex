@@ -88,6 +88,7 @@
         cmd("Pin Selection", "pin_selection", "⌘⇧P"),
         cmd("Show/Hide Side Panel", "toggle_panel", "⌘⇧L"),
         cmd("Request Compact", "request_compact", "⌘⇧K"),
+        cmd("Ask All Claudes…", "ask_all", "⌘⇧B"),
         SEP,
         cmd("Next Session", "next", "⌘]"),
         cmd("Previous Session", "prev", "⌘["),

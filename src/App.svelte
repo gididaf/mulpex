@@ -40,6 +40,7 @@
     type HubUpdateEvent,
     type SaveProgressEvent,
     type ExplainProgressEvent,
+    type BroadcastSummaryEvent,
     type SessionsChangedEvent,
     type SessionExitedEvent,
     type ProjectHandle,
@@ -127,6 +128,8 @@
   import SecretsDialog from "./lib/components/SecretsDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
   import RemoteDialog from "./lib/components/RemoteDialog.svelte";
+  import BroadcastDialog from "./lib/components/BroadcastDialog.svelte";
+  import { applySummaryEvent } from "./lib/broadcast";
   import ConnectHostDialog from "./lib/components/ConnectHostDialog.svelte";
   import RemoteProjectPicker from "./lib/components/RemoteProjectPicker.svelte";
   import ContextMenu from "./lib/components/ContextMenu.svelte";
@@ -360,6 +363,8 @@
   let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
   /** ⌘⇧O: the Remote Control dialog is open. */
   let showRemote = $state(false);
+  /** ⌘⇧B: the Ask All Claudes popup is open (the round itself outlives it). */
+  let showAskAll = $state(false);
   /** File ▸ Connect to Remote Mulpex…: the pairing dialog is open. */
   let showConnect = $state(false);
   /** ⌘O on a remote host: the host whose folders the picker browses. */
@@ -1232,6 +1237,9 @@
       case "remote_control":
         showRemote = true;
         break;
+      case "ask_all":
+        showAskAll = true;
+        break;
       case "connect_host":
         showConnect = true;
         break;
@@ -1355,7 +1363,7 @@
    * `messages` open their own focus-taking UI, and `open_project` opens a native
    * folder dialog. Refocusing the terminal after those would fight them.
    */
-  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project", "remote_control", "connect_host"]);
+  const PALETTE_KEEPS_FOCUS = new Set(["rename", "messages", "open_project", "remote_control", "connect_host", "ask_all"]);
   async function runPaletteAction(id: string) {
     showPalette.set(false);
     await handleMenu(id);
@@ -1421,6 +1429,12 @@
       if (e.code === "KeyK") {
         e.preventDefault();
         void handleMenu("request_compact");
+        return;
+      }
+      // ⌘⇧B — Ask All Claudes, likewise.
+      if (e.code === "KeyB") {
+        e.preventDefault();
+        void handleMenu("ask_all");
         return;
       }
       // ⌘⇧Q — Checkpoint & Quit, likewise.
@@ -1519,6 +1533,7 @@
         terminals.setLock(owner ? { cols, rows } : null);
       }),
       listen<ExplainProgressEvent>("explain-progress", (e) => applyExplainProgress(e.payload)),
+      listen<BroadcastSummaryEvent>("broadcast-summary", (e) => applySummaryEvent(e.payload)),
       listen<SessionExitedEvent>("session-exited", (e) => {
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
@@ -1832,6 +1847,18 @@
       onclose={() => {
         showRemote = false;
         terminals.refocus();
+      }}
+    />
+  {/if}
+  {#if showAskAll}
+    <BroadcastDialog
+      onclose={() => {
+        showAskAll = false;
+        terminals.refocus();
+      }}
+      onfocus={(h, id) => {
+        showAskAll = false;
+        focusInstance(h, id);
       }}
     />
   {/if}

@@ -164,6 +164,7 @@
       ["restart", "Restart Session…", "⌘⇧R", isClaude],
       ["save_session", "Save Session…", "⌘S", isClaude],
       ["request_compact", "Request Compact", "⌘⇧K", isClaude],
+      ["ask_all", "Ask All Claudes…", "⌘⇧B", true],
       ["load_session", "Load Session…", "⌘L", true],
       ["import_docs", "Import Docs…", "", true],
       ["remote_control", "Remote Control…", "⌘⇧O", true],

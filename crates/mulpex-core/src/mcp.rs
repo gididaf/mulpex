@@ -254,6 +254,18 @@ pub(crate) fn tool_defs() -> Value {
             },
         },
         {
+            "name": "hub_reply_broadcast",
+            "description": "Answer a question the USER asked every claude at once (Mulpex's \"Ask All Claudes\"). Use it ONLY when a message from Mulpex asks you to, passing the id that message gives — it is the one way to reply to Mulpex (hub_send cannot reach it). Your answer is shown to the user next to every other claude's and summarized, so make it short, self-contained and to the point.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The broadcast id from the Mulpex message." },
+                    "answer": { "type": "string", "description": "Your answer, in the language the question was asked in." },
+                },
+                "required": ["id", "answer"],
+            },
+        },
+        {
             "name": "hub_remote_open",
             "description": "Start a Claude Code instance on ANOTHER MACHINE over ssh, in a Mulpex terminal, and coordinate with it. Opens its own terminal by default; pass terminal_id to use one that already exists, including one the user ssh'd in on themselves. Use this when work has to happen on a remote server (a deploy, a staging box, anything that must run there rather than here). The remote instance is told it is being driven by you, works autonomously, and SIGNALS you when it finishes, gets blocked, or needs an answer — you are woken by a hub message, so do NOT sit polling it. Talk to it with hub_terminal_send and read it with hub_terminal_read, using the terminal id this returns. It is a terminal, NOT a hub instance: hub_send can never reach it. Requires working ssh key access to the target, and claude installed there.",
             "inputSchema": {
@@ -351,6 +363,7 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_close" => hub_close(ctx, &args),
         "hub_remote_open" => hub_remote_open(ctx, &args),
         "hub_todo" => hub_todo(ctx, &args),
+        "hub_reply_broadcast" => hub_reply_broadcast(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
@@ -1047,6 +1060,39 @@ pub fn log_message(log: &Path, from: &str, to: &str, body: &str) {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// Answer an "Ask All Claudes" round: `broadcast/<bid>/<my id>.json`, which the
+/// app's progress poll reads. Refused unless the app opened that round (its
+/// `open` marker), so a guessed or stale id can't plant a reply. Written to a
+/// temp name and renamed, so the app never reads half an answer.
+fn hub_reply_broadcast(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let bid = args.get("id").and_then(|v| v.as_str()).ok_or("missing 'id'")?;
+    let answer = args
+        .get("answer")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'answer'")?;
+    if answer.trim().is_empty() {
+        return Err("'answer' is empty.".to_string());
+    }
+    let dir = crate::broadcast_dir(&ctx.state_dir, bid)
+        .filter(|d| d.join("open").exists())
+        .ok_or_else(|| {
+            format!("No open broadcast '{bid}' — it was closed, replaced, or the id is wrong. Nothing to do.")
+        })?;
+    let me = ctx.instance;
+    let body = json!({ "from": me, "ts": crate::hook::now(), "answer": answer }).to_string();
+    let tmp = dir.join(format!(".{me}.json.tmp"));
+    std::fs::write(&tmp, body)
+        .and_then(|_| std::fs::rename(&tmp, dir.join(format!("{me}.json"))))
+        .map_err(|e| format!("could not save the answer: {e}"))?;
+    log_message(
+        &ctx.state_dir.join("messages.log"),
+        &format!("claude#{me}"),
+        APP_SENDER,
+        answer,
+    );
+    Ok(json!({ "ok": true, "note": "Answer delivered to the user." }).to_string())
 }
 
 fn hub_inbox(ctx: &Ctx) -> String {
@@ -3223,6 +3269,34 @@ mod tests {
             compacting_dir: state_dir.join("compacting"),
             state_dir,
         }
+    }
+
+    // -- hub_reply_broadcast --------------------------------------------------
+
+    #[test]
+    fn reply_broadcast_needs_an_open_round() {
+        let dir = std::env::temp_dir().join(format!("mulpex-bcast-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 4);
+        let args = json!({ "id": "abc123", "answer": "I did X.\nLine two — עברית" });
+        // No round opened: refused, nothing written.
+        assert!(hub_reply_broadcast(&ctx, &args).is_err());
+        assert!(!dir.join("broadcast/abc123/4.json").exists());
+        // A path in the id is refused outright.
+        let bad = json!({ "id": "../x", "answer": "a" });
+        assert!(hub_reply_broadcast(&ctx, &bad).is_err());
+
+        let round = crate::broadcast_dir(&dir, "abc123").unwrap();
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("open"), "").unwrap();
+        hub_reply_broadcast(&ctx, &args).expect("accepted");
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(round.join("4.json")).unwrap()).unwrap();
+        assert_eq!(saved["answer"], "I did X.\nLine two — עברית");
+        assert_eq!(saved["from"], 4);
+        let log = std::fs::read_to_string(dir.join("messages.log")).unwrap();
+        assert!(log.contains("claude#4\tMulpex\tI did X.\\nLine two"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- cross-project messaging ---------------------------------------------

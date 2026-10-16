@@ -702,6 +702,39 @@ senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), an
 (below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
 the old `HUB_RULES`.
 
+## Ask All Claudes (⌘⇧B) — the one app message that IS answered
+
+`broadcast.rs` sends one question to the picked claudes of every open project, through
+`send_app_message` like the senders above. The answer cannot come back by `hub_send`: "Mulpex"
+is not an address, and `HUB_RULES` forbids trying. So there is a dedicated tool,
+`hub_reply_broadcast {id, answer}`:
+
+- **Where it writes.** `broadcast/<bid>/<my id>.json` in that project's scratch dir
+  (`mulpex_core::broadcast_dir`, which also refuses any id that is not a plain token). It writes a
+  temp file and renames it, and logs the answer to `messages.log` as `claude#N → Mulpex`.
+- **When it refuses.** Unless `broadcast/<bid>/open` exists. The app writes that marker when it
+  sends, and removes it on cancel or when a new round replaces this one. So a late or guessed
+  answer is refused.
+- **`HUB_RULES` is untouched.** The question's body states the exception itself ("through that
+  tool only, never hub_send"), and the tool's description says to use it only when a Mulpex
+  message asks.
+- **Row states** come from `broadcast_progress`, which the frontend polls once a second:
+  `sent` (inbox file still there), then `busy` / `read`, then one of the final states:
+  - `replied`: the answer file exists.
+  - `gone`: the claude closed.
+  - `fallback`: the claude read the question and sat `waiting` for 1.5 s with no answer file. Its
+    last assistant text from the transcript (`remote::chat::parse_line`) becomes the answer, minus
+    the "⟳ hub message from …" line.
+  - `noanswer`: the same, but with no text at all.
+- **The summary.** When every row is final, the frontend runs the summary itself. "Summarize now"
+  runs it early, over what has arrived so far. It is a headless Sonnet with no tools and no saved
+  session, streamed as `broadcast-summary` events; the prompt is `broadcast_prompt.md`.
+- **Measured** (`broadcast::tests::a_real_round_end_to_end`, real claudes in two projects,
+  2026-10-15):
+  - Asked a question, both claudes called the tool, and the round completed in about 10 s.
+  - Told not to use the tool, both fell back to their transcript text.
+  - Sonnet named both projects in its summary.
+
 ## The user's list (`hub_todo`)
 
 Called "For me" (`hub_user_asks`, `asks.rs`) until 2026-10-15; the old store dir `<home>/asks/` and

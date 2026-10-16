@@ -1,6 +1,7 @@
 //! Tauri app wiring: managed state, command surface, native menu + event
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
+mod broadcast;
 mod checkpoint;
 mod remote_update;
 mod claude_bin;
@@ -68,6 +69,7 @@ fn is_forwarded(id: &str) -> bool {
             | "pin_selection"
             | "toggle_panel"
             | "request_compact"
+            | "ask_all"
             | "minimize"
             | "next"
             | "prev"
@@ -88,6 +90,7 @@ fn is_forwarded(id: &str) -> bool {
 fn teardown(app: &tauri::AppHandle) {
     app.state::<AppState>().ws.lock().unwrap().teardown_all();
     explain::discard_all();
+    broadcast::cancel_summary();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -178,6 +181,11 @@ pub fn run() {
             commands::import_apply,
             commands::restart_app,
             commands::quit_app,
+            commands::broadcast_targets,
+            commands::broadcast_send,
+            commands::broadcast_progress,
+            commands::broadcast_summarize,
+            commands::broadcast_cancel,
             commands::checkpoint_stop,
             commands::checkpoint_progress,
             commands::checkpoint_cancel,

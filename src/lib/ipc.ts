@@ -637,6 +637,45 @@ export const restartApp = () => invoke<void>("restart_app");
 /** Quit through the normal teardown — the end of ⌘⇧Q Checkpoint & Quit. */
 export const quitApp = () => invoke<void>("quit_app");
 
+/** ⌘⇧B Ask All Claudes (`broadcast.rs`): one claude that can be asked. */
+export interface BroadcastTarget {
+  handle: ProjectHandle;
+  project: string;
+  id: number;
+  name: string | null;
+  status: Status;
+}
+/** A row's state: `sent` (unread), `busy` (read, still working or asking),
+ *  `read` (read, idle, settling), then a final one — `replied` (via the tool),
+ *  `fallback` (its last message, it never called the tool), `noanswer`, `gone`. */
+export type BroadcastRowState = "sent" | "busy" | "read" | "replied" | "fallback" | "noanswer" | "gone";
+export interface BroadcastRow {
+  handle: ProjectHandle;
+  project: string;
+  id: number;
+  name: string | null;
+  state: BroadcastRowState;
+  reply: string | null;
+}
+export interface BroadcastRound {
+  bid: string;
+  message: string;
+  rows: BroadcastRow[];
+  complete: boolean;
+}
+/** `broadcast-summary`: the next piece of the summary, its end, or why it failed. */
+export interface BroadcastSummaryEvent {
+  reqId: string;
+  kind: "delta" | "done" | "error";
+  text: string;
+}
+export const broadcastTargets = () => invoke<BroadcastTarget[]>("broadcast_targets");
+export const broadcastSend = (message: string, targets: { handle: ProjectHandle; id: number }[]) =>
+  invoke<string>("broadcast_send", { message, targets });
+export const broadcastProgress = () => invoke<BroadcastRound | null>("broadcast_progress");
+export const broadcastSummarize = (reqId: string) => invoke<void>("broadcast_summarize", { reqId });
+export const broadcastCancel = () => invoke<void>("broadcast_cancel");
+
 /** ⌘⇧Q Checkpoint & Quit (`checkpoint.rs`): one claude asked to stop, or to wake. */
 export interface CheckpointTarget {
   handle: ProjectHandle;

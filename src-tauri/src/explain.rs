@@ -343,7 +343,7 @@ fn note_fork(handle: ProjectHandle, id: usize, req_id: &str, dir: &Path, sid: &s
 }
 
 /// The text of a `stream_event` / `content_block_delta` / `text_delta` line.
-fn text_delta(v: &serde_json::Value) -> Option<&str> {
+pub(crate) fn text_delta(v: &serde_json::Value) -> Option<&str> {
     if v.get("type")?.as_str()? != "stream_event" {
         return None;
     }

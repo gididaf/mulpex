@@ -57,6 +57,8 @@ pub struct Workspace {
     /// ⌘⇧Q Checkpoint & Quit: who was asked to stop, and wakes still queued
     /// after a relaunch. See `checkpoint.rs`.
     pub checkpoint: crate::checkpoint::Checkpoint,
+    /// ⌘⇧B Ask All Claudes: the one round in flight. See `broadcast.rs`.
+    pub broadcast: crate::broadcast::Broadcast,
 }
 
 impl Default for Workspace {
@@ -75,6 +77,7 @@ impl Workspace {
             geometry: (DEFAULT_COLS, DEFAULT_ROWS),
             geometry_owner: None,
             checkpoint: Default::default(),
+            broadcast: Default::default(),
         }
     }
 
@@ -2402,6 +2405,16 @@ impl Core {
             })
             .map(|s| s.id)
             .collect()
+    }
+
+    /// `claude#id`'s transcript `.jsonl`, if it has one on disk yet.
+    pub fn transcript_of(&self, id: usize) -> Option<PathBuf> {
+        let s = self.sessions.iter().find(|s| s.id == id && !s.is_shell())?;
+        if s.session_id.is_empty() {
+            return None;
+        }
+        let p = crate::saves::transcript_path(&self.project_dir, &s.session_id);
+        p.is_file().then_some(p)
     }
 
     /// The sidebar label for `claude#id`, if it has one.

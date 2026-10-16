@@ -523,6 +523,41 @@ pub fn quit_app(app: AppHandle) {
     app.exit(0)
 }
 
+/// ⌘⇧B: every claude that can be asked, in every project.
+#[tauri::command]
+pub fn broadcast_targets(state: State<AppState>) -> Vec<crate::broadcast::Target> {
+    state.ws.lock().unwrap().broadcast_targets()
+}
+
+/// ⌘⇧B: ask the picked claudes, replacing any earlier round. Returns its id.
+#[tauri::command]
+pub fn broadcast_send(
+    state: State<AppState>,
+    message: String,
+    targets: Vec<crate::broadcast::Pick>,
+) -> Result<String, String> {
+    state.ws.lock().unwrap().broadcast_send(&message, &targets)
+}
+
+/// The current round, with every row re-checked, or `null` when none.
+#[tauri::command]
+pub fn broadcast_progress(state: State<AppState>) -> Option<crate::broadcast::RoundView> {
+    state.ws.lock().unwrap().broadcast_progress()
+}
+
+/// Summarize the answers in so far; streams `broadcast-summary` events.
+#[tauri::command]
+pub fn broadcast_summarize(app: AppHandle, state: State<AppState>, req_id: String) -> Result<(), String> {
+    let (_, prompt) = state.ws.lock().unwrap().broadcast_summary_prompt()?;
+    crate::broadcast::summarize(app, req_id, prompt)
+}
+
+/// End the round: take back unread questions, refuse late answers.
+#[tauri::command]
+pub fn broadcast_cancel(state: State<AppState>) {
+    state.ws.lock().unwrap().broadcast_cancel()
+}
+
 /// ⌘⇧Q: ask every live claude in every project to stop at a checkpoint.
 #[tauri::command]
 pub fn checkpoint_stop(state: State<AppState>) -> Vec<crate::checkpoint::Target> {

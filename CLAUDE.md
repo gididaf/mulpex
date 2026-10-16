@@ -24,7 +24,7 @@ reasoning in `docs/`.
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — To Do (`hub_todo` lists, opt-in per row via right-click, drafts until UPDATE) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator's claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
-| [docs/hub.md](docs/hub.md) | Idle-wake listener, `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) or to a sidebar name (`hub_instances` shows names) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
+| [docs/hub.md](docs/hub.md) | Idle-wake listener, ⌘⇧B Ask All Claudes (`hub_reply_broadcast`), `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) or to a sidebar name (`hub_instances` shows names) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explain.md](docs/explain.md) | ⌘⇧E Explain Selection: select text in a claude, the side panel's Explain tab explains it in simple Hebrew; a hidden Sonnet `--fork-session` of the conversation writes it (streamed, markdown sanitized, hard RTL); follow-ups `--resume` that fork (cache: $0.12 vs $0.91 for a re-fork), which Mulpex deletes on close; gated on the transcript file, not `worked`. Replaced `/explain` (2026-10-08) and the Explainer panel before it | `explain.rs`, `explain_prompt.md`, `lib/explain.ts`, `ExplainTab.svelte`, `lib/markdown.ts`, `Core::explain_target` |
@@ -92,6 +92,8 @@ src-tauri/            the Tauri app (Rust backend)
                       push — docs/remote-control.md; and Remote Hosts (client.rs drives
                       another Mulpex, desktop.rs + rpc.rs serve one) — docs/remote-hosts.md
   src/checkpoint.rs   ⌘⇧Q Checkpoint & Quit + the wake after relaunch — docs/sessions.md
+  src/broadcast.rs    ⌘⇧B Ask All Claudes: one question to every claude, answers via
+                      `hub_reply_broadcast`, a Sonnet summary — docs/hub.md
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
   src/project.rs      recents + open-project set (~/.mulpex/recents.txt, open.txt)
   src/snapshot.rs     serde types shared w/ frontend (adds ProjectHandle, WorkspaceInfo)
@@ -240,7 +242,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<p
 
 ## Keyboard
 
-Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘⇧E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧L** side panel/**⌘⇧K** request compact/**⌘⇧Q** checkpoint & quit/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
+Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘⇧E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧L** side panel/**⌘⇧K** request compact/**⌘⇧Q** checkpoint & quit/**⌘⇧B** ask all claudes/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
 **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row, **⌘⌥[ / ⌘⌥]** previous/next remote host —
 claimed in the webview by `e.code` too, since Option changes the bracket's character) are intercepted
@@ -257,7 +259,7 @@ AppKit never falls through to the main menu. Since focus is almost always in the
 accelerator that competes with a text-editing binding is effectively dead.
 
 So **⌘⇧] / ⌘⇧[, ⌘⇧← / ⌘⇧→ and ⌘⇧↑ / ⌘⇧↓ are declared in the menu but claimed in the webview**
-(as are ⌘⇧P / ⌘⇧L / ⌘⇧E / ⌘⇧K / ⌘⇧Q)
+(as are ⌘⇧P / ⌘⇧L / ⌘⇧E / ⌘⇧K / ⌘⇧Q / ⌘⇧B)
 (`App.svelte::onGlobalKey`), where a DOM keydown runs *before* that default action. Matched on
 `e.code` — `e.key` is `}`/`{` for the brackets and layout-dependent. Why the brackets failed is
 *not* established (they are not a text-editing binding; AppKit matching a shifted-punctuation key

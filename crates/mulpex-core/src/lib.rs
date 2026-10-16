@@ -56,6 +56,20 @@ pub fn name_request_path(state_dir: &std::path::Path, id: usize) -> std::path::P
     state_dir.join(NAMEREQ_DIR).join(id.to_string())
 }
 
+/// One "Ask All Claudes" round (⌘⇧B): `<state_dir>/broadcast/<bid>/`. The app
+/// writes `open` there when it sends the question; `hub_reply_broadcast` writes
+/// `<id>.json` beside it. `None` for an id that is not a plain token, so a reply
+/// can never name a path outside the dir.
+pub fn broadcast_dir(state_dir: &std::path::Path, bid: &str) -> Option<std::path::PathBuf> {
+    let ok = !bid.is_empty()
+        && bid.len() <= 64
+        && bid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    ok.then(|| state_dir.join(BROADCAST_DIR).join(bid))
+}
+
+/// See `broadcast_dir`.
+pub const BROADCAST_DIR: &str = "broadcast";
+
 /// The flag that records "this row has a name, stop asking" — read by the
 /// `UserPromptSubmit` hook (`hook::instance_named`), written by whichever side
 /// settled it: the instance naming itself, or the app when the *user* renames the

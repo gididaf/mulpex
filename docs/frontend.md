@@ -471,6 +471,30 @@ could not outlive the app (the tab says so on a shell).
   claude emits none of those modes. Don't drop it to "let the user choose"; that brings back a pin
   key that can never work, and leaves `promptbox.ts` reading a screen it was never measured on.
 
+## Ask All Claudes popup (⌘⇧B)
+
+`BroadcastDialog.svelte` is a modal with two views.
+
+- **Compose:** a question box (⌘↩ sends) and every live claude across projects, all ticked and
+  grouped by project.
+- **Progress:** a row per claude, showing its state. Rows with an answer expand to show it, and
+  ↗ opens that claude. Below the rows is the streamed summary.
+
+The round lives in `lib/broadcast.ts`, not in the popup:
+
+- Closing the popup keeps the round polling. A summary that comes due while the popup is closed
+  still runs, and ⌘⇧B reopens onto it.
+- A summary written early is redone once every row is in.
+- "New question" cancels the round on the backend.
+
+**Text direction:**
+- The answers use `renderMarkdownAuto`.
+- The summary takes one direction from the question's first letter. Its bullets open with an
+  English `project · claude#N`, so a per-block `dir="auto"` would read a Hebrew summary as LTR.
+
+**Shortcut:** ⌘⇧B is declared in the menu and claimed in `onGlobalKey`, like ⌘⇧K. The backend is
+in [hub.md](hub.md).
+
 ## Hub panel is Messages only
 
 `HubPanel.svelte` renders **Messages** and nothing else. It used to show **Waiting** and **Locks**

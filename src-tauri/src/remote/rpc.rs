@@ -94,6 +94,12 @@ pub const DENIED: &[&str] = &[
     "set_mute_menu_checked",
     "restart_app",
     "quit_app",
+    // ⌘⇧B asks every project on THIS machine; a remote host's own ⌘⇧B is local there.
+    "broadcast_targets",
+    "broadcast_send",
+    "broadcast_progress",
+    "broadcast_summarize",
+    "broadcast_cancel",
     "checkpoint_stop",
     "checkpoint_progress",
     "checkpoint_cancel",
