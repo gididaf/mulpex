@@ -54,6 +54,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "import-update",
     "pins-changed",
     "todos-changed",
+    "checkpoint-changed",
 ];
 
 /// The most terminal output in one frame.
@@ -467,12 +468,13 @@ impl Server {
                 let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
                 let args = req.get("args").cloned().unwrap_or(Value::Null);
                 let epoch = self.epoch;
+                let device = device.clone();
                 std::thread::spawn(move || {
                     let res = match app() {
                         _ if !super::rpc::ALLOWED.contains(&cmd.as_str()) => {
                             Err(format!("`{cmd}` can't be run from a remote Mulpex"))
                         }
-                        Some(app) => super::rpc::dispatch(&app, &cmd, &args),
+                        Some(app) => super::rpc::dispatch(&app, &cmd, &args, &device),
                         None => Err("Mulpex isn't ready".into()),
                     };
                     let msg = match res {

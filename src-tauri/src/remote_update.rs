@@ -115,15 +115,19 @@ fn drive(app: &AppHandle, to: &str) -> Result<(), String> {
 
     let state = app.state::<AppState>();
     state.ws.lock().unwrap().checkpoint_stop();
+    // Holds this window's auto-compact, which would otherwise type `/compact`
+    // into a claude that just stopped (checkpoint.ts::compactsHeld).
+    crate::checkpoint::changed(app, true);
     // From here on, any way out that does not restart must un-stop them.
     let undo = |why: String| {
         state.ws.lock().unwrap().checkpoint_cancel();
+        crate::checkpoint::changed(app, false);
         why
     };
     let mut clear_since: Option<Instant> = None;
     loop {
         if cancelled() {
-            state.ws.lock().unwrap().checkpoint_cancel();
+            undo(String::new());
             set("cancelled", json!({}));
             return Ok(());
         }
@@ -164,7 +168,7 @@ fn drive(app: &AppHandle, to: &str) -> Result<(), String> {
     ))
     .map_err(|e| undo(format!("download failed: {e}")))?;
     if cancelled() {
-        state.ws.lock().unwrap().checkpoint_cancel();
+        undo(String::new());
         set("cancelled", json!({}));
         return Ok(());
     }

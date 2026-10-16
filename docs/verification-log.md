@@ -2591,3 +2591,26 @@ Measured on claude 2.1.301, driving a real `claude` with a scrubbed env and its 
   - the hidden ⌘⇧E / ⌘S runs with the proxy on (same `spawn_env()` call, not driven);
   - the Linux build (the code uses only `/bin/sh`, `/dev/urandom` and tokio, but was not compiled
     for Linux).
+
+## 2026-10-16 — ⌘⇧Q, restart, wake offer and ⌘⇧O on a remote host
+
+Two real apps (hidden windows, the `test-remote-hosts.sh` setup, pre-paired over a local relay),
+host A with one real claude 2.1.301 in its project, driven through B's `drive/` queue:
+
+- **⌘⇧Q on A's tab in B:** B's panel read "Checkpoint & restart vm", the claude read the stop
+  through its listener and B showed `1 / 1 stopped`. "Restart vm": `restart_app` answered
+  (`ok null`), A came back as a new pid, B reconnected with claude#1 restored, and the claude
+  printed "Mulpex is back" — the auto-wake, with no dialog.
+- **Held compacts:** A's `compactsHeld` read `true` during B's round and `false` after Cancel.
+- **A second round elsewhere** (B's Local tab, ⌘⇧Q): refused with "A checkpoint is already
+  running on vm".
+- **Relay killed mid-round:** host `offline`, the panel said the claudes stay stopped; relay back,
+  `connected`, Cancel un-stopped them.
+- **Wake offer:** ⌘⇧Q + Quit on A itself, A relaunched by hand: both windows showed the card.
+  "Wake all" in B closed A's card, removed `checkpoint.json` and woke the claude. Repeated with
+  "Not now" in A: B's card closed.
+- **Refusals over the link:** revoking B's own device, `remote_set_enabled`, `quit_app`. Revoking
+  another device worked. `restart_app` alone restarted A and B reconnected.
+
+Not driven: the host menu's "Restart Mulpex…" confirm (a native dialog), and the visible layout
+of the stacked wake cards and the host ⌘⇧O dialog.

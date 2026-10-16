@@ -40,14 +40,21 @@
     deaf: "can't hear",
   };
 
-  const finalLabel = $derived(meta.mode === "update" ? "Update & Restart" : "Quit Mulpex");
+  const host = $derived(meta.hostName ?? "the host");
+  const title = $derived(
+    meta.mode === "update" ? "Checkpoint & Update" : meta.mode === "restart" ? `Checkpoint & restart ${host}` : "Checkpoint & Quit",
+  );
+  const finalLabel = $derived(
+    meta.mode === "update" ? "Update & Restart" : meta.mode === "restart" ? `Restart ${host}` : "Quit Mulpex",
+  );
+  const anywayLabel = $derived(
+    meta.mode === "update" ? "Update anyway" : meta.mode === "restart" ? "Restart anyway" : "Quit anyway",
+  );
 </script>
 
 <div class="card" role="dialog" aria-label="Checkpoint and quit">
   <div class="head">
-    <span class="title">
-      {meta.mode === "update" ? "Checkpoint & Update" : "Checkpoint & Quit"}
-    </span>
+    <span class="title">{title}</span>
     <span class="count" class:all={sum.allDone}>{sum.done} / {sum.total} stopped</span>
   </div>
   <div class="bar">
@@ -58,8 +65,13 @@
     <p class="note">No claudes are running — nothing to stop.</p>
   {:else}
     <p class="note">
-      Every claude was asked to stop at a safe point, note where it is, and stop its
-      background jobs. Next launch, Mulpex offers to wake them all.
+      {#if meta.mode === "restart"}
+        Every claude on {host} was asked to stop at a safe point, note where it is, and stop
+        its background jobs. When {host} is back, they wake by themselves.
+      {:else}
+        Every claude was asked to stop at a safe point, note where it is, and stop its
+        background jobs. Next launch, Mulpex offers to wake them all.
+      {/if}
     </p>
     <div class="list">
       {#each groups as g (g.project)}
@@ -85,12 +97,12 @@
 
   <div class="actions">
     {#if sum.allDone}
-      <button class="primary" disabled={meta.leaving} onclick={finishCheckpoint}>
+      <button class="primary" disabled={meta.leaving || meta.lost} onclick={finishCheckpoint}>
         {meta.leaving ? "Saving…" : finalLabel}
       </button>
     {:else if sum.onlyStuckLeft}
-      <button class="danger" disabled={meta.leaving} onclick={finishCheckpoint}>
-        {meta.mode === "update" ? "Update anyway" : "Quit anyway"}
+      <button class="danger" disabled={meta.leaving || meta.lost} onclick={finishCheckpoint}>
+        {anywayLabel}
       </button>
     {:else}
       <span class="wait">Waiting for {sum.total - sum.done}…</span>

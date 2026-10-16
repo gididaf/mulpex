@@ -1,39 +1,60 @@
 <script lang="ts">
   // After a ⌘⇧Q Checkpoint & Quit: offer to wake every claude that stopped. A
   // fixed card like the update banner, so the restored panes stay readable.
-  import { dismissResume, resumeTargets, wakeAll } from "../checkpoint";
+  // One card for this Mulpex and one per remote host that came back at a
+  // checkpoint (`checkpoint.ts::hostResumeTargets`), stacked.
+  import { dismissResume, hostResumeTargets, resumeTargets, wakeAll } from "../checkpoint";
+  import { hosts } from "../hosts";
   import type { CheckpointTarget } from "../ipc";
 
-  let { onwoke }: { onwoke: (n: number) => void } = $props();
+  let { onwoke }: { onwoke: (n: number, host: number) => void } = $props();
 
-  const targets = $derived($resumeTargets as CheckpointTarget[]);
-  const projects = $derived([...new Set(targets.map((t) => t.project))]);
+  const offers = $derived.by(() => {
+    const out: { host: number; title: string; targets: CheckpointTarget[] }[] = [];
+    const local = $resumeTargets as CheckpointTarget[];
+    if (local.length) out.push({ host: 0, title: "Mulpex quit at a checkpoint", targets: local });
+    for (const [slot, targets] of $hostResumeTargets) {
+      const name = $hosts.get(slot)?.name ?? "A remote host";
+      out.push({ host: slot, title: `◆ ${name} came back from a checkpoint`, targets });
+    }
+    return out;
+  });
+  const projectsOf = (t: CheckpointTarget[]) => [...new Set(t.map((x) => x.project))];
 </script>
 
-{#if targets.length}
-  <div class="card" role="dialog" aria-label="Wake checkpointed claudes">
-    <span class="title">Mulpex quit at a checkpoint</span>
-    <p class="note">
-      {targets.length}
-      {targets.length === 1 ? "claude" : "claudes"} stopped before it closed, in
-      {projects.join(", ")}. Wake them to re-arm their monitors and carry on where they
-      left off — each one decides itself whether anything is left to do.
-    </p>
-    <div class="actions">
-      <button class="primary" onclick={async () => onwoke(await wakeAll())}>Wake all</button>
-      <button class="ghost" onclick={dismissResume}>Not now</button>
-    </div>
+{#if offers.length}
+  <div class="stack">
+    {#each offers as o (o.host)}
+      <div class="card" role="dialog" aria-label="Wake checkpointed claudes">
+        <span class="title">{o.title}</span>
+        <p class="note">
+          {o.targets.length}
+          {o.targets.length === 1 ? "claude" : "claudes"} stopped before it closed, in
+          {projectsOf(o.targets).join(", ")}. Wake them to re-arm their monitors and carry on where they
+          left off — each one decides itself whether anything is left to do.
+        </p>
+        <div class="actions">
+          <button class="primary" onclick={async () => onwoke(await wakeAll(o.host), o.host)}>Wake all</button>
+          <button class="ghost" onclick={() => dismissResume(o.host)}>Not now</button>
+        </div>
+      </div>
+    {/each}
   </div>
 {/if}
 
 <style>
-  .card {
+  .stack {
     position: fixed;
     top: calc(3.2rem + var(--menubar-offset));
     right: 1rem;
     z-index: 60;
     width: 24rem;
     max-width: calc(100vw - 2rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .card {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
