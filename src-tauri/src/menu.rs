@@ -53,10 +53,14 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let checkpoint_quit = MenuItemBuilder::with_id("checkpoint_quit", "Checkpoint & Quit…")
         .accelerator("Cmd+Shift+Q")
         .build(app)?;
+    // Settings for `live_token.rs` (off unless a token file is set). No
+    // accelerator, for the same reason as Check for Updates.
+    let live_token = MenuItemBuilder::with_id("live_token", "Live Token…").build(app)?;
     let app_menu = SubmenuBuilder::new(app, "Mulpex")
         .about(None)
         .item(&check_updates)
         .item(&full_disk_access)
+        .item(&live_token)
         .separator()
         .services()
         .separator()

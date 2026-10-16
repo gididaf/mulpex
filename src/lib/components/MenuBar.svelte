@@ -34,6 +34,7 @@
       title: "Mulpex",
       items: [
         cmd("Check for Updates…", "check_updates"),
+        cmd("Live Token…", "live_token"),
         SEP,
         cmd("Checkpoint & Quit…", "checkpoint_quit", "⌘⇧Q"),
         cmd("Quit Mulpex", "quit", "⌘Q"),

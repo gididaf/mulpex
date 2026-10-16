@@ -445,6 +445,18 @@ export const secretsSave = (
 ) => call<string[]>("secrets_save", { projectHandle, id, name, projectOnly, rows, send });
 
 /** A saved set's rows, values included — only for the edit form. */
+/** Mulpex ▸ Live Token… (`live_token.rs`). `host` is the machine whose
+ *  settings these are: 0 for this one, a slot for a remote host. */
+export interface LiveTokenStatus {
+  token_file: string;
+  refresh_command: string;
+  running: boolean;
+  token_problem: string | null;
+}
+export const liveTokenGet = (host: number) => call<LiveTokenStatus>("live_token_get", {}, host);
+export const liveTokenSet = (host: number, tokenFile: string, refreshCommand: string) =>
+  call<LiveTokenStatus>("live_token_set", { tokenFile, refreshCommand }, host);
+
 export const secretsGet = (name: string, projectHandle: ProjectHandle) =>
   call<{ rows: SecretRow[]; project_only: boolean }>("secrets_get", { name }, slotOf(projectHandle));
 

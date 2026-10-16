@@ -463,6 +463,12 @@ impl Session {
                 // wins over `/tui fullscreen` and the rollout gate (measured,
                 // 2.1.292: `0` emits no ?1049h / ?100xh).
                 cmd.env("CLAUDE_CODE_NO_FLICKER", "0");
+                // Live Token: point the API at Mulpex's proxy, which puts the
+                // current token on every request (`live_token.rs`). Nothing
+                // when the feature is off.
+                for (k, v) in crate::live_token::spawn_env().unwrap_or_default() {
+                    cmd.env(k, v);
+                }
                 cmd.env("MULPEX_INSTANCE_ID", id.to_string());
                 cmd.env("MULPEX_STATE_DIR", state_dir);
                 cmd.env(

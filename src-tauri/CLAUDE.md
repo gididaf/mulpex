@@ -13,6 +13,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `remote/client.rs`, `remote/desktop.rs`, `remote/rpc.rs` (Remote Hosts: driving another Mulpex / being driven), `pty.rs` `OutputSink::desktop_tap`, `Workspace::geometry_owner` | [../docs/remote-hosts.md](../docs/remote-hosts.md) — handles, mirror snapshots at an exact stream offset, the geometry lease |
 | `explain.rs`, `explain_prompt.md` (⌘⇧E: a Sonnet `--fork-session` explains a selection; follow-ups `--resume` that fork; Mulpex deletes it) | [../docs/explain.md](../docs/explain.md) — why follow-ups resume instead of re-fork (measured cache cost), why it is gated on the transcript file |
 | `secrets.rs` (⌘K) | [../docs/secrets.md](../docs/secrets.md) |
+| `live_token.rs` (Mulpex ▸ Live Token…: the token-swapping API proxy), its env in `pty.rs`/`saves.rs`/`explain.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
 | `todos.rs` (To Do: `hub_todo`, drafts, UPDATE) | [../docs/hub.md](../docs/hub.md) — single writer, delivery gate, message body; [../docs/frontend.md](../docs/frontend.md) — drafts and conflicts. No field may be named `handle` (`client.rs::lift`) |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts` → [../docs/linux.md](../docs/linux.md) |

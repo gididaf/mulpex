@@ -125,6 +125,7 @@
   import RenameDialog from "./lib/components/RenameDialog.svelte";
   import LoadDialog from "./lib/components/LoadDialog.svelte";
   import SecretsDialog from "./lib/components/SecretsDialog.svelte";
+  import LiveTokenDialog from "./lib/components/LiveTokenDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
   import RemoteDialog from "./lib/components/RemoteDialog.svelte";
   import ConnectHostDialog from "./lib/components/ConnectHostDialog.svelte";
@@ -358,6 +359,8 @@
   let importFor = $state<ProjectHandle | null>(null);
   /** ⌘K: the claude the Secrets dialog is for, or null when closed. */
   let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
+  /** Mulpex ▸ Live Token…: the host (0 = this machine) whose settings are open. */
+  let liveTokenHost = $state<number | null>(null);
   /** ⌘⇧O: the Remote Control dialog is open. */
   let showRemote = $state(false);
   /** File ▸ Connect to Remote Mulpex…: the pairing dialog is open. */
@@ -1318,6 +1321,10 @@
       case "full_disk_access":
         await openFda();
         break;
+      case "live_token":
+        // The settings of the machine being looked at: a remote host's tab edits that host.
+        liveTokenHost = get(activeHost);
+        break;
       case "checkpoint_quit":
         await startCheckpoint("quit");
         break;
@@ -1859,6 +1866,16 @@
         const t = secretsFor;
         secretsFor = null;
         if (t) sendSecretsTag(t.handle, t.id, keys);
+        terminals.refocus();
+      }}
+    />
+  {/if}
+  {#if liveTokenHost != null}
+    <LiveTokenDialog
+      host={liveTokenHost}
+      hostLabel={liveTokenHost > 0 ? hostName(liveTokenHost) : null}
+      onclose={() => {
+        liveTokenHost = null;
         terminals.refocus();
       }}
     />
