@@ -4,10 +4,19 @@
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { remoteRevokeDevice, remoteSetEnabled, remoteSetRelayUrl, remoteStatus } from "../ipc";
   import { IS_LINUX } from "../platform";
+  import { hosts } from "../hosts";
 
   // ⌘⇧O: turn Remote Control on or off and pair a phone (`remote.rs`). The
   // status is live — `remote-changed` fires on every connect, drop and join.
-  let { onclose }: { onclose: () => void } = $props();
+  //
+  // With `host` set (⌘⇧O on a remote tab) it is THAT host's Remote Control,
+  // read through the link: pair a phone or another computer to it, remove
+  // devices. What would cut the link this window drives it through — turning
+  // it off, moving its relay, removing this computer — is not offered (and
+  // `rpc.rs` refuses it anyway). No `remote-changed` reaches us from there,
+  // so it is polled.
+  let { onclose, host = 0 }: { onclose: () => void; host?: number } = $props();
+  const hostName = $derived(host ? ($hosts.get(host)?.name ?? "remote host") : null);
 
   let st = $state<RemoteStatus | null>(null);
   let url = $state("");
@@ -16,17 +25,26 @@
   let sheet: HTMLDivElement | undefined = $state();
 
   $effect(() => {
-    remoteStatus().then((s) => {
-      st = s;
-      url = s.relay_url;
-    });
-    const un = listen<RemoteStatus>("remote-changed", (e) => (st = e.payload));
+    const h = host;
+    remoteStatus(h)
+      .then((s) => {
+        st = s;
+        url = s.relay_url;
+      })
+      .catch((e) => (error = String(e)));
+    const un = h ? null : listen<RemoteStatus>("remote-changed", (e) => (st = e.payload));
     // A pairing QR lasts 10 minutes; asking again replaces an expired one.
-    const tick = setInterval(() => remoteStatus().then((s) => (st = s)), 30_000);
+    const tick = setInterval(
+      () =>
+        remoteStatus(h)
+          .then((s) => (st = s))
+          .catch(() => {}),
+      h ? 3_000 : 30_000,
+    );
     sheet?.focus();
     return () => {
       clearInterval(tick);
-      un.then((f) => f());
+      un?.then((f) => f());
     };
   });
 
@@ -35,7 +53,11 @@
     const again = kind === "desktop" ? "a new pairing link" : "a new QR scan";
     if (!(await confirm(`Remove ${name}? It will need ${again} to connect again.`, { title: `Remove ${what}`, kind: "warning" })))
       return;
-    st = await remoteRevokeDevice(id);
+    try {
+      st = await remoteRevokeDevice(id, host);
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   /** The pairing link, for another Mulpex (File ▸ Connect to Remote Mulpex…):
@@ -59,6 +81,18 @@
   }
 
   const since = (secs: number) => new Date(secs * 1000).toLocaleDateString();
+
+  // Who is connected, phones and computers apart (as the top bar counts them):
+  // a computer driving it is not a phone.
+  const who = $derived.by(() => {
+    const on = st?.devices.filter((d) => d.online) ?? [];
+    const phones = on.filter((d) => d.kind !== "desktop").length;
+    const macs = on.length - phones;
+    const parts = [];
+    if (phones || !macs) parts.push(`${phones} ${phones === 1 ? "phone" : "phones"}`);
+    if (macs) parts.push(`${macs} ${macs === 1 ? "computer" : "computers"}`);
+    return parts.join(", ");
+  });
 
   async function toggle() {
     if (!st || busy) return;
@@ -116,17 +150,19 @@
     onclick={(e) => e.stopPropagation()}
     onkeydown={onKey}
   >
-    <div class="label">Remote Control</div>
+    <div class="label">Remote Control{#if hostName} · ◆ {hostName}{/if}</div>
     {#if st}
       <div class="row">
         <span class="dot {st.state}"></span>
         <span class="state">
           {words[st.state]}{#if st.state === "connected"}
-            · {st.clients} {st.clients === 1 ? "phone" : "phones"}{/if}
+            · {who}{/if}
         </span>
-        <button class="toggle" class:on={st.enabled} disabled={busy} onclick={toggle}>
-          {st.enabled ? "Turn off" : "Turn on"}
-        </button>
+        {#if !host}
+          <button class="toggle" class:on={st.enabled} disabled={busy} onclick={toggle}>
+            {st.enabled ? "Turn off" : "Turn on"}
+          </button>
+        {/if}
       </div>
       {#if st.error}<div class="error">{st.error}</div>{/if}
 
@@ -138,7 +174,10 @@
         </div>
         <div class="row link">
           <button onclick={copyLink}>{copied ? "Copied ✓" : "Copy link"}</button>
-          <span class="muted">To drive this Mulpex from another one: paste it there in File ▸ Connect to Remote Mulpex… (once, within 10 minutes).</span>
+          <span class="muted"
+            >To drive {hostName ?? "this Mulpex"} from another one: paste it there in File ▸ Connect to Remote
+            Mulpex… (once, within 10 minutes).</span
+          >
         </div>
       {/if}
 
@@ -151,12 +190,23 @@
               >{d.kind === "desktop" ? "💻" : "📱"} {d.name}{#if d.push} 🔔{/if}
               <span class="muted">· added {since(d.added)}</span></span
             >
-            <button onclick={() => revoke(d.id, d.name, d.kind)}>Remove</button>
+            {#if host && d.id === st.you}
+              <span class="muted">this computer</span>
+            {:else}
+              <button onclick={() => revoke(d.id, d.name, d.kind)}>Remove</button>
+            {/if}
           </div>
         {/each}
       {/if}
 
       <div class="label sub">Relay address</div>
+      {#if host}
+        <div class="row"><span class="state">{st.relay_url}</span></div>
+        <div class="hint">
+          Turning {hostName}'s Remote Control off, or moving its relay, would cut the link this
+          window drives it through — do that on {hostName} itself.
+        </div>
+      {:else}
       <div class="row">
         <input
           bind:value={url}
@@ -170,6 +220,7 @@
           <button onclick={resetUrl} title={st.default_relay_url}>Reset</button>
         {/if}
       </div>
+      {/if}
     {/if}
     {#if error}<div class="error">{error}</div>{/if}
   </div>

@@ -122,6 +122,16 @@ pub fn dismiss() {
     let _ = std::fs::remove_file(saved_path());
 }
 
+/// Tell every window (this one, and each remote desktop driving it) that a
+/// round started or ended, or that the "Wake all" offer was answered. `active`
+/// holds compacts in THIS window while someone else runs the round
+/// (`checkpoint.ts::compactsHeld`); every listener also re-reads
+/// `checkpoint_pending`, so a "Wake all" answered on one side closes on both.
+pub fn changed(app: &tauri::AppHandle, active: bool) {
+    use tauri::Emitter;
+    let _ = app.emit("checkpoint-changed", serde_json::json!({ "active": active }));
+}
+
 impl Workspace {
     /// Ask every live claude in every project to stop at a checkpoint. Replaces
     /// any earlier round: a second ⌘⇧Q re-asks everyone, including claudes

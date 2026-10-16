@@ -877,6 +877,14 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
   into cloudraw#157 the second it stopped for the quit, and the resume prompt sent it back to work
   (three Slack posts while the panel said "stopped"). When the hold lifts, every project gets one
   auto-compact tick, since hub updates only come on a change.
+- **Someone else's round holds compacts too.** `checkpoint_stop` / `_cancel` / `_wake` /
+  `_dismiss` emit `checkpoint-changed {active}`; the window listens and holds compacts while
+  `active` (`heldElsewhere`). That covers a round run from afar — a remote desktop's ⌘⇧Q, or a
+  remote-ordered update (`remote_update.rs` emits it too) — which this window's own `quitting`
+  flag never sees. Before this, a host's auto-compact could type `/compact` into a claude a remote
+  update had just stopped.
+- **On a remote host's tab** ⌘⇧Q runs the round on **that host** and the final button restarts it
+  (docs/remote-hosts.md, "Checkpoint, restart and the wake offer on a host").
 - Monitors are why the note matters: quitting kills every background task a claude armed, and
   `--resume` restores only the conversation. The Mulpex hub listener comes back by itself (plugin
   monitor); agentalk and artifact watches come back only because the claude wrote them down.

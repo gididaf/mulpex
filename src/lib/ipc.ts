@@ -644,7 +644,7 @@ export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecis
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
  * runs teardown (kills every project's `claude` process group, removes the
  * scratch root) before re-execing. Used to apply a downloaded update. */
-export const restartApp = () => invoke<void>("restart_app");
+export const restartApp = (host = 0) => call<void>("restart_app", {}, host);
 
 /** Quit through the normal teardown — the end of ⌘⇧Q Checkpoint & Quit. */
 export const quitApp = () => invoke<void>("quit_app");
@@ -670,13 +670,16 @@ export interface CheckpointProgress {
   listener: boolean;
 }
 
-export const checkpointStop = () => invoke<CheckpointTarget[]>("checkpoint_stop");
-export const checkpointProgress = () => invoke<CheckpointProgress[]>("checkpoint_progress");
-export const checkpointCancel = () => invoke<void>("checkpoint_cancel");
-export const checkpointCommit = () => invoke<void>("checkpoint_commit");
-export const checkpointPending = () => invoke<CheckpointTarget[]>("checkpoint_pending");
-export const checkpointWake = () => invoke<number>("checkpoint_wake");
-export const checkpointDismiss = () => invoke<void>("checkpoint_dismiss");
+// `host` 0 is this Mulpex; a remote host's checkpoint runs there, and its
+// `checkpoint_commit` always records an auto-wake (it ends in a restart nobody
+// at that screen answers).
+export const checkpointStop = (host = 0) => call<CheckpointTarget[]>("checkpoint_stop", {}, host);
+export const checkpointProgress = (host = 0) => call<CheckpointProgress[]>("checkpoint_progress", {}, host);
+export const checkpointCancel = (host = 0) => call<void>("checkpoint_cancel", {}, host);
+export const checkpointCommit = (host = 0) => call<void>("checkpoint_commit", {}, host);
+export const checkpointPending = (host = 0) => call<CheckpointTarget[]>("checkpoint_pending", {}, host);
+export const checkpointWake = (host = 0) => call<number>("checkpoint_wake", {}, host);
+export const checkpointDismiss = (host = 0) => call<void>("checkpoint_dismiss", {}, host);
 
 /** ⌘⇧O Remote Control (`remote.rs`). Also the `remote-changed` event payload. */
 export interface RemoteStatus {
@@ -693,6 +696,9 @@ export interface RemoteStatus {
   pair_url: string;
   qr_svg: string;
   devices: RemoteDevice[];
+  /** Only when read from a remote desktop: the asking computer's own device id
+   *  there, which it must not remove (`rpc.rs`). */
+  you?: string;
 }
 export interface RemoteDevice {
   id: string;
@@ -708,9 +714,9 @@ export interface RemoteDevice {
 /** Answer a phone's typing request (`remote-type`). */
 export const remoteReply = (rid: string, ok: boolean, why: string | null, id: number | null = null) =>
   invoke<void>("remote_reply", { rid, ok, why, id });
-export const remoteRevokeDevice = (id: string) =>
-  invoke<RemoteStatus>("remote_revoke_device", { id });
-export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
+export const remoteRevokeDevice = (id: string, host = 0) =>
+  call<RemoteStatus>("remote_revoke_device", { id }, host);
+export const remoteStatus = (host = 0) => call<RemoteStatus>("remote_status", {}, host);
 export const remoteSetEnabled = (on: boolean) =>
   invoke<RemoteStatus>("remote_set_enabled", { on });
 export const remoteSetRelayUrl = (url: string) =>

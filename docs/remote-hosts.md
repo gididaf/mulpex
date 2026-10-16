@@ -4,7 +4,8 @@ One Mulpex driving another. The user's case is a Mac driving a Linux VM, which i
 reachable over RDP (laggy, and copy/paste breaks). The VM's projects show up on the Mac as tabs
 behind a **host switcher**. Each claude there is a **real terminal mirror** of the VM's pane: you
 type into it, and copy/paste uses the Mac's own clipboard. Every feature works on a remote tab:
-saves, explain, secrets, pins, compact, open/close projects and drag-and-drop.
+saves, explain, secrets, pins, compact, open/close projects, drag-and-drop, ⌘⇧Q (which restarts
+the host) and the host's own ⌘⇧O.
 
 Built on Remote Control (`remote-control.md`), and uses the same relay, pairing and encryption.
 A remote desktop pairs exactly like a phone. Then it says `hello` as a desktop and gets the host
@@ -130,12 +131,47 @@ The rest of the lease:
   for remote handles, and `compactLines` shows the phase the host's hub reports. The auto-compact
   rules are enforced only by the host.
 - **Selections** (⌘⇧E, ⌘⇧P, ⌘K's prompt read) are read from the Mac's mirror.
-- **Never sent to the host:** `switch_project`, `focus_session`, and the host's lifecycle commands
-  (`rpc.rs::DENIED`, with reasons). Driving the host never moves its own window around.
+- **Never sent to the host:** `switch_project`, `focus_session`, `quit_app` (nobody could start it
+  again), and anything that would cut the link itself — `remote_set_enabled`,
+  `remote_set_relay_url` (`rpc.rs::DENIED`, with reasons). Driving the host never moves its own
+  window around.
 - **Files:** a drop, and Ctrl+V with an image in a remote claude, upload over the channel. They
   land in `<home>/remote/uploads/<id>/` on the host (0600, pruned after 7 days, 100 MB cap,
   folders kept whole), and the host paths are pasted. Ctrl+V with no image goes through as
   `\x16`.
+
+## Checkpoint, restart and the wake offer on a host
+
+Before 2026-10-16 ⌘⇧Q on a remote tab stopped the **Mac's** claudes and quit the Mac; the host was
+untouched, because every `checkpoint_*`, `restart_app` and `remote_*` command was `DENIED`. Now:
+
+- **⌘⇧Q acts on the machine whose tab is in front.** On a host's tab, `checkpoint.ts` runs the
+  same panel with `host` set, every `checkpoint_*` call goes through `ipc.ts::call`, and the
+  rows read the host's lifted statuses like any remote project. One round at a time across all
+  machines: a second ⌘⇧Q elsewhere is refused with a toast naming where one is running.
+- **Its final button restarts the host** ("Restart vm"), never quits it — nobody could start it
+  again. `rpc.rs` maps `checkpoint_commit` to `checkpoint_commit(true)` (auto-wake: nobody is at
+  that screen to click "Wake all"), then `restart_app` answers first and restarts 800 ms later
+  (`RESTART_DELAY`), so the Mac reads success, not a dropped link. The tabs grey, reconnect and
+  rebuild on the new `boot`; the claudes get "Mulpex is back" as their listeners come up.
+- **The link dropping mid-round** greys the final button and says the claudes stay stopped;
+  Cancel once it is back un-stops them.
+- **Plain restart:** the host switcher's right-click ▸ **Restart Mulpex…**. It names any claude
+  still `working` there (cut off mid-turn, resumed after) and points at ⌘⇧Q; Restart anyway.
+- **The "Wake all" offer** of a host relaunched at a checkpoint (someone ⌘⇧Q'd *on* it and started
+  it again) shows on the Mac too: `checkpoint_pending` is read through the link on every connect.
+  Wake/dismiss on either side emits `checkpoint-changed`, forwarded to the Mac as
+  `host-checkpoint-changed {slot}` (it names no project, so it can't be lifted like the rest);
+  both re-read, so the card closes on both.
+- **⌘⇧O on a host's tab** is that host's Remote Control: its QR / pairing link, its devices,
+  removing a phone. What would cut this link is not offered — no on/off, the relay address is
+  read-only, and the Mac's own row says "this computer". `rpc.rs` enforces the last one too:
+  `dispatch` gets the asking `device` and refuses to revoke it, and `remote_status` answers with
+  `you` set to it. No `remote-changed` reaches the Mac from there, so the dialog polls (3 s).
+
+Measured headless with two real apps and a real claude on the host (2026-10-16): the round, the
+restart and the auto-wake; the link dropping mid-round; the wake offer answered on the Mac and,
+separately, on the host; host compacts held during the round; the refusals.
 
 ## Lifecycle (`remoteHosts.ts`)
 

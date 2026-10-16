@@ -33,6 +33,7 @@
     reparentSession,
     setMuteMenuChecked,
     quitApp,
+    restartApp,
     remoteSnapshotReply,
     type BootstrapInfo,
     type WorkspaceInfo,
@@ -112,7 +113,7 @@
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CheckpointPanel from "./lib/components/CheckpointPanel.svelte";
   import ResumeDialog from "./lib/components/ResumeDialog.svelte";
-  import { checkpointOpen, checkResume, startCheckpoint } from "./lib/checkpoint";
+  import { checkpointOpen, checkResume, compactsHeld, initCheckpointEvents, startCheckpoint } from "./lib/checkpoint";
   import FdaBanner from "./lib/components/FdaBanner.svelte";
   import { checkFda, openFda } from "./lib/fda";
   import { checkForUpdate, startUpdateChecks } from "./lib/updater";
@@ -251,6 +252,7 @@
         ...(st.enabled && !connected
           ? [{ label: "Reconnect now", run: () => void connectHost(slot, true) }]
           : []),
+        ...(connected ? [{ label: "Restart Mulpex…", run: () => void restartHost(slot) }] : []),
         { sep: true },
         {
           label: "Remove…",
@@ -266,6 +268,36 @@
         },
       ],
     };
+  }
+
+  /** The host menu's "Restart Mulpex…": no checkpoint, so a claude mid-turn is
+   *  cut off (it resumes after the restart, minus that turn) — say who first,
+   *  and point at ⌘⇧Q, which stops them cleanly. */
+  async function restartHost(slot: number) {
+    const name = hostName(slot);
+    const busy: string[] = [];
+    for (const p of get(projects).values()) {
+      if (slotOf(p.handle) !== slot) continue;
+      for (const [id, status] of p.statuses) if (status === "working") busy.push(`${p.name} claude#${id}`);
+    }
+    const msg = busy.length
+      ? `${busy.length} ${busy.length === 1 ? "claude is" : "claudes are"} working on ${name}: ${busy.join(", ")}. ` +
+        `Restarting now cuts ${busy.length === 1 ? "it" : "them"} off mid-turn. ` +
+        `Checkpoint & Quit (⌘⇧Q on one of ${name}'s tabs) stops them cleanly first.`
+      : `Restart Mulpex on ${name}? Its claudes come back as they were.`;
+    const ok = await confirm(msg, {
+      title: `Restart ${name}`,
+      kind: busy.length ? "warning" : "info",
+      okLabel: busy.length ? "Restart anyway" : "Restart",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return;
+    try {
+      await restartApp(slot);
+      flashToast(`Restarting ${name}…`);
+    } catch (e) {
+      flashToast(String(e));
+    }
   }
 
   /** Focus a session within the active project. */
@@ -362,7 +394,8 @@
   /** Mulpex ▸ Live Token…: the host (0 = this machine) whose settings are open. */
   let liveTokenHost = $state<number | null>(null);
   /** ⌘⇧O: the Remote Control dialog is open. */
-  let showRemote = $state(false);
+  /** ⌘⇧O is open on this host's Remote Control (0 = this Mulpex), or closed. */
+  let remoteFor = $state<number | null>(null);
   /** File ▸ Connect to Remote Mulpex…: the pairing dialog is open. */
   let showConnect = $state(false);
   /** ⌘O on a remote host: the host whose folders the picker browses. */
@@ -1233,7 +1266,8 @@
         if (h != null) importFor = h;
         break;
       case "remote_control":
-        showRemote = true;
+        // A remote tab in front: that host's Remote Control (devices, pairing).
+        remoteFor = get(activeHost);
         break;
       case "connect_host":
         showConnect = true;
@@ -1326,7 +1360,8 @@
         liveTokenHost = get(activeHost);
         break;
       case "checkpoint_quit":
-        await startCheckpoint("quit");
+        // A remote tab in front: checkpoint THAT host's claudes and restart it.
+        await startCheckpoint("quit", get(activeHost)).catch((e) => flashToast(String(e)));
         break;
       case "next":
         cycle(1);
@@ -1577,6 +1612,7 @@
           projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
           text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
           dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },
+          compactsHeld: get(compactsHeld),
         };
         void invoke("debug_dump", { name: "ui", text: JSON.stringify(ui, null, 1) });
         // One queued action per tick: a click (by selector and text), a menu
@@ -1643,6 +1679,8 @@
     // the pane with the question rather than merely raising the window.
     let stopAttention: (() => void) | null = null;
     let stopHosts: (() => void) | null = null;
+    // Before the hosts connect: each one's "Wake all" offer is read as it does.
+    const stopCheckpoint = initCheckpointEvents();
     initAttention(focusInstance).then((stop) => {
       stopAttention = stop;
     });
@@ -1697,6 +1735,7 @@
       stopUpdateChecks();
       stopAttention?.();
       stopHosts?.();
+      stopCheckpoint();
       stopLinuxKeys?.();
       unlisteners.forEach((p) => p.then((f) => f()));
     };
@@ -1723,7 +1762,7 @@
       onhost={selectHost}
       onhostmenu={openHostMenu}
     />
-    <TopBar onremote={() => (showRemote = true)} />
+    <TopBar onremote={() => (remoteFor = 0)} />
     <aside class="sidebar">
       <InstanceList
         onselect={selectSession}
@@ -1834,10 +1873,11 @@
       />
     </div>
   {/if}
-  {#if showRemote}
+  {#if remoteFor != null}
     <RemoteDialog
+      host={remoteFor}
       onclose={() => {
-        showRemote = false;
+        remoteFor = null;
         terminals.refocus();
       }}
     />
@@ -1941,7 +1981,10 @@
   <CheckpointPanel onfocus={focusInstance} />
 {/if}
 <ResumeDialog
-  onwoke={(n) => flashToast(`Waking ${n} ${n === 1 ? "claude" : "claudes"} as each one comes up…`)}
+  onwoke={(n, host) =>
+    flashToast(
+      `Waking ${n} ${n === 1 ? "claude" : "claudes"}${host ? ` on ${hostName(host)}` : ""} as each one comes up…`,
+    )}
 />
 
 <style>

@@ -71,6 +71,16 @@ pub const ALLOWED: &[&str] = &[
     "import_discard",
     "import_apply",
     "browse_dir",
+    "checkpoint_stop",
+    "checkpoint_progress",
+    "checkpoint_cancel",
+    "checkpoint_commit",
+    "checkpoint_pending",
+    "checkpoint_wake",
+    "checkpoint_dismiss",
+    "restart_app",
+    "remote_status",
+    "remote_revoke_device",
 ];
 
 /// Never from a remote desktop, and why:
@@ -82,9 +92,14 @@ pub const ALLOWED: &[&str] = &[
 ///   (`compact.ts`), reached through `fa`; writing the phase from afar would
 ///   race it.
 /// - `set_mute_menu_checked`: this Mulpex's own menu.
-/// - `restart_app`, `quit_app`, `checkpoint_*`: this whole app's lifecycle.
-/// - `remote_*`, `host_*`, `fda_*`, `geometry_take_back`: this machine's own
-///   settings and permissions, and the remote-control plumbing itself.
+/// - `quit_app`: nobody could start this Mulpex again from afar. A remote
+///   ⌘⇧Q ends in `restart_app` instead.
+/// - `remote_set_enabled`, `remote_set_relay_url`: either one cuts the very
+///   link the remote desktop is driving through. (`remote_revoke_device` is
+///   allowed, but refuses the caller's own device for the same reason.)
+/// - `remote_reply`, `remote_snapshot_reply`, `host_*`, `fda_*`,
+///   `geometry_take_back`: this machine's own permissions, and the
+///   remote-control plumbing itself.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const DENIED: &[&str] = &[
     "switch_project",
@@ -94,24 +109,14 @@ pub const DENIED: &[&str] = &[
     "resize_terminals",
     "set_compact_phase",
     "set_mute_menu_checked",
-    "restart_app",
     "quit_app",
-    "checkpoint_stop",
-    "checkpoint_progress",
-    "checkpoint_cancel",
-    "checkpoint_commit",
-    "checkpoint_pending",
-    "checkpoint_wake",
-    "checkpoint_dismiss",
     "geometry_take_back",
     "remote_snapshot_reply",
     "debug_dump_enabled",
     "debug_dump",
     "debug_drive_take",
-    "remote_status",
     "remote_set_enabled",
     "remote_set_relay_url",
-    "remote_revoke_device",
     "remote_reply",
     "host_list",
     "host_update",
@@ -143,9 +148,15 @@ fn out<T: serde::Serialize>(v: T) -> Result<Value, String> {
     serde_json::to_value(v).map_err(|e| e.to_string())
 }
 
+/// How long a remote `restart_app` waits before restarting, so its answer
+/// reaches the remote desktop first (it would otherwise read a dropped link
+/// as a failure).
+const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// Run one allowed command, as the local frontend would have. Blocking: the
-/// caller runs it off the connection thread.
-pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value) -> Result<Value, String> {
+/// caller runs it off the connection thread. `device` is the remote desktop
+/// asking — the one thing it must never do is cut itself off.
+pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Result<Value, String> {
     if !ALLOWED.contains(&cmd) {
         return Err(format!("`{cmd}` can't be run from a remote Mulpex"));
     }
@@ -236,6 +247,39 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value) -> Result<Value, Strin
         "import_discard" => out(c::import_discard(h()?)),
         "import_apply" => out(c::import_apply(st(), h()?, arg(args, "decisions")?)?),
         "browse_dir" => out(c::browse_dir(arg(args, "path")?)?),
+        // ⌘⇧Q on a remote tab: the remote desktop runs the panel, this host
+        // stops its own claudes. It always ends in a restart nobody here will
+        // answer a "Wake all" for, so the checkpoint wakes by itself.
+        "checkpoint_stop" => out(c::checkpoint_stop(st(), app.clone())),
+        "checkpoint_progress" => out(c::checkpoint_progress(st())),
+        "checkpoint_cancel" => out(c::checkpoint_cancel(st(), app.clone())),
+        "checkpoint_commit" => {
+            st().ws.lock().unwrap().checkpoint_commit(true).map_err(|e| e.to_string())?;
+            out(())
+        }
+        "checkpoint_pending" => out(c::checkpoint_pending(st())),
+        "checkpoint_wake" => out(c::checkpoint_wake(st(), app.clone())),
+        "checkpoint_dismiss" => out(c::checkpoint_dismiss(app.clone())),
+        "restart_app" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(RESTART_DELAY);
+                app.request_restart();
+            });
+            out(())
+        }
+        "remote_status" => {
+            let mut v = out(super::remote_status())?;
+            v["you"] = Value::String(device.to_string());
+            Ok(v)
+        }
+        "remote_revoke_device" => {
+            let target: String = arg(args, "id")?;
+            if target == device {
+                return Err("That is this computer's own pairing — removing it would cut the link you are using.".into());
+            }
+            out(super::remote_revoke_device(target))
+        }
         // In `ALLOWED` but not matched above: a bug in this file, said plainly.
         _ => Err(format!("`{cmd}` is allowed but has no dispatcher")),
     }

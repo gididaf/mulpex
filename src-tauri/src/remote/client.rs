@@ -575,6 +575,9 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
             }
             if name == "projects-changed" {
                 emit("host-projects-changed", json!({"slot": slot, "ws": payload}));
+            } else if name == "checkpoint-changed" {
+                // Unlike the rest it names no project, so say which host.
+                emit("host-checkpoint-changed", json!({"slot": slot, "ev": payload}));
             } else if super::desktop::EVENT_NAMES.contains(&name) {
                 emit(name, payload);
             }

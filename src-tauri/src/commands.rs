@@ -525,8 +525,10 @@ pub fn quit_app(app: AppHandle) {
 
 /// ⌘⇧Q: ask every live claude in every project to stop at a checkpoint.
 #[tauri::command]
-pub fn checkpoint_stop(state: State<AppState>) -> Vec<crate::checkpoint::Target> {
-    state.ws.lock().unwrap().checkpoint_stop()
+pub fn checkpoint_stop(state: State<AppState>, app: AppHandle) -> Vec<crate::checkpoint::Target> {
+    let targets = state.ws.lock().unwrap().checkpoint_stop();
+    crate::checkpoint::changed(&app, true);
+    targets
 }
 
 /// Per claude asked to stop: alive, stop message still unread, listener up.
@@ -537,8 +539,9 @@ pub fn checkpoint_progress(state: State<AppState>) -> Vec<crate::checkpoint::Pro
 
 /// ⌘⇧Q's Cancel: take back unread stop messages, tell the rest to carry on.
 #[tauri::command]
-pub fn checkpoint_cancel(state: State<AppState>) {
-    state.ws.lock().unwrap().checkpoint_cancel()
+pub fn checkpoint_cancel(state: State<AppState>, app: AppHandle) {
+    state.ws.lock().unwrap().checkpoint_cancel();
+    crate::checkpoint::changed(&app, false);
 }
 
 /// Record who was asked to stop, right before quitting or restarting.
@@ -560,14 +563,17 @@ pub fn checkpoint_pending(state: State<AppState>) -> Vec<crate::checkpoint::Targ
 
 /// "Wake all": queue "Mulpex is back" for every checkpointed claude.
 #[tauri::command]
-pub fn checkpoint_wake(state: State<AppState>) -> usize {
-    state.ws.lock().unwrap().checkpoint_wake()
+pub fn checkpoint_wake(state: State<AppState>, app: AppHandle) -> usize {
+    let n = state.ws.lock().unwrap().checkpoint_wake();
+    crate::checkpoint::changed(&app, false);
+    n
 }
 
 /// "Not now": forget the checkpoint.
 #[tauri::command]
-pub fn checkpoint_dismiss() {
-    crate::checkpoint::dismiss()
+pub fn checkpoint_dismiss(app: AppHandle) {
+    crate::checkpoint::dismiss();
+    crate::checkpoint::changed(&app, false);
 }
 
 /// A project's current hub snapshot for the initial HubPanel paint (thereafter
