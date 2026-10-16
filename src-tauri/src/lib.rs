@@ -7,6 +7,7 @@ mod remote_update;
 mod claude_bin;
 mod commands;
 mod hub;
+mod live_token;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menu;
 mod project;
@@ -66,6 +67,7 @@ fn is_forwarded(id: &str) -> bool {
             | "messages"
             | "explain"
             | "secrets"
+            | "live_token"
             | "pin_selection"
             | "toggle_panel"
             | "request_compact"
@@ -172,6 +174,8 @@ pub fn run() {
             commands::secrets_get,
             commands::secrets_update,
             commands::secrets_delete,
+            commands::live_token_get,
+            commands::live_token_set,
             commands::list_guides,
             commands::delete_guide,
             commands::load_guide,
@@ -228,6 +232,10 @@ pub fn run() {
             // shell spawn inline. The same thread then re-probes periodically, so
             // a rotating token stays live in a long-running Mulpex.
             claude_bin::warm_and_refresh();
+
+            // Live Token (off unless configured): bind its proxy before any
+            // project restores, so restored claudes are spawned pointing at it.
+            live_token::init();
 
             // Put a commented `watchers.txt` in the home dir if there isn't one.
             // The watcher exemption works out of the box (the built-ins cover the

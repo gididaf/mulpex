@@ -61,6 +61,8 @@ pub const ALLOWED: &[&str] = &[
     "secrets_get",
     "secrets_update",
     "secrets_delete",
+    "live_token_get",
+    "live_token_set",
     "list_guides",
     "delete_guide",
     "load_guide",
@@ -228,6 +230,10 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value) -> Result<Value, Strin
             arg(args, "rows")?,
         )?),
         "secrets_delete" => out(c::secrets_delete(arg(args, "name")?)?),
+        "live_token_get" => out(c::live_token_get()),
+        "live_token_set" => {
+            out(c::live_token_set(arg(args, "tokenFile")?, arg(args, "refreshCommand")?)?)
+        }
         "list_guides" => out(c::list_guides(st(), h()?)?),
         "delete_guide" => out(c::delete_guide(st(), h()?, arg(args, "file")?)?),
         "load_guide" => out(c::load_guide(st(), h()?, arg(args, "file")?)?),

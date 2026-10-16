@@ -765,6 +765,22 @@ pub fn secrets_get(name: String) -> Result<crate::secrets::SavedDetail, String> 
     crate::secrets::get_saved(&mulpex_core::mulpex_home(), &name)
 }
 
+/// Mulpex ▸ Live Token…: the settings and whether the token file reads.
+#[tauri::command]
+pub fn live_token_get() -> crate::live_token::Status {
+    crate::live_token::status()
+}
+
+/// Mulpex ▸ Live Token… Save. Empty `tokenFile` turns the feature off.
+#[tauri::command]
+pub fn live_token_set(
+    token_file: String,
+    refresh_command: String,
+) -> Result<crate::live_token::Status, String> {
+    crate::live_token::set_settings(crate::live_token::Settings { token_file, refresh_command })?;
+    Ok(crate::live_token::status())
+}
+
 /// ⌘K ✎ Save: replace a saved set's rows; `project_only` re-tags it to this project.
 #[tauri::command]
 pub fn secrets_update(

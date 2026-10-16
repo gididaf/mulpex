@@ -2549,3 +2549,45 @@ four inputs).
 Also seen: the old AppImage launcher process outlived the restart, with no children (its
 `mulpex` had exited and its scratch dir was gone). It was killed by hand; it was harmless, but
 it kept the old mount alive.
+
+## 2026-10-16 — Live Token (docs/live-token.md)
+
+Measured on claude 2.1.301, driving a real `claude` with a scrubbed env and its own `CLAUDE_CONFIG_DIR`:
+
+- **`ANTHROPIC_UNIX_SOCKET` + `ssh-placeholder`:**
+  - `policy_limits` arrived as plain HTTP with no auth header.
+  - Every `/v1/messages` attempt opened with a TLS ClientHello (`\x16\x03\x01…`), captured with a
+    raw socket listener. Header rewriting there is impossible; the approach was ruled out.
+- **`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`:**
+  - `/v1/messages?beta=true` arrived as plain HTTP with `Bearer` auth and `oauth-2025-04-20` in
+    `anthropic-beta`. `HEAD /api/hello` arrived too.
+  - Bootstrap, `/api/oauth/*` and telemetry still went straight to `api.anthropic.com` with the env
+    token, even with `CLAUDE_CODE_API_BASE_URL` also set.
+  - A placeholder env token made bootstrap fail with a 401 (the baseline gets a 403 for env tokens
+    anyway).
+  - ToolSearch's optimistic mode turned off; `ENABLE_TOOL_SEARCH=true` brought it back.
+  - The banner and `/usage` were identical to a run without the proxy.
+  - The base URL's path prefix (`/<secret>`) was kept on every request.
+- **Live swap in one interactive session (Python probe proxy):** good → invalid → good token between
+  turns gave 200, then 401 ("Please run /login"), then 200, with the fingerprints changing to match.
+- **The Rust proxy (`serve_for_manual_e2e` harness) with a real claude:**
+  - no secret, or a wrong one → 403;
+  - a `-p` round trip worked;
+  - a well-formed invalid token in the file → upstream 401 → refresh command ran once → retried with
+    the good token. The claude printed the answer and never saw the 401.
+  - With no requests at all, the 60 s loop ran the refresh command and restored the file.
+  - An interactive 12-line streamed reply came through intact.
+  - A malformed file (no `sk-ant-` prefix) kept the last good token.
+- **Two real apps over a local relay** (the `test-remote-hosts.sh` setup; B drives A):
+  - B ▸ host tab ▸ Live Token… showed "Live Token · vm" and wrote `live-token.json` into **A's**
+    home only.
+  - A claude spawned on A before saving had no `ANTHROPIC_BASE_URL`. One spawned after had it plus
+    `ENABLE_TOOL_SEARCH=true`, and answered a prompt through A's proxy.
+  - After `live_token_set` with an empty file over `host_invoke`, the next claude again had no
+    proxy env.
+- **NOT measured:**
+  - a switch between two different real accounts (only one was available);
+  - a real usage-limit 429;
+  - the hidden ⌘⇧E / ⌘S runs with the proxy on (same `spawn_env()` call, not driven);
+  - the Linux build (the code uses only `/bin/sh`, `/dev/urandom` and tokio, but was not compiled
+    for Linux).

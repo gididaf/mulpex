@@ -201,6 +201,7 @@ fn run(
         .env_clear()
         .envs(claude_bin::forwarded_env())
         .env("PATH", claude_bin::merged_path())
+        .envs(crate::live_token::spawn_env().unwrap_or_default())
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
