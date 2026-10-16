@@ -19,7 +19,7 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   - `ENABLE_TOOL_SEARCH=true`, unless the user's own env already sets it.
 
   Both are documented Claude Code env vars. This covers interactive claudes (`pty.rs`) and the
-  hidden `claude -p` runs (`saves.rs` — also used by Import Docs — and `explain.rs`).
+  hidden `claude -p` runs (`saves.rs` — also used by Import Docs — `explain.rs` and `broadcast.rs`).
 - **On each request**, the proxy reads the token file again, but only when its mtime or size has
   changed. It replaces `Authorization: Bearer …` with that token and forwards the request to the real
   API: the user's own `ANTHROPIC_BASE_URL` if they set one, else `api.anthropic.com`. The response
