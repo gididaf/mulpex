@@ -2585,6 +2585,8 @@ impl Core {
                 // only thing that can tell the updater not to restart the app out
                 // from under a live agentalk channel.
                 let watching = mulpex_core::watching_path(&self.state_dir, s.id).exists();
+                let background_only = status == Status::Working
+                    && mulpex_core::only_background_work(&self.state_dir, s.id);
                 let ctx_pct = std::fs::read_to_string(mulpex_core::ctx_path(&self.state_dir, s.id))
                     .ok()
                     .and_then(|t| t.trim().parse::<f64>().ok())
@@ -2599,6 +2601,7 @@ impl Core {
                     id: s.id,
                     status,
                     watching,
+                    background_only,
                     ctx_pct,
                     compact_phase,
                     compacting,
@@ -4542,6 +4545,43 @@ mod tests {
             name_verdict("same", true, false, Some("same")),
             NameVerdict::Ignore
         );
+    }
+
+    /// A turn that ended with background shells still up reads `working`, and
+    /// ⌘⇧K waited for `waiting` forever: viva-la-rts's claude#1671 stopped for
+    /// its compact with a headless-browser test run in the background and sat at
+    /// "compact: waiting for checkpoint…" until a hub message woke it. The
+    /// snapshot now says when `working` is only that.
+    #[test]
+    fn the_snapshot_tells_a_finished_turn_with_background_work_from_a_live_one() {
+        let (_env, root, mut core) = scratch_core("background-only-test");
+        let id = core.spawn_instance().unwrap().id;
+        let status = core.state_dir.join(id.to_string());
+        let flag = core.state_dir.join("bg").join(id.to_string());
+        std::fs::create_dir_all(core.state_dir.join("bg")).unwrap();
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        let bg_only = |core: &Core| {
+            core.hub_snapshot().statuses.iter().find(|e| e.id == id).unwrap().background_only
+        };
+
+        std::fs::write(&status, "working").unwrap();
+        assert!(!bg_only(&core), "a turn in progress");
+        // `Stop`'s order: status, then the flag.
+        pause();
+        std::fs::write(&flag, "").unwrap();
+        assert!(bg_only(&core), "turn over, only background work left");
+        // The background job's wake starts a new turn.
+        pause();
+        std::fs::write(&status, "working").unwrap();
+        assert!(!bg_only(&core), "a new turn is a live one");
+        // A stale flag never makes an idle instance anything but idle.
+        std::fs::write(&status, "waiting").unwrap();
+        pause();
+        std::fs::write(&flag, "").unwrap();
+        assert!(!bg_only(&core), "only `working` can be background-only");
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An instance that ends a turn without having named itself gets a

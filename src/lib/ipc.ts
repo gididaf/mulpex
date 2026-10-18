@@ -70,6 +70,10 @@ export interface StatusEntry {
    *  `status` says `waiting`. Only the updater's busy guard reads it — a restart
    *  would kill the claude and drop whatever the watcher is attached to. */
   watching: boolean;
+  /** `working` only because the turn ended with background work still running
+   *  (no turn in progress). Compact treats it as a checkpoint. Absent from an
+   *  older remote host's snapshot. */
+  background_only?: boolean;
   /** Context window used, whole percent (Claude Code's own number, via the
    *  statusline). Null until the first reply. */
   ctx_pct: number | null;

@@ -797,7 +797,14 @@ A claude can't run `/compact` on itself, and compacting mid-step loses the step.
   is typed. An idle claude skips this phase.
 - **`compacting`** — `lib/compact.ts` saw status `waiting` *and* an empty input box
   (`promptbox.ts`; a `needs` dialog or a draft just keeps it waiting) and typed `/compact\r` in one
-  write.
+  write. **`working` with `background_only` counts as `waiting` here**: a turn that ended with a
+  `run_in_background` shell still up reads `working` (`bg/<id>`), so the request used to wait for
+  the shell — on 2026-10-18 viva-la-rts's claude#1671 stopped for its compact with a long
+  headless-browser test run in the background and sat at "waiting for checkpoint…" until a hub
+  message woke it. The snapshot's `background_only` is `mulpex_core::only_background_work` (flag no
+  older than the status). Measured on claude 2.1.302 in tmux: `/compact` at the idle prompt with a
+  `sleep 150` shell running compacted, the shell survived it, and its completion still woke the
+  claude afterwards. The hub listener never caused this — it is a watcher, not `bg` work.
 - **`resume`** — `hook::sessionstart` (source `compact`) flips `compacting` → `resume`, only from
   `compacting`, so an automatic compaction during `requested` does not skip the checkpoint. The app
   types the resume prompt (bracketed paste + `\r`, like Remote Control) at the next empty box and

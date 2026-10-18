@@ -4,7 +4,8 @@
 //   requested   the hook adds "stop at a checkpoint" to every tool call
 //               (`mulpex_core::hook::COMPACT_NOTE`) until the turn ends; an idle
 //               claude skips straight to the next step
-//   compacting  the turn ended (status `waiting`, input box empty): Mulpex typed
+//   compacting  the turn ended (status `waiting`, or `working` with only
+//               background work left; input box empty): Mulpex typed
 //               `/compact`
 //   resume      the compaction's `SessionStart` arrived (the hook flips the file);
 //               Mulpex types RESUME and the request is done
@@ -183,9 +184,14 @@ export function dropCompact(h: ProjectHandle, id: number) {
   if (get(reqs).has(keyOf(h, id))) put(h, id, null);
 }
 
+// A turn that ended with background shells still running reads `working`, but
+// the claude has stopped — waiting for `waiting` would wait for the test run.
 function ready(h: ProjectHandle, id: number): boolean {
   const p = get(projects).get(h);
-  return p?.statuses.get(id) === "waiting" && terminals.promptBox(h, id) === "empty";
+  const status = p?.statuses.get(id);
+  const bgOnly =
+    status === "working" && !!p?.hub?.statuses.find((e) => e.id === id)?.background_only;
+  return (status === "waiting" || bgOnly) && terminals.promptBox(h, id) === "empty";
 }
 
 /** Advance one request as far as the claude's state allows. */

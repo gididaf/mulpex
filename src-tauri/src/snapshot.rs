@@ -172,6 +172,12 @@ pub struct StatusEntry {
     /// watcher is attached to, which is the updater's business and nobody
     /// else's. → `mulpex_core::WATCHING_DIR`.
     pub watching: bool,
+    /// `working` only because the turn ended with background work still running
+    /// (a `run_in_background` shell, a background agent) — no turn is in
+    /// progress (`mulpex_core::only_background_work`). Lets ⌘⇧K / auto-compact
+    /// treat it as a checkpoint: waiting for `waiting` there never ends while a
+    /// long test run is up, and the claude has already stopped for the compact.
+    pub background_only: bool,
     /// How full the context window is, whole percent, as Claude Code reports
     /// it to the statusline (`mulpex_core::CTX_DIR`). `None` until the first
     /// reply. Rounded so the snapshot only changes when the number shown does.

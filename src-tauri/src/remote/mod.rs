@@ -2079,6 +2079,7 @@ mod tests {
                 id: 1,
                 status: Status::Needs,
                 watching: false,
+                background_only: false,
                 ctx_pct: Some(40),
                 compact_phase: Some("requested".into()),
                 compacting: false,
