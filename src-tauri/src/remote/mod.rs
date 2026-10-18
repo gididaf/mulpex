@@ -804,6 +804,11 @@ struct Session {
     /// Set once it said `hello` as a remote desktop (`desktop.rs`). It then
     /// gets no phone view and no notifications.
     desk: Option<desktop::Desk>,
+    /// A remote desktop this host refused (another wire). It stays on the link
+    /// to order and follow an update, and must not get the phone view either:
+    /// it reads one as a host from before Remote Hosts and gives up (seen in
+    /// scripts/test-remote-update.sh, a view change mid-update).
+    refused_desk: bool,
     /// The claude whose chat this phone has open, if any.
     watch: Option<Watch>,
     /// The terminal this phone has open, if any.
@@ -998,7 +1003,7 @@ impl Server {
             if seq != self.sent_seq {
                 if let Some(v) = &view {
                     let cids: Vec<u64> =
-                        self.sessions.iter().filter(|(_, s)| s.desk.is_none()).map(|(c, _)| *c).collect();
+                        self.sessions.iter().filter(|(_, s)| s.desk.is_none() && !s.refused_desk).map(|(c, _)| *c).collect();
                     for cid in cids {
                         self.send_sealed(ws, cid, v)?;
                     }
@@ -1154,7 +1159,7 @@ impl Server {
         let Some((eh, ch)) = crypto::host_handshake(&secret, &device_pub, &eph) else {
             return json!({"t": "denied", "why": "bad handshake"});
         };
-        self.sessions.insert(cid, Session { device, ch, desk: None, watch: None, term: None, visible: true });
+        self.sessions.insert(cid, Session { device, ch, desk: None, refused_desk: false, watch: None, term: None, visible: true });
         self.report();
         json!({"t": "hs", "eh": b64(&eh)})
     }
@@ -1868,19 +1873,28 @@ mod tests {
             serde_json::from_slice(&ch.open(d["c"].as_str().unwrap()).unwrap()).unwrap()
         };
 
-        // Another version is refused, with ours.
+        // A desktop from before the fingerprint (no `wire`) is refused, with
+        // our version and wire.
         let mut old = connect(&mut ws, 8);
-        say(&mut ws, 8, json!({"t": "sealed", "c": old.seal(json!({"t": "hello", "kind": "desktop", "proto": 1, "app": "0.0.1"}).to_string().as_bytes())}));
+        say(&mut ws, 8, json!({"t": "sealed", "c": old.seal(json!({"t": "hello", "kind": "desktop", "proto": 1, "app": env!("CARGO_PKG_VERSION")}).to_string().as_bytes())}));
         let r = next(&mut ws, &mut old, 8);
         assert_eq!((r["t"].as_str(), r["app"].as_str()), (Some("refused"), Some(env!("CARGO_PKG_VERSION"))));
+        assert_eq!(r["wire"].as_str(), Some(env!("MULPEX_WIRE")));
+
+        // So is another wire, whatever its version.
+        let mut other = connect(&mut ws, 7);
+        say(&mut ws, 7, json!({"t": "sealed", "c": other.seal(json!({"t": "hello", "kind": "desktop", "proto": 1, "app": env!("CARGO_PKG_VERSION"), "wire": "0000000000000000"}).to_string().as_bytes())}));
+        assert_eq!(next(&mut ws, &mut other, 7)["t"], "refused");
 
         let mut ch = connect(&mut ws, 9);
         let tell = |ws: &mut tungstenite::WebSocket<TcpStream>, ch: &mut Channel, m: Value| {
             say(ws, 9, json!({"t": "sealed", "c": ch.seal(m.to_string().as_bytes())}));
         };
-        tell(&mut ws, &mut ch, json!({"t": "hello", "kind": "desktop", "proto": desktop::PROTO, "app": env!("CARGO_PKG_VERSION"), "name": "MacBook"}));
+        // Another app version on the same wire is welcome.
+        tell(&mut ws, &mut ch, json!({"t": "hello", "kind": "desktop", "proto": desktop::PROTO, "app": "0.0.1", "wire": env!("MULPEX_WIRE"), "name": "MacBook"}));
         let w = next(&mut ws, &mut ch, 9);
         assert_eq!(w["t"], "welcome");
+        assert_eq!(w["wire"].as_str(), Some(env!("MULPEX_WIRE")));
         assert_eq!((w["geo"]["cols"].as_u64(), w["device"].as_str()), (Some(100), Some("mac1")));
         assert!(!w["boot"].as_str().unwrap().is_empty());
 

@@ -23,6 +23,9 @@ mod secrets;
 mod snapshot;
 mod state;
 mod vtgrid;
+// Read by `build.rs`; the app itself only needs `env!("MULPEX_WIRE")`.
+#[cfg(test)]
+mod wire;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

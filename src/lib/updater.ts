@@ -147,14 +147,26 @@ export async function checkForUpdate(manual = false): Promise<void> {
 }
 
 /** The version every connected remote host was brought to this run. Remote
- * Hosts needs both sides on the same version, so a host must update BEFORE this
- * Mulpex restarts — after it, the host refuses our hello. */
+ * Hosts needs both sides on the same wire fingerprint (`wire.rs`), so a host
+ * on another wire must update BEFORE this Mulpex restarts — after it, the host
+ * refuses our hello. */
 let remotesAt: string | null = null;
 
-/** Order every connected host to update to `version`, and wait until each is
- * back on it. Rejects with the first failure, after calling the others off. */
-function updateRemotes(version: string): Promise<void> {
-  const slots = [...get(hosts).values()].filter((h) => h.state === "connected").map((h) => h.slot);
+/** The wire fingerprint `release.sh` put in latest.json, or null: a release
+ * from before it, which every host must follow. */
+function wireOf(u: Update): string | null {
+  const w = u.rawJson?.wire;
+  return typeof w === "string" && w ? w : null;
+}
+
+/** Order every connected host whose wire `version` changes to update to it,
+ * and wait until each is back on it. A host already on that wire keeps running
+ * (its claudes are not stopped); right-click › Update host brings it along when
+ * the user wants. Rejects with the first failure, after calling the others off. */
+function updateRemotes(version: string, wire: string | null): Promise<void> {
+  const slots = [...get(hosts).values()]
+    .filter((h) => h.state === "connected" && (wire === null || h.wire !== wire))
+    .map((h) => h.slot);
   if (slots.length === 0) return Promise.resolve();
   patch({ phase: "remotes", remotes: slots, error: null });
   return new Promise(async (resolve, reject) => {
@@ -225,7 +237,7 @@ export async function applyUpdate(force = false): Promise<void> {
   if (remotesAt !== pending.version) {
     const version = pending.version;
     try {
-      await updateRemotes(version);
+      await updateRemotes(version, wireOf(pending));
     } catch (e) {
       // Cancel already put the banner back; anything else is a failure, and
       // this Mulpex stays on the version its hosts still run.

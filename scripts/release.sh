@@ -161,15 +161,21 @@ fi
 
 LATEST="$BUNDLE/latest.json"
 SIGNATURE="$(cat "$SIGFILE")"
+# The wire fingerprint (src-tauri/src/wire.rs), asked of the binary that ships.
+# A Mac reads it before updating and updates first only the remote hosts on
+# another wire; the rest keep running (docs/remote-hosts.md).
+WIRE="$(target/release/mulpex --wire-hash)"
+[[ "$WIRE" =~ ^[0-9a-f]{16}$ ]] || { echo "ERROR: bad wire fingerprint '$WIRE'" >&2; exit 1; }
 PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 URL="https://github.com/$REPO/releases/download/$TAG/Mulpex.app.tar.gz"
 
-VERSION="$VERSION" NOTES="$NOTES" PUB_DATE="$PUB_DATE" \
+VERSION="$VERSION" NOTES="$NOTES" PUB_DATE="$PUB_DATE" WIRE="$WIRE" \
 SIGNATURE="$SIGNATURE" URL="$URL" node -e '
   const out = {
     version: process.env.VERSION,
     notes: process.env.NOTES,
     pub_date: process.env.PUB_DATE,
+    wire: process.env.WIRE,
     platforms: {
       "darwin-aarch64": {
         signature: process.env.SIGNATURE,

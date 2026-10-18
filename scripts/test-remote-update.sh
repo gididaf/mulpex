@@ -3,14 +3,22 @@
 # Mulpex .app bundles, a local relay, and a local update server — nothing
 # touches GitHub or the installed app.
 #
-# Two bundles are built from this checkout: BASE (the current version) and NEXT
-# (a made-up higher one), both pointed at http://127.0.0.1:$WWW/latest.json,
-# which offers NEXT. A is the host, B the Mac driving it.
+# Three bundles are built from this checkout, all pointed at
+# http://127.0.0.1:$WWW/latest.json: BASE (the current version), NEXT (a
+# made-up higher one with a code change in a wire file, so another wire
+# fingerprint — src-tauri/src/wire.rs) and COMPAT (higher too, same wire as
+# BASE). A is the host, B the Mac driving it.
 #
 #   1. late host:  A on BASE, B on NEXT → B orders A up; A updates, restarts,
 #                  and B is connected to it on NEXT.
 #   2. one click:  A and B on BASE; B's "Update & Restart" updates A first,
 #                  then itself; both end on NEXT and connected.
+#   3. compatible: A on BASE, B on COMPAT → they connect, A is left alone and
+#                  B sees it behind; then B orders A up by hand.
+#   4. one click, compatible: A and B on BASE, COMPAT offered → only B updates;
+#                  A keeps running, and B reconnects to it.
+#   5. rollout:    A on LEGACY (the v0.47.1 release commit, from before the
+#                  fingerprint), B on NEXT → B orders A up, as in 1.
 #
 # With CLAUDE=1, scenario 2 also puts a real, busy claude in A: it must get the
 # checkpoint stop, and the wake after A's relaunch.
@@ -35,6 +43,7 @@ RELAY_URL="http://127.0.0.1:$PORT"
 CLAUDE_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')"; export CLAUDE_VERSION
 BASE="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 NEXT="${BASE%.*}.99"
+COMPAT="${BASE%.*}.98"
 KEY="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key}"
 export CARGO_TARGET_DIR="$ROOT/target/update-test"
 # Run from inside a Mulpex claude, this shell carries that claude's hub identity;
@@ -63,35 +72,56 @@ cargo build -q -p mulpex-relay
 export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 export CI=true
-build() { # $1 version → $WORK/build-$1/
+build() { # $1 version [$2 = "rewire": change the wire | a git commit to build instead] → $WORK/build-$1/
   local v=$1 src="$WORK/src-$1"
-  echo "› building v$v"
+  echo "› building v$v${2:+ ($2)}"
   mkdir -p "$src"
-  rsync -a --exclude target --exclude node_modules --exclude .git "$ROOT/" "$src/"
+  if [ -n "${2:-}" ] && [ "$2" != rewire ]; then
+    git -C "$ROOT" archive "$2" | tar -x -C "$src"
+  else
+    rsync -a --exclude target --exclude node_modules --exclude .git "$ROOT/" "$src/"
+  fi
   ln -s "$ROOT/node_modules" "$src/node_modules"
   # One shared target dir (the second build reuses the first's deps), but
   # bundle-helper.sh copies from ./target, so it must be reachable from here.
   mkdir -p "$CARGO_TARGET_DIR"; ln -s "$CARGO_TARGET_DIR" "$src/target"
-  sed -i '' "s/^version = \"$BASE\"/version = \"$v\"/" "$src/src-tauri/Cargo.toml"
+  sed -i '' "s/^version = \"[0-9.]*\"/version = \"$v\"/" "$src/src-tauri/Cargo.toml"
+  [ "${2:-}" = rewire ] && printf '\n#[allow(dead_code)]\nconst UPDATE_TEST_REWIRE: u8 = 0;\n' >>"$src/src-tauri/src/commands.rs"
   local cfg
   cfg=$(printf '{"version":"%s","app":{"windows":[{"title":"Mulpex","width":1280,"height":820,"visible":%s,"backgroundThrottling":"disabled"}]},"bundle":{"targets":["app"]},"plugins":{"updater":{"endpoints":["http://127.0.0.1:%s/latest.json"],"dangerousInsecureTransportProtocol":true}}}' "$v" "$( [ -n "${VISIBLE:-}" ] && echo true || echo false )" "$WWW")
   (cd "$src" && npx tauri build --debug --bundles app --config "$cfg" >"$WORK/build-$v.log" 2>&1) || {
     tail -30 "$WORK/build-$v.log"; exit 1;
   }
-  mkdir -p "$WORK/build-$v"
-  cp -R "$CARGO_TARGET_DIR/debug/bundle/macos/Mulpex.app" "$WORK/build-$v/"
-  cp "$CARGO_TARGET_DIR/debug/bundle/macos/Mulpex.app.tar.gz"* "$WORK/build-$v/"
+  local out="$WORK/build-${3:-$v}"
+  mkdir -p "$out"
+  cp -R "$CARGO_TARGET_DIR/debug/bundle/macos/Mulpex.app" "$out/"
+  cp "$CARGO_TARGET_DIR/debug/bundle/macos/Mulpex.app.tar.gz"* "$out/"
 }
 build "$BASE"
-build "$NEXT"
+build "$NEXT" rewire
+build "$COMPAT"
+# The last release from before the fingerprint (v0.47.1), under BASE's version number.
+LEGACY_REF="${LEGACY_REF:-e7e452d}"  # chore: v0.47.1
+[ -z "${VISIBLE:-}" ] && build "$BASE" "$LEGACY_REF" legacy
+
+wire_of() { "$WORK/build-$1/Mulpex.app/Contents/MacOS/mulpex" --wire-hash; }
+if [ "$(wire_of "$BASE")" = "$(wire_of "$COMPAT")" ] && [ "$(wire_of "$BASE")" != "$(wire_of "$NEXT")" ]; then
+  echo "  ✓ wires: BASE = COMPAT = $(wire_of "$BASE"), NEXT = $(wire_of "$NEXT")"
+else
+  echo "  ✗ wires: BASE $(wire_of "$BASE"), COMPAT $(wire_of "$COMPAT"), NEXT $(wire_of "$NEXT")"; exit 1
+fi
 
 mkdir -p "$WORK/www"
-cp "$WORK/build-$NEXT/Mulpex.app.tar.gz" "$WORK/www/"
-SIG="$(cat "$WORK/build-$NEXT/Mulpex.app.tar.gz.sig")" NEXT="$NEXT" URL="http://127.0.0.1:$WWW/Mulpex.app.tar.gz" node -e '
-  const out = { version: process.env.NEXT, notes: "test", pub_date: new Date().toISOString(),
-    platforms: { "darwin-aarch64": { signature: process.env.SIG, url: process.env.URL } } };
-  require("fs").writeFileSync(process.argv[1], JSON.stringify(out));
-' "$WORK/www/latest.json"
+offer() { # $1 version: latest.json offers it, with its wire, as release.sh writes it
+  cp "$WORK/build-$1/Mulpex.app.tar.gz" "$WORK/www/Mulpex-$1.app.tar.gz"
+  SIG="$(cat "$WORK/build-$1/Mulpex.app.tar.gz.sig")" V="$1" WIRE="$(wire_of "$1")" \
+  URL="http://127.0.0.1:$WWW/Mulpex-$1.app.tar.gz" node -e '
+    const out = { version: process.env.V, notes: "test", pub_date: new Date().toISOString(), wire: process.env.WIRE,
+      platforms: { "darwin-aarch64": { signature: process.env.SIG, url: process.env.URL } } };
+    require("fs").writeFileSync(process.argv[1], JSON.stringify(out));
+  ' "$WORK/www/latest.json"
+}
+offer "$NEXT"
 # --directory puts $WORK on its command line, so cleanup's pkill finds it.
 python3 -m http.server "$WWW" --bind 127.0.0.1 --directory "$WORK/www" >"$WORK/www.log" 2>&1 & PIDS+=($!)
 
@@ -150,6 +180,12 @@ running() { pgrep -f "$1/Contents/MacOS/mulpex" >/dev/null; }
 connected() {
   python3 -c 'import json,sys; sys.exit(0 if any(h["state"] == "connected" for h in json.load(open(sys.argv[1]))["hosts"]) else 1)' "$1/B/dump/ui.txt" 2>/dev/null
 }
+# What B's UI knows about the host: `<state> <version>`.
+host_seen() {
+  python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hosts"][0]; print(h["state"], h.get("version"))' "$1/B/dump/ui.txt" 2>/dev/null
+}
+sees() { [ "$(host_seen "$1")" = "$2" ]; }
+a_pid() { pgrep -f "$1/A.app/Contents/MacOS/mulpex" | head -1; }
 FAIL=0
 ok() { echo "  ✓ $1"; }
 bad() { echo "  ✗ $1"; FAIL=1; }
@@ -201,5 +237,52 @@ if [ -n "${CLAUDE:-}" ]; then
   if until_ok 200 grep -qs "Mulpex is back. Before it quit" "$TMPDIR/mulpex-$NEW/1/messages.log"; then ok "the claude got the wake"; else bad "no wake message"; fi
 fi
 teardown click
+
+if [ -z "${VISIBLE:-}" ]; then
+# ---- 3. compatible host ----------------------------------------------------------
+echo "› 3. compatible host (A v$BASE, B v$COMPAT, same wire)"
+offer "$COMPAT"
+S="$WORK/compat"
+setup compat "$BASE" "$COMPAT"
+if until_ok 60 sees "$S" "connected $BASE"; then ok "B connected to A on v$BASE"; else bad "B sees: $(host_seen "$S")"; fi
+P0="$(a_pid "$S")"
+sleep 20
+if is_version "$S/A.app" "$BASE" && [ "$(a_pid "$S")" = "$P0" ] && sees "$S" "connected $BASE"; then
+  ok "A was left alone (same pid, still v$BASE)"
+else bad "A changed: v$(version_of "$S/A.app"), pid $P0 → $(a_pid "$S"), B sees $(host_seen "$S")"; fi
+# The host menu's "Update to v…" sends this same order (after a confirm dialog).
+printf '%s' "{\"invoke\":\"host_update\",\"args\":{\"host\":1,\"version\":\"$COMPAT\"}}" >"$S/B/drive/1.json"
+if until_ok 180 is_version "$S/A.app" "$COMPAT"; then ok "by hand: A updated to v$COMPAT"; else bad "by hand: A is still v$(version_of "$S/A.app")"; fi
+sleep 3
+if until_ok 90 sees "$S" "connected $COMPAT"; then ok "B is connected to A on v$COMPAT"; else bad "B sees: $(host_seen "$S")"; fi
+teardown compat
+
+# ---- 4. one click, compatible --------------------------------------------------------
+echo "› 4. one click, compatible (A and B v$BASE, v$COMPAT offered)"
+S="$WORK/click-compat"
+setup click-compat "$BASE" "$BASE"
+sleep 8
+if until_ok 60 sees "$S" "connected $BASE"; then ok "B connected to A"; else bad "B sees: $(host_seen "$S")"; fi
+P0="$(a_pid "$S")"
+printf '%s' '{"click":".card button.primary","text":"Update"}' >"$S/B/drive/1.json"
+if until_ok 180 is_version "$S/B.app" "$COMPAT"; then ok "the Mac updated"; else bad "the Mac is still v$(version_of "$S/B.app")"; fi
+if until_ok 30 running "$S/B.app"; then ok "the Mac restarted"; else bad "the Mac did not come back"; fi
+if is_version "$S/A.app" "$BASE" && [ "$(a_pid "$S")" = "$P0" ]; then ok "the host was not touched"; else
+  bad "the host changed: v$(version_of "$S/A.app"), pid $P0 → $(a_pid "$S")"; fi
+sleep 3
+if until_ok 60 sees "$S" "connected $BASE"; then ok "B is connected to A (still v$BASE)"; else bad "B sees: $(host_seen "$S")"; fi
+teardown click-compat
+
+# ---- 5. rollout ----------------------------------------------------------------------
+echo "› 5. rollout (A on $LEGACY_REF, from before the fingerprint; B v$NEXT)"
+offer "$NEXT"
+S="$WORK/rollout"
+setup rollout legacy "$NEXT"
+if until_ok 120 is_version "$S/A.app" "$NEXT"; then ok "A installed v$NEXT by itself"; else bad "A is still v$(version_of "$S/A.app")"; fi
+if until_ok 30 running "$S/A.app"; then ok "A restarted"; else bad "A did not come back"; fi
+sleep 3
+if until_ok 60 connected "$S"; then ok "B is connected to A again"; else bad "B never reconnected — B sees: $(host_seen "$S")"; fi
+teardown rollout
+fi
 
 [ "$FAIL" = 0 ] && echo "all passed" || { echo "FAILED — KEEP=1 keeps $WORK"; exit 1; }

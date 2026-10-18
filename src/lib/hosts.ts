@@ -8,6 +8,7 @@
 // hosts' connection states, and which host is in front. The lifecycle (pairing,
 // building a host's tabs when it connects) is `remoteHosts.ts`.
 
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { derived, get, writable } from "svelte/store";
 
@@ -42,6 +43,8 @@ export interface HostStatus {
   layout: HostLayout | null;
   /** The host's app version, once it said. */
   version: string | null;
+  /** Its wire fingerprint (`wire.rs`). Null: from before it. */
+  wire: string | null;
   /** An update this Mulpex ordered there (`client.rs::HostUpdate`). */
   update: HostUpdate | null;
 }
@@ -73,6 +76,32 @@ export interface HostLayout {
     project_name: string;
     sessions: import("./ipc").SessionInfo[];
   }[];
+}
+
+/** This Mulpex's own app version ("" until read). */
+export const appVersion = writable<string>("");
+void getVersion()
+  .then((v) => appVersion.set(v))
+  .catch(() => {});
+
+/** `1.2.3` → `[1, 2, 3]`; anything else is not a version we can order.
+ *  Mirrors `client.rs::version_of`. */
+function versionOf(v: string | null): number[] | null {
+  const p = (v ?? "").trim().split(".");
+  if (p.length !== 3 || p.some((x) => !/^\d+$/.test(x))) return null;
+  return p.map(Number);
+}
+
+/** A connected host on an older version than this Mulpex. Its wire is the
+ *  same (it connected), so nothing forces it to update; the host menu offers
+ *  "Update to v…" instead (docs/remote-hosts.md). */
+export function hostBehind(h: HostStatus, mine: string): boolean {
+  if (h.state !== "connected") return false;
+  const a = versionOf(h.version);
+  const b = versionOf(mine);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i];
+  return false;
 }
 
 /** Every paired host, by slot. Empty for anyone who never paired one — then

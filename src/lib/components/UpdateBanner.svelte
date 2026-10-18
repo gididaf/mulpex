@@ -11,7 +11,7 @@
     type UpdateState,
   } from "../updater";
   import { startCheckpoint } from "../checkpoint";
-  import { hosts, type HostUpdate } from "../hosts";
+  import { hosts, hostUpdateCancel, hostUpdateClear, type HostUpdate } from "../hosts";
 
   /** One line per remote host being updated. */
   function stepText(u: HostUpdate | null | undefined): string {
@@ -49,7 +49,30 @@
   // on `idle`), and a menu item that shows nothing while the network hangs reads
   // as broken — the same nowhere-to-appear failure as the old picker-only errors.
   const visible = $derived(s.phase !== "idle");
+
+  /** Hosts updating on their own — right-click › Update to v… — rather than
+   *  as the first half of this Mulpex's update (`remotes`, shown above). */
+  const byHand = $derived(
+    s.phase === "remotes" ? [] : [...$hosts.values()].filter((h) => h.update).sort((a, b) => a.slot - b.slot),
+  );
 </script>
+
+<div class="stack">
+{#each byHand as h (h.slot)}
+  {@const u = h.update!}
+  {@const ended = u.step === "done" || u.step === "error" || u.step === "cancelled"}
+  <div class="card" class:error={u.step === "error"} role="status">
+    <div class="row">
+      <span class="title">Updating {h.name} to v{u.to}</span>
+      {#if ended}
+        <button class="ghost" onclick={() => void hostUpdateClear(h.slot)}>Dismiss</button>
+      {:else}
+        <button class="ghost" onclick={() => void hostUpdateCancel(h.slot)}>Cancel</button>
+      {/if}
+    </div>
+    <p class="notes host">{stepText(u)}</p>
+  </div>
+{/each}
 
 {#if visible}
   <div class="card" class:error={s.phase === "error"} role="status">
@@ -132,14 +155,20 @@
     {/if}
   </div>
 {/if}
+</div>
 
 <style>
-  .card {
+  .stack {
     position: fixed;
     right: 1rem;
     bottom: 2.2rem;
     z-index: 50;
     max-width: 26rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .card {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;

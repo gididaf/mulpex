@@ -65,6 +65,10 @@ git archive --format=tar HEAD | ssh "$HOST" "rm -rf ~/$REMOTE_DIR && mkdir -p ~/
 # .bashrc (where nvm installs itself) nor necessarily ~/.cargo/env.
 ssh "$HOST" "bash -lc 'set -e; source ~/.nvm/nvm.sh; source ~/.cargo/env; cd ~/$REMOTE_DIR && npm ci && npm run tauri build -- --bundles deb,appimage'"
 
+# Same source, same fingerprint — checked against latest.json below, since a
+# Linux host on another wire than the one advertised would refuse the Mac.
+WIRE="$(ssh "$HOST" "~/$REMOTE_DIR/target/release/mulpex --wire-hash")"
+
 OUT="target/release/bundle/linux"
 rm -rf "$OUT" && mkdir -p "$OUT"
 APPIMAGE="Mulpex_${VERSION}_amd64.AppImage"
@@ -96,11 +100,17 @@ fi
 
 BASE="https://github.com/$REPO/releases/download/$TAG"
 APPIMAGE_SIG="$(cat "$OUT/$APPIMAGE.sig")" DEB_SIG="$(cat "$OUT/$DEB.sig")" \
-APPIMAGE_URL="$BASE/$APPIMAGE" DEB_URL="$BASE/$DEB" VERSION="$VERSION" node -e '
+APPIMAGE_URL="$BASE/$APPIMAGE" DEB_URL="$BASE/$DEB" VERSION="$VERSION" WIRE="$WIRE" node -e '
   const fs = require("fs");
   const out = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (out.version !== process.env.VERSION) {
     console.error(`ERROR: latest.json is ${out.version}, this build is ${process.env.VERSION}`);
+    process.exit(1);
+  }
+  // A skeleton (dry run with no Mac half) has none yet: take this one.
+  out.wire ??= process.env.WIRE;
+  if (out.wire !== process.env.WIRE) {
+    console.error(`ERROR: latest.json says wire ${out.wire}, this Linux build is ${process.env.WIRE}`);
     process.exit(1);
   }
   out.platforms["linux-x86_64"] = { signature: process.env.APPIMAGE_SIG, url: process.env.APPIMAGE_URL };

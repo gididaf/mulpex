@@ -100,6 +100,9 @@ pub struct HostStatus {
     pub layout: Option<Value>,
     /// The host's app version, from its `welcome` or `refused`.
     pub version: Option<String>,
+    /// The host's wire fingerprint (`wire.rs`), from the same. `None`: a host
+    /// from before it, which must update to talk to this one.
+    pub wire: Option<String>,
     /// An update this Mulpex ordered on the host (`remote_update.rs` there).
     pub update: Option<HostUpdate>,
 }
@@ -140,6 +143,7 @@ struct Conn {
     geo: Option<Value>,
     boot: Option<String>,
     version: Option<String>,
+    wire: Option<String>,
     update: Option<HostUpdate>,
 }
 
@@ -192,6 +196,7 @@ fn status_of(g: &Inner, h: &HostCfg) -> HostStatus {
         geo: c.and_then(|c| c.geo.clone()),
         layout: h.layout.clone(),
         version: c.and_then(|c| c.version.clone()),
+        wire: c.and_then(|c| c.wire.clone()),
         update: c.and_then(|c| c.update.clone()),
     }
 }
@@ -243,6 +248,7 @@ fn start(slot: u32, pairing: Option<(Key32, Sender<Result<(), String>>)>) {
                 geo: None,
                 boot: None,
                 version: None,
+                wire: None,
                 update: None,
             },
         );
@@ -477,7 +483,7 @@ fn serve(
                     return End::Retry("bad handshake".into());
                 };
                 let hello = json!({"t": "hello", "kind": "desktop", "proto": super::desktop::PROTO,
-                                   "app": env!("CARGO_PKG_VERSION"), "name": me});
+                                   "app": env!("CARGO_PKG_VERSION"), "wire": env!("MULPEX_WIRE"), "name": me});
                 if let Err(e) = raw(ws, json!({"t": "sealed", "c": c.seal(hello.to_string().as_bytes())})) {
                     return End::Retry(e);
                 }
@@ -523,6 +529,7 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
                     c.geo = m.get("geo").cloned();
                     c.boot = boot;
                     c.version = m.get("app").and_then(Value::as_str).map(String::from);
+                    c.wire = m.get("wire").and_then(Value::as_str).map(String::from);
                     // A host updated after refusing us comes back on our version.
                     if let Some(u) = c.update.as_mut().filter(|u| Some(&u.to) == c.version.as_ref()) {
                         u.step = "done".into();
@@ -544,6 +551,12 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
         "update-progress" => return on_update_progress(slot, epoch, &m),
         // A phone's view: the host is a Mulpex from before Remote Hosts.
         "state" => {
+            // A host that refused us still sends its phone view now and then
+            // (one from before v0.48 always does). While an update we ordered
+            // there runs, that is not "too old" — the update is the answer.
+            if with_conn(slot, epoch, |c| c.update.as_ref().is_some_and(|u| !u.ended())).unwrap_or(false) {
+                return None;
+            }
             set_state(slot, epoch, "error", Some("That Mulpex is too old to be driven from here — update it".into()));
             return Some(End::Stop);
         }
@@ -697,6 +710,7 @@ fn on_refused(slot: u32, epoch: u64, tx: &Sender<String>, m: &Value) -> Option<E
     let theirs = m.get("app").and_then(Value::as_str).unwrap_or("?").to_string();
     let update = with_conn(slot, epoch, |c| {
         c.version = Some(theirs.clone());
+        c.wire = m.get("wire").and_then(Value::as_str).map(String::from);
         c.update.clone()
     })
     .flatten();

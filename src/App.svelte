@@ -3,7 +3,7 @@
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
-  import { open as openFolder, confirm } from "@tauri-apps/plugin-dialog";
+  import { open as openFolder, confirm, message } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -88,10 +88,13 @@
   import { terminals } from "./lib/terminals";
   import {
     activeHost,
+    appVersion,
     geometryDriver,
+    hostBehind,
     hostFrontendAction,
     hostName,
     hostOnline,
+    hostUpdate,
     hostUpload,
     hosts,
     isRemote,
@@ -256,6 +259,9 @@
           ? [{ label: "Reconnect now", run: () => void connectHost(slot, true) }]
           : []),
         ...(connected ? [{ label: "Restart Mulpex…", run: () => void restartHost(slot) }] : []),
+        ...(hostBehind(st, get(appVersion))
+          ? [{ label: `Update to v${get(appVersion)}…`, run: () => void updateHostByHand(slot) }]
+          : []),
         { sep: true },
         {
           label: "Remove…",
@@ -271,6 +277,26 @@
         },
       ],
     };
+  }
+
+  /** The host menu's "Update to v…": a host on this Mulpex's wire but an older
+   *  version, which nothing forces to update. The same order Update & Restart
+   *  sends; its progress shows in the update card. */
+  async function updateHostByHand(slot: number) {
+    const st = get(hosts).get(slot);
+    const mine = get(appVersion);
+    if (!st || !mine) return;
+    const ok = await confirm(
+      `Update ${st.name} from v${st.version} to v${mine}? Its claudes stop at a checkpoint, ` +
+        `Mulpex restarts there, and they wake by themselves after.`,
+      { title: "Update Remote Mulpex", okLabel: "Update", cancelLabel: "Cancel" },
+    );
+    if (!ok) return;
+    try {
+      await hostUpdate(slot, mine);
+    } catch (e) {
+      await message(String(e), { title: "Update Remote Mulpex", kind: "error" });
+    }
   }
 
   /** The host menu's "Restart Mulpex…": no checkpoint, so a claude mid-turn is
@@ -1623,7 +1649,7 @@
           activeHost: get(activeHost),
           activeProject: get(activeProjectHandle),
           activeSession: get(activeId),
-          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo, update: h.update })),
+          hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo, update: h.update, version: h.version, wire: h.wire })),
           projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
           text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
           dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },

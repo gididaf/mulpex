@@ -26,6 +26,11 @@ Traps that live in this directory specifically:
   there) or `DENIED` — or `every_command_is_classified` fails; that test is the only thing standing
   between a new feature and a dead button on every remote host's tab.
 
+- **A code edit in a wire file forces every remote host to update** with the next release
+  (`wire.rs::FILES`: `remote/rpc.rs`, `remote/desktop.rs`, `remote/client.rs`, `snapshot.rs`,
+  `remote_update.rs`, `commands.rs`; comment-only edits don't count). Changing a serialized shape
+  a remote desktop reads that lives *outside* those files is not seen — touch a wire file in the
+  same release. → [../docs/remote-hosts.md](../docs/remote-hosts.md)
 - **`lib.rs::is_forwarded` is an allowlist.** A menu item not listed there builds, appears, shows its
   accelerator and even ticks itself, while the frontend never hears a thing. Same for
   `capabilities/default.json` and the notification plugin.

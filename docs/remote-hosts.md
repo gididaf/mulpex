@@ -191,15 +191,39 @@ separately, on the host; host compacts held during the round; the refusals.
 - **Attention:** remote claudes count in the dock badge and notifications, which name the host.
   A (re)connect is a priming pass for that host (`attention.ts::quietHost`), so whatever already
   needed you there doesn't fire a burst of banners.
-- **Versions:** `hello` carries the app version, and a mismatch is refused with the other side's
-  version. A host from before Remote Hosts answers with a phone view, which the Mac reports as
-  "too old". The Mac keeps its hosts on its own version itself — see **Updates** below.
+- **Versions:** `hello` carries the app version and the **wire fingerprint** (`wire.rs`). The host
+  connects on the fingerprint, not the version; a mismatch (or a `hello` with none — a Mac from
+  before v0.48) is refused with the host's version and wire. A host from before Remote Hosts
+  answers with a phone view, which the Mac reports as "too old". See **Updates** below.
+
+## The wire fingerprint (`wire.rs`, `build.rs`)
+
+Until v0.48 both sides had to run the same app version, so every release — half of which never
+touched the link — stopped every claude on every host. Now `build.rs` hashes the files that define
+what the two sides say to each other and bakes it in as `MULPEX_WIRE`:
+`remote/rpc.rs`, `remote/desktop.rs`, `remote/client.rs`, `snapshot.rs`, `remote_update.rs`,
+`commands.rs` (most command signatures and return types). Each line is trimmed and blank lines and
+whole `//` comment lines are dropped first, so a doc-only edit is not a new wire.
+
+- **Same fingerprint = compatible, whatever the versions.** It is deliberately coarse: any code
+  edit in those files is a new wire, even one that would have been harmless. No judgment is asked
+  of anyone, so it cannot be forgotten.
+- **What it does not see:** a serialized type defined outside those files (e.g. in `todos.rs`,
+  `pins.rs`) that the Mac's frontend reads from a host. If you change one of those shapes, also
+  touch a wire file in the same release (or add the file to `wire::FILES`).
+- **latest.json carries it** (`"wire"`, written by `release.sh` from `mulpex --wire-hash` on the
+  built binary; `release-linux.sh` refuses a Linux build whose hash differs). A Mac reads it
+  before updating (`updater.ts::wireOf`, the plugin's `rawJson`). Missing → treated as a new wire.
+- **A host behind on the same wire** keeps running. Its host button shows `↑` with the versions in
+  the tooltip, and right-click › **Update to v…** sends the same `update` order, after a confirm
+  (`App.svelte::updateHostByHand`). Its progress is a card of its own in `UpdateBanner.svelte`.
 
 ## Updates: the hosts go first (`remote_update.rs`, `updater.ts`)
 
-Both sides must run the same version, and after the Mac restarts into an update its `hello` is
-refused. So an update order has to reach each host *before* the Mac restarts — or, for a host that
-was offline then, through the refusal itself.
+Both sides must have the same wire fingerprint, and after the Mac restarts into an update on a new
+wire its `hello` is refused. So an update order has to reach each host on another wire *before*
+the Mac restarts — or, for a host that was offline then, through the refusal itself. A host
+already on the new release's wire is not touched.
 
 - **The message.** `{"t":"update","to":v}` / `{"t":"update-cancel"}`, Mac → host, sealed like
   everything else. It is handled in `on_sealed` **before** the desk check, so a host that just
@@ -228,14 +252,15 @@ was offline then, through the refusal itself.
   Any failure after step 2 un-stops the claudes. On the next launch, `lib.rs` setup calls
   `checkpoint_auto_wake`, which queues the wake with no "Wake all" dialog (docs/sessions.md).
 - **The Mac, one click** (`updater.ts::applyUpdate`): before its own busy check and install, it
-  calls `host_update` on every *connected* host and waits on `HostStatus.update` until each says
+  calls `host_update` on every *connected* host whose `wire` differs from latest.json's (all of
+  them when latest.json has none) and waits on `HostStatus.update` until each says
   `done`. Each host is `done` when its reconnect is refused with `app == to` (the Mac is still on
   the old version, so that refusal *is* the success). Any host error or Cancel calls the rest off,
   and the Mac does not update. Its hosts still run the old version, so the link keeps working.
   The banner shows one line per host (`UpdateBanner.svelte`).
 - **A late host** (offline during the update, so now older than the Mac): `client.rs::on_refused`
-  sees a host strictly older by number (`version_of`, never a string compare) and orders it to the
-  Mac's version on the spot. The host's state reads `updating`, and a `restarting` ends the link
+  (reached only on a wire mismatch now) sees a host strictly older by number (`version_of`, never
+  a string compare) and orders it to the Mac's version on the spot. The host's state reads `updating`, and a `restarting` ends the link
   with `Retry`, so backoff reconnects to the updated host. A host newer than the Mac keeps the old
   "update both" message, unless the Mac ordered that version, in which case it is `done`.
 - **A host from before this feature** ignores the unknown message. After 30 s with no answer
@@ -298,11 +323,23 @@ was offline then, through the refusal itself.
   before the host was read) was replayed and its fix checked, with no window on screen. Write actions
   with `printf '%s'`, never `echo`: zsh's `echo` turns `\r` into a raw CR, the JSON stops parsing, and
   the action silently never runs (that cost an hour of chasing a typing bug that did not exist).
-- **Remote updates, end to end:** `bash scripts/test-remote-update.sh`. It builds two real `.app`
-  bundles, BASE and a made-up NEXT, both pointed at a local `latest.json` that offers NEXT
-  (`dangerousInsecureTransportProtocol`, so nothing touches GitHub). It runs two scenarios:
+- **Remote updates, end to end:** `bash scripts/test-remote-update.sh`. It builds three real
+  `.app` bundles — BASE, a made-up NEXT with a code edit in `commands.rs` (another wire) and
+  COMPAT (same wire as BASE) — pointed at a local `latest.json`
+  (`dangerousInsecureTransportProtocol`, so nothing touches GitHub). It runs four scenarios:
   - **late host:** A is on BASE and B on NEXT, and A must update itself;
   - **one click:** both are on BASE, and a driven click on B's "Update & Restart" must update A,
-    then B.
+    then B;
+  - **compatible:** A on BASE, B on COMPAT connect and A is left alone (same pid); then a driven
+    `host_update` (what the menu item sends) brings A to COMPAT;
+  - **one click, compatible:** COMPAT offered; only B updates, A keeps its pid, B reconnects;
+  - **rollout:** A built from the last pre-fingerprint release (`LEGACY_REF`, default `e7e452d`
+    = v0.47.1), B on NEXT; A must update itself as in "late host".
+
+  Its first run caught a race: a host sends its phone view (`state`) to every session that is not
+  a desktop, which included a Mac it had just refused and that was waiting on an update — the Mac
+  read it as "too old" and gave up. Fixed on both ends: the host marks a refused desktop
+  (`Session::refused_desk`) and sends it no view, and the Mac ignores `state` while an update it
+  ordered is still running (needed for hosts still on ≤ v0.47.1).
 
   `CLAUDE=1` adds a busy real claude in A, which must get both the stop and the wake.

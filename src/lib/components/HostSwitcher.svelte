@@ -4,7 +4,7 @@
   // is paired. Each button carries its host's red/green badges summed over all
   // its projects — so a claude on the VM waiting for you shows while you are
   // working locally — and a dot for the connection.
-  import { activeHost, hosts, type HostStatus } from "../hosts";
+  import { activeHost, appVersion, hostBehind, hosts, type HostStatus } from "../hosts";
   import { hostBadges } from "../stores";
 
   let {
@@ -45,10 +45,13 @@
     {@render badges(0)}
   </button>
   {#each list as h (h.slot)}
+    {@const behind = hostBehind(h, $appVersion)}
     <button
       class="host {h.state}"
       class:active={$activeHost === h.slot}
-      title="{h.name} — {TITLE[h.state]}{h.error ? `: ${h.error}` : ''} (right-click for options)"
+      title="{h.name} — {TITLE[h.state]}{h.error ? `: ${h.error}` : ''}{behind
+        ? ` · v${h.version} — v${$appVersion} available, right-click › Update`
+        : ''} (right-click for options)"
       onclick={() => onselect(h.slot)}
       oncontextmenu={(e) => {
         e.preventDefault();
@@ -57,6 +60,7 @@
     >
       <span class="dot"></span>
       <span class="name">◆ {h.name}</span>
+      {#if behind}<span class="behind">↑</span>{/if}
       {@render badges(h.slot)}
     </button>
   {/each}
@@ -122,6 +126,10 @@
   .disconnected .name,
   .error .name {
     opacity: 0.6;
+  }
+  .behind {
+    font-size: 0.7rem;
+    color: #d29922;
   }
   .badge {
     flex: none;

@@ -37,8 +37,10 @@ use crate::pty::{DesktopTap, TapMsg};
 use crate::snapshot::ProjectHandle;
 
 /// Bumped when a remote desktop and this host could no longer understand each
-/// other at all. Separately, both sides must run the **same app version**:
-/// every tunnelled command's signature is part of this protocol.
+/// other at all. Separately, both sides must have the **same wire fingerprint**
+/// (`MULPEX_WIRE`, `wire.rs`): every tunnelled command's signature is part of
+/// this protocol, and the fingerprint changes whenever that code does. The app
+/// version may differ.
 pub const PROTO: u64 = 1;
 
 /// Events a remote frontend needs to hear exactly as this one does. Handles in
@@ -414,6 +416,12 @@ fn prune_uploads() {
     }
 }
 
+/// Whether a `hello` speaks this build's wire: same `proto` and fingerprint.
+fn wire_matches(req: &Value) -> bool {
+    req.get("proto").and_then(Value::as_u64) == Some(PROTO)
+        && req.get("wire").and_then(Value::as_str) == Some(env!("MULPEX_WIRE"))
+}
+
 impl Server {
     /// Mark whether any remote desktop is connected (events are recorded only
     /// then), and how long a read may wait: a desktop's keystrokes and echoes
@@ -424,13 +432,16 @@ impl Server {
         any
     }
 
-    /// A `hello` from a remote desktop: same version, or refused with ours.
+    /// A `hello` from a remote desktop: same wire, or refused with our version.
+    /// A desktop from before the fingerprint sends none, and is refused.
     pub(super) fn desk_hello(&mut self, ws: &mut Ws, cid: u64, req: &Value) -> Result<(), String> {
         let mine = env!("CARGO_PKG_VERSION");
-        let proto = req.get("proto").and_then(Value::as_u64);
-        let theirs = req.get("app").and_then(Value::as_str).unwrap_or("");
-        if proto != Some(PROTO) || theirs != mine {
-            let msg = json!({"t": "refused", "why": "version", "app": mine, "proto": PROTO});
+        let wire = env!("MULPEX_WIRE");
+        if !wire_matches(req) {
+            if let Some(s) = self.sessions.get_mut(&cid) {
+                s.refused_desk = true;
+            }
+            let msg = json!({"t": "refused", "why": "version", "app": mine, "proto": PROTO, "wire": wire});
             return self.send_sealed(ws, cid, &msg.to_string());
         }
         let name: String = req.get("name").and_then(Value::as_str).unwrap_or("Mac").chars().take(60).collect();
@@ -440,7 +451,7 @@ impl Server {
         self.desktops_online();
         let ((cols, rows), owner) = geometry_and_owner();
         let msg = json!({
-            "t": "welcome", "proto": PROTO, "app": mine, "boot": boot_id(), "name": hostname(),
+            "t": "welcome", "proto": PROTO, "app": mine, "wire": wire, "boot": boot_id(), "name": hostname(),
             "device": device, "geo": {"cols": cols, "rows": rows, "owner": owner.map(|o| o.1)},
         });
         self.send_sealed(ws, cid, &msg.to_string())
