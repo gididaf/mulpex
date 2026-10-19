@@ -6,7 +6,8 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | --- | --- |
 | `pty.rs` (spawn, geometry, task delivery, `kill`), `claude_bin.rs` | [../docs/sessions.md](../docs/sessions.md) — binary resolution, login env forwarding, status words; [../docs/rendering.md](../docs/rendering.md) — one geometry; [../docs/shell-terminals.md](../docs/shell-terminals.md) — the tty sweep behind a terminal's `running`/`cwd` |
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
-| `vtgrid.rs`, the `Recorder`, `SessionKind` | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
+| `ptyd.rs`, `pty.rs` `Session`/`OutputSink`/`compose`, `Core::open` adoption, `lib.rs` `teardown`, `restart_app`, `crates/mulpex-ptyd/*` | [../docs/ptyd.md](../docs/ptyd.md) — the daemon owns every PTY; quit vs detach; why a `Session` drop must not kill during a detach; daemon changes ship late |
+| `SessionKind`; `crates/mulpex-ptyd/src/vtgrid.rs` (the `Recorder`, now run by the daemon) | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
 | `saves.rs`, `docs_import.rs`, `save_prompts/*` (⌘S: fork → memoryless check → fork fix, read-only tools, writes `mulpex/saves/` at the git root; guides; the links file; Import Docs' sort / apply / one commit / link fixing) | [../docs/saves.md](../docs/saves.md) — why the doc must stand alone, why the forks run in the project dir, why `total_cost_usd` over-reports |
 | `remote/*` (Remote Control: relay connection, pairing/E2E crypto, transcript chat, dialog keys, Web Push), `pty.rs` `OutputSink::tap` | [../docs/remote-control.md](../docs/remote-control.md) — the security model, why typing goes through the desktop, the measured dialog keys |

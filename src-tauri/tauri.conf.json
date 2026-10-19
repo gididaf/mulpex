@@ -42,7 +42,8 @@
     ],
     "createUpdaterArtifacts": true,
     "externalBin": [
-      "binaries/mulpex-helper"
+      "binaries/mulpex-helper",
+      "binaries/mulpex-ptyd"
     ],
     "icon": [
       "icons/icon.icns"

@@ -28,6 +28,10 @@ const DEFAULT_ROWS: u16 = 32;
 /// How many of the most recent hub messages we surface in the feed.
 const MSG_FEED_MAX: usize = 200;
 
+/// Set by `teardown_all`: the scratch root is being removed, and the poll
+/// loop's registry write (outside the lock) must not put it back.
+pub static TORN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Tauri-managed state. The `Workspace` holds every open project (0..N);
 /// `helper_path` is the absolute path of the `mulpex-helper` binary the hooks/MCP
 /// invoke.
@@ -122,7 +126,10 @@ impl Workspace {
             return Ok((h, false));
         }
         let handle = self.alloc_handle();
-        let state_dir = self.state_root.join(handle.to_string());
+        // Named for the project, not the handle: the dir has to outlive this
+        // app, since a claude that survives a restart (`ptyd.rs`) still has
+        // this path as its `MULPEX_STATE_DIR`.
+        let state_dir = self.state_root.join(crate::ptyd::project_key(&canon));
         let core = Core::open(handle, canon, helper_path, state_dir, self.geometry)?;
         self.projects.push(core);
         self.active = Some(handle);
@@ -239,9 +246,52 @@ impl Workspace {
         }
     }
 
+    /// A restart that keeps every session running (`ptyd::restart_detached`):
+    /// save what the next app needs to adopt them — the store, and each
+    /// project's row manifest — and let go without killing anything. The
+    /// scratch root stays; it is the daemon's, and every claude still uses it.
+    pub fn detach_all(&mut self) {
+        for core in &mut self.projects {
+            core.persist_sessions();
+            core.adopt_manifest.clear();
+            core.sync_adopt_manifest();
+        }
+        // `Session`'s Drop does not kill while `ptyd::detaching()`.
+        self.projects.clear();
+        crate::ptyd::detach();
+    }
+
+    /// The size the daemon's surviving sessions run at, adopted before any
+    /// project opens: every PTY shares one geometry, and the frontend must
+    /// build its xterms at exactly the size those panes were drawn for.
+    pub fn adopt_geometry(&mut self) {
+        let live = crate::ptyd::list();
+        if let Some(s) = live.iter().find(|s| s["alive"] == true) {
+            let (c, r) = (s["cols"].as_u64().unwrap_or(0) as u16, s["rows"].as_u64().unwrap_or(0) as u16);
+            if c >= 1 && r >= 1 {
+                self.geometry = (c, r);
+            }
+        }
+    }
+
+    /// After every project has opened: end whatever the daemon still holds that
+    /// no project took — its project is no longer open, so (as before the
+    /// daemon) nothing of it runs.
+    pub fn kill_unadopted(&self) {
+        let ours: HashSet<u32> = self.projects.iter().flat_map(|c| c.sessions.iter().map(|s| s.sid())).collect();
+        for s in crate::ptyd::list() {
+            let sid = s["sid"].as_u64().unwrap_or(0) as u32;
+            if !ours.contains(&sid) {
+                eprintln!("[ptyd] ending {} — no open project claims it", s["key"]);
+                crate::ptyd::kill_sid(sid);
+            }
+        }
+    }
+
     /// Kill every project's process groups and remove the whole scratch root. The
     /// "no orphaned claude" guarantee, now across all projects.
     pub fn teardown_all(&mut self) {
+        TORN_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         for core in &mut self.projects {
             core.teardown();
         }
@@ -363,6 +413,8 @@ pub struct Core {
     /// Last-written `terminals/meta`, so the 200 ms poll rewrites it only when a
     /// terminal actually starts or finishes a command, or changes directory.
     terminal_meta: String,
+    /// Last-written row manifest (`ADOPT_MANIFEST`), for the same reason.
+    adopt_manifest: String,
     /// The size this project's PTYs run at (cols, rows). Every spawn uses it, so
     /// a session created now matches the xterm the frontend is about to build for
     /// it; `resize_all` keeps it current. Seeded from `Workspace::geometry`.
@@ -472,7 +524,82 @@ impl Core {
         // would silently take the failed one's number.
         let mut used: HashSet<usize> = HashSet::new();
         let mut next_free = 1usize;
+
+        // Sessions the daemon kept running through an app restart come back
+        // first, as they were — same process, same pane, every row they had
+        // (unprompted claudes and terminals too, which the store never held).
+        // The row manifest the last app left in the scratch dir says how each
+        // was shown; one spawned too late to be in it gets its defaults.
+        let mut adopted_uuids: HashSet<String> = HashSet::new();
+        let mut adopted_active: Option<usize> = None;
+        {
+            let prefix = pty::session_key(&state_dir, 0).trim_end_matches('0').to_string();
+            let manifest = read_adopt_manifest(&state_dir);
+            let mut live: Vec<serde_json::Value> = crate::ptyd::list()
+                .into_iter()
+                .filter(|s| s["alive"] == true && s["key"].as_str().is_some_and(|k| k.starts_with(&prefix)))
+                .collect();
+            let id_of = |s: &serde_json::Value| s["meta"]["id"].as_u64().unwrap_or(0) as usize;
+            live.sort_by_key(|s| (manifest.iter().position(|r| r.id == id_of(s)).unwrap_or(usize::MAX), id_of(s)));
+            for info in &live {
+                let id = id_of(info);
+                if id == 0 || used.contains(&id) {
+                    continue;
+                }
+                let shell = info["meta"]["kind"] == "shell";
+                let row = manifest.iter().find(|r| r.id == id);
+                let session_id = row
+                    .map(|r| r.session_id.clone())
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| info["meta"]["session_id"].as_str().unwrap_or("").to_string());
+                let kind = if shell { pty::SessionKind::Shell } else { pty::SessionKind::Claude };
+                match Session::adopt(id, kind, &session_id, info, crate::ptyd::take_snapshot(&state_dir, id)) {
+                    Ok(session) => {
+                        used.insert(id);
+                        if !shell {
+                            adopted_uuids.insert(session_id);
+                        }
+                        if let Some(r) = row {
+                            if r.active {
+                                adopted_active = Some(id);
+                            }
+                            if r.worked {
+                                worked.insert(id);
+                            }
+                            if let Some(name) = &r.name {
+                                names.insert(id, name.clone());
+                                if let Some(by) = r.name_by.as_deref().and_then(NameSource::parse) {
+                                    name_by.insert(id, by);
+                                }
+                            }
+                            if r.muted {
+                                muted.insert(id);
+                            }
+                            if let Some(p) = r.parent {
+                                parents.insert(id, p);
+                            }
+                            if r.collapsed {
+                                collapsed.insert(id);
+                            }
+                            if let Some(pct) = r.auto_compact {
+                                auto_compact.insert(id, pct);
+                            }
+                            if r.todos {
+                                todos_on.insert(id);
+                            }
+                        }
+                        sessions.push(session);
+                    }
+                    Err(e) => eprintln!("[ptyd] could not adopt {}: {e}", info["key"]),
+                }
+            }
+        }
+
         for (position, saved) in store.load().into_iter().enumerate() {
+            // Already running: adopted above, not resumed a second time.
+            if adopted_uuids.contains(&saved.session_id) {
+                continue;
+            }
             // A store written before ids were persisted (or one with a duplicate
             // after hand-editing) numbers sequentially, exactly as before.
             let id = match saved.id {
@@ -599,10 +726,15 @@ impl Core {
             sticky,
             terminal_index: String::new(),
             terminal_meta: String::new(),
+            adopt_manifest: String::new(),
             geometry,
             pending_spawns: VecDeque::new(),
             last_spawn_at: None,
         };
+        // The row that had focus before the restart has it again.
+        if let Some(id) = adopted_active {
+            core.set_active(id);
+        }
         core.persist_sessions();
         core.sync_todos_flags();
         core.write_live_instances();
@@ -1941,7 +2073,13 @@ impl Core {
                     // exits ("No conversation found") — both measured on
                     // v2.1.291. Without this, a restored claude the user quit
                     // with Ctrl+C inside the grace came back at the next launch.
-                    && !mulpex_core::session_id_path(&self.state_dir, session.id).exists();
+                    && !mulpex_core::session_id_path(&self.state_dir, session.id).exists()
+                    // Or it never exited at all: the PTY daemon went away and
+                    // took it along. The conversation is intact on disk, so the
+                    // record stays for the next launch's `--resume`.
+                    || (session.lost_with_daemon()
+                        && !self.closing.contains(&session.id)
+                        && self.worked.contains(&session.id));
                 if lost_restore && !session.session_id.is_empty() {
                     // Said out loud: a row the user believes closed coming back
                     // at the next launch was reported once and never reproduced.
@@ -2552,6 +2690,9 @@ impl Core {
                 session.session_id
             );
             session.session_id = uuid;
+            // The daemon outlives this app; the next one recognises the
+            // session by what it holds.
+            session.publish_meta();
             changed = true;
         }
         if changed {
@@ -2910,6 +3051,40 @@ impl Core {
         self.terminal_meta = out;
     }
 
+    /// Publish every row as the sidebar shows it to `ADOPT_MANIFEST`, for the
+    /// app after a restart to adopt the daemon's sessions with (`Core::open`).
+    /// The store cannot do this: it holds only worked claudes, and a restart
+    /// must bring back every row — a fresh claude, a terminal — as it was.
+    /// Called from the poll loop; writes only on change.
+    pub fn sync_adopt_manifest(&mut self) {
+        let rows: Vec<serde_json::Value> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                serde_json::json!({
+                    "id": s.id,
+                    "active": i == self.active,
+                    "session_id": s.session_id,
+                    "worked": self.worked.contains(&s.id),
+                    "name": self.names.get(&s.id),
+                    "name_by": self.name_by.get(&s.id).map(|b| b.as_str()),
+                    "muted": self.muted.contains(&s.id),
+                    "parent": self.parents.get(&s.id),
+                    "collapsed": self.collapsed.contains(&s.id),
+                    "auto_compact": self.auto_compact.get(&s.id),
+                    "todos": self.todos_on.contains(&s.id),
+                })
+            })
+            .collect();
+        let out = serde_json::Value::Array(rows).to_string();
+        if out == self.adopt_manifest {
+            return;
+        }
+        let _ = std::fs::write(self.state_dir.join(ADOPT_MANIFEST), &out);
+        self.adopt_manifest = out;
+    }
+
     /// Deterministic teardown: kill every session's process group, then remove
     /// the scratch dir. Ports `impl Drop for App`; called from the app's
     /// `RunEvent` exit handler (managed-state Drop isn't guaranteed on quit).
@@ -2923,6 +3098,39 @@ impl Core {
 }
 
 // ---- module helpers (ported from app.rs) ----
+
+/// Every row of a project as the last app showed it, in the scratch dir —
+/// which outlives the app, being the daemon's (`Core::sync_adopt_manifest`).
+const ADOPT_MANIFEST: &str = "ptyd-rows.json";
+
+/// One row of `ADOPT_MANIFEST`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct AdoptRow {
+    id: usize,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    worked: bool,
+    name: Option<String>,
+    name_by: Option<String>,
+    #[serde(default)]
+    muted: bool,
+    parent: Option<usize>,
+    #[serde(default)]
+    collapsed: bool,
+    auto_compact: Option<u8>,
+    #[serde(default)]
+    todos: bool,
+    #[serde(default)]
+    active: bool,
+}
+
+fn read_adopt_manifest(state_dir: &Path) -> Vec<AdoptRow> {
+    std::fs::read_to_string(state_dir.join(ADOPT_MANIFEST))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
 
 /// The thresholds the context menu offers for auto-compact.
 pub const AUTO_COMPACT_CHOICES: [u8; 4] = [50, 60, 70, 80];
@@ -4470,6 +4678,34 @@ mod tests {
         );
 
         core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The point of the PTY daemon: an app goes away without killing anything
+    /// (here: its `Core` is leaked, as a crash or a detached restart leaves
+    /// it), the next one opens the same project and gets the very same
+    /// terminal back — same id, same name, same process, still taking input.
+    #[test]
+    fn a_reopened_project_adopts_the_sessions_the_daemon_kept() {
+        let (_g, root, mut core) = scratch_core("adopt");
+        let info = core.spawn_terminal(None, Some("my shell".into()), true).unwrap();
+        let screen = crate::pty::terminal_screen_path(&core.state_dir, info.id);
+        core.sessions[0].send(b"echo BEFORE-$((6*7))\r");
+        assert!(wait_until(|| std::fs::read_to_string(&screen).is_ok_and(|t| t.contains("BEFORE-42"))));
+        core.sync_adopt_manifest();
+        let (project_dir, state_dir) = (core.project_dir.clone(), core.state_dir.clone());
+        let sid = core.sessions[0].sid();
+        std::mem::forget(core);
+
+        let mut again = Core::open(2, project_dir, Path::new("/nonexistent/mulpex-helper"), state_dir, TEST_GEOMETRY).unwrap();
+        assert_eq!(again.sessions.len(), 1, "the terminal was not adopted");
+        let s = &again.sessions[0];
+        assert_eq!((s.id, s.sid(), s.is_shell(), s.is_alive()), (info.id, sid, true, true));
+        assert_eq!(again.display_name(info.id).as_deref(), Some("my shell"));
+        assert!(again.next_id > info.id, "a new row could reuse the adopted id");
+        again.sessions[0].send(b"echo AFTER-$((6*7))\r");
+        assert!(wait_until(|| std::fs::read_to_string(&screen).is_ok_and(|t| t.contains("AFTER-42"))));
+        again.teardown();
         let _ = std::fs::remove_dir_all(&root);
     }
 

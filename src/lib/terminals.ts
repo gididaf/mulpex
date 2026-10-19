@@ -327,14 +327,7 @@ class TerminalManager {
       };
       void invoke("host_attach", { host: slot, projectHandle: handle, id, channel });
     } else {
-      // PTY output arrives base64-chunked over this session's channel.
-      const channel = new Channel<string>();
-      channel.onmessage = (chunk) => {
-        const bytes = b64ToBytes(chunk);
-        entry.received += bytes.length;
-        term.write(bytes);
-      };
-      attachSession(handle, id, channel);
+      attachSession(handle, id, this.localChannel(entry));
     }
     this.entries.set(key, entry);
     container.style.visibility = key === this.activeKey ? "visible" : "hidden";
@@ -372,13 +365,54 @@ class TerminalManager {
     if (!e || e.slot) return;
     e.term.reset();
     e.received = 0;
+    attachSession(handle, id, this.localChannel(e));
+  }
+
+  /** A local pane's stream. PTY output arrives base64-chunked; a message that
+   *  starts with `{` (which base64 never does) is a control frame from
+   *  `pty.rs::compose`, rebuilding a pane the PTY daemon kept through an app
+   *  restart: `snap` resets the xterm to a size — painting the screen the
+   *  previous app serialized, if any — and says which stream offset it now
+   *  shows; `r` resizes it at exactly that point in the stream, the way the
+   *  PTY did (docs/rendering.md: bytes drawn for one size must never reach an
+   *  xterm of another). `received` stays the stream offset throughout, so the
+   *  next restart's snapshot is cut at the right byte. */
+  private localChannel(e: Entry): Channel<string> {
+    const term = e.term;
     const channel = new Channel<string>();
     channel.onmessage = (chunk) => {
+      if (chunk.charCodeAt(0) === 123) {
+        const f = JSON.parse(chunk) as { t: string; cols: number; rows: number; offset?: number; s?: string };
+        if (f.t === "snap") {
+          term.reset();
+          if (term.cols !== f.cols || term.rows !== f.rows) term.resize(f.cols, f.rows);
+          if (f.s) term.write(f.s);
+          term.write("", () => term.scrollToBottom());
+          e.received = f.offset ?? 0;
+        } else if (f.t === "r") {
+          term.write("", () => {
+            if (term.cols !== f.cols || term.rows !== f.rows) term.resize(f.cols, f.rows);
+          });
+        }
+        return;
+      }
       const bytes = b64ToBytes(chunk);
       e.received += bytes.length;
-      e.term.write(bytes);
+      term.write(bytes);
     };
-    attachSession(handle, id, channel);
+    return channel;
+  }
+
+  /** Every local pane serialized, for a restart that keeps the sessions
+   *  running (`ptyd-snapshot`). Remote mirrors belong to their hosts. */
+  async snapshotAll(): Promise<{ projectHandle: number; id: number; data: string; offset: number; cols: number; rows: number }[]> {
+    const out = [];
+    for (const e of [...this.entries.values()]) {
+      if (e.slot) continue;
+      const s = await this.serialize(e.handle, e.id);
+      if (s) out.push({ projectHandle: e.handle, id: e.id, ...s });
+    }
+    return out;
   }
 
   dispose(handle: number, id: number): void {

@@ -97,6 +97,7 @@ pub fn start(app: AppHandle) {
                 // this is what stops the manifest instances read from going on
                 // advertising it as running. Writes only on change.
                 core.sync_terminal_index();
+                core.sync_adopt_manifest();
                 let snap = core.hub_snapshot();
                 // An instance that ended a turn still unnamed gets a provisional
                 // label from its own task, so the row stops showing the user's
@@ -127,7 +128,9 @@ pub fn start(app: AppHandle) {
             // Cross-project addressing rests on this file. Written outside the
             // lock and only when the bytes change, so a quiet tick costs one
             // string compare — and a closed project simply stops appearing.
-            Registry::write_if_changed(&state_root, &reg);
+            if !crate::state::TORN_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                Registry::write_if_changed(&state_root, &reg);
+            }
 
             for (handle, id) in todos_changed {
                 let _ = app.emit("todos-changed", SessionExited { handle, id });

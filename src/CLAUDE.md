@@ -18,6 +18,10 @@ ordering, drag-to-reorder clamping, the two tab badges, the dock badge and notif
 the hub panel is Messages-only, and the ⌘⇧L side panel (To Do · Pins · Explain) — is in
 [../docs/frontend.md](../docs/frontend.md).
 
+**A local pane's channel carries control frames too** (`terminals.ts::localChannel`): a message
+starting with `{` is `snap`/`r` from `pty.rs::compose`, rebuilding a pane the PTY daemon kept
+through an app restart. `received` must stay the stream offset. → [../docs/ptyd.md](../docs/ptyd.md)
+
 **Linux** has no native menu: `lib/linuxKeys.ts` maps Super chords to the menu ids (`platform.ts`
 says which OS). → [../docs/linux.md](../docs/linux.md)
 

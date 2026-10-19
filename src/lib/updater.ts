@@ -14,7 +14,7 @@ import { hosts, hostUpdate, hostUpdateCancel, hostUpdateClear, isRemote } from "
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { get, writable } from "svelte/store";
 
-import { restartApp } from "./ipc";
+import { restartApp, updateSurvives } from "./ipc";
 import { projects } from "./stores";
 
 /** How often the background check runs. Deliberately hours, not minutes: a
@@ -152,6 +152,11 @@ export async function checkForUpdate(manual = false): Promise<void> {
  * refuses our hello. */
 let remotesAt: string | null = null;
 
+/** A number from latest.json, or null when the release predates the field. */
+function numOf(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 /** The wire fingerprint `release.sh` put in latest.json, or null: a release
  * from before it, which every host must follow. */
 function wireOf(u: Update): string | null {
@@ -251,7 +256,11 @@ export async function applyUpdate(force = false): Promise<void> {
     }
     remotesAt = version;
   }
-  if (!force) {
+  // When the running PTY daemon is one the new version drives, every claude
+  // and terminal keeps running through the restart (`ptyd.rs`) — there is
+  // nothing to warn about, and nothing to stop first.
+  const survives = await updateSurvives(numOf(pending.rawJson?.ptyd), numOf(pending.rawJson?.ptyd_min)).catch(() => false);
+  if (!force && !survives) {
     const busy = busySessionCount();
     if (busy > 0) {
       patch({ phase: "confirming", busy });
@@ -279,9 +288,10 @@ export async function applyUpdate(force = false): Promise<void> {
       }
     });
     // The bundle on disk is now the new version; restart into it. Goes through
-    // `AppHandle::restart` so teardown kills every `claude` process group and
-    // removes the scratch root first — a plain `relaunch()` would orphan them.
-    await restartApp();
+    // `AppHandle::restart` so teardown runs first — detached (every session
+    // kept for the new app to adopt) when they survive, otherwise killing every
+    // `claude` process group, which a plain `relaunch()` would orphan.
+    await restartApp(0, survives);
   } catch (e) {
     patch({ phase: "error", error: String(e) });
   }

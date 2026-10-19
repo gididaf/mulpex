@@ -56,18 +56,24 @@ open(f"{w}/A/open.txt", "w").write(f"{w}/proj\n")
 EOF
 
 PIDS=()
+# Each app's sessions live in its PTY daemon (docs/ptyd.md), which outlives
+# the app by design — so a run ends them by ending the daemons too.
+daemons() { cat "$WORK"/A/ptyd/ptyd.pid "$WORK"/B/ptyd/ptyd.pid 2>/dev/null || true; }
 cleanup() {
-  [ -n "${KEEP:-}" ] && { echo "kept running: ${PIDS[*]} (work dir $WORK)"; return; }
-  kill "${PIDS[@]}" 2>/dev/null || true
+  [ -n "${KEEP:-}" ] && { echo "kept running: ${PIDS[*]} $(daemons) (work dir $WORK)"; return; }
+  kill "${PIDS[@]}" $(daemons) 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 relay() { target/debug/mulpex-relay --listen "127.0.0.1:$PORT" --static remote/dist --data "$WORK/relay" >"$WORK/relay.log" 2>&1 & RELAY=$!; PIDS+=($RELAY); }
-start_a() { MULPEX_DEBUG_DUMP=1 MULPEX_DEBUG_REMOTE=1 MULPEX_HOME="$WORK/A" MULPEX_DEBUG_TAIL_BYTES=8192 "$BIN" >"$WORK/A.log" 2>&1 & A=$!; PIDS+=($A); sleep 5; mkdir -p "$TMPDIR/mulpex-$A/1/termreq"; }
+# The project's scratch dir: under A's daemon's root, named for the project.
+KEY="$(printf %s "$(cd "$WORK/proj" && pwd -P)" | shasum -a 256 | cut -c1-16)"
+SD() { ls -d "${TMPDIR%/}"/mulpex-*/"$KEY" 2>/dev/null | head -1; }
+start_a() { MULPEX_DEBUG_DUMP=1 MULPEX_DEBUG_REMOTE=1 MULPEX_HOME="$WORK/A" MULPEX_DEBUG_TAIL_BYTES=8192 "$BIN" >"$WORK/A.log" 2>&1 & A=$!; PIDS+=($A); sleep 5; mkdir -p "$(SD)/termreq"; }
 start_b() { MULPEX_DEBUG_DUMP=1 MULPEX_HOME="$WORK/B" "$BIN" >"$WORK/B.log" 2>&1 & B=$!; PIDS+=($B); }
 N=0
-req() { N=$((N + 1)); printf '%s' "$1" >"$TMPDIR/mulpex-$A/1/termreq/$(printf %016d $N)-t.json"; }
+req() { N=$((N + 1)); printf '%s' "$1" >"$(SD)/termreq/$(printf %016d $N)-t.json"; }
 check() { # $1 scenario, then the terminal ids
   local name=$1; shift
   for id in "$@"; do

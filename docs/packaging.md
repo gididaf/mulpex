@@ -5,6 +5,16 @@ the signing identity is load-bearing, how auto-update works, and what runs on th
 
 Back to [CLAUDE.md](../CLAUDE.md).
 
+## The PTY daemon is a second sidecar
+
+`mulpex-ptyd` (docs/ptyd.md) is staged by the same `scripts/bundle-helper.sh` and listed beside the
+helper in `bundle.externalBin`, so it is signed with the bundle. The app never runs it from the
+bundle: it copies it to `<mulpex home>/ptyd/<PROTO>-<hash>/` and starts that, because the daemon
+outlives the app and an update replaces the bundle under it. The helper is copied to
+`<mulpex home>/bin/` for the same reason. `latest.json` carries `ptyd`/`ptyd_min` (from
+`mulpex --ptyd-proto`), and the updater reads them to tell whether an update keeps every claude
+running.
+
 ## Bundling the helper (signed sidecar)
 
 **The dev flow stages the sidecar too.** `externalBin` applies in `tauri dev` as well: building the

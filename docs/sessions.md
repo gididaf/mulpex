@@ -439,6 +439,15 @@ the capability and `sendNotification` is simply denied at runtime; the badge (a 
 keeps working, so the failure looks like "notifications are flaky", not "notifications are off".
 Same allowlist shape as `lib.rs::is_forwarded` for menu ids.
 
+## The scratch dir outlives the app (since the PTY daemon)
+
+The scratch root is the daemon's, `temp/mulpex-<daemon pid>`, and a project's dir under it is
+`ptyd::project_key` of its path — not `mulpex-<app pid>/<handle>` as below. A claude that survives
+an app restart keeps its `MULPEX_STATE_DIR`, so both had to stop changing with the app. Its inbox,
+status and markers are therefore still there after a restart; `Core::open` adopts the live
+sessions from the daemon (with `ptyd-rows.json`, the row manifest) before it `--resume`s anything.
+See docs/ptyd.md.
+
 ## The scratch dir is rebuilt before every spawn
 
 Reported from the field on v0.8: a Mulpex that had been open since Aug 23 started failing **every**

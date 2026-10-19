@@ -2614,3 +2614,40 @@ host A with one real claude 2.1.301 in its project, driven through B's `drive/` 
 
 Not driven: the host menu's "Restart Mulpex…" confirm (a native dialog), and the visible layout
 of the stacked wake cards and the host ⌘⇧O dialog.
+
+## 2026-10-19 — the PTY daemon (docs/ptyd.md)
+
+- **TCC, before anything was built:** a probe bundle signed as `com.mulpex.app` spawned a setsid'd
+  child and exited. The child kept Documents and Full Disk Access (`~/Library/Mail`), and so did
+  each new process it exec'd, for 12 s after the parent died. It kept them again with the bundle on
+  disk **replaced** by a re-signed build mid-run (16/16).
+- **`cargo test -p mulpex-ptyd`**: 45 unit tests plus `tests/reattach.rs` against the real binary:
+  - an app vanishing mid-stream, then a new connection: output contiguous (a counter, no gap or
+    repeat) and the resize at its offset;
+  - kill reaches a background process group;
+  - exit is reported;
+  - shutdown removes the root;
+  - a second daemon on the same home exits;
+  - idle exit.
+- **`cargo test -p mulpex`**: 163 passed, against an in-process daemon. That includes a project
+  reopened after its `Core` was leaked: the same terminal came back with the same id, sid and name,
+  and still took input.
+- **`scripts/test-ptyd.sh` with `CLAUDE=1`**, macOS, and Linux (gidi-dev-mulpex, Xvfb :97,
+  `VISIBLE=1`). All passed on both:
+  - **detached restart:** same daemon, same shell and claude pids, every pane dump IDENTICAL
+    (plain, `less` on the alt screen, the claude TUI); the focused row kept focus; the claude's hub
+    listener was the same pid; the claude answered a prompt;
+  - **`kill -9` of the app:** same, with dumps IDENTICAL from the ring replay;
+  - **quit:** no app, daemon, shell or claude left, and the root was removed.
+- **`scripts/test-remote-update.sh` with `CLAUDE=1`**: real signed bundles and a local update
+  server, all five scenarios plus the new 2b:
+  - 2: a busy claude on the host **survived the update**: same pid, never stopped, adopted by the
+    updated app;
+  - 2b: the same release without the `ptyd` fields still ran the checkpoint stop and the wake.
+- **`scripts/test-remote-hosts.sh`**: all IDENTICAL, the host restart now adopting.
+- **NOT verified:**
+  - an update of the installed `/Applications` app on a real working machine;
+  - the AppImage itself on Linux (only the headless debug build; the mount-vanishing case is
+    covered by design, since nothing runs from the mount after a copy);
+  - a daemon whose protocol is out of range (no second protocol exists yet; the frozen ops are
+    covered by a byte fixture).

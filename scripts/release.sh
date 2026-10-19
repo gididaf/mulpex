@@ -166,16 +166,22 @@ SIGNATURE="$(cat "$SIGFILE")"
 # another wire; the rest keep running (docs/remote-hosts.md).
 WIRE="$(target/release/mulpex --wire-hash)"
 [[ "$WIRE" =~ ^[0-9a-f]{16}$ ]] || { echo "ERROR: bad wire fingerprint '$WIRE'" >&2; exit 1; }
+# The PTY-daemon protocols this build drives (docs/ptyd.md). A running Mulpex
+# whose daemon is in this range keeps every claude through the update.
+read -r PTYD_MIN PTYD <<<"$(target/release/mulpex --ptyd-proto)"
+[[ "$PTYD_MIN" =~ ^[0-9]+$ && "$PTYD" =~ ^[0-9]+$ ]] || { echo "ERROR: bad ptyd protocol '$PTYD_MIN $PTYD'" >&2; exit 1; }
 PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 URL="https://github.com/$REPO/releases/download/$TAG/Mulpex.app.tar.gz"
 
-VERSION="$VERSION" NOTES="$NOTES" PUB_DATE="$PUB_DATE" WIRE="$WIRE" \
+VERSION="$VERSION" NOTES="$NOTES" PUB_DATE="$PUB_DATE" WIRE="$WIRE" PTYD="$PTYD" PTYD_MIN="$PTYD_MIN" \
 SIGNATURE="$SIGNATURE" URL="$URL" node -e '
   const out = {
     version: process.env.VERSION,
     notes: process.env.NOTES,
     pub_date: process.env.PUB_DATE,
     wire: process.env.WIRE,
+    ptyd: Number(process.env.PTYD),
+    ptyd_min: Number(process.env.PTYD_MIN),
     platforms: {
       "darwin-aarch64": {
         signature: process.env.SIGNATURE,

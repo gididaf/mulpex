@@ -110,6 +110,10 @@ pub const DENIED: &[&str] = &[
     "set_compact_phase",
     "set_mute_menu_checked",
     "quit_app",
+    // A detached restart's pane snapshots come from THIS window's xterms; the
+    // survival check is for this machine's own updater.
+    "save_snapshots",
+    "update_survives",
     // ⌘⇧B asks every project on THIS machine; a remote host's own ⌘⇧B is local there.
     "broadcast_targets",
     "broadcast_send",
@@ -268,9 +272,14 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
         "checkpoint_dismiss" => out(c::checkpoint_dismiss(app.clone())),
         "restart_app" => {
             let app = app.clone();
+            let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
             std::thread::spawn(move || {
                 std::thread::sleep(RESTART_DELAY);
-                app.request_restart();
+                if detach {
+                    crate::ptyd::restart_detached(app);
+                } else {
+                    app.request_restart();
+                }
             });
             out(())
         }

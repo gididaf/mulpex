@@ -1,0 +1,33 @@
+[package]
+name = "mulpex-ptyd"
+version = "0.1.0"
+edition = "2021"
+description = "Mulpex's PTY daemon: owns every claude/terminal PTY so they outlive an app restart"
+
+[lib]
+name = "mulpex_ptyd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mulpex-ptyd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+mulpex-core = { path = "../mulpex-core" }
+# The Live Token proxy (daemon/live_token.rs) — moved here from the app so a
+# claude's API calls keep flowing while the app restarts.
+tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "rt-multi-thread"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

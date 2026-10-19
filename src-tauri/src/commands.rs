@@ -511,9 +511,36 @@ pub fn focus_session(state: State<AppState>, project_handle: ProjectHandle, id: 
 /// scheduling choice, not ours (measured today: it does not, and the events do
 /// fire), so relying on it would be a latent bug one runtime update away.
 /// `request_restart` always goes through `request_exit(RESTART_EXIT_CODE)`.
+///
+/// `detach`: keep every claude and terminal running through the restart (an
+/// update the running PTY daemon survives — `ptyd::restart_detached`). Without
+/// it this is a quit and a relaunch, as it always was.
 #[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    app.request_restart()
+pub fn restart_app(app: AppHandle, detach: Option<bool>) {
+    if detach.unwrap_or(false) {
+        crate::ptyd::restart_detached(app)
+    } else {
+        app.request_restart()
+    }
+}
+
+/// The frontend's pane snapshots for a detached restart (`ptyd-snapshot`).
+#[tauri::command]
+pub fn save_snapshots(state: State<AppState>, snapshots: Vec<crate::ptyd::PaneSnapshot>) {
+    let ws = state.ws.lock().unwrap();
+    for s in &snapshots {
+        if let Some(core) = ws.project(s.project_handle) {
+            crate::ptyd::write_snapshot(&core.state_dir, s);
+        }
+    }
+    crate::ptyd::snapshots_saved();
+}
+
+/// Whether installing a release keeps every session running: its
+/// `latest.json` says which daemon protocols the new app drives.
+#[tauri::command]
+pub fn update_survives(ptyd: Option<u32>, ptyd_min: Option<u32>) -> bool {
+    crate::ptyd::update_survives(ptyd, ptyd_min)
 }
 
 /// Quit Mulpex — the end of ⌘⇧Q Checkpoint & Quit. `exit` goes through

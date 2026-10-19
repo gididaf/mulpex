@@ -113,19 +113,30 @@ fn drive(app: &AppHandle, to: &str) -> Result<(), String> {
         return Err(format!("this Mulpex is offered v{}, not v{to}", update.version));
     }
 
+    // When this Mulpex's PTY daemon is one the new version drives, every
+    // claude keeps running through the restart (`ptyd.rs`): nothing is stopped,
+    // checkpointed or woken — the restart is detached instead.
+    let raw = &update.raw_json;
+    let num = |k: &str| raw.get(k).and_then(Value::as_u64).map(|v| v as u32);
+    let survives = crate::ptyd::update_survives(num("ptyd"), num("ptyd_min"));
+
     let state = app.state::<AppState>();
-    state.ws.lock().unwrap().checkpoint_stop();
-    // Holds this window's auto-compact, which would otherwise type `/compact`
-    // into a claude that just stopped (checkpoint.ts::compactsHeld).
-    crate::checkpoint::changed(app, true);
+    if !survives {
+        state.ws.lock().unwrap().checkpoint_stop();
+        // Holds this window's auto-compact, which would otherwise type `/compact`
+        // into a claude that just stopped (checkpoint.ts::compactsHeld).
+        crate::checkpoint::changed(app, true);
+    }
     // From here on, any way out that does not restart must un-stop them.
     let undo = |why: String| {
-        state.ws.lock().unwrap().checkpoint_cancel();
-        crate::checkpoint::changed(app, false);
+        if !survives {
+            state.ws.lock().unwrap().checkpoint_cancel();
+            crate::checkpoint::changed(app, false);
+        }
         why
     };
     let mut clear_since: Option<Instant> = None;
-    loop {
+    while !survives {
         if cancelled() {
             undo(String::new());
             set("cancelled", json!({}));
@@ -174,16 +185,22 @@ fn drive(app: &AppHandle, to: &str) -> Result<(), String> {
     }
     set("installing", json!({}));
     update.install(bytes).map_err(|e| undo(format!("install failed: {e}")))?;
-    state
-        .ws
-        .lock()
-        .unwrap()
-        .checkpoint_commit(true)
-        .map_err(|e| undo(format!("couldn't save the checkpoint: {e}")))?;
+    if !survives {
+        state
+            .ws
+            .lock()
+            .unwrap()
+            .checkpoint_commit(true)
+            .map_err(|e| undo(format!("couldn't save the checkpoint: {e}")))?;
+    }
 
     set("restarting", json!({}));
     // Let the relay loop send that before teardown takes the connection down.
     std::thread::sleep(Duration::from_millis(1500));
-    app.request_restart();
+    if survives {
+        crate::ptyd::restart_detached(app.clone());
+    } else {
+        app.request_restart();
+    }
     Ok(())
 }

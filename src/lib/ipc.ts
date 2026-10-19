@@ -646,9 +646,31 @@ export const importApply = (projectHandle: ProjectHandle, decisions: ImportDecis
   call<ApplyReport>("import_apply", { projectHandle, decisions });
 
 /** Relaunch the app through `AppHandle::restart` — the only restart path that
- * runs teardown (kills every project's `claude` process group, removes the
- * scratch root) before re-execing. Used to apply a downloaded update. */
-export const restartApp = (host = 0) => call<void>("restart_app", {}, host);
+ * runs teardown before re-execing. Used to apply a downloaded update.
+ *
+ * `detach`: leave every claude and terminal running in the PTY daemon for the
+ * relaunched app to adopt (`ptyd.rs`) — for an update the running daemon
+ * survives (`updateSurvives`). Without it, teardown kills them all, as ⌘Q does. */
+export const restartApp = (host = 0, detach = false) =>
+  call<void>("restart_app", detach ? { detach: true } : {}, host);
+
+/** One local pane's serialized screen at its exact stream offset, for the app
+ * after a detached restart to repaint from (`ptyd-snapshot`). */
+export interface PaneSnapshot {
+  projectHandle: ProjectHandle;
+  id: number;
+  data: string;
+  offset: number;
+  cols: number;
+  rows: number;
+}
+
+export const saveSnapshots = (snapshots: PaneSnapshot[]) => invoke<void>("save_snapshots", { snapshots });
+
+/** Whether installing a release keeps every session running: the running PTY
+ * daemon is one the new app (per its latest.json `ptyd_min`/`ptyd`) drives. */
+export const updateSurvives = (ptyd: number | null, ptydMin: number | null) =>
+  invoke<boolean>("update_survives", { ptyd, ptydMin });
 
 /** Quit through the normal teardown — the end of ⌘⇧Q Checkpoint & Quit. */
 export const quitApp = () => invoke<void>("quit_app");

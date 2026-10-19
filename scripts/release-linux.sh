@@ -68,6 +68,8 @@ ssh "$HOST" "bash -lc 'set -e; source ~/.nvm/nvm.sh; source ~/.cargo/env; cd ~/$
 # Same source, same fingerprint — checked against latest.json below, since a
 # Linux host on another wire than the one advertised would refuse the Mac.
 WIRE="$(ssh "$HOST" "~/$REMOTE_DIR/target/release/mulpex --wire-hash")"
+# ...and the PTY-daemon protocols it drives, which must match the Mac's.
+read -r PTYD_MIN PTYD <<<"$(ssh "$HOST" "~/$REMOTE_DIR/target/release/mulpex --ptyd-proto")"
 
 OUT="target/release/bundle/linux"
 rm -rf "$OUT" && mkdir -p "$OUT"
@@ -100,7 +102,7 @@ fi
 
 BASE="https://github.com/$REPO/releases/download/$TAG"
 APPIMAGE_SIG="$(cat "$OUT/$APPIMAGE.sig")" DEB_SIG="$(cat "$OUT/$DEB.sig")" \
-APPIMAGE_URL="$BASE/$APPIMAGE" DEB_URL="$BASE/$DEB" VERSION="$VERSION" WIRE="$WIRE" node -e '
+APPIMAGE_URL="$BASE/$APPIMAGE" DEB_URL="$BASE/$DEB" VERSION="$VERSION" WIRE="$WIRE" PTYD="$PTYD" PTYD_MIN="$PTYD_MIN" node -e '
   const fs = require("fs");
   const out = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (out.version !== process.env.VERSION) {
@@ -111,6 +113,12 @@ APPIMAGE_URL="$BASE/$APPIMAGE" DEB_URL="$BASE/$DEB" VERSION="$VERSION" WIRE="$WI
   out.wire ??= process.env.WIRE;
   if (out.wire !== process.env.WIRE) {
     console.error(`ERROR: latest.json says wire ${out.wire}, this Linux build is ${process.env.WIRE}`);
+    process.exit(1);
+  }
+  out.ptyd ??= Number(process.env.PTYD);
+  out.ptyd_min ??= Number(process.env.PTYD_MIN);
+  if (out.ptyd !== Number(process.env.PTYD) || out.ptyd_min !== Number(process.env.PTYD_MIN)) {
+    console.error(`ERROR: latest.json says ptyd ${out.ptyd_min}..${out.ptyd}, this Linux build is ${process.env.PTYD_MIN}..${process.env.PTYD}`);
     process.exit(1);
   }
   out.platforms["linux-x86_64"] = { signature: process.env.APPIMAGE_SIG, url: process.env.APPIMAGE_URL };

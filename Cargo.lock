@@ -2604,6 +2604,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mulpex-core",
+ "mulpex-ptyd",
  "p256",
  "portable-pty",
  "qrcode",
@@ -2640,6 +2641,28 @@ version = "0.4.6"
 dependencies = [
  "anyhow",
  "mulpex-core",
+]
+
+[[package]]
+name = "mulpex-ptyd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mulpex-core",
+ "portable-pty",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

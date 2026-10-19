@@ -4,6 +4,7 @@ members = [
     "crates/mulpex-core",
     "crates/mulpex-helper",
     "crates/mulpex-relay",
+    "crates/mulpex-ptyd",
     "src-tauri",
 ]
 

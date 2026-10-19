@@ -34,6 +34,7 @@
     setMuteMenuChecked,
     quitApp,
     restartApp,
+    saveSnapshots,
     remoteSnapshotReply,
     type BootstrapInfo,
     type WorkspaceInfo,
@@ -1566,6 +1567,15 @@
 
     unlisteners.push(
       listen<string>("menu", (e) => handleMenu(e.payload)),
+      // A restart that keeps every session (`ptyd.rs`): hand over each pane's
+      // screen, so the next app repaints it exactly.
+      listen("ptyd-snapshot", async () => {
+        try {
+          await saveSnapshots(await terminals.snapshotAll());
+        } catch (err) {
+          console.error("pane snapshots failed:", err);
+        }
+      }),
       listen<RemoteTypeEvent>("remote-type", (e) => remoteType(e.payload)),
       listen<RemoteKeyEvent>("remote-key", (e) => remoteKey(e.payload)),
       listen<RemoteKeysEvent>("remote-keys", (e) => remoteKeys(e.payload)),

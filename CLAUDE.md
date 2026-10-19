@@ -21,6 +21,7 @@ reasoning in `docs/`.
 
 | File | Covers | Read it before touching |
 | --- | --- | --- |
+| [docs/ptyd.md](docs/ptyd.md) | `mulpex-ptyd`, the daemon that owns every PTY so claudes and terminals outlive an app restart: who owns what, the stable scratch root, quit vs detach vs crash, adoption (`ptyd-rows.json`), repainting an adopted pane (snapshot / ring from spawn / redraw), `PROTO` and why an update never replaces a running daemon, `latest.json`'s `ptyd`/`ptyd_min`, the TCC measurement | `crates/mulpex-ptyd/*`, `pty.rs` `Session`/`OutputSink`, `ptyd.rs`, `Core::open`, `lib.rs` `teardown`, `updater.ts`, `remote_update.rs`, anything about restarting |
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — To Do (`hub_todo` lists, opt-in per row via right-click, drafts until UPDATE) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator's claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
@@ -65,14 +66,19 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
 crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` / `statusline` dispatch → mulpex-core
                       (there was a `crates/mulpex-cli/` here — `mpx`, a second host over
                        tmux — deleted 2026-09-17; see the note under this block)
+crates/mulpex-ptyd/   lib + bin: the PTY daemon — owns every PTY, child, output ring, shell
+                      recorder (`vtgrid`, moved here) and the Live Token proxy, so they
+                      outlive the app; `procs` (process table + kill sequence), `proto`,
+                      `client` (the app's side) — docs/ptyd.md
 crates/mulpex-relay/  bin: the Remote Control relay (runs on the VM; routes sealed frames,
                       serves the phone app) — docs/remote-control.md
 src-tauri/            the Tauri app (Rust backend)
-  src/pty.rs          Session = one claude OR one shell on a PTY (SessionKind), streaming
-                      to a frontend Channel
-  src/vtgrid.rs       shell terminals only: a small VT grid → plain-text transcript on
-                      disk (+ timed screen frames while a full-screen program is up),
-                      so a claude in another process can read a terminal's output
+  src/pty.rs          Session = one claude OR one shell (SessionKind) on a PTY the
+                      DAEMON owns; builds argv/env, mirrors the output ring, streams
+                      to a frontend Channel, rebuilds an adopted pane (`compose`)
+  src/ptyd.rs         the daemon connection, starting it, exit modes (quit / detach),
+                      pane snapshots, `update_survives` — docs/ptyd.md
+  (vtgrid.rs moved to crates/mulpex-ptyd: the daemon records shell transcripts now)
   src/state.rs        Workspace = N open projects (Vec<Core> + active handle + the ONE
                       geometry every PTY spawns at); each Core = one project + sessions
                       + its OWN scratch dir; reap/persist/hub-read
@@ -344,9 +350,14 @@ form drops it.
   `state.rs::tests::open_with_nothing_to_restore_spawns_no_session`.
 - **Teardown:** handled in `lib.rs` via `RunEvent` (managed-state `Drop` isn't guaranteed on
   exit). Window close → `app.exit(0)` → `ExitRequested` → `Workspace::teardown_all()` kills
-  **every project's** process groups (`killpg` SIGHUP→SIGKILL→wait) **then** removes the whole
-  scratch root. This is the "no orphaned claude" guarantee, now across all projects. `open.txt` is
-  **not** touched on teardown, so the set survives to next launch.
+  **every project's** sessions (through the daemon: tty sweep, background groups, `killpg`,
+  reap) **then** removes the whole scratch root and tells the daemon to `shutdown`. This is the
+  "no orphaned claude" guarantee, now across all projects. `open.txt` is **not** touched on
+  teardown, so the set survives to next launch.
+- **Restart without stopping anything:** an update the running PTY daemon survives restarts
+  **detached** (`ptyd::restart_detached`): pane snapshots, the row manifest, then teardown only
+  closes the socket. A crash leaves everything running too. The next launch **adopts** the
+  daemon's sessions in `Core::open` instead of `--resume`ing them. → [docs/ptyd.md](docs/ptyd.md)
 
 ## Shared-tree guardrail
 
@@ -371,6 +382,13 @@ hard block (that was considered; command-detection is heuristic and shell-bypass
 Short forms of rules whose full reasoning lives in `docs/`. Each one has been broken at least once
 and cost real time; each links to the measurement that settled it.
 
+- **A session outlives the app; a `Session` drop is not a kill during a detach.** The daemon owns
+  every PTY, so anything that assumed "the app quitting ends the claude" is now only true on a
+  real quit. The scratch root is the daemon's (`mulpex-<daemon pid>`), a project's dir is named
+  by `ptyd::project_key`, never by its handle, and the helper runs from `<home>/bin/` — all three
+  must outlive the app for a surviving claude's hooks to keep working. Daemon code reaches users
+  only after their next real quit (an update never replaces a running daemon), so keep
+  `crates/mulpex-ptyd` small and bump `proto::PROTO` for any wire change. → [docs/ptyd.md](docs/ptyd.md)
 - **One geometry, or the pane is corrupted forever.** An xterm must never be fed bytes rendered for
   a different size — claude repaints *differentially* and never rewrites a row it believes is
   correct, so debris is permanent. `Workspace::geometry` is the single (cols, rows) every PTY in

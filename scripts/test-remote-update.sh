@@ -20,8 +20,12 @@
 #   5. rollout:    A on LEGACY (the v0.47.1 release commit, from before the
 #                  fingerprint), B on NEXT → B orders A up, as in 1.
 #
-# With CLAUDE=1, scenario 2 also puts a real, busy claude in A: it must get the
-# checkpoint stop, and the wake after A's relaunch.
+# With CLAUDE=1, scenario 2 also puts a real, busy claude in A. The offered
+# release says which PTY-daemon protocols it drives (`ptyd`/`ptyd_min`, as
+# release.sh writes them), so A's claude must SURVIVE the update — same
+# process, never stopped (docs/ptyd.md). Scenario 2b offers the same release
+# without those fields, as every release before the daemon did: then the claude
+# must get the checkpoint stop, and the wake after A's relaunch.
 #
 #   bash scripts/test-remote-update.sh          # build, run, clean up
 #   KEEP=1 bash scripts/test-remote-update.sh   # leave the work dir
@@ -112,12 +116,16 @@ else
 fi
 
 mkdir -p "$WORK/www"
-offer() { # $1 version: latest.json offers it, with its wire, as release.sh writes it
+offer() { # $1 version [$2 = "noptyd": leave out the daemon protocols]: latest.json offers it, as release.sh writes it
   cp "$WORK/build-$1/Mulpex.app.tar.gz" "$WORK/www/Mulpex-$1.app.tar.gz"
-  SIG="$(cat "$WORK/build-$1/Mulpex.app.tar.gz.sig")" V="$1" WIRE="$(wire_of "$1")" \
+  local pp; pp="$("$WORK/build-$1/Mulpex.app/Contents/MacOS/mulpex" --ptyd-proto 2>/dev/null || true)"
+  [ "${2:-}" = noptyd ] && pp=""
+  SIG="$(cat "$WORK/build-$1/Mulpex.app.tar.gz.sig")" V="$1" WIRE="$(wire_of "$1")" PP="$pp" \
   URL="http://127.0.0.1:$WWW/Mulpex-$1.app.tar.gz" node -e '
     const out = { version: process.env.V, notes: "test", pub_date: new Date().toISOString(), wire: process.env.WIRE,
       platforms: { "darwin-aarch64": { signature: process.env.SIG, url: process.env.URL } } };
+    const [min, max] = (process.env.PP || "").split(" ").map(Number);
+    if (process.env.PP) { out.ptyd_min = min; out.ptyd = max; }
     require("fs").writeFileSync(process.argv[1], JSON.stringify(out));
   ' "$WORK/www/latest.json"
 }
@@ -167,7 +175,14 @@ EOF
   MULPEX_DEBUG_DUMP=1 MULPEX_HOME="$d/B" "$d/B.app/Contents/MacOS/mulpex" >>"$d/B.log" 2>&1 &
   PIDS+=($!)
 }
+# A project's scratch dir: under its app's PTY daemon's root, named for the
+# project (sha256 of its real path) — it outlives the app on purpose.
+sd_of() { # $1 scenario dir
+  local k; k="$(printf %s "$(cd "$1/proj" && pwd -P)" | shasum -a 256 | cut -c1-16)"
+  ls -d "${TMPDIR%/}"/mulpex-*/"$k" 2>/dev/null | head -1
+}
 teardown() {
+  # The daemons too: they run from a copy in each home, so under $WORK/$1/.
   pkill -f "$WORK/$1/" 2>/dev/null || true
   kill "$RELAY" 2>/dev/null || true
   sleep 2
@@ -203,16 +218,20 @@ teardown late
 fi
 
 # ---- 2. one click ------------------------------------------------------------------
-echo "› 2. one click on the Mac (A and B v$BASE)"
-S="$WORK/click"
-setup click "$BASE" "$BASE"
+one_click() { # $1 scenario name, $2 "survive" | "checkpoint"
+echo "› 2 ($1). one click on the Mac (A and B v$BASE), claudes expected to $2"
+S="$WORK/$1"
+setup "$1" "$BASE" "$BASE"
+CPID=""
 if [ -n "${CLAUDE:-}" ]; then
   sleep 5
-  APID="$(pgrep -f "$S/A.app/Contents/MacOS/mulpex" | head -1)"
-  mkdir -p "$TMPDIR/mulpex-$APID/1/spawn"
+  ASD="$(sd_of "$S")"
+  mkdir -p "$ASD/spawn"
   printf '%s' '{"from":0,"tasks":["Run the shell command `sleep 25` three times, one after another, as separate Bash calls. Then reply DONE."]}' \
-    >"$TMPDIR/mulpex-$APID/1/spawn/0001.json"
+    >"$ASD/spawn/0001.json"
   sleep 25
+  CPID="$(cat "$ASD"/pids/* 2>/dev/null | head -1)"
+  [ -n "$CPID" ] && ok "A's claude is running (pid $CPID)" || bad "A's claude never started"
 fi
 sleep 8
 if [ -n "${VISIBLE:-}" ]; then
@@ -220,9 +239,9 @@ if [ -n "${VISIBLE:-}" ]; then
 else
   printf '%s' '{"click":".card button.primary","text":"Update"}' >"$S/B/drive/1.json"
 fi
-if [ -n "${CLAUDE:-}" ]; then
+if [ -n "${CLAUDE:-}" ] && [ "$2" = checkpoint ]; then
   # A's scratch dir goes with A's restart, so look while it is still there.
-  if until_ok 120 grep -qs "about to quit" "$TMPDIR/mulpex-$APID/1/messages.log"; then ok "the claude got the stop"; else bad "no stop message seen"; fi
+  if until_ok 120 grep -qs "about to quit" "$ASD/messages.log"; then ok "the claude got the stop"; else bad "no stop message seen"; fi
 fi
 if until_ok "$( [ -n "${VISIBLE:-}" ] && echo 900 || echo 300 )" is_version "$S/A.app" "$NEXT"; then ok "the host updated first"; else
   bad "the host is still v$(version_of "$S/A.app") — B saw:"
@@ -232,11 +251,22 @@ if until_ok 180 is_version "$S/B.app" "$NEXT"; then ok "then the Mac updated"; e
 if until_ok 30 running "$S/A.app" && until_ok 30 running "$S/B.app"; then ok "both restarted"; else bad "one of them did not come back"; fi
 sleep 3
 if until_ok 60 connected "$S"; then ok "B is connected to A again"; else bad "B never reconnected"; fi
-if [ -n "${CLAUDE:-}" ]; then
-  NEW="$(pgrep -f "$S/A.app/Contents/MacOS/mulpex" | head -1)"
-  if until_ok 200 grep -qs "Mulpex is back. Before it quit" "$TMPDIR/mulpex-$NEW/1/messages.log"; then ok "the claude got the wake"; else bad "no wake message"; fi
+if [ -n "${CLAUDE:-}" ] && [ "$2" = checkpoint ]; then
+  if until_ok 200 grep -qs "Mulpex is back. Before it quit" "$(sd_of "$S")/messages.log"; then ok "the claude got the wake"; else bad "no wake message"; fi
 fi
-teardown click
+if [ -n "${CLAUDE:-}" ] && [ "$2" = survive ]; then
+  kill -0 "$CPID" 2>/dev/null && ok "A's claude survived the update (same pid $CPID)" || bad "A's claude died in the update"
+  grep -qs "about to quit" "$ASD/messages.log" && bad "the claude was stopped anyway" || ok "the claude was never stopped"
+  [ "$(cat "$(sd_of "$S")"/pids/* 2>/dev/null | head -1)" = "$CPID" ] && ok "the updated A adopted it" || bad "the updated A did not adopt it"
+fi
+teardown "$1"
+}
+one_click click survive
+if [ -n "${CLAUDE:-}" ]; then
+  offer "$NEXT" noptyd
+  one_click click-legacy checkpoint
+  offer "$NEXT"
+fi
 
 if [ -z "${VISIBLE:-}" ]; then
 # ---- 3. compatible host ----------------------------------------------------------

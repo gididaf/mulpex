@@ -13,6 +13,12 @@ must not depend on Claude Code internals, because Claude Code updates constantly
 
 - **Off by default.** `<mulpex home>/live-token.json` holds `token_file` and `refresh_command`. An
   empty `token_file` means off. When it is off, no proxy starts and no spawn changes at all.
+- **The proxy runs in the PTY daemon** (`crates/mulpex-ptyd/src/daemon/live_token.rs`), not in
+  the app, since 2026-10-19: claudes now outlive an app restart (docs/ptyd.md), and the port they
+  call has to be served while the app is down. The app keeps the settings and the dialog and pushes
+  the effective config (`live_token::push`: token file, refresh command, the upstream base URL and
+  the refresh command's environment — the two things only the app can read from the login
+  environment) on every connect and every change; the reply says where the proxy listens.
 - **When it is on**, Mulpex runs an HTTP proxy on `127.0.0.1:<random port>`. Every claude it spawns
   gets two env vars:
   - `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>`;

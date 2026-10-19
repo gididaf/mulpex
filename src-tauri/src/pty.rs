@@ -2,27 +2,27 @@
 //! plain interactive shell (a "terminal", see `SessionKind`).
 //!
 //! Unlike the old TUI, we do **not** emulate the terminal here — xterm.js in the
-//! frontend is the emulator. The backend is a raw byte pipe: the PTY reader
-//! thread streams bytes to the session's frontend `Channel`, and keystrokes come
-//! back via `send`. We keep the parts that are genuinely terminal-agnostic: the
-//! process invocation (flags/env) and the process-group teardown.
+//! frontend is the emulator. The backend is a raw byte pipe: PTY bytes stream to
+//! the session's frontend `Channel`, and keystrokes come back via `send`.
 //!
-//! Shell sessions carry one extra thing: a `vtgrid::Recorder` that maintains a
-//! plain-text transcript on disk, because a claude instance lives in a different
-//! process and can only read a terminal's output through a file.
+//! **The PTY itself is not ours.** Since the daemon (`mulpex-ptyd`, see
+//! `ptyd.rs` and docs/ptyd.md) every PTY, child process and shell transcript
+//! recorder lives there, so a session outlives an app restart. What stays here
+//! is everything Mulpex-specific about a spawn — the argv, the whole
+//! environment, the hub files — and a mirror of the output ring.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use mulpex_ptyd::client::{Event, Handler};
+use mulpex_ptyd::procs;
 use tauri::ipc::Channel;
 
 use crate::claude_bin;
-use crate::vtgrid::Recorder;
+use crate::ptyd;
 
 /// The spawn-time text and the `hub_spawn` child's first prompt now live in
 /// `mulpex_core::rules`, shared with `mpx`. `HUB_RULES` is a two-process contract
@@ -100,11 +100,6 @@ pub fn terminal_frames_path(state_dir: &Path, id: usize) -> PathBuf {
 /// milliseconds — so this is a backstop, not the expected path.
 const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the recorder publishes an unchanged-but-unpublished screen. The
-/// PTY reader thread only runs when there is output, so without this the final
-/// chunk of a burst (typically the shell prompt itself) would sit unpublished.
-const RECORDER_SETTLE: Duration = Duration::from_millis(200);
-
 
 /// How long to wait for a spawned child to reach its first turn before declaring
 /// the task undelivered. The task is on `claude`'s command line from the start, so
@@ -179,6 +174,11 @@ fn delivery_settled(state_dir: &Path, id: usize) -> bool {
 /// session's initial repaint isn't lost; on attach the buffer is flushed and we
 /// switch to live streaming. Bytes are base64-encoded over the channel (a plain
 /// `Serialize` payload that survives Tauri IPC without ArrayBuffer plumbing).
+///
+/// The bytes come from the daemon (`mulpex-ptyd`), which owns the PTY; this is
+/// the app's mirror of its ring, at the same absolute offsets — which is what
+/// lets a session adopted after an app restart (`Session::adopt`) be repainted
+/// from a snapshot at an exact offset plus the ring after it.
 pub struct OutputSink {
     state: Mutex<SinkState>,
     /// The last stretch of output and whoever is watching it live: Remote
@@ -188,12 +188,16 @@ pub struct OutputSink {
     /// xterm got. Taken BEFORE `state` in `push`, so a tap can never see a byte
     /// the channel hasn't been handed, or miss one it has.
     tail: Mutex<Tail>,
+    /// How an adopted session's pane is rebuilt on its first attach (instead of
+    /// flushing a buffer it never had). `None` for a session spawned this run.
+    replay: Mutex<Option<Replay>>,
 }
 
 /// How much of a terminal's recent output a phone repaints from.
 const TAIL_BYTES: usize = 256 * 1024;
 /// A claude's tail: what a remote desktop catches up from between the screen
-/// snapshot it was sent and the live stream (`remote/desktop.rs`).
+/// snapshot it was sent and the live stream (`remote/desktop.rs`), and what a
+/// pane is rebuilt from after an app restart.
 const CLAUDE_TAIL_BYTES: usize = 2 * 1024 * 1024;
 
 fn tail_cap(shell: bool) -> usize {
@@ -245,13 +249,100 @@ struct Tail {
     start: u64,
     resizes: std::collections::VecDeque<(u64, u16, u16)>,
     init: (u16, u16),
+    /// The PTY's size now, (cols, rows).
+    size: (u16, u16),
     taps: Vec<std::sync::mpsc::Sender<Vec<u8>>>,
     dtaps: Vec<std::sync::mpsc::Sender<TapMsg>>,
+}
+
+impl Tail {
+    fn total(&self) -> u64 {
+        self.start + self.ring.len() as u64
+    }
 }
 
 enum SinkState {
     Buffering(Vec<u8>),
     Attached(Channel<String>),
+}
+
+/// An xterm's screen as the frontend serialized it just before the previous
+/// app restarted (`ptyd::save_snapshots`): everything up to `offset`.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub data: String,
+    pub offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// What an adopted pane is rebuilt from on its first attach.
+#[derive(Debug, Clone, Default)]
+pub struct Replay {
+    pub snapshot: Option<Snapshot>,
+}
+
+/// One message on a local pane's channel. Plain base64 is output (base64 never
+/// starts with `{`); a JSON object is a control frame for `terminals.ts`:
+/// `snap` resets the xterm to a size (optionally painting a serialized screen)
+/// and says which stream offset it now shows; `r` resizes it at that point in
+/// the stream.
+fn snap_msg(cols: u16, rows: u16, offset: u64, screen: &str) -> String {
+    serde_json::json!({"t": "snap", "cols": cols, "rows": rows, "offset": offset, "s": screen}).to_string()
+}
+
+fn resize_msg(cols: u16, rows: u16) -> String {
+    serde_json::json!({"t": "r", "cols": cols, "rows": rows}).to_string()
+}
+
+/// How a rebuilt pane gets from nothing to the live stream, in channel
+/// messages. Three cases, in order of preference (docs/ptyd.md):
+///
+/// 1. A snapshot at an offset the ring still holds: paint it, then the ring
+///    from there — exact.
+/// 2. The ring still starts at spawn: reset to the spawn size and replay all of
+///    it, resizes included — exact.
+/// 3. Neither (a crash, after more than a ring of output): replay what there is
+///    at the current size, and report `true` so the caller makes the program
+///    redraw (`Session::repaint`).
+fn compose(t: &Tail, replay: &Replay) -> (Vec<String>, bool) {
+    let total = t.total();
+    if let Some(s) = replay.snapshot.as_ref().filter(|s| s.offset >= t.start && s.offset <= total) {
+        let mut out = vec![snap_msg(s.cols, s.rows, s.offset, &s.data)];
+        out.extend(ring_msgs(t, s.offset));
+        return (out, false);
+    }
+    if t.start == 0 {
+        let mut out = vec![snap_msg(t.init.0, t.init.1, 0, "")];
+        out.extend(ring_msgs(t, 0));
+        return (out, false);
+    }
+    // The size in force at `start` is unknown; the first marker after it (if
+    // any) fixes it from there on.
+    let mut out = vec![snap_msg(t.size.0, t.size.1, t.start, "")];
+    out.extend(ring_msgs(t, t.start));
+    (out, true)
+}
+
+/// The ring from absolute offset `from`, cut at each resize so the xterm
+/// changes size exactly where the PTY did.
+fn ring_msgs(t: &Tail, from: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes: Vec<u8> = t.ring.iter().copied().collect();
+    let mut at = from;
+    for &(off, cols, rows) in t.resizes.iter().filter(|r| r.0 >= from) {
+        let (a, b) = ((at - t.start) as usize, (off - t.start) as usize);
+        if b > a {
+            out.push(b64encode(&bytes[a..b]));
+        }
+        out.push(resize_msg(cols, rows));
+        at = off;
+    }
+    let a = (at - t.start) as usize;
+    if a < bytes.len() {
+        out.push(b64encode(&bytes[a..]));
+    }
+    out
 }
 
 impl OutputSink {
@@ -265,13 +356,26 @@ impl OutputSink {
                 start: 0,
                 resizes: Default::default(),
                 init,
+                size: init,
                 taps: Vec::new(),
                 dtaps: Vec::new(),
             }),
+            replay: Mutex::new(None),
         }
     }
 
-    /// Called from the reader thread for every chunk of PTY output.
+    /// Output at absolute offset `at`. Anything this sink already has is
+    /// dropped (an adopted session's first live bytes can overlap the ring it
+    /// was seeded with); a gap is taken as it comes.
+    pub(crate) fn push_at(&self, at: u64, bytes: &[u8]) {
+        let total = self.tail.lock().unwrap().total();
+        let skip = total.saturating_sub(at) as usize;
+        if skip < bytes.len() {
+            self.push(&bytes[skip..]);
+        }
+    }
+
+    /// Called for every chunk of PTY output.
     pub(crate) fn push(&self, bytes: &[u8]) {
         let mut t = self.tail.lock().unwrap();
         t.ring.extend(bytes);
@@ -294,12 +398,42 @@ impl OutputSink {
         }
     }
 
+    /// Text for the pane only: not output, so not in the ring and not at any
+    /// stream offset (an offset-keyed snapshot must never count it).
+    fn push_local(&self, bytes: &[u8]) {
+        let _t = self.tail.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        match &mut *st {
+            SinkState::Attached(ch) => {
+                let _ = ch.send(b64encode(bytes));
+            }
+            SinkState::Buffering(buf) => buf.extend_from_slice(bytes),
+        }
+    }
+
     /// The PTY changed size here in the stream.
     pub(crate) fn resized(&self, cols: u16, rows: u16) {
         let mut t = self.tail.lock().unwrap();
-        let at = t.start + t.ring.len() as u64;
+        let at = t.total();
         t.resizes.push_back((at, cols, rows));
+        t.size = (cols, rows);
         t.dtaps.retain(|tx| tx.send(TapMsg::Resize(cols, rows)).is_ok());
+        let st = self.state.lock().unwrap();
+        if let SinkState::Attached(ch) = &*st {
+            let _ = ch.send(resize_msg(cols, rows));
+        }
+    }
+
+    /// Start from the daemon's ring (an adopted session), to be rebuilt by
+    /// `replay` on the first attach.
+    fn seed(&self, start: u64, ring: Vec<u8>, resizes: Vec<(u64, u16, u16)>, init: (u16, u16), size: (u16, u16), replay: Replay) {
+        let mut t = self.tail.lock().unwrap();
+        t.start = start;
+        t.ring = ring.into();
+        t.resizes = resizes.into();
+        t.init = init;
+        t.size = size;
+        *self.replay.lock().unwrap() = Some(replay);
     }
 
     /// Watch this terminal: its recent output now, every new byte after. Under
@@ -325,57 +459,165 @@ impl OutputSink {
             ring: t.ring.iter().copied().collect(),
             resizes: t.resizes.iter().copied().collect(),
             init: t.init,
-            total: t.start + t.ring.len() as u64,
+            total: t.total(),
             rx,
         }
     }
 
-    /// Bind the frontend channel: flush anything buffered, then stream live.
-    /// Holding the lock across the swap means the reader thread can't interleave
-    /// a push between flush and attach (it blocks on `push`'s lock).
-    pub fn attach(&self, ch: Channel<String>) {
+    /// Bind the frontend channel: flush anything buffered (or, for an adopted
+    /// session, rebuild the pane from its snapshot and the ring), then stream
+    /// live. Holding both locks across the swap means no output can interleave
+    /// between the catch-up and the live stream. Returns whether the pane
+    /// could not be rebuilt exactly and wants a redraw.
+    pub fn attach(&self, ch: Channel<String>) -> bool {
+        let t = self.tail.lock().unwrap();
         let mut st = self.state.lock().unwrap();
-        if let SinkState::Buffering(buf) = &*st {
+        let mut redraw = false;
+        if let Some(replay) = self.replay.lock().unwrap().take() {
+            let (msgs, partial) = compose(&t, &replay);
+            for m in msgs {
+                let _ = ch.send(m);
+            }
+            // Pane-only text that arrived since (a failure notice).
+            if let SinkState::Buffering(buf) = &*st {
+                if !buf.is_empty() {
+                    let _ = ch.send(b64encode(buf));
+                }
+            }
+            redraw = partial;
+        } else if let SinkState::Buffering(buf) = &*st {
             if !buf.is_empty() {
                 let _ = ch.send(b64encode(buf));
             }
         }
         *st = SinkState::Attached(ch);
+        redraw
     }
 }
 
-/// A live `claude` or shell process on a PTY, streaming to one frontend terminal.
+/// Feeds a session's sink from the daemon's stream. An adopted session's
+/// events wait in `early` until the sink has been seeded with the ring they
+/// follow.
+struct SinkFeed {
+    sink: Arc<OutputSink>,
+    alive: Arc<AtomicBool>,
+    /// The daemon itself went away, taking the session with it — not the
+    /// child exiting. `reap_dead` keeps such a claude's record for the next
+    /// launch's `--resume`.
+    lost: Arc<AtomicBool>,
+    activity: Arc<Activity>,
+    early: Mutex<Option<Vec<Event>>>,
+}
+
+/// When a session last printed, for the seeded-command typer.
+#[derive(Default)]
+struct Activity {
+    saw_output: AtomicBool,
+    last: Mutex<Option<Instant>>,
+}
+
+impl SinkFeed {
+    fn apply(&self, ev: Event) {
+        match ev {
+            Event::Output(at, bytes) => {
+                self.sink.push_at(at, &bytes);
+                self.activity.saw_output.store(true, Ordering::Relaxed);
+                *self.activity.last.lock().unwrap() = Some(Instant::now());
+            }
+            Event::Resize(cols, rows) => self.sink.resized(cols, rows),
+            Event::Exit => self.alive.store(false, Ordering::Relaxed),
+            Event::Lost => {
+                self.lost.store(true, Ordering::Relaxed);
+                self.alive.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The sink is seeded: apply what waited, then everything as it comes.
+    fn release(&self) {
+        // Applied under the lock: an event arriving meanwhile waits in
+        // `event`, so it cannot overtake the ones queued before it.
+        let mut early = self.early.lock().unwrap();
+        for ev in early.take().unwrap_or_default() {
+            self.apply(ev);
+        }
+    }
+}
+
+impl Handler for SinkFeed {
+    fn event(&self, ev: Event) {
+        {
+            let mut early = self.early.lock().unwrap();
+            if let Some(q) = early.as_mut() {
+                q.push(ev);
+                return;
+            }
+        }
+        self.apply(ev);
+    }
+}
+
+/// A `claude` or shell on a PTY the daemon owns, streaming to one frontend
+/// terminal.
 pub struct Session {
     pub id: usize,
     pub session_id: String,
     pub kind: SessionKind,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// The daemon's handle for this PTY.
+    sid: u32,
+    client: Arc<mulpex_ptyd::client::Client>,
     alive: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
     sink: Arc<OutputSink>,
-    /// Plain-text transcript on disk. Shell sessions only — it exists so a
-    /// claude in another process can read this terminal's output.
-    recorder: Option<Arc<Mutex<Recorder>>>,
     /// The child's pid, captured at spawn so teardown still has it once the
     /// process has gone.
     child_pid: Option<libc::pid_t>,
-    /// Device number of this session's controlling terminal, latched once the
-    /// child is definitely up. `killpg` alone is not enough to tear a session
-    /// down — see `kill`.
-    tty_dev: Arc<AtomicU32>,
-    /// `kill` already ran. Its `wait()` reaps the child, after which the pid can
-    /// be recycled — so a second `killpg` (from `Drop`, minutes later for a row
-    /// ⌘S holds) could hit a stranger.
+    /// `kill` already ran: the daemon reaped the child, after which its pid
+    /// can be recycled.
     killed: bool,
     rows: u16,
     cols: u16,
 }
 
+/// Where a spawn's child runs and with what — the app builds all of it, the
+/// daemon only execs it (`env_clear` + exactly this env).
+struct Cmd {
+    argv: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+impl Cmd {
+    /// Like `portable_pty::CommandBuilder`, start from OUR environment.
+    fn new(prog: impl AsRef<std::ffi::OsStr>) -> Self {
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        Self { argv: vec![prog.as_ref().to_string_lossy().into_owned()], env }
+    }
+    fn arg(&mut self, a: impl AsRef<std::ffi::OsStr>) {
+        self.argv.push(a.as_ref().to_string_lossy().into_owned());
+    }
+    fn env(&mut self, k: impl AsRef<std::ffi::OsStr>, v: impl AsRef<std::ffi::OsStr>) {
+        self.env.insert(
+            k.as_ref().to_string_lossy().into_owned(),
+            v.as_ref().to_string_lossy().into_owned(),
+        );
+    }
+    fn env_remove(&mut self, k: &str) {
+        self.env.remove(k);
+    }
+}
+
+/// The daemon's name for (project scratch dir, id): stable across app
+/// restarts, so the next app finds its sessions.
+pub fn session_key(state_dir: &Path, id: usize) -> String {
+    format!("{}/{id}", state_dir.display())
+}
+
 impl Session {
-    /// Spawn `claude` or a shell in `dir` on a PTY of `rows`x`cols`. The reader
-    /// thread streams raw bytes to an `OutputSink` (and, for a shell, into a
-    /// `Recorder`); it never emulates the terminal — xterm.js does that.
+    /// Spawn `claude` or a shell in `dir` on a PTY of `rows`x`cols`. The PTY is
+    /// the daemon's; its output reaches an `OutputSink` here. Nothing here
+    /// emulates the terminal — xterm.js does that.
     pub fn spawn(
         id: usize,
         dir: &Path,
@@ -386,19 +628,12 @@ impl Session {
         let rows = rows.max(1);
         let cols = cols.max(1);
         let kind = spec.kind();
-
-        let pty_system = NativePtySystem::default();
-        let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let client = ptyd::client().map_err(anyhow::Error::msg)?;
 
         // One match resolves everything kind-specific: the command to run, the
         // scratch dir, and the optional first thing to type in. Everything after
         // this point is kind-agnostic.
-        let (mut cmd, state_dir, session_id, initial_task, seed) = match spec {
+        let (cmd, state_dir, session_id, initial_task, seed) = match spec {
             SpawnSpec::Claude {
                 settings_path,
                 state_dir,
@@ -463,9 +698,9 @@ impl Session {
                 // wins over `/tui fullscreen` and the rollout gate (measured,
                 // 2.1.292: `0` emits no ?1049h / ?100xh).
                 cmd.env("CLAUDE_CODE_NO_FLICKER", "0");
-                // Live Token: point the API at Mulpex's proxy, which puts the
-                // current token on every request (`live_token.rs`). Nothing
-                // when the feature is off.
+                // Live Token: point the API at the daemon's proxy, which puts
+                // the current token on every request (`live_token.rs`).
+                // Nothing when the feature is off.
                 for (k, v) in crate::live_token::spawn_env().unwrap_or_default() {
                     cmd.env(k, v);
                 }
@@ -492,24 +727,50 @@ impl Session {
                 seed.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             ),
         };
-        cmd.cwd(dir);
 
-        // A shell's transcript. Built before the child so the file exists the
-        // moment the terminal does — a read that races the first output should
-        // return "nothing yet", not a missing-file error.
-        let recorder = match kind {
-            SessionKind::Claude => None,
-            SessionKind::Shell => Some(Arc::new(Mutex::new(Recorder::new(
-                terminal_log_path(&state_dir, id),
-                terminal_screen_path(&state_dir, id),
-                terminal_frames_path(&state_dir, id),
-                rows,
-                cols,
-            )?))),
-        };
+        // A shell's transcript, written by the daemon (it has to keep recording
+        // while the app restarts): a claude in another process can only read a
+        // terminal's output through a file.
+        let record = (kind == SessionKind::Shell).then(|| {
+            serde_json::json!({
+                "log": terminal_log_path(&state_dir, id),
+                "screen": terminal_screen_path(&state_dir, id),
+                "frames": terminal_frames_path(&state_dir, id),
+            })
+        });
+        let env: Vec<serde_json::Value> = cmd.env.iter().map(|(k, v)| serde_json::json!([k, v])).collect();
+        let reply = client
+            .request(serde_json::json!({
+                "op": "spawn",
+                "key": session_key(&state_dir, id),
+                "argv": cmd.argv,
+                "env": env,
+                "cwd": dir,
+                "rows": rows,
+                "cols": cols,
+                "ring_cap": tail_cap(kind == SessionKind::Shell),
+                "record": record,
+                "meta": meta_of(kind, id, &session_id),
+            }))
+            .map_err(anyhow::Error::msg)?;
+        let sid = reply["sid"].as_u64().unwrap_or(0) as u32;
+        let child_pid = reply["pid"].as_i64().map(|p| p as libc::pid_t);
 
-        let child = pair.slave.spawn_command(cmd)?;
-        let child_pid = child.process_id().map(|p| p as libc::pid_t);
+        let sink = Arc::new(OutputSink::new(kind == SessionKind::Shell, (cols, rows)));
+        let alive = Arc::new(AtomicBool::new(true));
+        let lost = Arc::new(AtomicBool::new(false));
+        let activity = Arc::new(Activity::default());
+        client.register(
+            sid,
+            Arc::new(SinkFeed {
+                sink: Arc::clone(&sink),
+                alive: Arc::clone(&alive),
+                lost: Arc::clone(&lost),
+                activity: Arc::clone(&activity),
+                early: Mutex::new(None),
+            }),
+        );
+
         // Publish the child's pid so its hub listener can tell when it dies.
         //
         // Nothing else can tell it. `Session::kill` `killpg`s this pid's process
@@ -526,96 +787,15 @@ impl Session {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(dir.join(id.to_string()), pid.to_string());
         }
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let master = pair.master;
-
-        let sink = Arc::new(OutputSink::new(kind == SessionKind::Shell, (cols, rows)));
-        let alive = Arc::new(AtomicBool::new(true));
-        // Latched by the reader thread on first output. It can't be read here:
-        // `spawn_command` has returned from the fork, but the child sets its
-        // controlling terminal in the forked half and may not have got there
-        // yet. First output is proof it has.
-        let tty_dev = Arc::new(AtomicU32::new(0));
-        // Readiness signals for the one-shot hub-listener bootstrap: the reader
-        // thread marks when `claude` first paints (`saw_output`) and when it last
-        // emitted (`last_activity`), so the injector can wait until the initial UI
-        // has painted and then settled before typing into it.
-        let saw_output = Arc::new(AtomicBool::new(false));
-        let last_activity = Arc::new(Mutex::new(Instant::now()));
-        {
-            let sink = Arc::clone(&sink);
-            let alive = Arc::clone(&alive);
-            let saw_output = Arc::clone(&saw_output);
-            let last_activity = Arc::clone(&last_activity);
-            let recorder = recorder.clone();
-            let tty_dev = Arc::clone(&tty_dev);
-            thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            sink.push(&buf[..n]);
-                            if tty_dev.load(Ordering::Relaxed) == 0 {
-                                // The child has painted, so it definitely owns
-                                // the tty by now. Latched here so teardown still
-                                // knows the device after the child is gone.
-                                if let Some(dev) = child_pid.and_then(tty_dev_of) {
-                                    tty_dev.store(dev, Ordering::Relaxed);
-                                }
-                            }
-                            saw_output.store(true, Ordering::Relaxed);
-                            if let Ok(mut t) = last_activity.lock() {
-                                *t = Instant::now();
-                            }
-                            if let Some(rec) = &recorder {
-                                if let Ok(mut r) = rec.lock() {
-                                    r.push(&buf[..n]);
-                                }
-                            }
-                        }
-                    }
-                }
-                // EOF on the master is the process's death certificate. Note we
-                // deliberately do NOT `wait()` the child here: leaving it a zombie
-                // keeps its pid unrecyclable, which is what makes the `killpg` in
-                // `Drop`/`teardown_all` safe for a terminal that may sit in the
-                // list for a long time after exiting.
-                if let Some(rec) = &recorder {
-                    if let Ok(mut r) = rec.lock() {
-                        r.finish();
-                    }
-                }
-                alive.store(false, Ordering::Relaxed);
-            });
-        }
-
-        // Publish the recorder's pending state on a timer. The reader thread only
-        // runs when there is output, so the last chunk of a burst — usually the
-        // shell prompt itself — would otherwise stay unpublished indefinitely.
-        if let Some(rec) = &recorder {
-            let rec = Arc::clone(rec);
-            let alive = Arc::clone(&alive);
-            thread::spawn(move || {
-                while alive.load(Ordering::Relaxed) {
-                    thread::sleep(RECORDER_SETTLE);
-                    if let Ok(mut r) = rec.lock() {
-                        r.settle();
-                    }
-                }
-            });
-        }
 
         // A seeded terminal (`hub_terminal_open` with a command): type the command
         // once the shell has printed its prompt. Unlike `claude`, a shell has no
         // TUI to be "not listening yet" — waiting for first output plus a short
         // settle is enough, and the tty's own input buffer covers the rest.
         if let Some(seed) = seed {
-            let writer = Arc::clone(&writer);
+            let client = Arc::clone(&client);
             let alive = Arc::clone(&alive);
-            let saw_output = Arc::clone(&saw_output);
-            let last_activity = Arc::clone(&last_activity);
+            let activity = Arc::clone(&activity);
             thread::spawn(move || {
                 let start = Instant::now();
                 loop {
@@ -623,19 +803,17 @@ impl Session {
                     if !alive.load(Ordering::Relaxed) {
                         return;
                     }
-                    let quiet = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
-                    if saw_output.load(Ordering::Relaxed) && quiet >= Duration::from_millis(150) {
+                    let quiet = activity.last.lock().unwrap().map(|t| t.elapsed()).unwrap_or_default();
+                    if activity.saw_output.load(Ordering::Relaxed) && quiet >= Duration::from_millis(150) {
                         break;
                     }
                     if start.elapsed() >= SHELL_READY_TIMEOUT {
                         break;
                     }
                 }
-                if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(seed.as_bytes());
-                    let _ = w.write_all(b"\r");
-                    let _ = w.flush();
-                }
+                let mut line = seed.into_bytes();
+                line.push(b'\r');
+                client.send_input(sid, &line);
             });
         }
 
@@ -684,27 +862,124 @@ impl Session {
             id,
             session_id,
             kind,
-            writer,
-            master,
-            child,
+            sid,
+            client,
             alive,
+            lost,
             sink,
-            recorder,
             child_pid,
-            tty_dev,
             killed: false,
             rows,
             cols,
         })
     }
 
-    /// Bind this session's frontend terminal channel (flushing pre-attach output).
-    pub fn attach(&self, ch: Channel<String>) {
-        self.sink.attach(ch);
+    /// Take over a session the daemon kept running through an app restart
+    /// (`info` is its entry in the daemon's `list`). Its pane is rebuilt on the
+    /// first attach from `snapshot` (if the previous app left one) and the
+    /// daemon's ring — see `compose`.
+    pub fn adopt(id: usize, kind: SessionKind, session_id: &str, info: &serde_json::Value, snapshot: Option<Snapshot>) -> anyhow::Result<Self> {
+        use base64::Engine as _;
+        let client = ptyd::client().map_err(anyhow::Error::msg)?;
+        let sid = info["sid"].as_u64().unwrap_or(0) as u32;
+        let shell = kind == SessionKind::Shell;
+        let sink = Arc::new(OutputSink::new(shell, (80, 24)));
+        let alive = Arc::new(AtomicBool::new(true));
+        let lost = Arc::new(AtomicBool::new(false));
+        let feed = Arc::new(SinkFeed {
+            sink: Arc::clone(&sink),
+            alive: Arc::clone(&alive),
+            lost: Arc::clone(&lost),
+            activity: Arc::new(Activity::default()),
+            early: Mutex::new(Some(Vec::new())),
+        });
+        client.register(sid, feed.clone());
+        let a = match client.request(serde_json::json!({"op": "attach", "sid": sid})) {
+            Ok(a) => a,
+            Err(e) => {
+                client.unregister(sid);
+                anyhow::bail!(e);
+            }
+        };
+        let pair = |v: &serde_json::Value| (v[0].as_u64().unwrap_or(80) as u16, v[1].as_u64().unwrap_or(24) as u16);
+        let ring = base64::engine::general_purpose::STANDARD
+            .decode(a["ring"].as_str().unwrap_or(""))
+            .unwrap_or_default();
+        let resizes: Vec<(u64, u16, u16)> = a["resizes"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .map(|r| (r[0].as_u64().unwrap_or(0), r[1].as_u64().unwrap_or(80) as u16, r[2].as_u64().unwrap_or(24) as u16))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cols = a["cols"].as_u64().unwrap_or(80) as u16;
+        let rows = a["rows"].as_u64().unwrap_or(24) as u16;
+        sink.seed(
+            a["start"].as_u64().unwrap_or(0),
+            ring,
+            resizes,
+            pair(&a["init"]),
+            (cols, rows),
+            Replay { snapshot },
+        );
+        if a["alive"] == false {
+            alive.store(false, Ordering::Relaxed);
+        }
+        feed.release();
+        Ok(Self {
+            id,
+            session_id: session_id.to_string(),
+            kind,
+            sid,
+            client,
+            alive,
+            lost,
+            sink,
+            child_pid: info["pid"].as_i64().map(|p| p as libc::pid_t),
+            killed: false,
+            rows,
+            cols,
+        })
     }
 
-    /// Forward raw bytes to Claude's stdin (from xterm `onData`). Shares the PTY
-    /// writer (behind a mutex) with the one-shot hub-listener bootstrap thread.
+    /// The daemon's handle for this PTY.
+    pub fn sid(&self) -> u32 {
+        self.sid
+    }
+
+    /// Tell the daemon who this session is now (it outlives the app, and the
+    /// next app identifies it by this). Cheap; called when a claude's
+    /// conversation uuid changes under it (`reconcile_session_ids`).
+    pub fn publish_meta(&self) {
+        let _ = self.client.request(serde_json::json!({
+            "op": "set_meta", "sid": self.sid, "meta": meta_of(self.kind, self.id, &self.session_id),
+        }));
+    }
+
+    /// Bind this session's frontend terminal channel (flushing pre-attach
+    /// output, or rebuilding an adopted pane).
+    pub fn attach(&self, ch: Channel<String>) {
+        if self.sink.attach(ch) {
+            self.repaint();
+        }
+    }
+
+    /// Make the program redraw its whole screen: shrink the PTY by a row for a
+    /// moment and give it back, which every full-screen program answers with a
+    /// full repaint (SIGWINCH). Used when a pane could not be rebuilt exactly.
+    fn repaint(&self) {
+        let (sid, rows, cols, client) = (self.sid, self.rows, self.cols, Arc::clone(&self.client));
+        if rows < 2 {
+            return;
+        }
+        thread::spawn(move || {
+            let _ = client.request(serde_json::json!({"op": "resize", "sid": sid, "rows": rows - 1, "cols": cols}));
+            thread::sleep(Duration::from_millis(150));
+            let _ = client.request(serde_json::json!({"op": "resize", "sid": sid, "rows": rows, "cols": cols}));
+        });
+    }
+
     /// Remote Control: watch this terminal's output (`OutputSink::tap`).
     pub fn tap(&self) -> Option<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
         self.sink.tap()
@@ -715,14 +990,14 @@ impl Session {
         self.sink.desktop_tap()
     }
 
+    /// Forward raw bytes to the child's stdin (from xterm `onData`).
     pub fn send(&mut self, bytes: &[u8]) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
+        self.client.send_input(self.sid, bytes);
     }
 
-    /// Resize the PTY so the child re-lays-out. No-op if unchanged.
+    /// Resize the PTY so the child re-lays-out. No-op if unchanged. The sink
+    /// records the resize when the daemon reports it, at its exact place in
+    /// the stream.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -731,20 +1006,7 @@ impl Session {
         }
         self.rows = rows;
         self.cols = cols;
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        self.sink.resized(cols, rows);
-        // The recorder's grid has to track the child's idea of the screen, or
-        // cursor-addressed redraws land on the wrong rows.
-        if let Some(rec) = &self.recorder {
-            if let Ok(mut r) = rec.lock() {
-                r.resize(rows, cols);
-            }
-        }
+        let _ = self.client.request(serde_json::json!({"op": "resize", "sid": self.sid, "rows": rows, "cols": cols}));
     }
 
     /// This session's PTY geometry, `(cols, rows)`. The frontend's xterm for it
@@ -762,6 +1024,11 @@ impl Session {
         self.alive.load(Ordering::Relaxed)
     }
 
+    /// The session ended because the daemon did, not because its child exited.
+    pub fn lost_with_daemon(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+
     /// What this terminal is doing: is a foreground command running, and where
     /// is the shell sitting. `None` for a claude, for a dead session, and on any
     /// platform without the probe — a reader must be able to tell "not known"
@@ -770,7 +1037,7 @@ impl Session {
         if !self.is_shell() || !self.is_alive() {
             return None;
         }
-        shell_state_of(self.child_pid?)
+        procs::shell_state_of(self.child_pid?)
     }
 
     /// Write a line of Mulpex's own text into this session's pane.
@@ -787,10 +1054,18 @@ impl Session {
         // CRLF, not LF: the PTY is in raw mode, so a bare newline moves down a
         // row without returning to column 0 and the next line starts staircased
         // under the end of this one.
-        self.sink.push(format!("\r\n{text}\r\n").as_bytes());
+        self.sink.push_local(format!("\r\n{text}\r\n").as_bytes());
     }
 }
 
+/// What the daemon keeps about a session for the next app to recognise it.
+fn meta_of(kind: SessionKind, id: usize, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": if kind == SessionKind::Shell { "shell" } else { "claude" },
+        "id": id,
+        "session_id": session_id,
+    })
+}
 /// Why `dir` cannot be used as a working directory, in words for the user — or
 /// `None` if it is usable.
 ///
@@ -843,522 +1118,31 @@ pub fn dir_access_error(dir: &Path) -> Option<String> {
 
 impl Session {
 
-    /// Tear the session down: everything attached to its terminal, then its
-    /// process group, then the direct child (reaped, so nothing is left
-    /// `<defunct>`). Called explicitly for deterministic teardown on app quit
-    /// before the scratch dir is removed, and again from `Drop`.
-    ///
-    /// **`killpg` alone is not enough, and the gap is only visible with a
-    /// shell.** A `claude` is a node process and does no job control, so
-    /// everything its Bash tool spawns inherits its process group and one
-    /// `killpg` reaches the lot. An interactive shell *does* do job control and
-    /// puts every job in its own process group, which `killpg(shell_pgid)`
-    /// cannot reach. A foreground job still dies — dropping the master hangs up
-    /// the tty's foreground group — but a backgrounded `cmd &` is in neither,
-    /// and measured, it survived both the close and app quit. Giving the shell a
-    /// grace period after SIGHUP so it could hup its own jobs does not fix it
-    /// (measured at 150 ms and 400 ms).
-    ///
-    /// So the sweep is by **controlling terminal**: every process still attached
-    /// to this session's tty, which is exactly its descendants and nothing else,
-    /// since the device is ours for as long as the master is open. That is also
-    /// what a terminal emulator does when you close a tab with jobs running.
+    /// Tear the session down. The daemon does the killing — everything on its
+    /// terminal, a claude's background process groups, its own group, then the
+    /// child, reaped (`mulpex_ptyd::daemon::session::DSession::kill`, with the
+    /// reasoning for each step in `mulpex_ptyd::procs`). Waits until it is done.
     pub fn kill(&mut self) {
         if std::mem::replace(&mut self.killed, true) {
             return;
         }
-        // Ours only while `self.master` is still open — which it is, since Drop
-        // runs this before dropping the fields. Once the device is released the
-        // kernel can hand the same number to someone else's pty.
-        let dev = self.tty_dev.load(Ordering::Relaxed);
-        let dev = if dev != 0 {
-            Some(dev)
-        } else {
-            self.child_pid.and_then(tty_dev_of)
-        };
-        if let Some(dev) = dev {
-            kill_tty_session(dev);
-        }
-        // Before the claude itself: once it is gone they are reparented to
-        // launchd and nothing tells them apart from anyone else's.
-        if !self.is_shell() {
-            if let Some(pid) = self.child_pid {
-                kill_child_groups(pid);
-            }
-        }
-
-        if let Some(pid) = self.child.process_id() {
-            let pgid = pid as libc::pid_t;
-            unsafe {
-                libc::killpg(pgid, libc::SIGHUP);
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.client.request(serde_json::json!({"op": "kill", "sid": self.sid}));
+        // The daemon replies once the child is reaped; its exit event may
+        // still be in flight, and nothing is listening for it any more.
+        self.alive.store(false, Ordering::Relaxed);
+        self.client.unregister(self.sid);
     }
 }
 
-/// What a shell terminal is doing right now, as far as the kernel knows.
-///
-/// `running` on a terminal only ever meant "the shell process is alive", which
-/// is not the question a reader usually has — a shell sitting at its prompt and
-/// a shell three minutes into a build are both `running: true`, and from the
-/// transcript alone the two are indistinguishable for a terminal the *user* is
-/// driving (a command Mulpex submitted itself is tracked by its completion
-/// marker, but nothing typed by hand is).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellState {
-    /// A foreground command is running in this terminal.
-    pub command_running: bool,
-    /// The shell's own working directory. Unaffected by a foreground job, which
-    /// cannot change it.
-    pub cwd: Option<String>,
-}
-
-/// Ask the kernel what `pid`'s shell is doing. macOS-only, `None` elsewhere —
-/// the same shape as the tty sweep, and `None` means "not known", never "no".
-#[cfg(target_os = "macos")]
-fn shell_state_of(pid: libc::pid_t) -> Option<ShellState> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    if n != size {
-        return None;
-    }
-    // `e_tpgid` is the process group the tty currently has in the FOREGROUND;
-    // `pbi_pgid` is the shell's own. An interactive shell puts every job it runs
-    // into a process group of its own and hands the terminal to it, so the two
-    // differing IS a foreground command running — no heuristics, no parsing the
-    // prompt. A shell with no controlling terminal reports 0, which is not a
-    // disagreement worth reporting.
-    let command_running = info.e_tpgid != 0 && info.e_tpgid != info.pbi_pgid;
-    Some(ShellState {
-        command_running,
-        cwd: cwd_of(pid),
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn shell_state_of(_pid: libc::pid_t) -> Option<ShellState> {
-    None
-}
-
-/// `pid`'s current working directory.
-#[cfg(target_os = "macos")]
-fn cwd_of(pid: libc::pid_t) -> Option<String> {
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    if n != size {
-        return None;
-    }
-    // `vip_path` is a flat NUL-terminated buffer that `libc` declares as nested
-    // arrays to keep an old rustc happy; read it as the C string it is.
-    let raw = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
-    let path = raw.to_str().ok()?;
-    (!path.is_empty()).then(|| path.to_owned())
-}
-
-/// The device number of `pid`'s controlling terminal, or `None` if it has none
-/// (or is gone). Still readable while the process is a zombie.
-#[cfg(target_os = "macos")]
-fn tty_dev_of(pid: libc::pid_t) -> Option<u32> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    // NODEV is -1; 0 means "no controlling terminal".
-    if n == size && info.e_tdev != u32::MAX && info.e_tdev != 0 {
-        Some(info.e_tdev)
-    } else {
-        None
-    }
-}
-
-/// SIGKILL every process whose controlling terminal is `dev`.
-///
-/// Deliberately excludes this process: Mulpex launched from a terminal has a
-/// controlling tty of its own, and while that can never be one of our PTYs, the
-/// check costs nothing and makes the blast radius obvious.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn kill_tty_session(dev: u32) {
-    let me = std::process::id() as libc::pid_t;
-    for pid in all_pids() {
-        if pid <= 0 || pid == me {
-            continue;
-        }
-        if tty_dev_of(pid) == Some(dev) {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-/// Hang up, then kill, the process group of every direct child of `parent`
-/// that runs in a group of its own — a `claude`'s background commands.
-///
-/// Claude Code starts each background Bash command (a dev server, a `tail -f`,
-/// a Monitor) as its own process group with no controlling terminal (measured:
-/// `PGID == pid`, `SESS 0`, parent = the `claude`). So neither `killpg` on the
-/// claude's group nor `kill_tty_session` reaches them, and closing a claude
-/// left them running forever. Children in the claude's own group (its MCP
-/// servers) are left to that `killpg`; Mulpex's own group is never touched.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn kill_child_groups(parent: libc::pid_t) {
-    let theirs = unsafe { libc::getpgid(parent) };
-    let mine = unsafe { libc::getpgid(0) };
-    let mut groups: Vec<libc::pid_t> = all_pids()
-        .into_iter()
-        .filter(|&pid| pid > 1 && ppid_of(pid) == Some(parent))
-        .map(|pid| unsafe { libc::getpgid(pid) })
-        .filter(|&g| g > 1 && g != theirs && g != mine)
-        .collect();
-    groups.sort_unstable();
-    groups.dedup();
-    for g in &groups {
-        unsafe { libc::killpg(*g, libc::SIGHUP) };
-    }
-    for g in &groups {
-        unsafe { libc::killpg(*g, libc::SIGKILL) };
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn kill_child_groups(_parent: libc::pid_t) {}
-
-/// `PROC_ALL_PIDS` from `<sys/proc_info.h>`; the `libc` crate exposes
-/// `proc_listpids` but not this constant.
-#[cfg(target_os = "macos")]
-const PROC_ALL_PIDS: u32 = 1;
-
-#[cfg(target_os = "macos")]
-fn all_pids() -> Vec<libc::pid_t> {
-    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if bytes <= 0 {
-        return Vec::new();
-    }
-    let slot = std::mem::size_of::<libc::pid_t>() as libc::c_int;
-    // Headroom: processes can appear between sizing the buffer and filling it.
-    let cap = (bytes / slot) as usize + 64;
-    let mut pids = vec![0 as libc::pid_t; cap];
-    let bytes = unsafe {
-        libc::proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr() as *mut libc::c_void,
-            (cap * slot as usize) as libc::c_int,
-        )
-    };
-    if bytes <= 0 {
-        return Vec::new();
-    }
-    pids.truncate((bytes / slot) as usize);
-    pids
-}
-
-/// `KERN_PROCARGS2` from `<sys/sysctl.h>`. Returns argc, then the executable
-/// path, then the argv strings, then the environment — all NUL-separated in one
-/// blob. We do not parse it: every string we look for is distinctive enough that
-/// a substring search over the whole blob is both sufficient and immune to the
-/// layout's padding rules.
-#[cfg(target_os = "macos")]
-const KERN_PROCARGS2: libc::c_int = 49;
-
-/// A process's command line, as one lossy string with NUL turned into newline.
-/// `None` when the process is gone or is not ours to inspect.
-///
-/// **Argv only, in practice.** `KERN_PROCARGS2` is documented to return the
-/// environment after the arguments, and for our own children it does not: a
-/// legacy listener's blob came back 756 bytes — exactly its `zsh -c` line, with
-/// no `MULPEX_*` in it (measured against a live orphan). So nothing here may be
-/// keyed on an environment variable; a legacy listener's argv names
-/// `$MULPEX_STATE_DIR` unexpanded and cannot tell you *which* state dir it serves.
-/// That is why `reap_orphaned_listeners` keys on the parent instead.
-#[cfg(target_os = "macos")]
-fn argv_of(pid: libc::pid_t) -> Option<String> {
-    // The buffer has to be `KERN_ARGMAX`, not whatever a sizing call reports.
-    // Asking `KERN_PROCARGS2` for its size with a null buffer answers 32 — enough
-    // for `sleep 60` and nothing else (measured) — so a sized fetch silently
-    // returns a *truncated* command line. That cost a sweep that matched nothing
-    // at all while looking like it worked.
-    let mut argmax: libc::c_int = 0;
-    let mut argmax_len = std::mem::size_of::<libc::c_int>();
-    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let rc = unsafe {
-        libc::sysctl(
-            argmax_mib.as_mut_ptr(),
-            argmax_mib.len() as libc::c_uint,
-            &mut argmax as *mut _ as *mut libc::c_void,
-            &mut argmax_len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || argmax <= 0 {
-        return None;
-    }
-
-    let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
-    let mut size = argmax as usize;
-    let mut buf = vec![0u8; size];
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(size);
-    // NUL is the separator; turn the blob into one searchable line.
-    for b in buf.iter_mut() {
-        if *b == 0 {
-            *b = b'\n';
-        }
-    }
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// A process's parent pid, or `None` if it is gone.
-#[cfg(target_os = "macos")]
-fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    (n == size).then_some(info.pbi_ppid as libc::pid_t)
-}
-
-/// Whether `pid` has lost the parent that started it. On macOS every orphan is
-/// reparented to launchd, pid 1.
-#[cfg(target_os = "macos")]
-fn is_orphaned(pid: libc::pid_t) -> bool {
-    ppid_of(pid) == Some(1)
-}
-
-/// SIGKILL every **orphaned** hub listener on this machine, and report how many.
-///
-/// This is the one cleanup no other code path can do. A listener runs in its own
-/// process group with no controlling terminal (measured: `PGID == pid`, `SESS 0`,
-/// state `Ss`), so `Session::kill`'s `killpg` misses it and so does
-/// `kill_tty_session`. It outlives its `claude`, outlives app teardown, and is
-/// reparented to launchd still spinning `sleep 1` — six were found alive on one
-/// machine at once, the oldest more than a day old, belonging to a Mulpex that had
-/// exited the previous morning. `listen.rs` makes new listeners exit by
-/// themselves; this reaches the ones that predate that and the legacy shell loops
-/// that will never learn to.
-///
-/// **Orphanhood is the parent, not the path.** The obvious test — "does it name a
-/// scratch root that is dead?" — cannot be written: a legacy listener's argv
-/// spells its state dir as the literal `$MULPEX_STATE_DIR`, and the expanded value
-/// lives only in its environment, which `KERN_PROCARGS2` does not hand back for
-/// our own children (measured). `ppid == 1` is both available and exactly the
-/// signature that was observed. It is also safe by construction: a listener
-/// serving a live instance is a child of that `claude`, in this Mulpex or in
-/// another one or under `mpx`, and is therefore never matched.
-/// Split out from the kill so the selection can be tested without a test run
-/// SIGKILLing whatever orphans happen to be on the developer's machine.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn orphaned_listener_pids() -> Vec<libc::pid_t> {
-    let me = std::process::id() as libc::pid_t;
-    all_pids()
-        .into_iter()
-        .filter(|&pid| pid != me && pid > 1 && is_orphaned(pid))
-        .filter(|&pid| {
-            // One matcher, shared with the hook that excuses a listener from the
-            // "still working" count — two spellings of "this is a listener" is how
-            // one of them silently stops recognising the other.
-            argv_of(pid).is_some_and(|argv| mulpex_core::hook::command_is_hub_listener(&argv))
-        })
-        .collect()
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn reap_orphaned_listeners() -> usize {
-    let pids = orphaned_listener_pids();
-    for pid in &pids {
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
-    }
-    pids.len()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn reap_orphaned_listeners() -> usize {
-    0
-}
-
-// ---- Linux: the same questions as above, answered from /proc ----
-//
-// Each `/proc/<pid>/…` file is read whole and handed to a pure parser, so the
-// parsing is unit-tested on every platform against fixture strings, and the
-// Linux wrappers are only the file reads.
-
-#[cfg(any(target_os = "linux", test))]
-/// The fields of `/proc/<pid>/stat` the process sweeps need.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcStat {
-    /// The executable name, at most 15 bytes, as the kernel truncates it.
-    comm: String,
-    ppid: i32,
-    pgrp: i32,
-    /// Controlling terminal's device number; 0 means none.
-    tty_nr: i32,
-    /// The tty's FOREGROUND process group; -1 with no controlling terminal.
-    tpgid: i32,
-}
-
-#[cfg(any(target_os = "linux", test))]
-/// Parse one `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp session
-/// tty_nr tpgid …`. `comm` may itself hold spaces and parentheses, so it ends
-/// at the LAST `)` — never split the whole line on whitespace.
-fn parse_proc_stat(line: &str) -> Option<ProcStat> {
-    let open = line.find('(')?;
-    let close = line.rfind(')')?;
-    let comm = line.get(open + 1..close)?.to_owned();
-    let mut rest = line.get(close + 1..)?.split_whitespace();
-    let _state = rest.next()?;
-    let mut num = || rest.next()?.parse::<i32>().ok();
-    let ppid = num()?;
-    let pgrp = num()?;
-    let _session = num()?;
-    let tty_nr = num()?;
-    let tpgid = num()?;
-    Some(ProcStat { comm, ppid, pgrp, tty_nr, tpgid })
-}
-
-#[cfg(any(target_os = "linux", test))]
-/// A shell's foreground job, from its stat: the tty's foreground group differs
-/// from the shell's own — the same test as `e_tpgid != pbi_pgid` on macOS. No
-/// controlling terminal reports -1 (0 on some kernels), which is not a job.
-fn foreground_job_running(st: &ProcStat) -> bool {
-    st.tpgid > 0 && st.tpgid != st.pgrp
-}
-
-#[cfg(any(target_os = "linux", test))]
-/// `/proc/<pid>/cmdline` as one searchable string, NUL turned into newline —
-/// the same shape `argv_of` returns on macOS.
-fn cmdline_text(raw: &[u8]) -> String {
-    let joined: Vec<u8> = raw.iter().map(|&b| if b == 0 { b'\n' } else { b }).collect();
-    String::from_utf8_lossy(&joined).into_owned()
-}
-
-#[cfg(any(target_os = "linux", test))]
-/// Whether a process with this parent has lost the one that started it.
-///
-/// On macOS that is simply "parent is launchd". Linux reparents an orphan to
-/// the nearest **child subreaper** instead of pid 1 when one exists — on a
-/// desktop that is the user's `systemd --user` manager — so a parent named
-/// `systemd` counts too. Never matches a live listener: that one's parent is
-/// its `claude`.
-fn parent_means_orphaned(ppid: i32, parent_comm: Option<&str>) -> bool {
-    ppid == 1 || parent_comm == Some("systemd")
-}
-
-#[cfg(target_os = "linux")]
-fn proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
-    parse_proc_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
-#[cfg(target_os = "linux")]
-fn shell_state_of(pid: libc::pid_t) -> Option<ShellState> {
-    let st = proc_stat(pid)?;
-    Some(ShellState {
-        command_running: foreground_job_running(&st),
-        cwd: cwd_of(pid),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn cwd_of(pid: libc::pid_t) -> Option<String> {
-    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    let path = path.to_str()?;
-    (!path.is_empty()).then(|| path.to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn tty_dev_of(pid: libc::pid_t) -> Option<u32> {
-    let st = proc_stat(pid)?;
-    (st.tty_nr != 0).then_some(st.tty_nr as u32)
-}
-
-#[cfg(target_os = "linux")]
-fn all_pids() -> Vec<libc::pid_t> {
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn argv_of(pid: libc::pid_t) -> Option<String> {
-    Some(cmdline_text(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?))
-}
-
-#[cfg(target_os = "linux")]
-fn ppid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
-    proc_stat(pid).map(|st| st.ppid)
-}
-
-#[cfg(target_os = "linux")]
-fn is_orphaned(pid: libc::pid_t) -> bool {
-    let Some(ppid) = ppid_of(pid) else {
-        return false;
-    };
-    let parent = proc_stat(ppid);
-    parent_means_orphaned(ppid, parent.as_ref().map(|p| p.comm.as_str()))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tty_dev_of(_pid: libc::pid_t) -> Option<u32> {
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn kill_tty_session(_dev: u32) {}
+pub use procs::{reap_orphaned_listeners, ShellState};
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // `claude` (Node) setsids into its own group and spawns helpers; kill the
-        // whole process group, not just the direct pid, so nothing is orphaned.
-        self.kill();
+        // A restart that keeps every session (`ptyd::restart_detached`) drops
+        // them all on the way out; only a real teardown may kill.
+        if !ptyd::detaching() {
+            self.kill();
+        }
     }
 }
 
@@ -1372,7 +1156,7 @@ impl Drop for Session {
 /// omits `~/.local/bin` where the installer puts `claude` (see `claude_bin`).
 /// The same reconstructed `PATH` is handed to the child so tools it runs
 /// (`node`, `git`, Homebrew) resolve as they do in the user's terminal.
-fn claude_command() -> anyhow::Result<CommandBuilder> {
+fn claude_command() -> anyhow::Result<Cmd> {
     let bin = claude_bin::resolve_claude().ok_or_else(|| {
         anyhow::anyhow!(
             "Claude Code CLI not found. Mulpex launches your own `claude`, but no `claude` \
@@ -1381,13 +1165,13 @@ fn claude_command() -> anyhow::Result<CommandBuilder> {
             claude_bin::merged_path()
         )
     })?;
-    let mut cmd = CommandBuilder::new(bin);
+    let mut cmd = Cmd::new(bin);
     base_env(&mut cmd);
     Ok(cmd)
 }
 
 /// The environment every PTY child needs, whichever program it is.
-fn base_env(cmd: &mut CommandBuilder) {
+fn base_env(cmd: &mut Cmd) {
     // `portable_pty` passes OUR environment through — and a Finder-launched
     // bundle's environment is LaunchServices' bare one, which never saw a login
     // shell. So the rc files' exports have to be reconstructed and handed over
@@ -1437,14 +1221,14 @@ fn base_env(cmd: &mut CommandBuilder) {
 /// Deliberately not routed through `claude_command()`: that resolves the Claude
 /// CLI and *errors* when it's missing, and a plain terminal must not fail to
 /// open because `claude` isn't installed.
-fn shell_command() -> anyhow::Result<CommandBuilder> {
+fn shell_command() -> anyhow::Result<Cmd> {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         // A Finder-launched bundle has no SHELL either; same fallback the PATH
         // probe uses.
         .unwrap_or_else(|| claude_bin::DEFAULT_SHELL.to_string());
-    let mut cmd = CommandBuilder::new(&shell);
+    let mut cmd = Cmd::new(&shell);
     // `-l` alone is login-but-not-interactive: zsh would skip `.zshrc`, print no
     // prompt, and treat the PTY as a script. Both flags are required.
     cmd.arg("-l");
@@ -1493,91 +1277,7 @@ fn b64encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// A claude's background command runs in a process group of its own, which
-    /// `killpg` on the claude misses; `kill_child_groups` reaches it, and leaves
-    /// a child in the parent's own group alone.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn background_groups_of_a_child_are_killed() {
-        use std::io::BufRead as _;
-        use std::os::unix::process::CommandExt as _;
-        // `sh` stands in for the claude: one child in a group of its own (perl
-        // setpgrp, then exec sleep), one in sh's group. Both pids on stdout.
-        let mut sh = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("perl -e 'setpgrp(0,0); exec q(sleep), q(9999)' & echo $!; sleep 9999 & echo $!; wait")
-            .process_group(0)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = std::io::BufReader::new(sh.stdout.take().unwrap()).lines();
-        let own: libc::pid_t = lines.next().unwrap().unwrap().trim().parse().unwrap();
-        let same: libc::pid_t = lines.next().unwrap().unwrap().trim().parse().unwrap();
-        let alive = |pid: libc::pid_t| ppid_of(pid) == Some(sh.id() as libc::pid_t);
-        let settled = |f: &dyn Fn() -> bool| {
-            (0..100).any(|_| {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                f()
-            })
-        };
-        assert!(
-            settled(&|| unsafe { libc::getpgid(own) } == own),
-            "the background child never got a group of its own"
-        );
 
-        kill_child_groups(sh.id() as libc::pid_t);
-
-        assert!(settled(&|| !alive(own)), "the background group survived");
-        assert!(alive(same), "a child in the parent's own group was killed");
-
-        unsafe { libc::killpg(sh.id() as libc::pid_t, libc::SIGKILL) };
-        let _ = sh.wait();
-    }
-
-
-    /// `/proc/<pid>/stat` as Linux writes it, including a `comm` that holds a
-    /// space and a `)` — the reason the parser anchors on the LAST `)`.
-    #[test]
-    fn proc_stat_lines_parse() {
-        let shell = "4242 (bash) S 4100 4242 4242 34817 4300 4194560 1 0 0 0 2 1 0 0 20 0 1 0 9 1 2 3";
-        let st = parse_proc_stat(shell).unwrap();
-        assert_eq!(st, ProcStat { comm: "bash".into(), ppid: 4100, pgrp: 4242, tty_nr: 34817, tpgid: 4300 });
-        assert!(foreground_job_running(&st), "the tty's foreground group is a job, not the shell");
-
-        let idle = "4242 (zsh) S 4100 4242 4242 34817 4242 0";
-        assert!(!foreground_job_running(&parse_proc_stat(idle).unwrap()));
-
-        // A daemon: no controlling terminal, tpgid -1.
-        let daemon = "77 (we ird) proc)) S 1 77 77 0 -1 4194304 0";
-        let st = parse_proc_stat(daemon).unwrap();
-        assert_eq!(st.comm, "we ird) proc)");
-        assert_eq!((st.ppid, st.tty_nr, st.tpgid), (1, 0, -1));
-        assert!(!foreground_job_running(&st));
-
-        assert!(parse_proc_stat("").is_none());
-        assert!(parse_proc_stat("12 (cut").is_none());
-        assert!(parse_proc_stat("12 (short) S 1").is_none());
-    }
-
-    #[test]
-    fn cmdline_reads_as_one_line_per_argument() {
-        let raw = b"/opt/Mulpex/mulpex-helper\0listen\0";
-        assert_eq!(cmdline_text(raw), "/opt/Mulpex/mulpex-helper\nlisten\n");
-        assert!(mulpex_core::hook::command_is_hub_listener(&cmdline_text(raw)));
-    }
-
-    /// Linux hands an orphan to a subreaper (`systemd --user`) when there is
-    /// one, so "parent is pid 1" alone would never reap on a desktop — but a
-    /// listener whose `claude` is alive must never qualify.
-    #[test]
-    fn an_orphan_is_parented_by_init_or_a_systemd_subreaper() {
-        assert!(parent_means_orphaned(1, Some("systemd")));
-        assert!(parent_means_orphaned(1, None));
-        assert!(parent_means_orphaned(1834, Some("systemd")));
-        assert!(!parent_means_orphaned(5120, Some("claude")));
-        assert!(!parent_means_orphaned(5120, Some("node")));
-        assert!(!parent_means_orphaned(5120, None));
-    }
 
     /// A Remote Control tap gets the recent output, then every byte after it;
     /// the tail is bounded; a phone that went away is forgotten; and a claude
@@ -1626,72 +1326,6 @@ mod tests {
         assert_eq!(t2.total, 6 + CLAUDE_TAIL_BYTES as u64);
     }
 
-    /// The selection behind the one cleanup nothing else in this file can do —
-    /// and the one that has to be *narrow*, because it reaches into the process
-    /// table and SIGKILLs, with no undo.
-    ///
-    /// Both halves are load-bearing and each is the whole test on its own:
-    /// **orphaned** without **listener** is every stray daemon on the machine;
-    /// **listener** without **orphaned** is every listener still serving a live
-    /// instance — in this Mulpex, in a second one, or under `mpx`.
-    ///
-    /// The obvious third condition, "names a dead scratch root", is deliberately
-    /// absent and cannot be added: a legacy listener's argv spells its state dir
-    /// as the literal `$MULPEX_STATE_DIR`, and `KERN_PROCARGS2` does not return
-    /// the environment that would expand it (measured — see `argv_of`).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn only_a_parentless_listener_is_reaped() {
-        const MARK: &str = "\"/x/mulpex-helper\" listen";
-        let pidfile = std::env::temp_dir().join(format!(
-            "mulpex-orphan-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-
-        // A genuine orphan: the shell we spawn backgrounds a listener-shaped child
-        // and exits, so that child is reparented to launchd — exactly how a real
-        // one is made, by its `claude` dying underneath it.
-        let mut maker = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "/bin/sh -c 'echo $$ > {pf}; while :; do sleep 1; done # {MARK}' & exit 0",
-                pf = pidfile.display()
-            ))
-            .spawn()
-            .unwrap();
-        let _ = maker.wait();
-
-        // A listener whose parent is alive (us). Reaping this is the failure that
-        // would deafen a running instance.
-        let mut attached = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("while :; do sleep 1; done # {MARK}"))
-            .spawn()
-            .unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let orphan: libc::pid_t = std::fs::read_to_string(&pidfile)
-            .expect("the orphan should have written its pid")
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(is_orphaned(orphan), "the test's orphan must be parentless");
-
-        let reapable = orphaned_listener_pids();
-        assert!(reapable.contains(&orphan), "a parentless listener is reapable");
-        assert!(
-            !reapable.contains(&(attached.id() as libc::pid_t)),
-            "a listener whose instance is still alive must never be reaped"
-        );
-
-        unsafe { libc::kill(orphan, libc::SIGKILL) };
-        let _ = attached.kill();
-        let _ = attached.wait();
-        let _ = std::fs::remove_file(&pidfile);
-    }
 
     /// The task a spawner writes must reach the child WHOLE. This is the
     /// regression that cost two instances their briefs: the prompt used to be

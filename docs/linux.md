@@ -145,7 +145,10 @@ it from `rustc`. `src-tauri/tauri.linux.conf.json` is merged over
   killed, scratch root removed.
 - Title badge: `Mulpex` → `(1) Mulpex` while a claude asks, back after.
 - The AppImage runs, and its helper is served from the AppImage mount
-  (`/tmp/.mount_*/usr/bin/mulpex-helper`).
+  (`/tmp/.mount_*/usr/bin/mulpex-helper`). **Since the PTY daemon (docs/ptyd.md) both the helper
+  and `mulpex-ptyd` are copied out of the mount** (`<home>/bin/`, `<home>/ptyd/<ver>/`) and run from
+  there: the mount vanishes when the app quits, and claudes now outlive it. `scripts/test-ptyd.sh`
+  passes on the VM under Xvfb (`VISIBLE=1` — a hidden window measures 2x1 cells there).
 
 **Not measured:** anything over real RDP — that Mac ⌘ arrives as Super through
 xrdp, notifications on the XFCE desktop, the updater installing an update, and

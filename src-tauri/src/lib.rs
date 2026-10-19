@@ -14,6 +14,7 @@ mod project;
 mod pins;
 mod todos;
 mod pty;
+mod ptyd;
 mod remote;
 mod docs_import;
 mod explain;
@@ -22,7 +23,7 @@ mod saves;
 mod secrets;
 mod snapshot;
 mod state;
-mod vtgrid;
+pub(crate) use mulpex_ptyd::vtgrid;
 // Read by `build.rs`; the app itself only needs `env!("MULPEX_WIRE")`.
 #[cfg(test)]
 mod wire;
@@ -90,10 +91,23 @@ fn is_forwarded(id: &str) -> bool {
     ) || id.starts_with("project_")
 }
 
-/// Kill every project's session process groups and remove the scratch root.
-/// Idempotent, so running it on both window-close and exit is safe.
+/// Kill every project's session process groups and remove the scratch root —
+/// or, on a restart that keeps them (`ptyd::restart_detached`), save what the
+/// next app needs to adopt them and let go. Idempotent, so running it on both
+/// window-close and exit is safe.
 fn teardown(app: &tauri::AppHandle) {
-    app.state::<AppState>().ws.lock().unwrap().teardown_all();
+    {
+        let state = app.state::<AppState>();
+        let mut ws = state.ws.lock().unwrap();
+        if ptyd::detaching() {
+            ws.detach_all();
+        } else {
+            ws.teardown_all();
+            // Whatever the daemon still holds ends with this quit, and so
+            // does the daemon.
+            ptyd::shutdown();
+        }
+    }
     explain::discard_all();
     broadcast::cancel_summary();
 }
@@ -107,7 +121,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             ws: Mutex::new(Workspace::new()),
-            helper_path: resolve_helper_path(),
+            // A stable copy, not the bundle's: claudes now outlive the app
+            // (and its bundle, replaced by an update) — see `ptyd::stable_helper`.
+            helper_path: ptyd::stable_helper(&resolve_helper_path()),
         });
     // The native menu is macOS-only. Linux has no global menu bar, and a GTK
     // strip in the window was declined (the webview draws its own, `MenuBar.svelte`): there the webview claims every
@@ -188,6 +204,8 @@ pub fn run() {
             commands::import_apply,
             commands::restart_app,
             commands::quit_app,
+            commands::save_snapshots,
+            commands::update_survives,
             commands::broadcast_targets,
             commands::broadcast_send,
             commands::broadcast_progress,
@@ -236,7 +254,8 @@ pub fn run() {
             // a rotating token stays live in a long-running Mulpex.
             claude_bin::warm_and_refresh();
 
-            // Live Token (off unless configured): bind its proxy before any
+            // Live Token (off unless configured): its proxy runs in the PTY
+            // daemon (started here if it isn't running). Configured before any
             // project restores, so restored claudes are spawned pointing at it.
             live_token::init();
 
@@ -254,6 +273,16 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 let helper = state.helper_path.clone();
                 let mut ws = state.ws.lock().unwrap();
+                // The daemon's scratch root, not one of our own: it outlives
+                // this app, and every claude that survived the last restart
+                // has a dir under it as its `MULPEX_STATE_DIR`.
+                match ptyd::state_root() {
+                    Some(root) => ws.state_root = root,
+                    None => eprintln!("[ptyd] no PTY daemon — sessions cannot start"),
+                }
+                // Every PTY shares one size; take the one the surviving
+                // sessions run at, before the frontend builds an xterm.
+                ws.adopt_geometry();
                 // Before creating ours, collect the scratch roots of Mulpex
                 // processes that died without running teardown...
                 ws.sweep_stale_state_roots();
@@ -272,6 +301,9 @@ pub fn run() {
                     let _ = ws.open_or_focus(&dir, &helper);
                 }
                 ws.active = ws.projects.first().map(|c| c.handle);
+                // Sessions of a project that is no longer open end now.
+                ws.kill_unadopted();
+                ptyd::sweep_snapshots();
                 // Drop any dirs that no longer exist / failed to open from the set.
                 ws.persist_open();
                 // An update ordered from another Mulpex checkpointed these
