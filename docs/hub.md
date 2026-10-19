@@ -705,7 +705,15 @@ the old `HUB_RULES`.
 ## Ask All Claudes (⌘⇧B) — the one app message that IS answered
 
 `broadcast.rs` sends one question to the picked claudes of every open project, through
-`send_app_message` like the senders above. The answer cannot come back by `hub_send`: "Mulpex"
+`send_app_message` like the senders above.
+
+- **It follows the host in front.** With Local in front it asks this Mulpex's claudes; with a remote
+  host in front, that host's (`broadcast_*` are allowed in `remote/rpc.rs`, and `client.rs::lower`
+  translates `targets[].handle`). The round and its Sonnet summary run on that host;
+  `broadcast-summary` is in `desktop.rs::EVENT_NAMES`, and `broadcast.ts` matches it by `reqId`.
+- **One round per host.** `broadcast.ts` keeps a round per slot, so a local round keeps going while
+  a remote host is in front. A host still keeps one round of its own: a ⌘⇧B from its own window
+  replaces one started from afar, and the reverse (chosen 2026-10-19). The answer cannot come back by `hub_send`: "Mulpex"
 is not an address, and `HUB_RULES` forbids trying. So there is a dedicated tool,
 `hub_reply_broadcast {id, answer}`:
 

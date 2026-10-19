@@ -707,12 +707,13 @@ export interface BroadcastSummaryEvent {
   kind: "delta" | "done" | "error";
   text: string;
 }
-export const broadcastTargets = () => invoke<BroadcastTarget[]>("broadcast_targets");
-export const broadcastSend = (message: string, targets: { handle: ProjectHandle; id: number }[]) =>
-  invoke<string>("broadcast_send", { message, targets });
-export const broadcastProgress = () => invoke<BroadcastRound | null>("broadcast_progress");
-export const broadcastSummarize = (reqId: string) => invoke<void>("broadcast_summarize", { reqId });
-export const broadcastCancel = () => invoke<void>("broadcast_cancel");
+// `host` 0 is this Mulpex; a remote host's round runs there (its summary too).
+export const broadcastTargets = (host = 0) => call<BroadcastTarget[]>("broadcast_targets", {}, host);
+export const broadcastSend = (message: string, targets: { handle: ProjectHandle; id: number }[], host = 0) =>
+  call<string>("broadcast_send", { message, targets }, host);
+export const broadcastProgress = (host = 0) => call<BroadcastRound | null>("broadcast_progress", {}, host);
+export const broadcastSummarize = (reqId: string, host = 0) => call<void>("broadcast_summarize", { reqId }, host);
+export const broadcastCancel = (host = 0) => call<void>("broadcast_cancel", {}, host);
 
 /** ⌘⇧Q Checkpoint & Quit (`checkpoint.rs`): one claude asked to stop, or to wake. */
 export interface CheckpointTarget {

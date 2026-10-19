@@ -427,7 +427,8 @@
   /** ⌘⇧O is open on this host's Remote Control (0 = this Mulpex), or closed. */
   let remoteFor = $state<number | null>(null);
   /** ⌘⇧B: the Ask All Claudes popup is open (the round itself outlives it). */
-  let showAskAll = $state(false);
+  /** ⌘⇧B is open, for this host's claudes (0 = this Mulpex). */
+  let askAllHost = $state<number | null>(null);
   /** File ▸ Connect to Remote Mulpex…: the pairing dialog is open. */
   let showConnect = $state(false);
   /** ⌘O on a remote host: the host whose folders the picker browses. */
@@ -1302,7 +1303,8 @@
         remoteFor = get(activeHost);
         break;
       case "ask_all":
-        showAskAll = true;
+        // A remote tab in front: that host's claudes.
+        askAllHost = get(activeHost);
         break;
       case "connect_host":
         showConnect = true;
@@ -1933,14 +1935,15 @@
       }}
     />
   {/if}
-  {#if showAskAll}
+  {#if askAllHost != null}
     <BroadcastDialog
+      host={askAllHost}
       onclose={() => {
-        showAskAll = false;
+        askAllHost = null;
         terminals.refocus();
       }}
       onfocus={(h, id) => {
-        showAskAll = false;
+        askAllHost = null;
         focusInstance(h, id);
       }}
     />

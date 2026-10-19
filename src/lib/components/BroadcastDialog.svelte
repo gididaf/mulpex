@@ -1,13 +1,19 @@
 <script lang="ts">
-  // ⌘⇧B Ask All Claudes: one question to every claude in every project
-  // (`broadcast.rs`, `lib/broadcast.ts`). Compose view while no round is open;
-  // then a row per claude and the Sonnet summary. Closing keeps the round going.
+  // ⌘⇧B Ask All Claudes: one question to every claude in every project of the
+  // host in front (`broadcast.rs`, `lib/broadcast.ts`). Compose view while no
+  // round is open; then a row per claude and the Sonnet summary. Closing keeps
+  // the round going.
   import { broadcastTargets, type BroadcastRowState, type BroadcastTarget } from "../ipc";
-  import { endBroadcast, resumeBroadcast, round, sendBroadcast, summarize, summary } from "../broadcast";
+  import { endBroadcast, noSummary, resumeBroadcast, rounds, sendBroadcast, summarize, summaries } from "../broadcast";
+  import { hostName } from "../hosts";
   import { renderMarkdown, renderMarkdownAuto } from "../markdown";
   import { onMount } from "svelte";
 
-  let { onclose, onfocus }: { onclose: () => void; onfocus: (handle: number, id: number) => void } = $props();
+  let {
+    host,
+    onclose,
+    onfocus,
+  }: { host: number; onclose: () => void; onfocus: (handle: number, id: number) => void } = $props();
 
   const key = (h: number, id: number) => `${h}:${id}`;
 
@@ -20,16 +26,21 @@
   let sheet: HTMLDivElement | undefined = $state();
   let box: HTMLTextAreaElement | undefined = $state();
 
-  const r = $derived($round);
-  const sum = $derived($summary);
+  const r = $derived($rounds.get(host) ?? null);
+  const sum = $derived($summaries.get(host) ?? noSummary);
 
   async function loadTargets() {
-    targets = await broadcastTargets();
+    try {
+      targets = await broadcastTargets(host);
+    } catch (e) {
+      targets = [];
+      error = String(e);
+    }
     picked = new Set(targets.map((t) => key(t.handle, t.id)));
   }
 
   onMount(() => {
-    resumeBroadcast();
+    resumeBroadcast(host);
     void loadTargets();
   });
   $effect(() => {
@@ -68,7 +79,7 @@
     if (list.length === 0) return void (error = "Pick at least one claude");
     busy = true;
     try {
-      await sendBroadcast(message, list);
+      await sendBroadcast(host, message, list);
       open = new Set();
     } catch (e) {
       error = String(e);
@@ -78,9 +89,13 @@
   }
 
   async function newQuestion() {
-    await endBroadcast();
-    message = "";
     error = "";
+    try {
+      await endBroadcast(host);
+    } catch (e) {
+      return void (error = String(e));
+    }
+    message = "";
     await loadTargets();
   }
 
@@ -130,7 +145,7 @@
     onkeydown={onKey}
   >
     <div class="head">
-      <span class="label">Ask All Claudes</span>
+      <span class="label">Ask All Claudes{host ? ` · ${hostName(host)}` : ""}</span>
       {#if r}<span class="count" class:all={r.complete}>{done} / {r.rows.length} answered</span>{/if}
     </div>
 
@@ -209,9 +224,9 @@
         <button class="ghost" onclick={() => void newQuestion()}>New question</button>
         <span class="spacer"></span>
         {#if !r.complete}
-          <button disabled={answers === 0 || sum.state === "streaming"} onclick={() => void summarize()}>Summarize now</button>
+          <button disabled={answers === 0 || sum.state === "streaming"} onclick={() => void summarize(host)}>Summarize now</button>
         {:else if sum.state === "error" || sum.state === "done"}
-          <button disabled={answers === 0} onclick={() => void summarize()}>Summarize again</button>
+          <button disabled={answers === 0} onclick={() => void summarize(host)}>Summarize again</button>
         {/if}
         <button class="primary" onclick={onclose}>Close</button>
       {/if}

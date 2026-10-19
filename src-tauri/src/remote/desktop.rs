@@ -57,6 +57,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "pins-changed",
     "todos-changed",
     "checkpoint-changed",
+    "broadcast-summary",
 ];
 
 /// The most terminal output in one frame.

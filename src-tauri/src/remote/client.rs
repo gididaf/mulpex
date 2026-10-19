@@ -685,6 +685,10 @@ pub fn lower(args: &mut Value, base: u64) {
     if let Some(Value::Array(hs)) = args.get_mut("handles") {
         hs.iter_mut().for_each(down);
     }
+    // `broadcast_send`'s picks: `[{handle, id}]`.
+    if let Some(Value::Array(ts)) = args.get_mut("targets") {
+        ts.iter_mut().filter_map(|t| t.get_mut("handle")).for_each(down);
+    }
 }
 
 fn new_rid() -> String {
@@ -1172,6 +1176,9 @@ mod tests {
         let mut args = json!({"projectHandle": base + 5, "id": 1, "handles": [base + 2, base + 1]});
         lower(&mut args, base);
         assert_eq!(args, json!({"projectHandle": 5, "id": 1, "handles": [2, 1]}));
+        let mut picks = json!({"message": "q", "targets": [{"handle": base + 3, "id": 2}]});
+        lower(&mut picks, base);
+        assert_eq!(picks, json!({"message": "q", "targets": [{"handle": 3, "id": 2}]}));
     }
 
     /// The order goes only to a host that is strictly older, by number — not

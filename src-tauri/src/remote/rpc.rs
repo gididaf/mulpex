@@ -78,6 +78,11 @@ pub const ALLOWED: &[&str] = &[
     "checkpoint_pending",
     "checkpoint_wake",
     "checkpoint_dismiss",
+    "broadcast_targets",
+    "broadcast_send",
+    "broadcast_progress",
+    "broadcast_summarize",
+    "broadcast_cancel",
     "restart_app",
     "remote_status",
     "remote_revoke_device",
@@ -114,12 +119,6 @@ pub const DENIED: &[&str] = &[
     // survival check is for this machine's own updater.
     "save_snapshots",
     "update_survives",
-    // ⌘⇧B asks every project on THIS machine; a remote host's own ⌘⇧B is local there.
-    "broadcast_targets",
-    "broadcast_send",
-    "broadcast_progress",
-    "broadcast_summarize",
-    "broadcast_cancel",
     "geometry_take_back",
     "remote_snapshot_reply",
     "debug_dump_enabled",
@@ -270,6 +269,14 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
         "checkpoint_pending" => out(c::checkpoint_pending(st())),
         "checkpoint_wake" => out(c::checkpoint_wake(st(), app.clone())),
         "checkpoint_dismiss" => out(c::checkpoint_dismiss(app.clone())),
+        // ⌘⇧B on a remote tab asks this host's claudes. The host keeps one
+        // round, so this replaces one started from its own window (and the
+        // reverse); the summary runs here, its events forwarded.
+        "broadcast_targets" => out(c::broadcast_targets(st())),
+        "broadcast_send" => out(c::broadcast_send(st(), arg(args, "message")?, arg(args, "targets")?)?),
+        "broadcast_progress" => out(c::broadcast_progress(st())),
+        "broadcast_summarize" => out(c::broadcast_summarize(app.clone(), st(), arg(args, "reqId")?)?),
+        "broadcast_cancel" => out(c::broadcast_cancel(st())),
         "restart_app" => {
             let app = app.clone();
             let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
