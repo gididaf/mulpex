@@ -47,11 +47,14 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 
 - **View** — every project's sidebar rows with status, task, ctx %, and the open dialog. Built in
   `hub.rs`'s loop (only while on), sent when it changes. Each claude row also carries
-  `todos_open`/`todos_pending` (its To Do badge) and each project an `todos_rev`.
-- **To Do** — `todos-get {handle}` → `{t:"todos", handle, lists}`; `todos-edit {rid, handle, id, edit}` (edit ops incl. `comment` and `seen`)
-  and `todos-update {rid, handle, ids}` answer as `typed`. They call the same `Core` methods as the
-  desktop's commands, so drafts are shared with it. `Todo.svelte` re-fetches whenever `todos_rev`
-  changes while it is open; it opens from a row's `☐ n` badge or the chat header's "To Do".
+  `board_open`/`board_unread`/`board_urgent` (its Board badge) and each project a `board_rev`.
+- **Board** — `board-get {handle}` → `{t:"board", handle, board}`; `board-edit {rid, handle, edit}`,
+  `board-on {rid, handle, on}`, `board-image-get {rid, handle, id, offset}` and `board-image-put
+  {rid, handle, data, upload, done}` answer as `typed` with a `value`. Images go in chunks (a whole
+  one would not fit a relay frame once sealed). Same `Core` methods as the desktop's commands.
+  `Board.svelte` (columns as swipeable pages, a card screen, comments, images, attach via the file
+  input) re-fetches whenever `board_rev` changes; it opens from a row's `▦ n` badge or the chat
+  header's "Board". No column editing on the phone.
 - **Chat** — from the transcript `.jsonl` (`saves.rs::transcript_path`, re-resolved every 2 s since
   an in-TUI `/resume` moves it). Shown: human prompts (`origin.kind == "human"`), assistant text,
   tool calls collapsed with their results joined by id; task-notification wakes and interrupts as

@@ -390,16 +390,15 @@
               >⟳ {s.auto_compact}%</span
             >
           {/if}
-          {#if !shell && (s.todos_open || s.todos_pending)}
-            <!-- "To Do": what this claude needs from you. A click also selects
+          {#if !shell && (s.board_open || s.board_unread)}
+            <!-- The Board: this claude's cards. A click also selects
                  the row (it bubbles to the row button) and shows the tab. -->
             <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
             <span
               class="todos"
-              class:pending={s.todos_pending > 0}
-              class:urgent={s.todos_urgent > 0}
-              title="{s.todos_open} open for you{s.todos_urgent ? ` · ${s.todos_urgent} URGENT` : ''}{s.todos_unread ? ` · ${s.todos_unread} with a new reply` : ''}{s.todos_pending ? ` · ${s.todos_pending} edit(s) not sent yet — press UPDATE` : ''}"
-              onclick={() => openPanel("todo")}>☐ {s.todos_open}{#if s.todos_unread} 💬{/if}{#if s.todos_pending}<span class="pdot"></span>{/if}</span
+              class:urgent={s.board_urgent > 0}
+              title="{s.board_open} card(s) on the Board{s.board_urgent ? ` · ${s.board_urgent} URGENT` : ''}{s.board_unread ? ` · ${s.board_unread} updated since you looked` : ''}"
+              onclick={() => openPanel("board")}>▦ {s.board_open}{#if s.board_unread}<span class="pdot"></span>{/if}</span
             >
           {/if}
         </div>

@@ -21,8 +21,8 @@
 //! - `hub_spawn` — start new instances, each seeded with a task, and get their ids
 //! - `hub_terminal_open` / `_send` / `_read` / `_close` — create and drive plain
 //!   shell terminals in this project, and read their output incrementally
-//! - `hub_todo` — *my* "To Do" list: what I need from the user, shown in
-//!   Mulpex's side panel (the app owns the list; this only forwards the call)
+//! - `hub_board` — the project's Board: my cards, in the user's columns, shown
+//!   in Mulpex's side panel (the app owns the board; this only forwards the call)
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -218,37 +218,39 @@ pub(crate) fn tool_defs() -> Value {
             },
         },
         {
-            "name": "hub_todo",
-            "description": "YOUR list of what you need from the USER, shown in Mulpex's \"To Do\" side panel and as a count on your sidebar row. OFF by default: it works only for an instance the user turned it on for (right-click its row → \"To Do list\"), and while it is on Mulpex reminds you of it every turn. When it is off, do not use it — a call is refused; if the user asked you to use it, tell them how to turn it on. Each item is an `action` the user must take, a `decision` (pass `choices` so they can pick one with a click), or a `question`; `for` names the instance it is really for, when you collect a worker's ask onto your own list. Every call returns your whole list with each item's number `n`. You can change only your own list; `list` with `of` reads another instance's.",
+            "name": "hub_board",
+            "description": "The project's Board in Mulpex's side panel: columns the USER defines (Mulpex lists them, with what each one means, every turn), and cards. OFF by default: it works only while the user has it on for the project (right-click the project tab → \"Board\"); a call is refused otherwise — if the user asked you to use it, tell them how to turn it on. Each card has an assignee; you see and keep YOUR cards: every call returns your active cards (archived ones never), each with its number `n` and column. Move a card as its column's description says. Cards in the last column show their title only; `list` with `id` reads one card in full, with comments and image paths; `scope: \"all\"` lists every card on the board, slim.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "add", "update", "comment", "done", "remove"], "description": "What to do. `comment` adds to an item's follow-up thread (with `id` and `text`) — where you answer the user's comments and ask follow-ups. `done` takes the item off the list (there is no reopen — add it again if needed)." },
+                    "action": { "type": "string", "enum": ["list", "add", "update", "move", "comment", "archive"], "description": "What to do. `move` puts a card (or several) in a column, at its top. `comment` adds to a card's thread (with `id`, `text` and/or `images`) — where you answer the user and ask follow-ups. `archive` hides a card that no longer matters (only the user deletes)." },
                     "items": {
                         "type": "array",
-                        "description": "For `add`: the new items. One item per THING the user must do or answer — a QA pass is ONE item (\"QA the login flow\") with all its steps and questions in its `detail`, never one item per step.",
+                        "description": "For `add`: the new cards. One card per THING — a QA pass is ONE card (\"QA the login flow\") with all its steps and questions in its `detail`, never one card per step.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "kind": { "type": "string", "enum": ["action", "decision", "question"], "description": "A `decision` or `question` here is only for what can WAIT while you keep working. Anything you would block on (planning, assumptions, which way to build) goes to the AskUserQuestion tool instead — never onto this list." },
                                 "title": { "type": "string", "description": "One line, in the user's language." },
-                                "detail": { "type": "string", "description": "Optional. Markdown (headings, lists, code, tables), up to 20,000 characters, shown under the item's \"more\". Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
-                                "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision: the options (at most 8)." },
-                                "for": { "description": "Optional: the instance this ask is really for (\"7\" or \"claude#7\") — a worker of yours whose need you are relaying." },
-                                "urgent": { "type": "boolean", "description": "Optional, default false. Mark URGENT only when the user's attention is really needed as soon as possible (you are blocked on it right now, or something breaks or is lost if they wait) — not for ordinary asks. Urgent items show on top, in red." },
+                                "detail": { "type": "string", "description": "Optional. Markdown (headings, lists, code, tables), up to 20,000 characters. Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
+                                "column": { "description": "Optional: the column's name (default: the first column)." },
+                                "assignee": { "description": "Optional: whose card it is — default you. Another instance (\"7\" or \"claude#7\") when you coordinate workers (it is told), or null for nobody." },
+                                "choices": { "type": "array", "items": { "type": "string" }, "description": "For a decision that can WAIT: the options (at most 8), clicked by the user. Anything you would block on goes to AskUserQuestion instead." },
+                                "urgent": { "type": "boolean", "description": "Optional, default false. Only when the user's attention is really needed as soon as possible — not for ordinary cards. Urgent cards show on top, in red." },
+                                "images": { "type": "array", "items": { "type": "string" }, "description": "Optional: absolute paths of PNG/JPG/GIF/WebP images to attach (at most 10, 10 MB each), e.g. a screenshot from your QA." },
                             },
-                            "required": ["kind", "title"],
+                            "required": ["title"],
                         },
                     },
-                    "id": { "description": "For update/comment/done/remove: an item number `n`, or an array of them (update and comment take one). For `list`: one item number to read IN FULL — the list otherwise previews long text and shows only the latest comments." },
-                    "kind": { "type": "string", "enum": ["action", "decision", "question"], "description": "For `update`." },
+                    "id": { "description": "For update/comment: one card number `n`. For move/archive: a number or an array. For `list`: one card to read IN FULL (any card, even another's)." },
+                    "column": { "description": "For `move`: the column's name." },
                     "title": { "type": "string", "description": "For `update`." },
-                    "detail": { "type": "string", "description": "For `update` (empty string clears it). Markdown (headings, lists, code, tables), up to 20,000 characters, shown under the item's \"more\". Put LONG content here instead of in the conversation: QA/test steps, results, options compared, logs." },
+                    "detail": { "type": "string", "description": "For `update` (empty string clears it). Markdown, up to 20,000 characters." },
                     "choices": { "type": "array", "items": { "type": "string" }, "description": "For `update`." },
-                    "for": { "description": "For `update`: the instance it is for, or null to clear." },
-                    "urgent": { "type": "boolean", "description": "For `update`: set or clear URGENT. Mark URGENT only when the user's attention is really needed as soon as possible (you are blocked on it right now, or something breaks or is lost if they wait) — not for ordinary asks. Urgent items show on top, in red." },
+                    "assignee": { "description": "For `update`: hand the card to another instance (\"7\"), or null for nobody." },
+                    "urgent": { "type": "boolean", "description": "For `update`: set or clear URGENT." },
+                    "images": { "type": "array", "items": { "type": "string" }, "description": "For `update` (added to the card) or `comment`: absolute paths of images to attach." },
                     "text": { "type": "string", "description": "For `comment`: what to say, in the user's language. Markdown, up to 20,000 characters." },
-                    "of": { "description": "For `list` only: another instance in this project (\"4\" or \"claude#4\") whose list to READ." },
+                    "scope": { "type": "string", "enum": ["mine", "all"], "description": "For `list`: \"all\" lists every active card on the board (slim) — to see what your workers already have. Default: yours." },
                 },
                 "required": ["action"],
             },
@@ -362,7 +364,9 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         "hub_spawn" => hub_spawn(ctx, &args),
         "hub_close" => hub_close(ctx, &args),
         "hub_remote_open" => hub_remote_open(ctx, &args),
-        "hub_todo" => hub_todo(ctx, &args),
+        "hub_board" => hub_board(ctx, &args),
+        // A claude whose tool list predates the Board.
+        "hub_todo" => Err("hub_todo was replaced by the project's Board — use mcp__mulpex__hub_board.".into()),
         "hub_reply_broadcast" => hub_reply_broadcast(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
@@ -1347,34 +1351,22 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
     .to_string())
 }
 
-/// `hub_todo` — forwarded whole to the app, which owns the list (`todos.rs`
-/// in the app) and validates the call; only `of` is resolved here, and `from`
-/// is always this instance, so nothing can write another instance's list.
-fn hub_todo(ctx: &Ctx, args: &Value) -> Result<String, String> {
+/// `hub_board` — forwarded whole to the app, which owns the board (`board.rs`
+/// in the app) and validates the call; `from` is always this instance, so
+/// every change is stamped with who made it.
+fn hub_board(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
     if action.is_empty() {
-        return Err("missing `action` (list, add, update, comment, done, remove)".into());
+        return Err("missing `action` (list, add, update, move, comment, archive)".into());
     }
     let mut body = args.clone();
     let obj = body.as_object_mut().ok_or("arguments must be an object")?;
-    if let Some(of) = args.get("of") {
-        let n = match of {
-            Value::Number(n) => n.as_u64(),
-            Value::String(s) => s.trim().trim_start_matches("claude#").trim_start_matches('#').parse().ok(),
-            _ => None,
-        }
-        .ok_or("`of` must be an instance in this project, like \"4\" or \"claude#4\"")?;
-        obj.insert("of".into(), json!(n));
-    }
-    obj.insert("op".into(), json!("todos"));
+    obj.insert("op".into(), json!("board"));
     obj.insert("from".into(), json!(ctx.instance));
     let reply = app_request(ctx, body)?;
-    let mut out = json!({ "list": reply.get("list").cloned().unwrap_or(json!([])) });
+    let mut out = json!({ "board": reply.get("board").cloned().unwrap_or(json!({})) });
     if let Some(note) = reply.get("note").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
         out["done"] = json!(note);
-    }
-    if let Some(of) = reply.get("of").and_then(|x| x.as_u64()).filter(|&o| o != ctx.instance as u64) {
-        out["of"] = json!(format!("claude#{of} (read-only)"));
     }
     Ok(out.to_string())
 }
@@ -3997,17 +3989,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `hub_todo` forwards the call with the CALLER's identity stamped on it
-    /// (so nothing can write another instance's list), resolves `of`, and is
-    /// both listed and dispatched.
+    /// `hub_board` forwards the call with the CALLER's identity stamped on it,
+    /// and is both listed and dispatched.
     #[test]
-    fn todo_forwards_as_the_caller() {
-        let dir = tmpdir("todo");
+    fn board_forwards_as_the_caller() {
+        let dir = tmpdir("board");
         let ctx = test_ctx(&dir, 3);
-        assert!(hub_todo(&ctx, &json!({})).unwrap_err().contains("action"));
-        assert!(hub_todo(&ctx, &json!({"action": "list", "of": "nobody"}))
-            .unwrap_err()
-            .contains("`of`"));
+        assert!(hub_board(&ctx, &json!({})).unwrap_err().contains("action"));
 
         // Play the app: answer the one request that appears.
         let req_dir = dir.join("termreq");
@@ -4020,7 +4008,7 @@ mod tests {
                     std::fs::remove_file(&req).unwrap();
                     std::fs::write(
                         req.with_extension("done"),
-                        json!({"ok": true, "of": 4, "list": [{"n": 1}]}).to_string(),
+                        json!({"ok": true, "note": "moved #1", "board": {"cards": [{"n": 1}]}}).to_string(),
                     )
                     .unwrap();
                     return body;
@@ -4029,12 +4017,11 @@ mod tests {
             }
             panic!("no request");
         });
-        let out = hub_todo(&ctx, &json!({"action": "list", "of": "claude#4", "from": 9})).unwrap();
+        let out = hub_board(&ctx, &json!({"action": "move", "id": 1, "column": "Done", "from": 9})).unwrap();
         let sent = app.join().unwrap();
-        assert_eq!(sent["op"], "todos");
+        assert_eq!(sent["op"], "board");
         assert_eq!(sent["from"], 3, "the caller's identity, never its own claim");
-        assert_eq!(sent["of"], 4);
-        assert!(out.contains("claude#4 (read-only)"), "{out}");
+        assert!(out.contains("moved #1") && out.contains("\"n\":1"), "{out}");
 
         let listed: Vec<String> = tool_defs()
             .as_array()
@@ -4042,7 +4029,8 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_owned))
             .collect();
-        assert!(listed.contains(&"hub_todo".to_string()), "{listed:?}");
+        assert!(listed.contains(&"hub_board".to_string()), "{listed:?}");
+        assert!(!listed.contains(&"hub_todo".to_string()), "{listed:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

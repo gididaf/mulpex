@@ -17,7 +17,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `live_token.rs` (Mulpex ▸ Live Token…: settings + named tokens + pins for the daemon's token-swapping proxy), its env in `pty.rs`/`saves.rs`/`explain.rs`/`broadcast.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real, per-claude routes/pins |
 | `broadcast.rs`, `broadcast_prompt.md` (⌘⇧B Ask All Claudes) | [../docs/hub.md](../docs/hub.md) |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
-| `todos.rs` (To Do: `hub_todo`, drafts, UPDATE) | [../docs/hub.md](../docs/hub.md) — single writer, delivery gate, message body; [../docs/frontend.md](../docs/frontend.md) — drafts and conflicts. No field may be named `handle` (`client.rs::lift`) |
+| `board.rs` (the Board: `hub_board`, live outbox, images, migration from To Do) | [../docs/hub.md](../docs/hub.md) — single writer, what a claude sees, delivery, store; [../docs/frontend.md](../docs/frontend.md) — the UI, drag, images |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts`, a new item in `src/lib/components/MenuBar.svelte` → [../docs/linux.md](../docs/linux.md) |
 | `crates/mulpex-ptyd/src/procs.rs` process sweeps (`/proc` on Linux), `tauri.linux.conf.json`, `capabilities/linux.json`, `scripts/release-linux.sh` | [../docs/linux.md](../docs/linux.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |

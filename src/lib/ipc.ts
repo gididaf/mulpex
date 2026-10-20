@@ -51,16 +51,13 @@ export interface SessionInfo {
    *  before falling back to a status dot — the unknown-id default is "ready",
    *  which would paint a dead session green. */
   failed: string | null;
-  /** The To Do list is ON for this claude (right-click toggle; off by default). */
-  todos_on: boolean;
-  /** "To Do" (`todos.ts`): open items on this claude's list, and how many of
-   *  the user's edits wait for UPDATE. 0 for a terminal. */
-  todos_open: number;
-  todos_pending: number;
-  /** Items with a claude comment the user has not opened yet (💬). */
-  todos_unread: number;
-  /** Open items marked urgent — the badge turns red. */
-  todos_urgent: number;
+  /** The Board (`board.ts`): this claude's active cards outside the last
+   *  column. 0 for a terminal. */
+  board_open: number;
+  /** Its cards a claude changed since the user last opened them. */
+  board_unread: number;
+  /** Its cards a claude marked urgent — the badge turns red. */
+  board_urgent: number;
 }
 export interface StatusEntry {
   id: number;
@@ -299,96 +296,100 @@ export const getPins = (projectHandle: ProjectHandle) =>
 export const setPin = (projectHandle: ProjectHandle, id: number, pin: unknown | null) =>
   call<void>("set_pin", { projectHandle, id, pin });
 
-// ── "To Do" lists (src-tauri/src/todos.rs) ─────────────────────────────────
+// ── The Board (src-tauri/src/board.rs) ──────────────────────────────────────
 
-export type TodoKind = "action" | "decision" | "question";
-
-export interface TodoItem {
-  n: number;
-  kind: TodoKind;
-  title: string;
-  detail: string | null;
-  choices: string[];
-  status: "open" | "done";
-  done_by: "claude" | "user" | null;
-  author: "claude" | "user";
-  /** The follow-up thread, oldest first; append-only. */
-  comments: TodoComment[];
-  /** How many of `comments` the user has seen (opened the thread). */
-  seen: number;
-  chosen: string | null;
-  created: number;
-  updated: number;
-  rev: number;
-  /** The instance this ask is really for — a worker whose need an orchestrator
-   *  collected onto its own list. */
-  for: number | null;
-  /** Set by the claude only; shown on top, in red. */
-  urgent: boolean;
+export interface BoardColumn {
+  id: number;
+  name: string;
+  /** What goes here — the rule every claude reads. */
+  desc: string;
 }
 
-export interface TodoComment {
+export interface BoardComment {
+  /** Empty on comments saved before ids existed. */
+  id: string;
   by: "claude" | "user";
+  /** Which claude, when `by` is claude. */
+  who: number | null;
   text: string;
+  images: string[];
   at: number;
 }
 
-/** The user's draft over item `n` — what it should become at UPDATE. */
-export interface TodoDraft {
-  done: boolean | null;
-  /** The user's reply, appended to the thread at UPDATE. One per item. */
-  comment: string | null;
-  chosen: string | null;
-  delete: boolean;
-  base_rev: number;
-  /** Set when the claude removed the item while this draft had words on it. */
-  orphan: { kind: TodoKind; title: string } | null;
-}
-
-export interface TodoAdded {
-  tmp: string;
-  kind: TodoKind;
+export interface BoardCard {
+  n: number;
   title: string;
   detail: string | null;
+  images: string[];
+  col: number;
+  assignee: number | null;
+  /** Set by a claude only; pinned on top, in red. */
+  urgent: boolean;
+  choices: string[];
+  chosen: string | null;
+  comments: BoardComment[];
+  archived: boolean;
+  author: "claude" | "user";
+  by: number | null;
+  /** A claude changed it since the user last opened it. */
+  unread: boolean;
+  created: number;
+  updated: number;
 }
 
-export interface TodoList {
+export interface Board {
+  on: boolean;
   next: number;
-  items: TodoItem[];
-  drafts: { edits: Record<string, TodoDraft>; added: TodoAdded[] };
-  /** An UPDATE is queued, waiting for the claude to be able to hear it. */
-  sending: boolean;
+  columns: BoardColumn[];
+  /** In display order (per column, urgent first). */
+  cards: BoardCard[];
+  /** The user's changes waiting for UPDATE: claude id → card numbers. */
+  pending: Record<string, number[]>;
+  /** The user's comments UPDATE has not sent yet — still editable. */
+  unsent: string[];
+  /** Claudes whose message is out but that can't hear it yet. */
+  sending: number[];
 }
 
-export type TodoEdit =
-  | { op: "done"; n: number; done: boolean }
-  | { op: "comment"; n: number; text: string }
-  | { op: "seen"; n: number }
+export type BoardEdit =
+  | { op: "add"; title: string; detail?: string | null; col: number; assignee: number | null; images?: string[] }
+  | { op: "edit"; n: number; title?: string; detail?: string; images?: string[] }
+  | { op: "move"; n: number; col: number; before: number | null }
+  | { op: "assign"; n: number; to: number | null }
   | { op: "choose"; n: number; choice: string | null }
-  | { op: "dismiss"; n: number; on: boolean }
-  | { op: "add"; kind: TodoKind; title: string; detail?: string | null }
-  | { op: "edit_added"; tmp: string; kind?: TodoKind; title?: string; detail?: string }
-  | { op: "remove_added"; tmp: string }
-  | { op: "discard"; n: number }
-  | { op: "discard_all" };
+  | { op: "comment"; n: number; text: string; images: string[] }
+  | { op: "comment_edit"; n: number; id: string; text: string; images: string[] }
+  | { op: "comment_delete"; n: number; id: string }
+  | { op: "archive"; n: number; on: boolean }
+  | { op: "archive_column"; col: number }
+  | { op: "delete"; n: number }
+  | { op: "seen"; n: number }
+  | { op: "col_add"; name: string; desc?: string }
+  | { op: "col_edit"; col: number; name?: string; desc?: string }
+  | { op: "col_move"; col: number; before: number | null }
+  | { op: "col_delete"; col: number; to: number | null };
 
-export interface TodoSend {
-  id: number;
-  state: "queued" | "refused";
-  why: string | null;
-}
+export const boardGet = (projectHandle: ProjectHandle) => call<Board | null>("board_get", { projectHandle });
 
-export const todosGet = (projectHandle: ProjectHandle) =>
-  call<Record<string, TodoList>>("todos_get", { projectHandle });
+export const boardEdit = (projectHandle: ProjectHandle, edit: BoardEdit) =>
+  call<Board>("board_edit", { projectHandle, edit });
 
-export const todosEdit = (projectHandle: ProjectHandle, id: number, edit: TodoEdit) =>
-  call<TodoList>("todos_edit", { projectHandle, id, edit });
+export const boardUpdate = (projectHandle: ProjectHandle, ids: number[] | null = null) =>
+  call<{ sent: number[]; refused: string[] }>("board_update", { projectHandle, ids });
 
-export const setTodosEnabled = (projectHandle: ProjectHandle, id: number, on: boolean) =>
-  call<boolean>("set_todos_enabled", { projectHandle, id, on });
+export const boardSetOn = (projectHandle: ProjectHandle, on: boolean) =>
+  call<boolean>("board_set_on", { projectHandle, on });
 
-export const todosUpdate = (projectHandle: ProjectHandle, ids: number[]) =>
-  call<TodoSend[]>("todos_update", { projectHandle, ids });
+/** One chunk of a pasted image; the reply names the upload, or (with `done`) the id. */
+export const boardImagePut = (projectHandle: ProjectHandle, data: string, upload: string | null, done: boolean) =>
+  call<{ upload?: string; id?: string }>("board_image_put", { projectHandle, data, upload, done });
+
+/** Copy image files that exist on the project's host into the board. */
+export const boardImageImport = (projectHandle: ProjectHandle, paths: string[]) =>
+  call<string[]>("board_image_import", { projectHandle, paths });
+
+export const boardImageGet = (projectHandle: ProjectHandle, id: string, offset: number) =>
+  call<{ data: string; total: number }>("board_image_get", { projectHandle, id, offset });
 
 /** Tick/untick the "Mute Session" menu item for the focused session. */
 export const setMuteMenuChecked = (checked: boolean) =>

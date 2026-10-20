@@ -69,10 +69,11 @@ close it rather than leaving a dead row for the user to tidy by hand. Pass to: \
 killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
 close YOURSELF (the call would never return), and you cannot close a row in another project. \
 Terminals are not instances: hub_terminal_close closes those.\n\
-- mcp__mulpex__hub_todo — Mulpex's \"To Do\" list (the user may call it \"todo\", \"TODO\", \"my \
-list\" or \"the list\"). It is OFF unless the user turns it on for you; while it is on, Mulpex says \
-so on every turn. Never start using it on your own. If the user asks you to put something on it, \
-call the tool — if your list is off, the reply tells you how the user turns it on.\n\
+- mcp__mulpex__hub_board — the project's Board in Mulpex (the user may call it \"the board\", \
+\"todo\", \"TODO\", \"my list\" or \"the list\"): columns the user defines, with cards assigned to \
+claudes. It is OFF unless the user turns it on for the project; while it is on, Mulpex says so on \
+every turn. Never start using it on your own. If the user asks you to put something on it, call \
+the tool — if the board is off, the reply tells you how the user turns it on.\n\
 OTHER PROJECTS — Mulpex can have several projects open at once, and the instances in them are \
 reachable by message. hub_instances lists them under other_projects with the exact address of \
 each one; address them <project>#<n> (e.g. \"central-one#3\") in hub_send's `to`, and a message \
@@ -195,41 +196,40 @@ you acted on a hub message rather than on my prompt, and from whom. A message wh
 \"Mulpex\" comes from the Mulpex app itself, not from an instance: do what it asks, and never \
 hub_send a reply to it — there is no instance there to receive one.";
 
-/// Carried on every turn of a claude whose "To Do" list the user turned ON
-/// (`todos_on/<id>`, `hook::userpromptsubmit`) — never in `HUB_RULES`, because
-/// the list is opt-in per row: a claude in a quiet one-on-one, or a coworker's,
-/// must not start keeping one by itself.
-pub const TODOS_RULE: &str = "[Mulpex] The user turned ON your \"To Do\" list \
-(mcp__mulpex__hub_todo), shown in Mulpex's side panel. Whenever you need something from \
-the user — an action they must take, a decision (give the options as choices), or a question — \
-put it on that list. BUT THE LIST NEVER REPLACES AskUserQuestion: anything you would block on — \
-planning, assumptions, which way to build something, any answer that changes what you do next \
-— you ask with the AskUserQuestion tool, exactly as you would without the list, and never move \
-such a question onto it. The list is only for what can wait while you keep working (an action \
-for the user, a QA pass, a non-blocking pick). NO DUPLICATION: what is on the list stays OFF the conversation — the user \
+/// Carried on every turn of every claude while the project's Board is ON
+/// (`board_on`, `hook::userpromptsubmit`), followed by the board's columns —
+/// never in `HUB_RULES`, because the board is opt-in per project: a claude in a
+/// quiet one-on-one, or a coworker's, must not start keeping one by itself.
+pub const BOARD_RULE: &str = "[Mulpex] The user turned ON this project's Board \
+(mcp__mulpex__hub_board), shown in Mulpex's side panel: columns the USER defines, and cards. Each \
+card has an assignee — you see and keep YOUR cards (hub_board returns only yours; scope \"all\" \
+shows the whole board). Use it for the work you do with the user and for anything you need from \
+them: a QA pass, an action they must take, a non-blocking decision (give the options as choices). \
+FOLLOW THE COLUMN DESCRIPTIONS listed below: they are the user's workflow — move each card of \
+yours (action move, with the column's name) as soon as its column changes, e.g. into the column \
+that says you need the user to test, with the QA steps in the card's detail. You cannot add, \
+rename or delete columns; suggest a change in a comment if one is missing. \
+BUT THE BOARD NEVER REPLACES AskUserQuestion: anything you would block on — planning, \
+assumptions, which way to build something, any answer that changes what you do next — you ask \
+with the AskUserQuestion tool, exactly as you would without the board, and never move such a \
+question onto it. NO DUPLICATION: what is on the board stays OFF the conversation — the user \
 reads it in the panel, and repeating it in your replies only fills both context windows. When \
-you add an item or comment, your reply says at most a one-line pointer (\"Added To Do #3\", \
-\"Replied on #3\"), never its content, and never \"still waiting on you for X\" in later turns — \
-the list is the reminder. ONE ITEM PER THING, NEVER ONE PER STEP: one piece of work for the \
-user is ONE item — e.g. \"QA the login flow\" — with every step, check and sub-question inside its \
-detail (a Markdown checklist), never split into an item per step or per question; later \
-follow-ups on it go in its comments. LONG CONTENT GOES IN AN ITEM'S DETAIL, not the conversation: QA/test \
-steps, results, options compared, logs — write it as Markdown in the item's detail (shown \
-under \"more\", up to 20,000 characters; comments are Markdown too) and keep the reply to a \
-pointer. The list you get back previews long text; action list with id reads one item in full. \
-URGENT (urgent: true) is rare: use it ONLY when you really need the \
-user's attention as soon as possible — you are blocked on it right now, or something breaks or \
-is lost if they wait — never for an ordinary ask; clear it (update urgent: false) once that \
-stops being true. Keep it current: mark an item done as soon \
-as it no longer applies. If you coordinate other instances (you hub_spawned workers), you are \
-the user's one list: when a worker tells you it needs something from the user, add it to YOUR \
-list with for: <that worker's number>, and when the user answers it, pass the answer on to that \
-worker with hub_send. Each item has a comment thread: \
-follow-ups about an item go THERE (hub_todo action comment, with id and text) — answer the user's \
-comments on it, and ask your follow-up questions on it — until it is done. When a message from \
-\"Mulpex\" says the user pressed UPDATE, it lists exactly what they changed on your list \
-(checked, commented, chose, added, dismissed): act on it right away — do the work without \
-recapping their answers or choices in your reply, and answer their comments on the item.";
+you add, move or comment on a card, your reply says at most a one-line pointer (\"Moved #3 to \
+QA\", \"Replied on #3\"), never its content, and never \"still waiting on you for X\" in later \
+turns — the board is the reminder. ONE CARD PER THING, NEVER ONE PER STEP: one piece of work is \
+ONE card — e.g. \"QA the login flow\" — with every step, check and sub-question inside its \
+detail (a Markdown checklist), never a card per step; follow-ups go in its comments. LONG \
+CONTENT GOES IN A CARD'S DETAIL, not the conversation: QA/test steps, results, options compared, \
+logs — Markdown in the detail (up to 20,000 characters; comments are Markdown too). The board you \
+get back previews long text; action list with id reads one card in full. IMAGES: the user's \
+images reach you as [image: <path>] — Read the file to see it; attach your own (a screenshot \
+from your QA) with images: [absolute paths] on add, update or comment. URGENT (urgent: true) is \
+rare: ONLY when you really need the user's attention as soon as possible — never for an \
+ordinary card; clear it (update urgent: false) once that stops being true. If you coordinate \
+other instances (you hub_spawned workers), you may create or assign cards for them (assignee: \
+<number>) — that tells them. When a message from \"Mulpex\" lists changes on the Board, act on \
+it right away — do the work, answer comments on their card (action comment), and don't recap \
+it in your reply. Archive (action archive) a card that no longer matters; only the user deletes.";
 
 /// User-mandated zero-assumptions planning discipline (see old term_session.rs).
 const PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
@@ -410,17 +410,18 @@ mod tests {
             .filter(|n| !n.is_empty())
             .collect();
         assert!(named.contains(&"hub_send"), "{named:?}");
-        // The To Do list is opt-in per row: every claude is told it exists
+        // The Board is opt-in per project: every claude is told it exists
         // and is off (MCP tools load lazily, so a name alone doesn't say what
-        // "the TO DO list" means), while how to USE it rides the hook.
-        assert!(named.contains(&"hub_todo"), "{named:?}");
+        // "the board" or "the TO DO list" means), while how to USE it rides the hook.
+        assert!(named.contains(&"hub_board"), "{named:?}");
         assert!(HUB_RULES.contains("Never start using it on your own"));
-        assert!(TODOS_RULE.contains("mcp__mulpex__hub_todo"));
-        assert!(TODOS_RULE.contains("NO DUPLICATION"));
-        assert!(TODOS_RULE.contains("URGENT"));
-        assert!(TODOS_RULE.contains("ONE ITEM PER THING"));
-        assert!(TODOS_RULE.contains("NEVER REPLACES AskUserQuestion"));
-        assert!(TODOS_RULE.contains("LONG CONTENT GOES IN AN ITEM'S DETAIL"));
+        assert!(BOARD_RULE.contains("mcp__mulpex__hub_board"));
+        assert!(BOARD_RULE.contains("NO DUPLICATION"));
+        assert!(BOARD_RULE.contains("URGENT"));
+        assert!(BOARD_RULE.contains("ONE CARD PER THING"));
+        assert!(BOARD_RULE.contains("NEVER REPLACES AskUserQuestion"));
+        assert!(BOARD_RULE.contains("LONG CONTENT GOES IN A CARD'S DETAIL"));
+        assert!(BOARD_RULE.contains("FOLLOW THE COLUMN DESCRIPTIONS"));
         for n in named {
             assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
         }

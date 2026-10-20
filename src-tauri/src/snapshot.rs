@@ -88,16 +88,13 @@ pub struct SessionInfo {
     /// back to the unknown-id default and paint a green "ready" dot on a
     /// session that is dead.
     pub failed: Option<String>,
-    /// "To Do" (`todos.rs`): this claude's open items, and how many of the
-    /// user's edits are pending an UPDATE. The sidebar badge; 0 for a terminal.
-    /// The To Do list is on for this claude (context menu; off by default).
-    pub todos_on: bool,
-    pub todos_open: u32,
-    pub todos_pending: u32,
-    /// Items with a claude comment the user has not opened (the 💬 on the badge).
-    pub todos_unread: u32,
-    /// Open items the claude marked urgent (the badge turns red).
-    pub todos_urgent: u32,
+    /// The Board (`board.rs`): this claude's active cards outside the last
+    /// column — the sidebar badge; 0 for a terminal.
+    pub board_open: u32,
+    /// Its cards a claude changed since the user last opened them.
+    pub board_unread: u32,
+    /// Its cards a claude marked urgent (the badge turns red).
+    pub board_urgent: u32,
 }
 
 /// A locked file → holder, for the hub panel's Locks view.

@@ -55,7 +55,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "explain-progress",
     "import-update",
     "pins-changed",
-    "todos-changed",
+    "board-changed",
     "checkpoint-changed",
     "broadcast-summary",
 ];

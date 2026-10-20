@@ -9,7 +9,7 @@
 
 import { writable } from "svelte/store";
 
-export type PanelTab = "todo" | "pins" | "explain";
+export type PanelTab = "board" | "pins" | "explain";
 
 export interface RightPanel {
   open: boolean;
@@ -24,14 +24,16 @@ export const PANEL_MIN_FRAC = 0.15;
 export const PANEL_MAX_FRAC = 0.6;
 export const clampFrac = (f: number) => Math.min(PANEL_MAX_FRAC, Math.max(PANEL_MIN_FRAC, f));
 
-const TABS: PanelTab[] = ["todo", "pins", "explain"];
+const TABS: PanelTab[] = ["board", "pins", "explain"];
 
 function load(): RightPanel {
-  const def: RightPanel = { open: false, frac: 0.3, tab: "todo" };
+  const def: RightPanel = { open: false, frac: 0.3, tab: "board" };
   try {
     const v = JSON.parse(localStorage.getItem(KEY) ?? "null");
     if (v && typeof v.open === "boolean" && typeof v.frac === "number") {
-      return { open: v.open, frac: clampFrac(v.frac), tab: TABS.includes(v.tab) ? v.tab : "todo" };
+      // "todo" was the Board's tab before it replaced the To Do list.
+      const tab = v.tab === "todo" ? "board" : v.tab;
+      return { open: v.open, frac: clampFrac(v.frac), tab: TABS.includes(tab) ? tab : "board" };
     }
     const old = JSON.parse(localStorage.getItem(OLD_KEY) ?? "null");
     if (old && typeof old.open === "boolean" && typeof old.frac === "number") {

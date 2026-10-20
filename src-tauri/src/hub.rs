@@ -42,9 +42,9 @@ pub fn start(app: AppHandle) {
             // Collect everything under the lock, then drop it before emitting.
             let mut batch: Vec<(ProjectHandle, Vec<usize>, HubSnapshot, Vec<SessionInfo>)> =
                 Vec::new();
-            // To Do lists that changed this tick, by whoever: a claude's
-            // `hub_todo`, a desktop/phone edit, a delivered UPDATE.
-            let mut todos_changed: Vec<(ProjectHandle, usize)> = Vec::new();
+            // Boards that changed this tick, by whoever: a claude's `hub_board`,
+            // a desktop/phone edit, a delivered message.
+            let mut boards_changed: Vec<ProjectHandle> = Vec::new();
             // What every project publishes about itself to the others. This loop
             // is the only context that holds every `Core` at once, so it is the
             // only thing that can describe the workspace honestly.
@@ -67,8 +67,8 @@ pub fn start(app: AppHandle) {
                 // diff below publishes.
                 core.process_spawn_requests();
                 core.process_terminal_requests();
-                // To Do UPDATEs waiting for their claude to be able to hear them.
-                core.drain_todos_outbox();
+                // Board changes whose quiet period is over, for claudes that can hear them.
+                core.drain_board_outbox();
                 // hub_set_name: an instance labelling its own sidebar row. Cheap
                 // (an empty dir read) and it changes `session_infos`, so the diff
                 // below is what actually repaints the row.
@@ -114,10 +114,12 @@ pub fn start(app: AppHandle) {
                         &core.state_dir,
                         &sessions,
                         &snap,
-                        core.todos.rev(),
+                        core.board.rev(),
                     ));
                 }
-                todos_changed.extend(core.todos.take_dirty().into_iter().map(|id| (core.handle, id)));
+                if core.board.take_dirty() {
+                    boards_changed.push(core.handle);
+                }
                 batch.push((core.handle, removed, snap, sessions));
             }
             drop(ws);
@@ -132,8 +134,8 @@ pub fn start(app: AppHandle) {
                 Registry::write_if_changed(&state_root, &reg);
             }
 
-            for (handle, id) in todos_changed {
-                let _ = app.emit("todos-changed", SessionExited { handle, id });
+            for handle in boards_changed {
+                let _ = app.emit("board-changed", serde_json::json!({ "handle": handle }));
             }
             for (handle, removed, snap, sessions) in batch {
                 for id in &removed {

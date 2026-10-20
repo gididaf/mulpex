@@ -29,7 +29,6 @@
     setSessionMuted,
     setSessionCollapsed,
     setAutoCompact,
-    setTodosEnabled,
     liveTokenGet,
     liveTokenClaudes,
     liveTokenAssign,
@@ -67,7 +66,6 @@
     setSessionMutedLocal,
     setSessionCollapsedLocal,
     setAutoCompactLocal,
-    setTodosOnLocal,
     hiddenIds,
     collapsedAncestors,
     descendantsOf,
@@ -109,7 +107,7 @@
   import { IS_LINUX } from "./lib/platform";
   import { addPin, dropPins, loadPins, reloadPins } from "./lib/pins";
   import { openPanel, togglePanel, toggleTab } from "./lib/rightPanel";
-  import { dropTodos, loadTodos, reloadTodos } from "./lib/todos";
+  import { boards, dropBoard, loadBoard, setBoardOn, takeDrop } from "./lib/board";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
@@ -170,7 +168,7 @@
       activeSessionId: info.sessions[info.active]?.id ?? null,
     });
     void loadPins(info.handle);
-    void loadTodos(info.handle);
+    void loadBoard(info.handle);
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle).catch(() => null);
     if (snap) applyHubFor(info.handle, snap);
@@ -227,7 +225,7 @@
   function dropProject(handle: ProjectHandle) {
     terminals.disposeProject(handle);
     dropPins(handle);
-    dropTodos(handle);
+    dropBoard(handle);
     dropExplains(handle);
     removeProject(handle);
   }
@@ -506,16 +504,28 @@
     }
   }
 
-  async function applyTodosEnabled(h: ProjectHandle, id: number, on: boolean) {
-    try {
-      if (await setTodosEnabled(h, id, on)) {
-        setTodosOnLocal(h, id, on);
-        if (on) openPanel("todo");
-        flashToast(`To Do list ${on ? "on" : "off"} for claude#${id}`);
-      }
-    } catch (e) {
-      flashToast(String(e));
-    }
+  /** Right-click on a project tab: the Board's switch, and Close. */
+  function openProjectMenu(e: MouseEvent, h: ProjectHandle) {
+    const on = get(boards).get(h)?.on ?? false;
+    ctx = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          label: "Board",
+          hint: on ? "on" : undefined,
+          sub: [true, false].map((v) => ({
+            label: v ? "On" : "Off",
+            checked: on === v,
+            run: async () => {
+              if ((await setBoardOn(h, v)) && v) openPanel("board");
+            },
+          })),
+        },
+        { sep: true },
+        { label: "Close Project", hint: h === get(activeProjectHandle) ? "⌘⇧W" : undefined, danger: true, run: () => closeProjectHandle(h) },
+      ],
+    };
   }
 
   /** The row menu's Token submenu (Live Token): the tokens this machine has,
@@ -614,17 +624,6 @@
             // Auto-compact this row's claudes (`compact.ts`). Only ever set here,
             // by the user — no model can turn it on. A submenu; the current
             // choice carries a ✓.
-            // The To Do list (`todos.ts`) is off until the user turns it on here,
-            // for this row only — an orchestrator collects its workers' asks.
-            {
-              label: "To Do list",
-              hint: s.todos_on ? "on" : undefined,
-              sub: [true, false].map((on) => ({
-                label: on ? "On" : "Off",
-                checked: s.todos_on === on,
-                run: () => void applyTodosEnabled(h, s.id, on),
-              })),
-            },
             {
               label: "Auto-compact its claudes",
               hint: s.auto_compact != null ? `${s.auto_compact}%` : undefined,
@@ -1643,8 +1642,8 @@
         if (!isRemote(e.payload.handle)) terminals.reattach(e.payload.handle, e.payload.id);
       }),
       listen<SessionExitedEvent>("pins-changed", (e) => void reloadPins(e.payload.handle, e.payload.id)),
-      // A To Do list changed — by its claude, a remote desktop, the phone, or an UPDATE landing.
-      listen<SessionExitedEvent>("todos-changed", (e) => void reloadTodos(e.payload.handle, e.payload.id)),
+      // The Board changed — by a claude, a remote desktop, the phone, or a message delivered.
+      listen<{ handle: ProjectHandle }>("board-changed", (e) => void loadBoard(e.payload.handle)),
       // A remote desktop opened, closed or reordered a project here.
       listen<WorkspaceInfo>("projects-changed", (e) => void applyWorkspace(0, e.payload)),
       // A remote desktop starting to mirror one of this Mulpex's panes.
@@ -1665,7 +1664,6 @@
         terminals.dispose(e.payload.handle, e.payload.id);
         clearSaveState(e.payload.handle, e.payload.id);
         dropPins(e.payload.handle, e.payload.id);
-        dropTodos(e.payload.handle, e.payload.id);
         dropExplains(e.payload.handle, e.payload.id);
         dropCompact(e.payload.handle, e.payload.id);
       }),
@@ -1692,7 +1690,12 @@
       // swallows the native drop before the DOM sees it, so xterm never gets a
       // `drop` event and this handler is the only place a drop can be honoured.
       getCurrentWebview().onDragDropEvent((ev) => {
-        if (ev.payload.type === "drop") dropPaths(ev.payload.paths);
+        if (ev.payload.type !== "drop") return;
+        // An open Board card takes images dropped on the side panel; the
+        // position is physical pixels, the panel's rect CSS ones.
+        const r = window.devicePixelRatio || 1;
+        if (takeDrop(ev.payload.paths, ev.payload.position.x / r, ev.payload.position.y / r)) return;
+        dropPaths(ev.payload.paths);
       }),
     );
 
@@ -1861,6 +1864,7 @@
       onreorder={applyProjectOrder}
       onhost={selectHost}
       onhostmenu={openHostMenu}
+      onmenu={openProjectMenu}
     />
     <TopBar onremote={() => (remoteFor = 0)} />
     <aside class="sidebar">

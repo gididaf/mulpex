@@ -229,10 +229,11 @@ pub const WATCHING_DIR: &str = "watching";
 /// (`context_window.used_percentage`). Written by `statusline::run`.
 pub const CTX_DIR: &str = "ctx";
 
-/// `todos_on/<id>` exists while that claude's "To Do" list is ON — set by the
-/// user from the row's context menu, written by the app (`Core::sync_todos_flags`),
-/// read by `hook::userpromptsubmit`, which then carries `rules::TODOS_RULE`.
-pub const TODOS_ON_DIR: &str = "todos_on";
+/// `board_on` exists while the project's Board is ON, holding its columns (one
+/// per line, with the user's descriptions) — written by the app
+/// (`Core::sync_board_flag`), read by `hook::userpromptsubmit`, which then
+/// carries `rules::BOARD_RULE` and the columns on every turn of every claude.
+pub const BOARD_ON_FILE: &str = "board_on";
 
 /// `compactreq/<id>` = where that instance's ⌘⇧K compact request stands, one
 /// word: `requested` (the hook tells claude to stop at a checkpoint on every tool

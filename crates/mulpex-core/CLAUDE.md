@@ -15,7 +15,7 @@ the reason that outlived it.)
 | `hook.rs`, `config.rs` | [../../docs/sessions.md](../../docs/sessions.md) — what each status word means and why `needs` must mean "needs YOU"; [../../docs/hub.md](../../docs/hub.md) — listener arming and naming nudges; [../../docs/remote-control.md](../../docs/remote-control.md) — the `askq`/`plan` hooks write `dialog/<id>.json` before `needs` |
 | `statusline.rs` (`mulpex-helper statusline`) | its header — `--settings` replaces the person's own statusline, so it is found (project local > project > user) and run with the same stdin; context % goes to `ctx/<id>`. [../../docs/frontend.md](../../docs/frontend.md) — the sidebar side |
 | `secrets.rs` | [../../docs/secrets.md](../../docs/secrets.md) — the file format both processes read |
-| `mcp.rs` (`hub_send`/`hub_spawn`/`hub_set_name`/`hub_todo`/`hub_reply_broadcast`) | [../../docs/hub.md](../../docs/hub.md) — `hub_todo` only forwards; the list lives app-side (`src-tauri/src/todos.rs`) |
+| `mcp.rs` (`hub_send`/`hub_spawn`/`hub_set_name`/`hub_board`/`hub_reply_broadcast`) | [../../docs/hub.md](../../docs/hub.md) — `hub_board` only forwards; the board lives app-side (`src-tauri/src/board.rs`) |
 | `mcp.rs` (`hub_terminal_*`), `termlog.rs` | [../../docs/shell-terminals.md](../../docs/shell-terminals.md) |
 | `registry.rs` | [../../docs/hub.md](../../docs/hub.md) — the `<project>#<n>` grammar and its ordered parser |
 | `remote.rs` | [../../docs/remote-peers.md](../../docs/remote-peers.md) |

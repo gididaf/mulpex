@@ -12,7 +12,7 @@ mod live_token;
 mod menu;
 mod project;
 mod pins;
-mod todos;
+mod board;
 mod pty;
 mod ptyd;
 mod remote;
@@ -161,10 +161,13 @@ pub fn run() {
             commands::set_session_muted,
             commands::get_pins,
             commands::set_pin,
-            commands::todos_get,
-            commands::todos_edit,
-            commands::todos_update,
-            commands::set_todos_enabled,
+            commands::board_get,
+            commands::board_edit,
+            commands::board_set_on,
+            commands::board_update,
+            commands::board_image_put,
+            commands::board_image_import,
+            commands::board_image_get,
             commands::set_session_collapsed,
             commands::set_auto_compact,
             commands::set_mute_menu_checked,

@@ -542,7 +542,7 @@ pub fn project_view(
     state_dir: &std::path::Path,
     sessions: &[SessionInfo],
     snap: &HubSnapshot,
-    todos_rev: u64,
+    board_rev: u64,
 ) -> Value {
     let rows: Vec<Value> = sessions
         .iter()
@@ -571,16 +571,14 @@ pub fn project_view(
                 "parent": s.parent,
                 "exited": s.exited,
                 "failed": s.failed,
-                // "To Do": the badge, and whether UPDATE has anything to send.
-                "todos_on": s.todos_on,
-                "todos_open": s.todos_open,
-                "todos_pending": s.todos_pending,
-                "todos_unread": s.todos_unread,
-                "todos_urgent": s.todos_urgent,
+                // The Board: this claude's badge.
+                "board_open": s.board_open,
+                "board_unread": s.board_unread,
+                "board_urgent": s.board_urgent,
             })
         })
         .collect();
-    json!({ "handle": handle, "name": name, "sessions": rows, "todos_rev": todos_rev })
+    json!({ "handle": handle, "name": name, "sessions": rows, "board_rev": board_rev })
 }
 
 pub fn workspace_view(active: Option<ProjectHandle>, projects: Vec<Value>) -> Value {
@@ -1346,42 +1344,46 @@ impl Server {
                     s.watch = None;
                 }
             }
-            // "To Do" (`todos.rs`): the lists, a draft edit, UPDATE — the same
-            // `Core` methods the desktop's commands call, so drafts are shared.
-            Some("todos-get") => {
+            // The Board (`board.rs`): the same `Core` methods the desktop's
+            // commands call. Images go in chunks — a whole one would not fit a
+            // relay frame once sealed.
+            Some("board-get") => {
                 let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
-                let lists = with_core(handle, |c| c.todos_views()).unwrap_or_default();
-                let msg = json!({"t": "todos", "handle": handle, "lists": lists});
+                let board = with_core(handle, |c| c.board_view()).unwrap_or(Value::Null);
+                let msg = json!({"t": "board", "handle": handle, "board": board});
                 self.send_sealed(ws, cid, &msg.to_string())?;
             }
-            Some(t @ ("todos-edit" | "todos-update")) => {
+            Some(t @ ("board-edit" | "board-on" | "board-update" | "board-image-get" | "board-image-put")) => {
                 let rid = req.get("rid").and_then(Value::as_str).unwrap_or("").chars().take(64).collect::<String>();
                 let handle = req.get("handle").and_then(Value::as_u64).unwrap_or(0);
-                let result: Result<Option<String>, String> = if t == "todos-edit" {
-                    let id = req.get("id").and_then(Value::as_u64).map(|i| i as usize);
-                    match (id, serde_json::from_value::<crate::todos::TodoEdit>(req["edit"].clone())) {
-                        (Some(id), Ok(edit)) => with_core(handle, |c| c.todos_edit(id, edit).map(|_| None))
-                            .unwrap_or_else(|| Err("That project is closed".into())),
-                        _ => Err("Bad request".into()),
+                let closed = || Err::<Value, String>("That project is closed".into());
+                let result: Result<Value, String> = match t {
+                    "board-edit" => match serde_json::from_value::<crate::board::BoardEdit>(req["edit"].clone()) {
+                        Ok(edit) => with_core(handle, |c| c.board_edit(edit).map(|_| Value::Null)).unwrap_or_else(closed),
+                        Err(_) => Err("Bad request".into()),
+                    },
+                    "board-on" => {
+                        let on = req.get("on").and_then(Value::as_bool).unwrap_or(false);
+                        with_core(handle, |c| Ok(json!(c.set_board_on(on)))).unwrap_or_else(closed)
                     }
-                } else {
-                    let ids: Vec<usize> = serde_json::from_value(req["ids"].clone()).unwrap_or_default();
-                    with_core(handle, |c| {
-                        let refused: Vec<String> = c
-                            .todos_update(&ids)
-                            .into_iter()
-                            .filter(|s| s.state == "refused")
-                            .filter_map(|s| s.why)
-                            .collect();
-                        Ok((!refused.is_empty()).then(|| refused.join("; ")))
-                    })
-                    .unwrap_or_else(|| Err("That project is closed".into()))
+                    "board-update" => with_core(handle, |c| Ok(c.board_update(None))).unwrap_or_else(closed),
+                    "board-image-get" => {
+                        let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let offset = req.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        with_core(handle, |c| c.board.get_chunk(&id, offset)).unwrap_or_else(closed)
+                    }
+                    _ => {
+                        let data = req.get("data").and_then(Value::as_str).unwrap_or("").to_string();
+                        let upload = req.get("upload").and_then(Value::as_str).map(String::from);
+                        let done = req.get("done").and_then(Value::as_bool).unwrap_or(true);
+                        with_core(handle, |c| c.board.put_chunk(upload.as_deref(), &data, done)).unwrap_or_else(closed)
+                    }
                 };
-                let (ok, why) = match result {
-                    Ok(why) => (true, why),
-                    Err(e) => (false, Some(e)),
+                let (ok, why, value) = match result {
+                    Ok(v) => (true, None, v),
+                    Err(e) => (false, Some(e), Value::Null),
                 };
-                let msg = json!({"t": "typed", "rid": rid, "ok": ok, "why": why});
+                let msg = json!({"t": "typed", "rid": rid, "ok": ok, "why": why, "value": value});
                 self.send_sealed(ws, cid, &msg.to_string())?;
             }
             Some("visible") => {
@@ -2077,11 +2079,9 @@ mod tests {
             kind,
             exited: false,
             failed: failed.map(String::from),
-            todos_on: false,
-            todos_open: 0,
-            todos_pending: 0,
-            todos_unread: 0,
-            todos_urgent: 0,
+            board_open: 0,
+            board_unread: 0,
+            board_urgent: 0,
         };
         let sessions = vec![
             mk(1, SessionKind::Claude, None),

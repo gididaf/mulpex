@@ -366,11 +366,11 @@ already be in `needs` at launch and a burst of stale banners would bury the live
 > **with nothing of its own still running** — see **`needs` must mean "needs YOU"** in
 > [sessions.md](sessions.md).
 
-## The side panel (⌘⇧L): To Do · Pins · Explain
+## The side panel (⌘⇧L): Board · Pins · Explain
 
-One column right of the terminal with **three fixed tabs** — To Do, Pins, Explain (in that order).
+One column right of the terminal with **three fixed tabs** — Board, Pins, Explain (in that order).
 Tabs never close; only the whole panel shows or hides (⌘⇧L, or the ✕ in its header). Each tab shows
-the focused instance's content; To Do can also show the whole project. Shell: `RightPanel.svelte`;
+the focused instance's content, except the Board, which is the project's. Shell: `RightPanel.svelte`;
 state: `lib/rightPanel.ts` (`open`, `frac`, `tab`, in localStorage as `mulpex.rightPanel`, migrated
 once from the old `mulpex.pinsPanel`). ⌘⇧P with a selection pins and opens the Pins tab; with none it
 shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and opens the Explain tab.
@@ -384,61 +384,69 @@ shows Pins, or hides the panel if Pins is already showing. ⌘⇧E explains and 
 - **Explain used to be an overlay** so it would never resize a PTY. The column is global now, so
   that reason is gone, and it became a tab (the user's ask: one right panel, not several).
 
-### To Do (`hub_todo`)
+### Board (`hub_board`)
 
-What a claude needs from the user — an **action**, a **decision** (with choices to click) or a
-**question** — kept OUT of the conversation: `TODOS_RULE` forbids repeating list content in replies
-(a one-line pointer like "Added To Do #3" at most; no recap after an UPDATE), so the transcript
-doesn't carry everything twice. **Off by default**: right-click a claude's row → To Do list → On, for that row only (an
-orchestrator collects its workers' asks, tagged "for claude#N"; [hub.md](hub.md)). The tab says how
-to turn it on for a claude whose list is off. The claude writes the list with `mcp__mulpex__hub_todo` (backend: [hub.md](hub.md));
-`TodoTab.svelte` renders it; `lib/todos.ts` mirrors the backend (`src-tauri/src/todos.rs`).
+**One board per project**, Trello-like (2026-10-20; replaced the per-claude To Do list, whose
+items + comment threads + drafts-until-UPDATE made a QA back-and-forth hard): columns the USER
+defines, cards with an assignee, detail, choices, comments and images. Backend
+`src-tauri/src/board.rs` (model, outbox, store; [hub.md](hub.md)), mirror `lib/board.ts`, UI
+`BoardTab.svelte` (columns) + `CardOverlay.svelte` (one card) + `ImageStrip.svelte`/`Lightbox.svelte`.
 
-- **Each item has a comment thread** (2026-10-15; replaced the single editable note). Append-only,
-  both authors: the claude writes with `hub_todo` action `comment`, the user's reply is ONE draft
-  per item, appended at UPDATE. The thread is collapsed behind a "💬 Comment / 2 comments" bar under the item (like a post's
-  action bar — it opens below, not to the side); a claude comment past
-  `Item.seen` is unread — a dot on the link, `💬` on the row badge (`todos_unread`). Opening the
-  thread sends `{op:"seen"}` (not a draft — it changes the base, so read on the phone is read on the
-  desktop), and an open thread keeps marking new comments read. Old notes became the user's first
-  comment on load (`List::migrate`); old drafts' `note` is read as `comment` (serde alias).
-- **URGENT** (`Item.urgent`, 2026-10-15): set and cleared by the claude only (`add`/`update` with
-  `urgent`); `TODOS_RULE` and the schema say to use it only when the user's attention is needed as
-  soon as possible. Urgent items sort first within each claude's group (stable — `byUrgency`), get a
-  red edge and an `URGENT` tag, and turn the row badge red (`todos_urgent`). Nothing louder: no
-  dock badge, attention or push.
-- **The list never replaces `AskUserQuestion`** (2026-10-15, the user's most important tool): a
-  question the claude would block on (planning, assumptions, which way to build) still goes through
-  `AskUserQuestion` — options with descriptions, a recommended pick, multi-select, and a real stop.
-  Decision/question items are only for what can wait. Said in `TODOS_RULE` and in `kind`'s schema
-  description.
-- **No ✕ (dismiss) on an item** (removed 2026-10-15): next to the tick it read as a second "done"
-  and confused the user. The tick is the one way to close an item; "not needed" goes in a comment.
-  The backend still accepts `{op:"dismiss"}` (an older phone app may send it).
-- **The user's edits are drafts until UPDATE.** Check, comment, pick a choice, add a request:
-  each is a draft (marked *pending*) laid over the claude's item, and the claude never sees it.
-  UPDATE folds the drafts in and sends that claude one message from "Mulpex" listing exactly what
-  changed. In **All** view one UPDATE sends to every claude with changes, each its own diff.
-- **The drafts live on the backend**, not in the webview, so the desktop, a remote desktop and the
-  phone show the same pending set and any of them can send it. Last write wins per field.
-- **Conflicts:** the claude edits the base at once. A draft on an item it changed is kept and marked
-  "changed since your edit" (`rev > base_rev`). A draft with words on an item it removed becomes an
-  orphan, still sent as "re: #n, no longer on your list"; a bare tick on one is dropped.
-- **Done items leave the list on their own** (2026-10-15; there was a "Clear done" button the user
-  found annoying). The claude's `done` removes the item at once, like `remove`. The user's tick stays
-  a pending draft — still untickable — and the item goes when UPDATE delivers it. There is no
-  reopen. Done items in a list saved before this are dropped on load.
-- **Badge**: a claude row shows `☐ n` (open items) and a dot while edits wait for UPDATE, from
-  `SessionInfo.todos_open/todos_pending` — so remote desktops and the phone get it for free. No
-  attention signal and nothing auto-opens: the user asked for a quiet list.
-- **Details and comments are Markdown** (2026-10-15), both authors, up to 20 000 characters — the
-  claude is told to put long content (QA steps, results, logs) in a detail instead of the
-  conversation. Rendered only through `markdown.ts::renderMarkdownAuto` (phone: `richmd.ts`):
-  DOMPurify, links/images/inputs dropped — the webview can invoke Tauri commands. Each block gets
-  `dir="auto"` so a Hebrew list takes right-side bullets (Explain keeps its hard-RTL
-  `renderMarkdown`). Titles stay plain text. The list the claude gets back on every `hub_todo` call
-  previews long text (300 chars) and the last 3 comments; `list` with `id` reads one item whole —
-  otherwise each call would re-send every long detail into its context.
+- **Off by default, per project.** Right-click a project tab → Board → On, or the button in the
+  empty Board tab. Every claude of the project is told at once, and while it is on every turn
+  carries `BOARD_RULE` plus the current columns. Per project, not per row, because the board is
+  shared; the coworker's projects stay quiet until they turn it on.
+- **Columns are generic: only the user edits them.** A new board starts To Do / Doing / Done, each
+  with a default description. The **description is the rule claudes follow** — "Waiting for QA:
+  move here when you need me to test, with QA steps" is the user's workflow, not Mulpex's; the
+  hook carries name + description every turn (`board_on` file), so a renamed column reaches every
+  claude on its next turn. Click a name to rename; `⋯` = description, move left/right, archive all,
+  delete; `+` at the end adds one; headers drag. Deleting one with cards asks where they go
+  (another column, or archive). A claude cannot touch columns.
+- **Side by side in the panel**, each column `flex: 1 0 9.5rem`, the row scrolling sideways when
+  they don't fit. All / claude#N filter (claude#N = the focused claude's cards + unassigned),
+  per viewer in localStorage. A card shows title, #n, assignee chip, URGENT, ◆ (choices), 💬, 🖼,
+  and an unread dot (a claude changed it since the user opened it).
+- **Drag uses pointer events, captured only once the drag is live** (4 px). HTML5 DnD is gone
+  under Tauri (same as the sidebar), and capturing on press retargets the click — the column name's
+  rename button never got it (found in QA). A drop sends one `move {n, col, before}`.
+- **Order is storage order** — per column, urgent first (`Board::normalize`), so a position the
+  panel draws is a position it can send back. The user's new card goes to the end of its column; a
+  card a claude adds or moves lands on top (below urgent ones).
+- **Live board, UPDATE to tell.** Every edit is applied at once (no drafts), and queued for the
+  card's assignee; the footer's **UPDATE** (desktop and phone, one shared queue) sends each claude
+  one message. Cards with unsent changes carry a `pending` tag; the footer says "N cards not sent".
+  A 5 s timer after the last edit shipped first and was replaced the same day: the user wanted the
+  trigger, so a half-done round of QA replies is never sent. A change to an unassigned card tells
+  nobody. The composer's button is "Comment" (⌘↩), not "Send", so it never reads as UPDATE;
+  unsent text and images stay per card for the app run.
+- **The user's comment stays editable until UPDATE sends it**: it shows "not sent" with Edit /
+  Delete (desktop and phone). Comments carry an `id`; the queued event names it, and the message
+  reads the comment's CURRENT text, so an edit lands and a deleted one is no change (UPDATE goes
+  grey). `Core::board_edit` refuses `comment_edit`/`comment_delete` once it was sent (`unsent` in
+  the board view is the list). Comments saved before ids existed stay as posted.
+- **No text selection on the board**: `.cols` is `user-select: none` (inputs excepted), and while
+  a drag is live `body.no-select` stops it everywhere — a drag painted a selection across every
+  column it passed. The card overlay stays selectable (QA steps get copied).
+- **Card overlay** covers the tab (← / Esc; Esc in a field leaves the field first): title, column
+  ▾, assignee ▾ (a closed claude shows "claude#7 (closed)"), detail (Markdown, Edit), card images +
+  📎, choices, comments, composer. Opening it sends `seen`. Archive / Restore / Delete (confirm).
+- **Archive, not auto-removal.** Archived cards leave the board view (Archived lists them, Restore)
+  and never reach a claude's context; only the user deletes for good.
+- **Images are attachments, never Markdown `<img>`** — the sanitizer stays strict
+  (`renderMarkdownAuto` still forbids `img`/`a`). PNG/JPG/GIF/WebP checked by magic bytes, ≤10 MB,
+  ≤10 per comment or card. Paste (⌘V in the composer, `ClipboardEvent.files`), drop (the window's
+  one `onDragDropEvent` hands the paths to the open card when the drop lands on the panel —
+  `board.ts::takeDrop`; physical → CSS px), or 📎 (plugin-dialog). Shown as thumbnails from blob
+  URLs (`imageUrl`, one fetch per id), click → lightbox (←/→, Esc).
+- **Chunked both ways** (`board_image_put` 2 MB parts with an upload token, `board_image_get` 3 MB
+  parts): a whole 10 MB image, base64'd and sealed, would not fit one 16 MB relay frame from a
+  remote desktop or the phone. On a remote host's tab, picked/dropped files go through
+  `hostUpload` first and are imported by their path THERE.
+- **Badges, quiet as before**: the tab counts unread cards; a claude row shows `▦ n` (its active
+  cards outside the last column), a dot when one is unread, red when one is urgent. No dock badge,
+  no attention, nothing auto-opens.
+- **The board never replaces `AskUserQuestion`** — said in `BOARD_RULE`, as it was for the list.
 
 ### Pins
 

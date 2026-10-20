@@ -1560,12 +1560,13 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     if let Some(context) = crate::secrets::context(&ctx.state_dir, ctx.instance) {
         parts.push(context);
     }
-    // The To Do list, only where the user turned it on. A standing rule, not
-    // a one-off ask, so it rides every turn like the two above: an UPDATE
-    // arrives as a hub wake, which is exactly the turn that needs it. It cannot
-    // feed itself — following it creates no `todos_on/` file.
-    if todos_on(&ctx.state_dir, ctx.instance) {
-        parts.push(crate::rules::TODOS_RULE.to_string());
+    // The Board, only while the user has it on. A standing rule, not a one-off
+    // ask, so it rides every turn like the two above: a board change arrives as
+    // a hub wake, which is exactly the turn that needs it. It cannot feed itself
+    // — following it never writes `board_on`. The columns ride with it, so a
+    // column the user just renamed is the one the claude reads.
+    if let Some(columns) = board_columns(&ctx.state_dir) {
+        parts.push(format!("{}\nThe board's columns, in order:\n{columns}", crate::rules::BOARD_RULE));
     }
     if !parts.is_empty() {
         let out = serde_json::json!({
@@ -1947,9 +1948,9 @@ pub(crate) fn canonical_target(ctx: &Ctx, raw: &str) -> Option<PathBuf> {
     Some(std::fs::canonicalize(parent).ok()?.join(name))
 }
 
-/// The user turned this claude's "To Do" list on (`todos_on/<id>`).
-pub(crate) fn todos_on(state_dir: &Path, id: usize) -> bool {
-    state_dir.join(crate::TODOS_ON_DIR).join(id.to_string()).exists()
+/// The project's Board columns while the user has it on (`board_on`).
+pub(crate) fn board_columns(state_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(state_dir.join(crate::BOARD_ON_FILE)).ok()
 }
 
 pub(crate) fn now() -> u64 {

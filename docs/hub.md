@@ -700,8 +700,8 @@ it to `messages.log` as sent by `Mulpex` (`mcp::APP_SENDER`). `sender_label` tur
 "Mulpex" — without it `from: 0` would read as a "claude#0" to reply to — and `HUB_RULES` says a
 message from "Mulpex" is the app: do what it asks, never `hub_send` a reply. `bounce_dead_inbox`
 already skips `from: 0`, so an app message to a claude that dies is dropped, not bounced. Two
-senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), and the To Do UPDATE
-(below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
+senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), and the Board's change
+messages (below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
 the old `HUB_RULES`.
 
 ## Ask All Claudes (⌘⇧B) — the one app message that IS answered
@@ -745,45 +745,53 @@ is not an address, and `HUB_RULES` forbids trying. So there is a dedicated tool,
   - Told not to use the tool, both fell back to their transcript text.
   - Sonnet named both projects in its summary.
 
-## The user's list (`hub_todo`)
+## The Board (`hub_board`)
 
-Called "For me" (`hub_user_asks`, `asks.rs`) until 2026-10-15; the old store dir `<home>/asks/` and
-the sessions-file flag `asks` are still read and migrated on load.
+Replaced the per-claude To Do list (`hub_todo`, `todos.rs`) on 2026-10-20. One board per project
+([frontend.md](frontend.md) for the UI); `src-tauri/src/board.rs` is model, outbox and store.
 
-A claude's "To Do" list: what it needs from the USER (action / decision with choices / question),
-shown in the side panel ([frontend.md](frontend.md)) and as a count on its row.
-
-- **Off by default, per row, user-only.** Right-click → "To Do list" → On (`Core::set_todos_enabled`,
-  persisted as the store's `todos` column, mirrored to `todos_on/<id>`). Shipped first as a
-  `HUB_RULES` rule for every claude; changed the same day because a coworker's claudes, or a calm
-  one-on-one, must not start keeping a list unasked. So `HUB_RULES` only says it exists, is off, and
-  must never be started unasked — that line is needed because MCP tools load lazily (only the name
-  is visible), and without it a claude told "add this to the FOR ME list" searched the folder for a
-  file instead (seen in QA). How to use it is `rules::TODOS_RULE`, carried by `userpromptsubmit` on every turn of an enabled claude (every
-  turn, like the secrets note — an UPDATE arrives as a hub wake, and following the rule creates no
-  `todos_on/` file, so it cannot feed itself). A call from a claude whose list is off is refused with
-  the way to turn it on. Toggling tells the claude at once (an app message).
-- **One row, not its family.** The user talks to the orchestrator, so the orchestrator is the one
-  list: `TODOS_RULE` tells an enabled coordinator to collect its workers' asks onto its own list with
-  `for: <worker>` (shown as a "for claude#7" tag, and in the UPDATE body) and relay the answers.
-
-- **The app is the only writer.** The tool rides `app_request`'s `termreq/` channel as `op: "todos"`
-  with `from` stamped from the env identity, so an instance can only change its own list; the
-  helper does shape checks only (no serde derive in `mulpex-core` — the helper stays tiny). The
-  model, drafts, commit and message body are `src-tauri/src/todos.rs`; the store is
-  `<mulpex home>/todos/<key>.json` beside the session store, pruned with it like pins (⌘W loses a
-  list, a quit keeps it; a live claude not yet in `worked` is kept too).
-- **`list` with `of: <n>` reads another instance's list, read-only** — an orchestrator checking what
-  a worker already asked before asking twice. Any other action with a foreign `of` is refused.
-- **Items are numbered per claude, monotonically, never reused**, so "#3" means one thing for the
-  list's life; an action on a removed number says so rather than "not on your list".
-- **UPDATE is queued, then delivered** (`Core::drain_todos_outbox`, on the poll loop): once the
-  claude's listener is ready, or its status is `working` (the Stop hook catches mail mid-turn), or
-  after 180 s regardless — the listener only announces mail that arrives after it starts, the same
-  reason as `checkpoint.rs::drain_wake_queue`. The drafts are committed at delivery, not at the
-  click, so a quit before delivery leaves them pending rather than half-sent.
-- **The body lists the diff by section** (done / decisions / comments / added / dismissed),
-  then "Act on this now … Do NOT hub_send a reply". Self-contained, so a claude spawned before the
-  tool existed can still act on it.
-- **Every change marks the id dirty**; the poll loop emits `todos-changed {handle,id}` once per tick
-  (forwarded to remote desktops) and bumps the project's `todos_rev` in the phone's view.
+- **Off by default, per project, user-only.** `Board.on` in the board file; while on, the app
+  keeps `<state_dir>/board_on` holding the columns (`Core::sync_board_flag`, rewritten on every
+  user edit) and `hook::userpromptsubmit` carries `rules::BOARD_RULE` + those columns on every turn
+  of every claude. `HUB_RULES` only says it exists, is off, and must never be started unasked (MCP
+  tools load lazily — without that line "add it to the list" sent a claude searching for a file).
+  A call while off is refused with how to turn it on. Toggling tells every live claude at once.
+- **The app is the only writer.** The tool rides `app_request`'s `termreq/` as `op: "board"` with
+  `from` stamped from the env identity. An old helper's `op: "todos"` and an old tool list's
+  `hub_todo` both answer "use hub_board".
+- **What a claude gets back is small on purpose (context rot).** Its own active cards only:
+  title, column, a 300-char detail preview, the last comment; cards in the LAST column title only;
+  archived never. `id` reads one card (any) in full with image paths; `scope: "all"` lists every
+  active card, slim (an orchestrator). The board can hold hundreds; a claude's context must not.
+- **Claude powers**: add / update / move / comment / archive — on any card, so an orchestrator can
+  create or assign its workers' cards (that tells them). No delete (only the user), no column edits.
+  `images: [absolute paths]` are validated by content and copied into the store.
+- **Cards are numbered per project, monotonically, never reused.**
+- **Delivery: `board::Outbox`, drained by `Core::drain_board_outbox` on the poll loop.** Every
+  change makes `Event`s for the card's assignee (unless the assignee did it; reassigning tells both
+  sides). The USER's events wait in `waiting` until UPDATE (`board_update` → `release`); a claude's
+  change for another claude goes straight to `sending`. Released events fold per card (latest
+  state wins — a card moved twice is "now in C"; archive then restore says nothing) into one
+  message, through the usual gates: listener ready, or `working`, or `TODOS_WAIT` (180 s). UPDATE
+  refuses a claude that isn't running and keeps its queue; a row gone for good (⌘W) takes its queue
+  with it. **Only a real change counts**: each event carries the card's `Snap` from before
+its edit, the first per card is the baseline, and `pending` / `release` / the message compare the
+card now against it — a move there and back, a pick then un-pick, a hand-off and back, an edit
+undone, or a card made and deleted before UPDATE is no change, so UPDATE stays disabled (asked for
+by the user). Comments always count. The outbox is **saved in the board file**, so a quit keeps what was not sent. (A 5 s
+  timer after the last edit was the first design, replaced the same day at the user's request.)
+- **The message is self-contained**: per card what changed, comments verbatim, `[image: <abs
+  path>]` lines the claude Reads, and — for a card new to it (added, or handed over) — its detail
+  and images, so it can act without a tool call (measured: without that, claude#2 had to call
+  `list` to find the image). Then "Act on this now … Do NOT hub_send a reply".
+- **Store**: `<home>/boards/<key>.json` (`{dir, board}`, atomic tmp+rename) and images in
+  `<home>/boards/<key>/img/<uuid>.<ext>` — ids are validated as `<hex-uuid>.<ext>`, so one can never
+  name a path. Per project: NOT pruned by ⌘W. A deleted card's images go with it; unreferenced
+  images older than a day are swept on load (an upload never sent).
+- **Migration**: with no board file, the old `todos/<key>.json` (or `asks/`) becomes the first
+  cards — each open item a card in the first column, assigned to its claude, comments / choices /
+  urgent kept, a `for:` worker noted in the title — and the board is on if any row had its list on
+  (the sessions file's `todos` column is still READ for this; it is now always written empty). The
+  old file is renamed `.migrated`.
+- **Every change marks the store dirty**; the poll loop emits `board-changed {handle}` (forwarded
+  to remote desktops) and bumps `board_rev` in the phone's view.

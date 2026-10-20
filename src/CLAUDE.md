@@ -15,7 +15,7 @@ doc *before* the code:
 Everything else about this directory — dropped paths (bracketed paste, and why the trailing space is
 *inside* the markers), the sidebar's claudes-then-terminals split and its right-click menu, mute
 ordering, drag-to-reorder clamping, the two tab badges, the dock badge and notifications, and why
-the hub panel is Messages-only, and the ⌘⇧L side panel (To Do · Pins · Explain) — is in
+the hub panel is Messages-only, and the ⌘⇧L side panel (Board · Pins · Explain) — is in
 [../docs/frontend.md](../docs/frontend.md).
 
 **A local pane's channel carries control frames too** (`terminals.ts::localChannel`): a message

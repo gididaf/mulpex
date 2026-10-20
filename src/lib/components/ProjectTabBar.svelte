@@ -16,6 +16,7 @@
     onreorder,
     onhost,
     onhostmenu,
+    onmenu,
   }: {
     onselect: (h: ProjectHandle) => void;
     onclose: (h: ProjectHandle) => void;
@@ -23,6 +24,8 @@
     onreorder: (order: ProjectHandle[]) => void;
     onhost: (slot: number) => void;
     onhostmenu: (e: MouseEvent, slot: number) => void;
+    /** Right-click on a project's tab. */
+    onmenu: (e: MouseEvent, h: ProjectHandle) => void;
   } = $props();
 
   // Only the host in front's projects (`hosts.ts`): with several machines'
@@ -116,6 +119,11 @@
       class:dragging={dragging && dragIdx === i}
       class:drop-target={dragging && overIdx === i && dragIdx !== i}
       bind:this={tabEls[i]}
+      role="presentation"
+      oncontextmenu={(e) => {
+        e.preventDefault();
+        onmenu(e, p.handle);
+      }}
     >
       <button
         class="label"

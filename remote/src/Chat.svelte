@@ -30,8 +30,8 @@
     onclose,
     compact = null,
     oncompact,
-    todos = 0,
-    ontodo,
+    board = 0,
+    onboard,
   }: {
     title: string;
     status: string | null;
@@ -54,9 +54,9 @@
     /** Start or cancel that request. */
     oncompact: () => void;
     /** Open items on this claude's To Do list. */
-    todos?: number;
+    board?: number;
     /** Open the To Do screen for this claude. */
-    ontodo: () => void;
+    onboard: () => void;
   } = $props();
 
   let draft = $state("");
@@ -142,7 +142,7 @@
     <span class="title" dir="auto">{title}</span>
     {#if status}<span class="st {status}">{status === "needs" ? "needs you" : status}</span>{/if}
     {#if ctx}<span class="ctx {ctx.level}">{ctx.pct}%</span>{/if}
-    <button class="compact" onclick={ontodo}>To Do{todos ? ` (${todos})` : ""}</button>
+    <button class="compact" onclick={onboard}>Board{board ? ` (${board})` : ""}</button>
     <button class="compact" onclick={oncompact} disabled={gone}>
       {compact ? "Cancel compact" : "Compact"}
     </button>

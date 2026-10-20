@@ -279,58 +279,100 @@ pub fn set_pin(
     let _ = app.emit("pins-changed", crate::snapshot::SessionExited { handle: project_handle, id });
 }
 
-/// Every claude's "To Do" list in the project, with its drafts (`todos.rs`).
+/// The project's Board (`board.rs`), plus `sending`: the claudes a message
+/// is waiting for.
 #[tauri::command]
-pub fn todos_get(
-    state: State<AppState>,
-    project_handle: ProjectHandle,
-) -> std::collections::BTreeMap<usize, serde_json::Value> {
+pub fn board_get(state: State<AppState>, project_handle: ProjectHandle) -> serde_json::Value {
     match state.ws.lock().unwrap().project(project_handle) {
-        Some(core) => core.todos_views(),
-        None => Default::default(),
+        Some(core) => core.board_view(),
+        None => serde_json::Value::Null,
     }
 }
 
-/// The user's edit to one claude's list — a draft, or Clear done. Returns the
-/// list as it now stands; `todos-changed` follows from the poll loop, which is
-/// what reaches a remote desktop and the phone.
+/// The user's edit to the board. Returns the board as it now stands;
+/// `board-changed` follows from the poll loop, which is what reaches a remote
+/// desktop and the phone.
 #[tauri::command]
-pub fn todos_edit(
+pub fn board_edit(
     state: State<AppState>,
     project_handle: ProjectHandle,
-    id: usize,
-    edit: crate::todos::TodoEdit,
+    edit: crate::board::BoardEdit,
 ) -> Result<serde_json::Value, String> {
-    match state.ws.lock().unwrap().project(project_handle) {
-        Some(core) => core.todos_edit(id, edit),
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.board_edit(edit),
         None => Err("that project is closed".into()),
     }
 }
 
-/// Turn a claude's To Do list on or off (context menu). False if nothing changed.
+/// UPDATE: send the user's waiting Board changes — to `ids`, or to every
+/// claude with some. `{sent, refused}`.
 #[tauri::command]
-pub fn set_todos_enabled(
+pub fn board_update(
     state: State<AppState>,
     project_handle: ProjectHandle,
-    id: usize,
-    on: bool,
-) -> bool {
+    ids: Option<Vec<usize>>,
+) -> serde_json::Value {
     match state.ws.lock().unwrap().project_mut(project_handle) {
-        Some(core) => core.set_todos_enabled(id, on),
+        Some(core) => core.board_update(ids),
+        None => serde_json::json!({ "sent": [], "refused": ["that project is closed"] }),
+    }
+}
+
+/// Turn the project's Board on or off. False if nothing changed.
+#[tauri::command]
+pub fn board_set_on(state: State<AppState>, project_handle: ProjectHandle, on: bool) -> bool {
+    match state.ws.lock().unwrap().project_mut(project_handle) {
+        Some(core) => core.set_board_on(on),
         None => false,
     }
 }
 
-/// UPDATE: send each listed claude its pending edits.
+/// Store a pasted image for a card or comment, in base64 chunks (a whole 10 MB
+/// image would not fit one relay frame from a remote desktop). The first call
+/// has no `upload`; each reply names it; the call with `done` returns the id.
 #[tauri::command]
-pub fn todos_update(
+pub fn board_image_put(
     state: State<AppState>,
     project_handle: ProjectHandle,
-    ids: Vec<usize>,
-) -> Vec<crate::todos::TodoSend> {
-    match state.ws.lock().unwrap().project_mut(project_handle) {
-        Some(core) => core.todos_update(&ids),
-        None => Vec::new(),
+    data: String,
+    upload: Option<String>,
+    done: bool,
+) -> Result<serde_json::Value, String> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.board.put_chunk(upload.as_deref(), &data, done),
+        None => Err("that project is closed".into()),
+    }
+}
+
+/// Copy image files (picked, dropped, or uploaded to this host) into the
+/// board's store; returns their ids, all or nothing.
+#[tauri::command]
+pub fn board_image_import(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if paths.len() > crate::board::MAX_IMAGES {
+        return Err(format!("at most {} images at once", crate::board::MAX_IMAGES));
+    }
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => paths.iter().map(|p| core.board.import_image(p)).collect(),
+        None => Err("that project is closed".into()),
+    }
+}
+
+/// Part of one stored image, base64, from byte `offset` — `{data, total}`;
+/// the caller asks again until it has `total` bytes.
+#[tauri::command]
+pub fn board_image_get(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: String,
+    offset: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.board.get_chunk(&id, offset.unwrap_or(0)),
+        None => Err("that project is closed".into()),
     }
 }
 

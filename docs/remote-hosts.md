@@ -45,8 +45,8 @@ A remote project is `slot · 2^32 + its handle there`:
 - 0 is this Mulpex;
 - the sum is exact in JS.
 
-So `projects`, `terminals.ts`'s keys, pins, To Do lists (`todos-changed` is forwarded like
-`pins-changed`), explain, attention and save states all work on remote
+So `projects`, `terminals.ts`'s keys, pins, the Board (`board-changed` is forwarded like
+`pins-changed`; images come over `host_invoke` in chunks), explain, attention and save states all work on remote
 projects unchanged.
 
 `client.rs` is the only place a handle crosses the boundary:
@@ -208,7 +208,7 @@ whole `//` comment lines are dropped first, so a doc-only edit is not a new wire
 - **Same fingerprint = compatible, whatever the versions.** It is deliberately coarse: any code
   edit in those files is a new wire, even one that would have been harmless. No judgment is asked
   of anyone, so it cannot be forgotten.
-- **What it does not see:** a serialized type defined outside those files (e.g. in `todos.rs`,
+- **What it does not see:** a serialized type defined outside those files (e.g. in `board.rs`,
   `pins.rs`) that the Mac's frontend reads from a host. If you change one of those shapes, also
   touch a wire file in the same release (or add the file to `wire::FILES`).
 - **latest.json carries it** (`"wire"`, written by `release.sh` from `mulpex --wire-hash` on the

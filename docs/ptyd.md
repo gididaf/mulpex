@@ -88,7 +88,7 @@ lives, and the pid is the daemon's.
 
 The app writes `ptyd-rows.json` into each project's scratch dir from the poll
 loop (only on change): every row — id, uuid, worked, name and who set it, mute,
-parent, collapsed, auto-compact, To Do, which row had focus. The store cannot
+parent, collapsed, auto-compact, which row had focus. The store cannot
 serve: it holds only worked claudes, and a restart must bring back an
 unprompted claude or a terminal as well.
 

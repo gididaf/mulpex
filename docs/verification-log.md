@@ -2682,3 +2682,30 @@ Measured with the user's real token (claude 2.1.303):
 - **NOT measured:** two different real accounts (one available — the second token was the same
   token pasted again); a real usage-limit 429 on a pinned token; the ⌘S/⌘⇧E forks with a pin
   (same `spawn_env(route)` call, not driven); a remote host's tab; Linux.
+
+## The Board replacing the To Do list (2026-10-20)
+
+Measured, in the `board` worktree:
+
+- **Real claudes, real app (hidden window, isolated `CLAUDE_CONFIG_DIR`).** claude#1, told to add a
+  card for claude#2 in "Waiting for QA" with a 64×64 red PNG attached by path; claude#2, told to
+  wait for the Board message. Board file afterwards: the card in Done, image stored under
+  `boards/<key>/img/`, claude#2's comment "Red" — 11 s from creation to reply (5 s debounce +
+  listener). claude#2's transcript shows the per-turn rule with the user's four columns and
+  descriptions, and the message with `[image: <abs path>]`. First run's message lacked the
+  detail/images for a card *new to* that claude (it had to call `list`); fixed, re-measured.
+- **Remote host parity** (`scripts/test-remote-hosts.sh` + Board steps through the debug drive
+  queue's `host_invoke`): board turned on, a Hebrew card added, a PNG uploaded in chunks and
+  attached to a comment — all stored on the HOST's home — and the image read back over the relay
+  byte-exact. Every pre-existing remote-host scenario still IDENTICAL.
+- **UI, headless Chrome over CDP** against the real `BoardTab`/`CardOverlay` with a mocked IPC:
+  turn on, default columns, urgent pinned on top, claude cards land on top, filter, pointer drag
+  between columns and within one (one `move` sent; no click after a drag), card overlay +
+  `seen`, choose, a synthetic `ClipboardEvent` image paste → thumbnail → ⌘↩ sends text + image,
+  Esc order (field → card; lightbox first), lightbox; rename / add / drag / describe / delete
+  (move or archive) columns; archive → Archived → restore. Found and fixed there: pointer capture
+  on press stole the column name's click; the drag preview's `.ghost` class collided with a
+  button's. Phone `Board.svelte` rendered at 390 px: no page scroll, open card sends `seen`,
+  comment sent.
+- **Not measured**: a real ⌘V of a macOS screenshot in WKWebView (only a synthetic paste), a real
+  Finder drop onto the panel, the phone on a device, how the drag feels.

@@ -3,7 +3,7 @@
   import Chat, { type Item } from "./Chat.svelte";
   import type { DialogView } from "./Dialog.svelte";
   import Term from "./Term.svelte";
-  import Todo, { type TodoList } from "./Todo.svelte";
+  import BoardView, { type Board } from "./Board.svelte";
   import { unb64 } from "./crypto";
   import { dragSort, moveTo } from "./order";
   import { swipePages } from "./swipe";
@@ -28,16 +28,15 @@
     failed: string | null;
     /** The open question or plan, while the claude waits on it. */
     dialog: DialogView | null;
-    /** "To Do": open items on its list, and edits waiting for UPDATE. */
-    todos_open?: number;
-    todos_pending?: number;
-    /** Items with a claude comment not yet opened. */
-    todos_unread?: number;
-    /** Open items marked urgent: the badge turns red. */
-    todos_urgent?: number;
+    /** The Board: its active cards outside the last column. */
+    board_open?: number;
+    /** Its cards a claude changed since the user last opened them. */
+    board_unread?: number;
+    /** Its cards marked urgent: the badge turns red. */
+    board_urgent?: number;
   };
-  /** `todos_rev` changes whenever any To Do list in the project does. */
-  type Project = { handle: number; name: string; sessions: Row[]; todos_rev?: number };
+  /** `board_rev` changes whenever the project's Board does. */
+  type Project = { handle: number; name: string; sessions: Row[]; board_rev?: number };
   type View = { t: "state"; active: number | null; projects: Project[] };
 
   /** The claude whose conversation is open, if any. */
@@ -45,10 +44,13 @@
     null,
   );
 
-  /** The To Do screen, if open: one project's lists, focused on one claude. */
-  let todo = $state<{ handle: number; focus: number | null; lists: Record<string, TodoList>; loading: boolean } | null>(
+  /** The Board screen, if open: one project's board, opened from one claude (or none). */
+  let boardScreen = $state<{ handle: number; focus: number | null; board: Board | null; loading: boolean } | null>(
     null,
   );
+
+  /** A card is open inside the Board screen (Back closes it first). */
+  let boardCardOpen = $state(false);
 
   /** The terminal that is open, if any. */
   let term = $state<{ handle: number; id: number; gone: boolean } | null>(null);
@@ -94,7 +96,7 @@
         l.send({ t: "open", handle: chat.handle, id: chat.id });
       }
       if (l.state === "online" && term) l.send({ t: "term-open", handle: term.handle, id: term.id });
-      if (l.state === "online" && todo) l.send({ t: "todos-get", handle: todo.handle });
+      if (l.state === "online" && boardScreen) l.send({ t: "board-get", handle: boardScreen.handle });
       // The Mac skips a notification for the claude open here only while
       // the app is actually in front; a minimized app can stay connected.
       if (l.state === "online") l.send({ t: "visible", on: document.visibilityState === "visible" });
@@ -109,12 +111,12 @@
       }
       else if (msg.t === "term" && term && msg.handle === term.handle && msg.id === term.id) feedTerm(msg);
       else if (msg.t === "typed") {
-        typing.get(msg.rid)?.({ ok: msg.ok, why: msg.why ?? null, id: msg.id ?? null });
+        typing.get(msg.rid)?.({ ok: msg.ok, why: msg.why ?? null, id: msg.id ?? null, value: msg.value ?? null });
         typing.delete(msg.rid);
       }
-      else if (msg.t === "todos" && todo && msg.handle === todo.handle) {
-        todo.lists = msg.lists ?? {};
-        todo.loading = false;
+      else if (msg.t === "board" && boardScreen && msg.handle === boardScreen.handle) {
+        boardScreen.board = msg.board ?? null;
+        boardScreen.loading = false;
       }
       else if (msg.t === "chat" && chat && msg.handle === chat.handle && msg.id === chat.id) {
         chat.items = msg.reset ? msg.items : [...chat.items, ...msg.items];
@@ -136,7 +138,8 @@
   /** Typing requests waiting for the Mac's answer, by request id. */
   const typing = new Map<string, (r: Reply) => void>();
 
-  type Reply = { ok: boolean; why: string | null; id?: number | null };
+  /** `value`: what a Board request returns (an image chunk, an upload token). */
+  type Reply = { ok: boolean; why: string | null; id?: number | null; value?: any };
 
   /** A request the Mac answers (`typed`, matched by request id). */
   function request(msg: Record<string, unknown>, timeoutMs = 15_000): Promise<Reply> {
@@ -294,27 +297,32 @@
     history.pushState({ term: true }, "");
   }
 
-  function openTodo(handle: number, focus: number | null) {
-    todo = { handle, focus, lists: {}, loading: true };
-    conn.send({ t: "todos-get", handle });
-    history.pushState({ todo: true }, "");
+  function openBoard(handle: number, focus: number | null) {
+    boardScreen = { handle, focus, board: null, loading: true };
+    conn.send({ t: "board-get", handle });
+    history.pushState({ board: true }, "");
   }
 
-  // Re-read the lists whenever the Mac says one of them changed.
-  let todoRev: number | undefined;
+  // Re-read the board whenever the Mac says it changed.
+  let boardRev: number | undefined;
   $effect(() => {
-    const rev = todo ? view?.projects.find((p) => p.handle === todo!.handle)?.todos_rev : undefined;
-    if (todo && rev !== undefined && rev !== todoRev && link === "online") {
-      if (todoRev !== undefined) conn.send({ t: "todos-get", handle: todo.handle });
-      todoRev = rev;
+    const rev = boardScreen ? view?.projects.find((p) => p.handle === boardScreen!.handle)?.board_rev : undefined;
+    if (boardScreen && rev !== undefined && rev !== boardRev && link === "online") {
+      if (boardRev !== undefined) conn.send({ t: "board-get", handle: boardScreen.handle });
+      boardRev = rev;
     }
-    if (!todo) todoRev = undefined;
+    if (!boardScreen) boardRev = undefined;
   });
 
   function closeChat() {
-    // To Do sits on top of whatever opened it: Back closes only it.
-    if (todo) {
-      todo = null;
+    // The Board sits on top of whatever opened it: Back closes only it
+    // (an open card inside it pushed its own entry and closes first).
+    if (boardScreen) {
+      if (boardCardOpen) {
+        boardCardOpen = false;
+        return;
+      }
+      boardScreen = null;
       return;
     }
     if (term) {
@@ -331,7 +339,7 @@
   // A reload (pull-to-refresh, or Android killing the app in the background)
   // starts on the list, but the history still holds the entry an open chat or
   // terminal pushed: the first Back would pop it and do nothing visible. Drop it.
-  if (history.state?.chat || history.state?.term || history.state?.todo) history.back();
+  if (history.state?.chat || history.state?.term || history.state?.board || history.state?.card) history.back();
   document.addEventListener("visibilitychange", () => {
     conn.send({ t: "visible", on: document.visibilityState === "visible" });
     clearNotifications();
@@ -503,16 +511,18 @@
       {#if refusal}<p class="refusal">{refusals[refusal] ?? refusal}</p>{/if}
       Open Remote Control on your Mac (⌘⇧O) and scan its QR code.
     </div>
-  {:else if todo}
-    {@const fp = view?.projects.find((p) => p.handle === todo!.handle)}
-    <Todo
+  {:else if boardScreen}
+    {@const fp = view?.projects.find((p) => p.handle === boardScreen!.handle)}
+    <BoardView
+      handle={boardScreen.handle}
       claudes={ordered(fp?.sessions ?? []).filter((r) => r.row.kind === "claude").map((r) => ({ id: r.row.id, name: r.row.name ?? r.row.task }))}
-      lists={todo.lists}
-      focus={todo.focus}
-      loading={todo.loading}
+      board={boardScreen.board}
+      focus={boardScreen.focus}
+      loading={boardScreen.loading}
+      bind:cardOpen={boardCardOpen}
       onback={() => history.back()}
-      onedit={(id, edit) => request({ t: "todos-edit", handle: todo!.handle, id, edit })}
-      onupdate={(ids) => request({ t: "todos-update", handle: todo!.handle, ids })}
+      req={request}
+      onrefresh={() => boardScreen && conn.send({ t: "board-get", handle: boardScreen.handle })}
     />
   {:else if term}
     <Term
@@ -540,8 +550,8 @@
       onkey={sendKey}
       dialog={chatRow?.status === "needs" ? (chatRow.dialog ?? null) : null}
       onanswer={sendAnswer}
-      todos={chatRow?.todos_open ?? 0}
-      ontodo={() => chat && openTodo(chat.handle, chat.id)}
+      board={chatRow?.board_open ?? 0}
+      onboard={() => chat && openBoard(chat.handle, chat.id)}
     />
   {:else}
     <header>
@@ -614,16 +624,16 @@
                 <div class="top">
                   <span class="id">{label(row)}</span>
                   <span class="st {row.status ?? ''}">{statusWord(row)}</span>
-                  {#if row.todos_open || row.todos_pending}
+                  {#if row.board_open || row.board_unread}
                     <button
-                      class="todos"
-                      class:pending={!!row.todos_pending}
-                      class:urgent={!!row.todos_urgent}
-                      aria-label="To Do"
+                      class="cards"
+                      class:unread={!!row.board_unread}
+                      class:urgent={!!row.board_urgent}
+                      aria-label="Board"
                       onclick={(e) => {
                         e.stopPropagation();
-                        openTodo(shown.handle, row.id);
-                      }}>☐ {row.todos_open ?? 0}{#if row.todos_unread} 💬{/if}</button
+                        openBoard(shown.handle, row.id);
+                      }}>▦ {row.board_open ?? 0}</button
                     >
                   {/if}
                   {#if row.ctx_pct != null}<span class="ctx {ctxLevel(row)}">{row.ctx_pct}%</span>{/if}
@@ -891,7 +901,7 @@
   .st.needs {
     color: var(--red);
   }
-  .todos {
+  .cards {
     padding: 0.05rem 0.5rem;
     border: 0;
     border-radius: 999px;
@@ -901,10 +911,10 @@
     font-size: 0.75rem;
     font-weight: 700;
   }
-  .todos.pending {
+  .cards.unread {
     box-shadow: 0 0 0 2px var(--yellow);
   }
-  .todos.urgent {
+  .cards.urgent {
     background: var(--red);
     color: #fff;
   }
