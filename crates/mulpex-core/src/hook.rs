@@ -1546,27 +1546,31 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // it is the turn that most needs to know about unread mail.
     let welcome = nudges_welcome(system_turn, sanctioned_resume);
     let mut parts: Vec<String> = Vec::new();
-    if welcome && !listener_armed(ctx) {
-        parts.push(arm_listener_nudge(ctx));
-    }
-    if welcome && !instance_named(ctx) {
-        parts.push(AUTO_NAME_NUDGE.to_string());
-    }
-    if let Some(context) = crate::mcp::peers_context(ctx) {
-        parts.push(context);
+    // The Board, only while the user has it on. A standing rule, not a one-off
+    // ask, so it rides every turn like the peer snapshot: a board change arrives
+    // as a hub wake, which is exactly the turn that needs it. It cannot feed
+    // itself — following it never writes `board_on`. The columns ride with it,
+    // so a column the user just renamed is the one the claude reads.
+    if let Some(columns) = board_columns(&ctx.state_dir) {
+        parts.push(format!("{}\nThe board's columns, in order:\n{columns}", crate::rules::BOARD_RULE));
     }
     // Information rather than a request, so like the peer snapshot it rides every
     // turn: a hub wake may be the turn that needs the password.
     if let Some(context) = crate::secrets::context(&ctx.state_dir, ctx.instance) {
         parts.push(context);
     }
-    // The Board, only while the user has it on. A standing rule, not a one-off
-    // ask, so it rides every turn like the two above: a board change arrives as
-    // a hub wake, which is exactly the turn that needs it. It cannot feed itself
-    // — following it never writes `board_on`. The columns ride with it, so a
-    // column the user just renamed is the one the claude reads.
-    if let Some(columns) = board_columns(&ctx.state_dir) {
-        parts.push(format!("{}\nThe board's columns, in order:\n{columns}", crate::rules::BOARD_RULE));
+    if welcome && !listener_armed(ctx) {
+        parts.push(arm_listener_nudge(ctx));
+    }
+    if welcome && !instance_named(ctx) {
+        parts.push(AUTO_NAME_NUDGE.to_string());
+    }
+    // Last, and only in the room left: it is the one part that grows with the
+    // project (an orchestrator with a dozen workers wrote 14 KB, and the model
+    // saw only the peer list's first 2 KB — never the Board rule after it).
+    let used: usize = parts.iter().map(|p| p.chars().count() + 2).sum();
+    if let Some(context) = crate::mcp::peers_context_within(ctx, CONTEXT_LIMIT.saturating_sub(used)) {
+        parts.push(context);
     }
     if !parts.is_empty() {
         let out = serde_json::json!({
@@ -1947,6 +1951,12 @@ pub(crate) fn canonical_target(ctx: &Ctx, raw: &str) -> Option<PathBuf> {
     let name = abs.file_name()?;
     Some(std::fs::canonicalize(parent).ok()?.join(name))
 }
+
+/// What one hook's `additionalContext` may hold. Over 10,000 chars Claude Code
+/// saves it to a file and shows the model a 2 KB preview instead (measured on
+/// 2026-10-20: the largest shown whole was exactly 10,000; 10,019 was cut).
+/// A margin under that, since it counts UTF-16 units and we count chars.
+pub(crate) const CONTEXT_LIMIT: usize = 9_500;
 
 /// The project's Board columns while the user has it on (`board_on`).
 pub(crate) fn board_columns(state_dir: &Path) -> Option<String> {

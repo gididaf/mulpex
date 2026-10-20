@@ -2676,7 +2676,20 @@ fn hub_terminal_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
 /// A compact, human-readable snapshot of the OTHER instances + my unread count,
 /// injected into each turn by the `userpromptsubmit` hook. `None` when there's
 /// nothing worth saying (no peers and no unread messages).
+#[cfg(test)]
 pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
+    peers_context_within(ctx, usize::MAX)
+}
+
+/// A peer's task in the per-turn block: one line, at most this many chars.
+/// The full task is one `hub_instances` away; here it is paid for every turn.
+const PEER_TASK_CHARS: usize = 150;
+
+/// `peers_context`, at most `budget` chars: past it the peer list stops with
+/// how many were left out. The hook's whole output must stay under Claude
+/// Code's 10,000-char limit (`hook::CONTEXT_LIMIT`), or the model sees only a
+/// 2 KB preview of it.
+pub(crate) fn peers_context_within(ctx: &Ctx, budget: usize) -> Option<String> {
     let holds = locks_by_holder(ctx);
     let peers: Vec<usize> = live_ids(ctx).into_iter().filter(|&id| id != ctx.instance).collect();
     let unread = unread_for(ctx, ctx.instance);
@@ -2695,43 +2708,64 @@ pub(crate) fn peers_context(ctx: &Ctx) -> Option<String> {
     let mut s = String::from(
         "[Mulpex hub] You are one of several parallel Claude instances in this project.",
     );
-    if !peers.is_empty() {
-        s.push_str(" Other instances here right now:");
-        for id in peers {
-            let task = task_of(ctx, id);
-            let held = holds.get(&id).cloned().unwrap_or_default();
-            s.push_str(&format!("\n  - claude#{id}"));
-            if let Some(name) = local_name(reg.project_for_dir(&ctx.project_dir), id)
-                .and_then(|i| i.name.as_deref())
-            {
-                s.push_str(&format!(" \"{name}\""));
-            }
-            s.push_str(&format!(" [{}]", status_of(ctx, id)));
-            if !task.is_empty() {
-                s.push_str(&format!(" task: \"{task}\""));
-            }
-            if !held.is_empty() {
-                s.push_str(&format!(" holds: {}", held.join(", ")));
-            }
+    let mut lines = Vec::new();
+    for &id in &peers {
+        let task = task_of(ctx, id).split_whitespace().collect::<Vec<_>>().join(" ");
+        let held = holds.get(&id).cloned().unwrap_or_default();
+        let mut l = format!("\n  - claude#{id}");
+        if let Some(name) = local_name(reg.project_for_dir(&ctx.project_dir), id)
+            .and_then(|i| i.name.as_deref())
+        {
+            l.push_str(&format!(" \"{name}\""));
         }
+        l.push_str(&format!(" [{}]", status_of(ctx, id)));
+        if !task.is_empty() {
+            let short: String = task.chars().take(PEER_TASK_CHARS).collect();
+            let more = if short.len() < task.len() { "…" } else { "" };
+            l.push_str(&format!(" task: \"{short}{more}\""));
+        }
+        if !held.is_empty() {
+            l.push_str(&format!(" holds: {}", held.join(", ")));
+        }
+        lines.push(l);
     }
+    // Everything after the peer list, built first so its length is known.
+    let mut tail = String::new();
     if !elsewhere.is_empty() {
-        s.push_str("\nOTHER PROJECTS are open in Mulpex and their instances are reachable too:");
+        tail.push_str("\nOTHER PROJECTS are open in Mulpex and their instances are reachable too:");
         for p in elsewhere {
             let who: Vec<String> = p.instances.iter().map(|i| p.address(i.id)).collect();
-            s.push_str(&format!("\n  - {} — {}", p.name, who.join(", ")));
+            tail.push_str(&format!("\n  - {} — {}", p.name, who.join(", ")));
         }
-        s.push_str(
+        tail.push_str(
             "\n  Message them with mcp__mulpex__hub_send at those addresses. They are a DIFFERENT \
              repository and working tree, so they cannot see your files — anything you send must \
              be self-contained.",
         );
     }
     if unread > 0 {
-        s.push_str(&format!(
+        tail.push_str(&format!(
             "\nYou have {unread} unread hub message(s) — call mcp__mulpex__hub_inbox to read them."
         ));
     }
+    if !lines.is_empty() {
+        s.push_str(" Other instances here right now:");
+        let room = budget.saturating_sub(s.chars().count() + tail.chars().count() + 120);
+        let mut used = 0;
+        for (i, l) in lines.iter().enumerate() {
+            let n = l.chars().count();
+            if used + n > room {
+                s.push_str(&format!(
+                    "\n  - …and {} more — call mcp__mulpex__hub_instances for the full list.",
+                    lines.len() - i
+                ));
+                break;
+            }
+            used += n;
+            s.push_str(l);
+        }
+    }
+    s.push_str(&tail);
     Some(s)
 }
 
@@ -3419,6 +3453,28 @@ mod tests {
         assert!(block.contains("claude#3 \"auth fix\" [waiting]"), "{block}");
         // The source stays out of the per-turn block: it is paid for every prompt.
         assert!(!block.contains("user"), "{block}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An orchestrator with many workers must not push the hook past Claude
+    /// Code's limit: tasks are cut to one short line, and the list stops at the
+    /// budget with how many were left out.
+    #[test]
+    fn the_peer_block_stays_within_its_budget() {
+        let (root, ctx, _b) = two_projects("budget");
+        let ids: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+        std::fs::write(ctx.state_dir.join("instances"), ids.join("\n")).unwrap();
+        std::fs::create_dir_all(&ctx.tasks_dir).unwrap();
+        for i in 2..=40 {
+            std::fs::write(ctx.tasks_dir.join(i.to_string()), format!("step {i}\n{}", "x".repeat(900))).unwrap();
+        }
+        let full = peers_context(&ctx).unwrap();
+        assert!(full.contains("task: \"step 3 xxx"), "{full}");
+        assert!(!full.contains(&"x".repeat(200)), "a task is cut short");
+        assert!(full.contains("…\""));
+        let cut = peers_context_within(&ctx, 2_000).unwrap();
+        assert!(cut.chars().count() <= 2_000, "{}", cut.chars().count());
+        assert!(cut.contains("more — call mcp__mulpex__hub_instances"), "{cut}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
