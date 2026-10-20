@@ -354,6 +354,26 @@ export interface Board {
   unsent: string[];
   /** Claudes whose message is out but that can't hear it yet. */
   sending: number[];
+  /** Claudes' column changes waiting for Approve / Reject. */
+  proposals: BoardProposal[];
+}
+
+/** A column on the board (`id`), or one an earlier change of the same proposal adds (`new`, its name). */
+export type BoardColRef = { id: number } | { new: string };
+
+export type BoardColChange =
+  | { op: "add"; name: string; desc: string; before: BoardColRef | null }
+  | { op: "edit"; col: BoardColRef; name: string | null; desc: string | null }
+  | { op: "move"; col: BoardColRef; before: BoardColRef | null }
+  | { op: "delete"; col: BoardColRef; to: BoardColRef | null };
+
+export interface BoardProposal {
+  id: number;
+  /** The claude that proposed it. */
+  by: number;
+  why: string;
+  changes: BoardColChange[];
+  at: number;
 }
 
 export type BoardEdit =
@@ -372,7 +392,9 @@ export type BoardEdit =
   | { op: "col_add"; name: string; desc?: string }
   | { op: "col_edit"; col: number; name?: string; desc?: string }
   | { op: "col_move"; col: number; before: number | null }
-  | { op: "col_delete"; col: number; to: number | null };
+  | { op: "col_delete"; col: number; to: number | null }
+  | { op: "approve"; proposal: number }
+  | { op: "reject"; proposal: number; reason: string };
 
 export const boardGet = (projectHandle: ProjectHandle) => call<Board | null>("board_get", { projectHandle });
 

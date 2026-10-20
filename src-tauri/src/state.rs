@@ -2462,6 +2462,24 @@ impl Core {
             }
         }
         let now = crate::board::now();
+        if let crate::board::BoardEdit::Approve { proposal } | crate::board::BoardEdit::Reject { proposal, .. } = &edit {
+            let (approve, reason) = match &edit {
+                crate::board::BoardEdit::Reject { reason, .. } => (false, reason.as_str()),
+                _ => (true, ""),
+            };
+            let (by, msg, events) = self.board.mutate(|b| b.decide(*proposal, approve, reason, now))?;
+            // Like the user's own column edit: moved cards wait for UPDATE.
+            if !events.is_empty() {
+                self.board.outbox(|o, _| o.push(events, true, Instant::now()));
+            }
+            // The answer goes now. A row that is gone for good has no one to tell.
+            if self.sessions.iter().any(|s| s.id == by) {
+                self.send_app_message(by, &msg);
+            }
+            self.sync_board_flag();
+            self.board.touch();
+            return Ok(self.board_view());
+        }
         let (events, gone) = self.board.mutate(|b| b.apply_user(edit, now))?;
         if !events.is_empty() {
             self.board.outbox(|o, _| o.push(events, true, Instant::now()));
@@ -3650,6 +3668,37 @@ mod tests {
         );
         assert_eq!(core.next_id, 1, "first ⌘T should hand out instance id 1");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A claude's `hub_board` `columns` call changes nothing until the user's
+    /// Approve; then `board_on` (what every claude reads per turn) follows.
+    #[test]
+    fn a_column_proposal_goes_through_the_user() {
+        let _env = env_guard();
+        let root = std::env::temp_dir().join(format!("mulpex-board-prop-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("MULPEX_HOME", root.join("home/.mulpex"));
+        let mut core = Core::open(1, project_dir, Path::new("/nonexistent/mulpex-helper"), root.join("state"), TEST_GEOMETRY).unwrap();
+        core.set_board_on(true);
+        let r = core.apply_board_request(&serde_json::json!({
+            "op": "board", "from": 3, "action": "columns", "why": "QA",
+            "changes": [{"op": "add", "name": "Waiting for QA", "desc": "I test", "before": "Done"}],
+        }));
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r["note"].as_str().unwrap().contains("P1"));
+        let flag_file = core.state_dir.join(mulpex_core::BOARD_ON_FILE);
+        let flag = || std::fs::read_to_string(&flag_file).unwrap();
+        assert!(!flag().contains("Waiting for QA"));
+        assert_eq!(core.board_view()["proposals"].as_array().unwrap().len(), 1);
+        let edit: crate::board::BoardEdit = serde_json::from_value(serde_json::json!({"op": "approve", "proposal": 1})).unwrap();
+        let v = core.board_edit(edit).unwrap();
+        assert!(v["proposals"].as_array().unwrap().is_empty());
+        assert!(flag().contains("3. \"Waiting for QA\" — I test"), "{}", flag());
+        let edit: crate::board::BoardEdit = serde_json::from_value(serde_json::json!({"op": "reject", "proposal": 1, "reason": "x"})).unwrap();
+        assert!(core.board_edit(edit).is_err(), "decided once");
         let _ = std::fs::remove_dir_all(&root);
     }
 

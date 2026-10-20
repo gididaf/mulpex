@@ -109,6 +109,9 @@ export const lastCol = (b: Board | undefined) => b?.columns[b.columns.length - 1
 export const unreadCount = (b: Board | undefined, only?: number | null) =>
   b?.cards.filter((c) => !c.archived && c.unread && (only == null || c.assignee === only)).length ?? 0;
 
+/** Column proposals waiting for the user's Approve / Reject. */
+export const proposalCount = (b: Board | undefined) => (b?.on ? (b.proposals?.length ?? 0) : 0);
+
 export const imageCount = (c: BoardCard) => c.images.length + c.comments.reduce((n, m) => n + m.images.length, 0);
 
 // ── images ─────────────────────────────────────────────────────────────────

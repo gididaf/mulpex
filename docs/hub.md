@@ -764,7 +764,17 @@ Replaced the per-claude To Do list (`hub_todo`, `todos.rs`) on 2026-10-20. One b
   archived never. `id` reads one card (any) in full with image paths; `scope: "all"` lists every
   active card, slim (an orchestrator). The board can hold hundreds; a claude's context must not.
 - **Claude powers**: add / update / move / comment / archive — on any card, so an orchestrator can
-  create or assign its workers' cards (that tells them). No delete (only the user), no column edits.
+  create or assign its workers' cards (that tells them). No delete (only the user).
+- **Columns: a claude only PROPOSES** (`action: "columns"`, `changes` + `why`; added 2026-10-20 at
+  the user's request — "he must ask my permission"). `Board::propose` validates the whole set by
+  applying it to a copy (names resolve as the changes go, so a later change may name a column an
+  earlier one adds) and stores it in `Board.proposals`, columns as `ColRef::Id` (survives the user
+  renaming it meanwhile) or `ColRef::New` (added by the same proposal). The panel shows each with
+  Approve / Reject… (optional reason); the Board tab's count and a ▤ badge on the project tab count
+  them. `Board::decide` applies all or nothing through the user's own column edits — an approval
+  that no longer fits (a column it names is gone) is refused and the proposal stays, to reject —
+  and the answer goes to the proposer at once as a Mulpex message (no UPDATE); cards a delete moved
+  wait for UPDATE like the user's own delete. Every claude sees the new columns via `board_on`.
   `images: [absolute paths]` are validated by content and copied into the store.
 - **Cards are numbered per project, monotonically, never reused.**
 - **Delivery: `board::Outbox`, drained by `Core::drain_board_outbox` on the poll loop.** Every

@@ -9,7 +9,7 @@
   // only commits its width on release.
   import { activeProjectHandle, activeId } from "../stores";
   import { rightPanel, setPanelOpen, setTab, setPanelFrac, clampFrac, type PanelTab } from "../rightPanel";
-  import { boards, unreadCount } from "../board";
+  import { boards, unreadCount, proposalCount } from "../board";
   import { pins, pinKey } from "../pins";
   import { explains, explainKey, isStreaming } from "../explain";
   import { THEME, terminals } from "../terminals";
@@ -23,8 +23,9 @@
   const h = $derived($activeProjectHandle);
   const id = $derived($activeId);
 
-  /** Cards a claude changed since the user last opened them. */
-  const boardCount = $derived(h != null ? unreadCount($boards.get(h)) : 0);
+  /** Cards a claude changed since the user last opened them, plus column
+   *  proposals waiting for an answer. */
+  const boardCount = $derived(h != null ? unreadCount($boards.get(h)) + proposalCount($boards.get(h)) : 0);
   const pinCount = $derived(h != null && id != null ? ($pins.get(pinKey(h, id))?.length ?? 0) : 0);
   const ex = $derived(h != null && id != null ? $explains.get(explainKey(h, id)) : undefined);
 
@@ -91,7 +92,7 @@
           onclick={() => pick(t.tab)}
         >
           {t.label}
-          {#if t.tab === "board" && boardCount}<span class="count" title="Cards a claude updated since you last opened them">{boardCount}</span>{/if}
+          {#if t.tab === "board" && boardCount}<span class="count" title="Cards a claude updated since you last opened them, and column changes waiting for you">{boardCount}</span>{/if}
           {#if t.tab === "pins" && pinCount}<span class="count dim">{pinCount}</span>{/if}
           {#if t.tab === "explain" && ex}<span class="dot" class:live={isStreaming(ex)}></span>{/if}
         </button>

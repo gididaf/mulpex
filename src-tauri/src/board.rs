@@ -117,6 +117,46 @@ pub struct Board {
     /// Stored in display order: per column, urgent first (`normalize`).
     #[serde(default)]
     pub cards: Vec<Card>,
+    /// Claudes' column changes waiting for the user's Approve / Reject.
+    #[serde(default)]
+    pub proposals: Vec<Proposal>,
+    #[serde(default)]
+    pub next_prop: u32,
+}
+
+/// A claude's change to the columns, as one all-or-nothing set: nothing moves
+/// until the user approves it in the panel (`Board::decide`), and the claude is
+/// told the answer at once — no UPDATE.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Proposal {
+    pub id: u32,
+    pub by: usize,
+    #[serde(default)]
+    pub why: String,
+    pub changes: Vec<ColChange>,
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ColChange {
+    /// At the end, or before `before`.
+    Add { name: String, desc: String, before: Option<ColRef> },
+    Edit { col: ColRef, name: Option<String>, desc: Option<String> },
+    /// To the end, or before `before`.
+    Move { col: ColRef, before: Option<ColRef> },
+    /// Its cards go to `to`, or are archived — as the user's own delete.
+    Delete { col: ColRef, to: Option<ColRef> },
+}
+
+/// A column a change names: one on the board (by id, so the user renaming it
+/// meanwhile doesn't break the proposal), or one an earlier `Add` of the same
+/// proposal makes (by the name it is added with).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ColRef {
+    Id(u32),
+    New(String),
 }
 
 impl Default for Board {
@@ -132,6 +172,8 @@ impl Default for Board {
                 col(3, "Done", "Finished. Move a card here once it is done."),
             ],
             cards: Vec::new(),
+            proposals: Vec::new(),
+            next_prop: 0,
         }
     }
 }
@@ -177,6 +219,9 @@ pub enum BoardEdit {
     ColMove { col: u32, #[serde(default)] before: Option<u32> },
     /// Its cards go to `to`, or are archived when `to` is None.
     ColDelete { col: u32, #[serde(default)] to: Option<u32> },
+    /// A claude's column proposal (`Core::board_edit` → `Board::decide`).
+    Approve { proposal: u32 },
+    Reject { proposal: u32, #[serde(default)] reason: String },
 }
 
 /// What happened to a card, for the claude it concerns.
@@ -260,6 +305,9 @@ const MAX_COLUMNS: usize = 12;
 const MAX_TITLE: usize = 200;
 const MAX_COL_NAME: usize = 40;
 const MAX_COL_DESC: usize = 500;
+/// Changes in one column proposal, and proposals waiting at once.
+const MAX_PROP_CHANGES: usize = 20;
+const MAX_PROPOSALS: usize = 20;
 /// Details and comments are Markdown; details are where long content goes.
 const MAX_DETAIL: usize = 20_000;
 const MAX_COMMENT: usize = 20_000;
@@ -687,11 +735,18 @@ impl Board {
                     "there is no `{action}` — move the card to the column that fits (e.g. the last one), or `archive` it; only the user deletes cards"
                 ))
             }
+            "columns" => {
+                let id = self.propose(from, v, now)?;
+                format!(
+                    "column proposal P{id} is waiting for the user — nothing changed yet. Mulpex messages you \
+                     their Approve / Reject; carry on meanwhile"
+                )
+            }
             "list" => String::new(),
-            "" => return Err("missing `action` (list, add, update, move, comment, archive)".into()),
+            "" => return Err("missing `action` (list, add, update, move, comment, archive, columns)".into()),
             other => {
                 return Err(format!(
-                    "unknown action {other:?} — use list, add, update, move, comment or archive (the user edits the columns)"
+                    "unknown action {other:?} — use list, add, update, move, comment, archive or columns (to propose a column change)"
                 ))
             }
         };
@@ -925,6 +980,9 @@ impl Board {
                 let at = before.and_then(|b| self.columns.iter().position(|c| c.id == b)).unwrap_or(self.columns.len());
                 self.columns.insert(at, c);
             }
+            BoardEdit::Approve { .. } | BoardEdit::Reject { .. } => {
+                return Err("a proposal is decided by `Board::decide`".into());
+            }
             BoardEdit::ColDelete { col, to } => {
                 if self.columns.len() <= 1 {
                     return Err("the board needs at least one column".into());
@@ -968,6 +1026,137 @@ impl Board {
         self.normalize();
         Self::stamp(&mut ev, &snaps);
         Ok((ev, gone_images))
+    }
+
+    /// `action: "columns"`: validate a claude's column changes by applying
+    /// them to a copy, and queue them for the user. Names resolve as the
+    /// changes go, so a later change may name a column an earlier one added
+    /// or renamed. The proposal's id.
+    fn propose(&mut self, from: usize, v: &Value, now: u64) -> Result<u32, String> {
+        const SHAPE: &str = "`columns` needs `changes`: a non-empty array of {op: \"add\", name, desc?, before?} | \
+            {op: \"edit\", column, name?, desc?} | {op: \"move\", column, before?} | {op: \"delete\", column, to?} \
+            (columns by name; `before` omitted = at the end; `to` omitted = its cards are archived)";
+        let items = v.get("changes").and_then(|x| x.as_array()).filter(|a| !a.is_empty()).ok_or(SHAPE)?;
+        if items.len() > MAX_PROP_CHANGES {
+            return Err(format!("at most {MAX_PROP_CHANGES} changes in one proposal"));
+        }
+        if self.proposals.len() >= MAX_PROPOSALS {
+            return Err(format!("{MAX_PROPOSALS} column proposals already wait for the user — wait for their answer"));
+        }
+        let mut sim = self.clone();
+        let mut news: Vec<(String, u32)> = Vec::new();
+        let mut changes = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            let at = |e: String| format!("change {}: {e}", i + 1);
+            let text = |k: &str| it.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            // A name on `sim` → a ref that survives until approval.
+            let refer = |sim: &Board, news: &[(String, u32)], x: &Value| -> Result<ColRef, String> {
+                let id = sim.col_by(x)?;
+                Ok(match news.iter().find(|(_, n)| *n == id) {
+                    Some((name, _)) => ColRef::New(name.clone()),
+                    None => ColRef::Id(id),
+                })
+            };
+            let opt = |sim: &Board, news: &[(String, u32)], k: &str| -> Result<Option<ColRef>, String> {
+                match it.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(x) => refer(sim, news, x).map(Some),
+                }
+            };
+            let need = |k: &str| it.get(k).filter(|x| !x.is_null()).ok_or_else(|| at(format!("needs `{k}`")));
+            let ch = match it.get("op").and_then(|x| x.as_str()).unwrap_or("") {
+                "add" => ColChange::Add {
+                    name: one_line(&text("name").unwrap_or_default(), MAX_COL_NAME),
+                    desc: cut(text("desc").unwrap_or_default().trim(), MAX_COL_DESC),
+                    before: opt(&sim, &news, "before").map_err(at)?,
+                },
+                "edit" | "rename" => {
+                    let name = text("name").map(|n| one_line(&n, MAX_COL_NAME)).filter(|n| !n.is_empty());
+                    let desc = text("desc").map(|d| cut(d.trim(), MAX_COL_DESC));
+                    if name.is_none() && desc.is_none() {
+                        return Err(at("`edit` needs a new `name` and/or `desc`".into()));
+                    }
+                    ColChange::Edit { col: refer(&sim, &news, need("column")?).map_err(at)?, name, desc }
+                }
+                "move" => ColChange::Move {
+                    col: refer(&sim, &news, need("column")?).map_err(at)?,
+                    before: opt(&sim, &news, "before").map_err(at)?,
+                },
+                "delete" | "remove" => ColChange::Delete {
+                    col: refer(&sim, &news, need("column")?).map_err(at)?,
+                    to: opt(&sim, &news, "to").map_err(at)?,
+                },
+                _ => return Err(at(SHAPE.into())),
+            };
+            sim.apply_change(&ch, &mut news, now).map_err(at)?;
+            changes.push(ch);
+        }
+        let mut seen = HashSet::new();
+        if let Some(c) = sim.columns.iter().find(|c| !seen.insert(c.name.to_lowercase())) {
+            return Err(format!("two columns would be called {:?}", c.name));
+        }
+        self.next_prop += 1;
+        let why = cut(v.get("why").and_then(|x| x.as_str()).unwrap_or("").trim(), MAX_COL_DESC);
+        self.proposals.push(Proposal { id: self.next_prop, by: from, why, changes, at: now });
+        Ok(self.next_prop)
+    }
+
+    /// One change of a proposal, through the user's own column edits.
+    fn apply_change(&mut self, ch: &ColChange, news: &mut Vec<(String, u32)>, now: u64) -> Result<Vec<Event>, String> {
+        let id = |r: &ColRef| -> Result<u32, String> {
+            match r {
+                ColRef::Id(i) => self.col(*i).map(|c| c.id).ok_or_else(|| "a column it names is gone".into()),
+                ColRef::New(n) => news.iter().find(|(m, _)| m == n).map(|(_, i)| *i).ok_or_else(|| format!("no new column {n:?}")),
+            }
+        };
+        let edit = match ch {
+            ColChange::Add { name, desc, before } => {
+                let before = before.as_ref().map(&id).transpose()?;
+                let (mut ev, _) = self.apply_user(BoardEdit::ColAdd { name: name.clone(), desc: desc.clone() }, now)?;
+                let col = self.next_col;
+                news.push((name.clone(), col));
+                if before.is_some() {
+                    ev.extend(self.apply_user(BoardEdit::ColMove { col, before }, now)?.0);
+                }
+                return Ok(ev);
+            }
+            ColChange::Edit { col, name, desc } => BoardEdit::ColEdit { col: id(col)?, name: name.clone(), desc: desc.clone() },
+            ColChange::Move { col, before } => BoardEdit::ColMove { col: id(col)?, before: before.as_ref().map(&id).transpose()? },
+            ColChange::Delete { col, to } => BoardEdit::ColDelete { col: id(col)?, to: to.as_ref().map(&id).transpose()? },
+        };
+        Ok(self.apply_user(edit, now)?.0)
+    }
+
+    /// The user's Approve / Reject of proposal `id`: all its changes or none —
+    /// an approval that no longer fits the board (a column it names was
+    /// deleted meanwhile) is refused and the proposal stays, to reject. Returns
+    /// who proposed it, the message for them, and the cards' events.
+    pub fn decide(&mut self, id: u32, approve: bool, reason: &str, now: u64) -> Result<(usize, String, Vec<Event>), String> {
+        let i = self.proposals.iter().position(|p| p.id == id).ok_or("that proposal is gone")?;
+        if !approve {
+            let p = self.proposals.remove(i);
+            let reason = reason.trim();
+            let why = if reason.is_empty() { String::new() } else { format!(" Their reason: {reason}") };
+            let msg = format!(
+                "The user REJECTED your Board column proposal P{id} — the columns did not change.{why} \
+                 Don't propose it again unless the user asks. Do NOT hub_send a reply."
+            );
+            return Ok((p.by, msg, Vec::new()));
+        }
+        let p = self.proposals[i].clone();
+        let mut next = self.clone();
+        next.proposals.remove(i);
+        let mut news = Vec::new();
+        let mut ev = Vec::new();
+        for ch in &p.changes {
+            ev.extend(next.apply_change(ch, &mut news, now).map_err(|e| format!("can't apply P{id}: {e} — reject it instead"))?);
+        }
+        *self = next;
+        let msg = format!(
+            "The user APPROVED your Board column proposal P{id}. The columns are now:\n{}Do NOT hub_send a reply.",
+            self.columns_text()
+        );
+        Ok((p.by, msg, ev))
     }
 
     /// What a claude sees. By default only ITS cards that are not archived —
@@ -2130,6 +2319,62 @@ mod tests {
         assert!(b.card(1).unwrap().archived && b.col(b.card(1).unwrap().col).is_some());
         b.apply_user(BoardEdit::ColDelete { col: 2, to: None }, 2).unwrap();
         assert!(b.apply_user(BoardEdit::ColDelete { col: 1, to: None }, 2).is_err(), "the last column stays");
+    }
+
+    #[test]
+    fn a_claudes_column_change_waits_for_the_user() {
+        let mut b = Board::default();
+        let names = |b: &Board| b.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        // Names resolve as the changes go: the move names the column the add makes.
+        let (note, _) = claude(&mut b, 3, json!({"action":"columns","why":"QA piles up","changes":[
+            {"op":"add","name":"QA","desc":"I test here"},
+            {"op":"move","column":"qa","before":"Done"},
+            {"op":"edit","column":"Doing","desc":"now"},
+        ]})).unwrap();
+        assert!(note.contains("P1"), "{note}");
+        assert_eq!(names(&b), ["To Do", "Doing", "Done"], "nothing changes before approval");
+        assert_eq!(b.proposals[0].changes[1], ColChange::Move { col: ColRef::New("QA".into()), before: Some(ColRef::Id(3)) });
+        // The user renaming a column meanwhile doesn't break it: refs are ids.
+        b.apply_user(BoardEdit::ColEdit { col: 3, name: Some("Shipped".into()), desc: None }, 2).unwrap();
+        let (by, msg, _) = b.decide(1, true, "", 3).unwrap();
+        assert_eq!(by, 3);
+        assert_eq!(names(&b), ["To Do", "Doing", "QA", "Shipped"]);
+        assert_eq!(b.columns[1].desc, "now");
+        assert!(msg.contains("APPROVED") && msg.contains("\"QA\" — I test here"), "{msg}");
+        assert!(b.proposals.is_empty());
+
+        // Bad proposals are refused whole, at proposal time.
+        for bad in [
+            json!({"action":"columns","changes":[]}),
+            json!({"action":"columns","changes":[{"op":"delete","column":"nope"}]}),
+            json!({"action":"columns","changes":[{"op":"add","name":"qa"}]}),
+            json!({"action":"columns","changes":[{"op":"edit","column":"QA"}]}),
+            json!({"action":"columns","changes":[{"op":"delete","column":"QA","to":"QA"}]}),
+        ] {
+            assert!(claude(&mut b, 3, bad.clone()).is_err(), "{bad}");
+        }
+        assert!(b.proposals.is_empty());
+
+        // Reject: nothing changes, the reason reaches the claude.
+        claude(&mut b, 4, json!({"action":"columns","changes":[{"op":"delete","column":"QA"}]})).unwrap();
+        let (by, msg, _) = b.decide(2, false, "I like it", 4).unwrap();
+        assert_eq!(by, 4);
+        assert!(msg.contains("REJECTED") && msg.contains("I like it"));
+        assert_eq!(names(&b).len(), 4);
+
+        // A delete moves its cards like the user's own, and tells their claude.
+        claude(&mut b, 4, json!({"action":"add","items":[{"title":"a","column":"QA"}]})).unwrap();
+        claude(&mut b, 4, json!({"action":"columns","changes":[{"op":"delete","column":"QA","to":"Doing"}]})).unwrap();
+        // Approval re-checks the board: a column it names is gone → refused, kept.
+        claude(&mut b, 4, json!({"action":"columns","changes":[{"op":"edit","column":"To Do","name":"Later"}]})).unwrap();
+        b.apply_user(BoardEdit::ColDelete { col: 1, to: None }, 5).unwrap();
+        assert!(b.decide(4, true, "", 6).unwrap_err().contains("gone"));
+        assert_eq!(b.proposals.len(), 2);
+        let (_, _, ev) = b.decide(3, true, "", 6).unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].to, 4);
+        assert_eq!(b.cards[0].col, 2);
+        assert!(b.decide(3, true, "", 6).is_err(), "decided once");
     }
 
     #[test]

@@ -207,8 +207,11 @@ shows the whole board). Use it for the work you do with the user and for anythin
 them: a QA pass, an action they must take, a non-blocking decision (give the options as choices). \
 FOLLOW THE COLUMN DESCRIPTIONS listed below: they are the user's workflow — move each card of \
 yours (action move, with the column's name) as soon as its column changes, e.g. into the column \
-that says you need the user to test, with the QA steps in the card's detail. You cannot add, \
-rename or delete columns; suggest a change in a comment if one is missing. \
+that says you need the user to test, with the QA steps in the card's detail. THE COLUMNS ARE \
+THE USER'S: you never change them directly, you PROPOSE (action columns: add, rename, \
+re-describe, reorder or delete, with a short why) — only when the user asks, or when the work \
+clearly needs a column that is missing. Nothing changes until the user approves it in the panel; \
+Mulpex messages you the answer, so carry on meanwhile and never re-propose a rejected change. \
 BUT THE BOARD NEVER REPLACES AskUserQuestion: anything you would block on — planning, \
 assumptions, which way to build something, any answer that changes what you do next — you ask \
 with the AskUserQuestion tool, exactly as you would without the board, and never move such a \
@@ -422,6 +425,7 @@ mod tests {
         assert!(BOARD_RULE.contains("NEVER REPLACES AskUserQuestion"));
         assert!(BOARD_RULE.contains("LONG CONTENT GOES IN A CARD'S DETAIL"));
         assert!(BOARD_RULE.contains("FOLLOW THE COLUMN DESCRIPTIONS"));
+        assert!(BOARD_RULE.contains("THE COLUMNS ARE THE USER'S"));
         for n in named {
             assert!(listed.iter().any(|l| l == n), "HUB_RULES names {n}, which no tool is");
         }

@@ -12,7 +12,7 @@
   import { tick } from "svelte";
   import { activeProjectHandle, activeId, sessions } from "../stores";
   import { boards, boardAll, editBoard, setBoardOn, sendBoard, imageCount, unreadCount, pendingCards } from "../board";
-  import type { Board, BoardCard, BoardColumn } from "../ipc";
+  import type { Board, BoardCard, BoardColumn, BoardColChange, BoardColRef } from "../ipc";
   import { terminals } from "../terminals";
   import CardOverlay from "./CardOverlay.svelte";
 
@@ -39,6 +39,43 @@
   const archived = $derived(board?.cards.filter((c) => c.archived) ?? []);
 
   const edit = (e: Parameters<typeof editBoard>[1]) => (h != null ? editBoard(h, e) : Promise.resolve(false));
+
+  // ── claudes' column proposals ──────────────────────────────────────────────
+  // Nothing changes until Approve; the claude hears the answer at once.
+  let rejecting: number | null = $state(null);
+  let rejectWhy = $state("");
+
+  const refName = (b: Board, r: BoardColRef | null) =>
+    r == null ? null : "id" in r ? (b.columns.find((c) => c.id === r.id)?.name ?? "(a deleted column)") : r.new;
+
+  /** One change, said plainly: a line, an optional second line, and what it replaces. */
+  function said(b: Board, ch: BoardColChange): { icon: string; line: string; sub?: string; was?: string } {
+    const q = (s: string | null) => `“${s}”`;
+    switch (ch.op) {
+      case "add":
+        return { icon: "＋", line: `Add ${q(ch.name)} ${ch.before ? `before ${q(refName(b, ch.before))}` : "at the end"}`, sub: ch.desc || undefined };
+      case "edit": {
+        const old = "id" in ch.col ? b.columns.find((c) => "id" in ch.col && c.id === ch.col.id) : undefined;
+        const line = ch.name != null ? `Rename ${q(refName(b, ch.col))} → ${q(ch.name)}` : `Describe ${q(refName(b, ch.col))}`;
+        return { icon: "✎", line, sub: ch.desc != null ? ch.desc || "(no description)" : undefined, was: ch.desc != null ? old?.desc || undefined : undefined };
+      }
+      case "move":
+        return { icon: "↔", line: `Move ${q(refName(b, ch.col))} ${ch.before ? `before ${q(refName(b, ch.before))}` : "to the end"}` };
+      case "delete": {
+        const n = "id" in ch.col ? b.cards.filter((c) => "id" in ch.col && c.col === ch.col.id && !c.archived).length : 0;
+        const one = n === 1;
+        const cards = n ? `its ${n} card${one ? "" : "s"} ${ch.to ? `move${one ? "s" : ""} to ${q(refName(b, ch.to))}` : `${one ? "is" : "are"} archived`}` : "it has no cards";
+        return { icon: "✕", line: `Delete ${q(refName(b, ch.col))}`, sub: cards };
+      }
+    }
+  }
+
+  async function reject(id: number) {
+    if (await edit({ op: "reject", proposal: id, reason: rejectWhy })) {
+      rejecting = null;
+      rejectWhy = "";
+    }
+  }
 
   // ── adding cards ───────────────────────────────────────────────────────────
   let addingIn: number | null = $state(null);
@@ -264,6 +301,44 @@
         {showArchived ? "← Board" : `Archived${archived.length ? ` (${archived.length})` : ""}`}
       </button>
     </div>
+
+    {#if board.proposals?.length}
+      <div class="props">
+        {#each board.proposals as p (p.id)}
+          <div class="prop">
+            <div class="phead"><b>claude#{p.by}</b> wants to change the columns <span class="num">P{p.id}</span></div>
+            {#if p.why}<div class="pwhy" dir="auto">{p.why}</div>{/if}
+            <ul>
+              {#each p.changes as ch, i (i)}
+                {@const s = said(board, ch)}
+                <li class={ch.op}>
+                  <span class="picon">{s.icon}</span>
+                  <div>
+                    <div dir="auto">{s.line}</div>
+                    {#if s.sub}<div class="psub" dir="auto">{s.sub}</div>{/if}
+                    {#if s.was}<div class="pwas" dir="auto">was: {s.was}</div>{/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+            {#if rejecting === p.id}
+              <!-- svelte-ignore a11y_autofocus -->
+              <textarea dir="auto" rows="2" bind:value={rejectWhy} autofocus placeholder="Why not? (optional — claude#{p.by} reads it)"
+                onkeydown={(e) => { if (e.key === "Escape") rejecting = null; else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void reject(p.id); } }}></textarea>
+              <div class="row-end">
+                <button class="link" onclick={() => (rejecting = null)}>Cancel</button>
+                <button class="btn danger" onclick={() => reject(p.id)}>Reject</button>
+              </div>
+            {:else}
+              <div class="row-end">
+                <button class="btn quiet" onclick={() => { rejecting = p.id; rejectWhy = ""; }}>Reject…</button>
+                <button class="btn" onclick={() => edit({ op: "approve", proposal: p.id })}>Approve</button>
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
 
     {#if showArchived}
       <div class="archived">
@@ -518,6 +593,85 @@
   }
   .btn:disabled {
     opacity: 0.45;
+  }
+  .btn.danger {
+    background: var(--dot-needs);
+  }
+
+  /* ── column proposals ── */
+  .props {
+    flex: 0 1 auto;
+    max-height: 45%;
+    overflow-y: auto;
+    padding: 0.45rem 0.45rem 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .prop {
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 0.45rem 0.55rem;
+    font-size: 0.78rem;
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .phead {
+    color: var(--text-dim);
+  }
+  .phead b {
+    color: var(--text);
+  }
+  .phead .num {
+    float: right;
+    color: var(--text-faint);
+    font-size: 0.7rem;
+  }
+  .pwhy {
+    margin-top: 0.2rem;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .prop ul {
+    list-style: none;
+    margin: 0.35rem 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .prop li {
+    display: flex;
+    gap: 0.4rem;
+    color: var(--text);
+  }
+  .picon {
+    flex: 0 0 1rem;
+    text-align: center;
+    color: var(--accent);
+  }
+  .prop li.delete .picon {
+    color: var(--dot-needs);
+  }
+  .psub {
+    color: var(--text-dim);
+    white-space: pre-wrap;
+  }
+  .pwas {
+    color: var(--text-faint);
+    text-decoration: line-through;
+    white-space: pre-wrap;
+  }
+  .prop textarea {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 0.3rem;
+    font: inherit;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.25rem 0.4rem;
+    resize: vertical;
   }
 
   /* ── columns ── */

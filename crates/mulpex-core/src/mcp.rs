@@ -223,7 +223,7 @@ pub(crate) fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "add", "update", "move", "comment", "archive"], "description": "What to do. `move` puts a card (or several) in a column, at its top. `comment` adds to a card's thread (with `id`, `text` and/or `images`) — where you answer the user and ask follow-ups. `archive` hides a card that no longer matters (only the user deletes)." },
+                    "action": { "type": "string", "enum": ["list", "add", "update", "move", "comment", "archive", "columns"], "description": "What to do. `move` puts a card (or several) in a column, at its top. `comment` adds to a card's thread (with `id`, `text` and/or `images`) — where you answer the user and ask follow-ups. `archive` hides a card that no longer matters (only the user deletes). `columns` PROPOSES a change to the columns (with `changes` and `why`): nothing changes until the user approves it in the panel; Mulpex messages you their answer." },
                     "items": {
                         "type": "array",
                         "description": "For `add`: the new cards. One card per THING — a QA pass is ONE card (\"QA the login flow\") with all its steps and questions in its `detail`, never one card per step.",
@@ -250,6 +250,23 @@ pub(crate) fn tool_defs() -> Value {
                     "urgent": { "type": "boolean", "description": "For `update`: set or clear URGENT." },
                     "images": { "type": "array", "items": { "type": "string" }, "description": "For `update` (added to the card) or `comment`: absolute paths of images to attach." },
                     "text": { "type": "string", "description": "For `comment`: what to say, in the user's language. Markdown, up to 20,000 characters." },
+                    "changes": {
+                        "type": "array",
+                        "description": "For `columns`: one proposal, approved or rejected as a whole. Columns are named by their current name; a later change may name a column an earlier one adds or renames.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": { "type": "string", "enum": ["add", "edit", "move", "delete"] },
+                                "column": { "type": "string", "description": "For edit/move/delete: the column." },
+                                "name": { "type": "string", "description": "For add: its name. For edit: a new name." },
+                                "desc": { "type": "string", "description": "For add/edit: what goes in the column — the rule every claude follows, in the user's language." },
+                                "before": { "type": "string", "description": "For add/move: the column it goes before. Omitted: at the end." },
+                                "to": { "type": "string", "description": "For delete: the column its cards move to. Omitted: they are archived." },
+                            },
+                            "required": ["op"],
+                        },
+                    },
+                    "why": { "type": "string", "description": "For `columns`: one or two sentences the user reads next to the proposal." },
                     "scope": { "type": "string", "enum": ["mine", "all"], "description": "For `list`: \"all\" lists every active card on the board (slim) — to see what your workers already have. Default: yours." },
                 },
                 "required": ["action"],
@@ -1357,7 +1374,7 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
 fn hub_board(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
     if action.is_empty() {
-        return Err("missing `action` (list, add, update, move, comment, archive)".into());
+        return Err("missing `action` (list, add, update, move, comment, archive, columns)".into());
     }
     let mut body = args.clone();
     let obj = body.as_object_mut().ok_or("arguments must be an object")?;

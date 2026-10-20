@@ -8,6 +8,7 @@
   } from "../stores";
   import { activeHost, activeHostOnline, hosts } from "../hosts";
   import HostSwitcher from "./HostSwitcher.svelte";
+  import { boards, proposalCount } from "../board";
 
   let {
     onselect,
@@ -113,6 +114,7 @@
          must not keep the tab lit up. -->
     {@const ready = readyCount(p)}
     {@const needs = needsCount(p)}
+    {@const props = proposalCount($boards.get(p.handle))}
     <div
       class="tab"
       class:active={p.handle === $activeProjectHandle}
@@ -155,6 +157,14 @@
               : ''} you"
           >
             {needs}
+          </span>
+        {/if}
+        {#if props > 0}
+          <span
+            class="badge board"
+            title="{props} Board column change{props === 1 ? '' : 's'} waiting for your approval"
+          >
+            ▤{props}
           </span>
         {/if}
       </button>
@@ -254,6 +264,10 @@
   .badge.ready {
     background: var(--dot-ready);
     color: #0c2110;
+  }
+  .badge.board {
+    background: var(--accent);
+    color: var(--bg);
   }
   .badge.needs {
     background: var(--dot-needs);

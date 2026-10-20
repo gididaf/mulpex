@@ -396,13 +396,15 @@ defines, cards with an assignee, detail, choices, comments and images. Backend
   empty Board tab. Every claude of the project is told at once, and while it is on every turn
   carries `BOARD_RULE` plus the current columns. Per project, not per row, because the board is
   shared; the coworker's projects stay quiet until they turn it on.
-- **Columns are generic: only the user edits them.** A new board starts To Do / Doing / Done, each
+- **Columns are generic: only the user changes them.** A new board starts To Do / Doing / Done, each
   with a default description. The **description is the rule claudes follow** — "Waiting for QA:
   move here when you need me to test, with QA steps" is the user's workflow, not Mulpex's; the
   hook carries name + description every turn (`board_on` file), so a renamed column reaches every
   claude on its next turn. Click a name to rename; `⋯` = description, move left/right, archive all,
   delete; `+` at the end adds one; headers drag. Deleting one with cards asks where they go
-  (another column, or archive). A claude cannot touch columns.
+  (another column, or archive). A claude can only PROPOSE a column change: it shows above the
+  columns with Approve / Reject…, counted on the Board tab and as a ▤ badge on the project tab
+  ([hub.md](hub.md#the-board-hub_board)).
 - **Side by side in the panel**, each column `flex: 1 0 9.5rem`, the row scrolling sideways when
   they don't fit. All / claude#N filter (claude#N = the focused claude's cards + unassigned),
   per viewer in localStorage. A card shows title, #n, assignee chip, URGENT, ◆ (choices), 💬, 🖼,
