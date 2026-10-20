@@ -22,7 +22,8 @@ the hub panel is Messages-only, and the ⌘⇧L side panel (To Do · Pins · Exp
 starting with `{` is `snap`/`r` from `pty.rs::compose`, rebuilding a pane the PTY daemon kept
 through an app restart. `received` must stay the stream offset. → [../docs/ptyd.md](../docs/ptyd.md)
 
-**Linux** has no native menu: `lib/linuxKeys.ts` maps Super chords to the menu ids (`platform.ts`
+**Linux** has no native menu: `components/MenuBar.svelte` draws one in the window and
+`lib/linuxKeys.ts` maps Super chords to the menu ids, so a new menu item goes in both (`platform.ts`
 says which OS). → [../docs/linux.md](../docs/linux.md)
 
 **Remote Hosts** (driving another Mulpex): a remote project's handle is `slot · 2^32 + its handle`

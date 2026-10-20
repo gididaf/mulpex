@@ -78,7 +78,8 @@ That makes "dead" no longer mean "remove", which two things depend on:
 
 ## Killing a session: `killpg` is not enough once a shell is involved
 
-`Session::kill` now sweeps **by controlling terminal** before the `killpg`, and that extra step
+A kill (the daemon's `DSession::kill` → `crates/mulpex-ptyd/src/procs.rs` since the PTY daemon)
+now sweeps **by controlling terminal** before the `killpg`, and that extra step
 exists entirely because of terminals:
 
 - A `claude` is a node process and does **no job control**, so everything its Bash tool spawns
@@ -110,7 +111,7 @@ Creating/driving a terminal is a `termreq/` file handshake through the poll loop
 **Why a grid emulator and not a line-based ANSI stripper.** `cargo`, `vite`, `docker compose` and
 every spinner repaint by moving the cursor and erasing. A filter that merely drops escape
 sequences emits *every intermediate frame*, stacked. Measured on real captured PTY bytes
-(`src-tauri/tests/fixtures/cargo-build.bin`, recorded through a real pty at 32×120): cargo's
+(`crates/mulpex-ptyd/tests/fixtures/cargo-build.bin`, recorded through a real pty at 32×120): cargo's
 progress bar repaints one line **17 times**; replayed through `vtgrid` the log is 8 lines — the 7
 `Compiling` lines and `Finished`, exactly what a human read on screen. Frozen as
 `vtgrid::replays`. So `Screen` is a bounded rows×cols grid the escape sequences actually act on,

@@ -105,6 +105,8 @@ A Cargo workspace + a Svelte/Vite frontend:
 - **`crates/mulpex-helper`** — a tiny binary (`hook <event>` / `mcp`) that each child `claude`
   invokes by absolute path. Kept separate from the GUI so it stays small and fast to exec (a
   hook forks on every tool call).
+- **`crates/mulpex-ptyd`** — the PTY daemon: it owns every claude and terminal, so they keep
+  running through an app restart or update.
 - **`src-tauri`** — the Tauri app: PTY hosting (`pty.rs`), the `Workspace` of open projects with
   per-project reap/persist/hub-read (`state.rs`), commands (`commands.rs`), the 200 ms poll loop
   that emits handle-scoped hub updates over every project (`hub.rs`), the native menu (`menu.rs`),
@@ -149,8 +151,9 @@ logged in (`claude` must be on your `PATH`) — Mulpex launches your own `claude
 hours (or on demand via **Mulpex ▸ Check for Updates…**), and a new version raises a card with an
 **Update & Restart** button that downloads, verifies, installs and relaunches. No second `xattr`
 — that flag is set by the *browser* that downloads a file, and the in-app updater doesn't go
-through one. If sessions are mid-turn it says so and asks before restarting; sessions come back
-via `--resume`.
+through one. Claudes and terminals keep running through the restart; only when the update also needs a
+new PTY daemon does it ask first if sessions are mid-turn, and they then come back via
+`--resume`. Connected remote hosts are updated first when needed.
 
 ## Develop
 
@@ -160,6 +163,7 @@ Requires Rust and Node. Mulpex launches whatever `claude` you have installed (re
 ```sh
 npm install
 npm run tauri dev      # builds mulpex-helper, starts Vite, launches the app
+npm run tauri:dev      # same, on a free port with a home per git worktree (several side by side)
 ```
 
 ## Build

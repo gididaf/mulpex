@@ -4,21 +4,22 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 
 | You are editing | Read first |
 | --- | --- |
-| `pty.rs` (spawn, geometry, task delivery, `kill`), `claude_bin.rs` | [../docs/sessions.md](../docs/sessions.md) — binary resolution, login env forwarding, status words; [../docs/rendering.md](../docs/rendering.md) — one geometry; [../docs/shell-terminals.md](../docs/shell-terminals.md) — the tty sweep behind a terminal's `running`/`cwd` |
+| `pty.rs` (spawn, geometry, task delivery, `kill`), `claude_bin.rs` | [../docs/sessions.md](../docs/sessions.md) — binary resolution, login env forwarding, status words; [../docs/rendering.md](../docs/rendering.md) — one geometry; [../docs/shell-terminals.md](../docs/shell-terminals.md) — the tty sweep behind a terminal's `running`/`cwd` (now in `crates/mulpex-ptyd/src/procs.rs`) |
 | `state.rs` (`Core`, `Workspace`, `reap_dead`, poll-loop handshakes) | [../docs/sessions.md](../docs/sessions.md) — kept-failed instances, stable ids, `sticky` restores; [../docs/hub.md](../docs/hub.md) — spawn/name/term request fulfilment |
 | `ptyd.rs`, `pty.rs` `Session`/`OutputSink`/`compose`, `Core::open` adoption, `lib.rs` `teardown`, `restart_app`, `crates/mulpex-ptyd/*` | [../docs/ptyd.md](../docs/ptyd.md) — the daemon owns every PTY; quit vs detach; why a `Session` drop must not kill during a detach; daemon changes ship late |
 | `SessionKind`; `crates/mulpex-ptyd/src/vtgrid.rs` (the `Recorder`, now run by the daemon) | [../docs/shell-terminals.md](../docs/shell-terminals.md) |
 | the remote-peer watcher | [../docs/remote-peers.md](../docs/remote-peers.md) |
 | `saves.rs`, `docs_import.rs`, `save_prompts/*` (⌘S: fork → memoryless check → fork fix, read-only tools, writes `mulpex/saves/` at the git root; guides; the links file; Import Docs' sort / apply / one commit / link fixing) | [../docs/saves.md](../docs/saves.md) — why the doc must stand alone, why the forks run in the project dir, why `total_cost_usd` over-reports |
 | `remote/*` (Remote Control: relay connection, pairing/E2E crypto, transcript chat, dialog keys, Web Push), `pty.rs` `OutputSink::tap` | [../docs/remote-control.md](../docs/remote-control.md) — the security model, why typing goes through the desktop, the measured dialog keys |
-| `remote/client.rs`, `remote/desktop.rs`, `remote/rpc.rs` (Remote Hosts: driving another Mulpex / being driven), `pty.rs` `OutputSink::desktop_tap`, `Workspace::geometry_owner` | [../docs/remote-hosts.md](../docs/remote-hosts.md) — handles, mirror snapshots at an exact stream offset, the geometry lease |
+| `remote/client.rs`, `remote/desktop.rs`, `remote/rpc.rs`, `remote_update.rs`, `wire.rs` (Remote Hosts: driving another Mulpex / being driven), `pty.rs` `OutputSink::desktop_tap`, `Workspace::geometry_owner` | [../docs/remote-hosts.md](../docs/remote-hosts.md) — handles, mirror snapshots at an exact stream offset, the geometry lease |
 | `explain.rs`, `explain_prompt.md` (⌘⇧E: a Sonnet `--fork-session` explains a selection; follow-ups `--resume` that fork; Mulpex deletes it) | [../docs/explain.md](../docs/explain.md) — why follow-ups resume instead of re-fork (measured cache cost), why it is gated on the transcript file |
 | `secrets.rs` (⌘K) | [../docs/secrets.md](../docs/secrets.md) |
-| `live_token.rs` (Mulpex ▸ Live Token…: the token-swapping API proxy), its env in `pty.rs`/`saves.rs`/`explain.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real, per-claude routes/pins |
+| `live_token.rs` (Mulpex ▸ Live Token…: settings + named tokens + pins for the daemon's token-swapping proxy), its env in `pty.rs`/`saves.rs`/`explain.rs`/`broadcast.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real, per-claude routes/pins |
+| `broadcast.rs`, `broadcast_prompt.md` (⌘⇧B Ask All Claudes) | [../docs/hub.md](../docs/hub.md) |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
 | `todos.rs` (To Do: `hub_todo`, drafts, UPDATE) | [../docs/hub.md](../docs/hub.md) — single writer, delivery gate, message body; [../docs/frontend.md](../docs/frontend.md) — drafts and conflicts. No field may be named `handle` (`client.rs::lift`) |
-| `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts` → [../docs/linux.md](../docs/linux.md) |
-| `pty.rs` process sweeps (`/proc` on Linux), `tauri.linux.conf.json`, `capabilities/linux.json`, `scripts/release-linux.sh` | [../docs/linux.md](../docs/linux.md) |
+| `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts`, a new item in `src/lib/components/MenuBar.svelte` → [../docs/linux.md](../docs/linux.md) |
+| `crates/mulpex-ptyd/src/procs.rs` process sweeps (`/proc` on Linux), `tauri.linux.conf.json`, `capabilities/linux.json`, `scripts/release-linux.sh` | [../docs/linux.md](../docs/linux.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
 
 Traps that live in this directory specifically:
@@ -56,7 +57,7 @@ Traps that live in this directory specifically:
   - **Why:** Claude Code runs each one as a direct child in its own process group, with no
     controlling terminal (measured: `PGID == pid`, `SESS 0`, `Ss`). So the `killpg` and
     `kill_tty_session` both miss it.
-  - **The fix:** since 2026-10-07, `Session::kill` first runs `kill_child_groups` and kills the
+  - **The fix:** since 2026-10-07, a kill (now the daemon's `DSession::kill`) first runs `kill_child_groups` and kills the
     group of every direct child of the `claude`. That covers ⌘W, ⌘S, ⌘⇧R and quit.
   - **What it can't catch:** a `claude` that dies on its own (a crash, `/exit`). Its children are
     reparented to launchd and can no longer be told apart. The hub listener therefore still has to

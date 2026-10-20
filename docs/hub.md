@@ -182,8 +182,9 @@ whole reason the repair is a two-hook file handshake instead of a check inside `
 
 ### A listener outlives everything that is supposed to kill it
 
-`Session::kill` `killpg`s the child's process group (`pty.rs`) and sweeps its controlling terminal
-(`kill_tty_session`). **A hub listener escapes both.** Claude Code runs each background command in
+A kill (`Session::kill`, done by the daemon's `DSession::kill` since 2026-10-19) `killpg`s the
+child's process group and sweeps its controlling terminal (`kill_tty_session`, both in
+`crates/mulpex-ptyd/src/procs.rs`). **A hub listener escapes both.** Claude Code runs each background command in
 its own process group with no controlling terminal — measured on live listeners: `PGID == pid`,
 `SESS 0`, state `Ss` (no `+`). So it survives ⌘W, a crash and app teardown alike, and launchd
 adopts it still spinning `sleep 1`. Six were found alive on one machine at once, the oldest from
@@ -393,15 +394,16 @@ one `MULPEX_STATE_DIR` (`pty.rs`), every hub path is `state_dir.join(…)`, so a
 had no name a child process could utter. The feature is therefore mostly about *naming*.
 
 - **The registry** (`mulpex-core/src/registry.rs`, published at the state ROOT as
-  `temp/mulpex-<pid>/registry.json`) is the one file that says what the other projects are, where
+  `temp/mulpex-<daemon pid>/registry.json`) is the one file that says what the other projects are, where
   each one's state dir is, and who is live in it. The **poll loop writes it** (`hub.rs`) because it
   is the only context holding every `Core` under one lock; `Core::registry_entry` builds an entry
   from the snapshot it already computed, so it costs no extra disk reads and inherits `statuses`'
   membership rule — shells and failed-to-start instances are absent, exactly as they are locally.
   Written only when the bytes change, temp+rename.
-  - The root is per **process** (`mulpex-<pid>`), so "reachable" means precisely "open in this
-    Mulpex window" — a second Mulpex is a separate universe, with no code to make it so.
-  - A child knows its own `MULPEX_STATE_DIR = <root>/<handle>`, so it finds the registry with
+  - The root is per **PTY daemon** (`mulpex-<daemon pid>`, docs/ptyd.md — it outlives an app
+    restart), so "reachable" means precisely "open in this Mulpex" — a second Mulpex with its own
+    home is a separate universe, with no code to make it so.
+  - A child knows its own `MULPEX_STATE_DIR = <root>/<project_key>`, so it finds the registry with
     `parent()`. **No new env var was needed**, which is why nothing in `pty.rs` changed.
   - Staleness is ≤200 ms — the same guarantee the per-project `instances` file already gives, so
     validating a foreign recipient is no more of a race than validating a local one.

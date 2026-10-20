@@ -160,7 +160,9 @@ Shift+Enter's ESC+CR in one write).
 
 Ops: `hello`, `list`, `shutdown` (frozen); `spawn`, `attach` (ring + resizes +
 init, and streaming starts exactly after it — both under the ring lock),
-`resize`, `kill` (replies once reaped), `set_meta`, `live_token`, `detach`.
+`resize`, `kill` (replies once reaped), `set_meta`, `live_token` (its reply carries
+`routes: true` since 2026-10-19), `live_token_stats`, `detach`. An additive op or reply field
+that the app detects at runtime is not a `PROTO` bump (docs/live-token.md).
 Events: `exit`, `resize` (at its place in the stream). A new connection's
 `hello` replaces the old one; a session streams to an app only after that app
 spawned or attached it.

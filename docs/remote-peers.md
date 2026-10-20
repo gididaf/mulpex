@@ -74,7 +74,7 @@ treated as free regardless of how its prompt looks.
 ## The marker, and why it looks like that
 
 Every one of these was measured against a real remote over ssh (fixtures
-`src-tauri/tests/fixtures/remote-claude-*.bin`, pinned by `vtgrid::remote_claude_replays`):
+`crates/mulpex-ptyd/tests/fixtures/remote-claude-*.bin`, pinned by `vtgrid::remote_claude_replays`):
 
 - **`<<<MPX <token> <kind> <summary>>>>`, because the delimiters cannot be markdown.** The first
   design used `__MPX_TO_LOCAL__`. Claude Code renders its output as markdown, `__x__` is *bold*, and

@@ -529,8 +529,10 @@ not a cosmetic relabel. The number is what the sidebar shows, what a person says
 `hub_send` addresses (`claude#15`, `central-one#3`) — so after a restart every number named a
 different conversation than it had the day before. The store now carries the id as a **fourth
 positional column**, `<uuid>[\t<name>[\tmuted[\t<id>]]]`, read with `splitn(4, '\t')`, and a restore
-reuses it. (Two more columns followed: the `hub_spawn` parent's id and a `collapsed` flag, making
-the full line `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`. An older build reads
+reuses it. (More columns followed: the `hub_spawn` parent's id, a `collapsed` flag, the auto-compact
+percent, who named the row (`name_by`) and the To Do flag, making the full line
+`<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos]]]]]]]]`
+— `persist.rs` is the source of truth. An older build reads
 the id column of such a line as garbage, so downgrading loses the number of any nested row.) Gaps are kept (#2, #3, #15) because the gap is the truth; `next_id` continues from
 `max + 1`, so a fresh ⌘T cannot collide with a restored instance or land in a hole.
 

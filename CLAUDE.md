@@ -26,16 +26,16 @@ reasoning in `docs/`.
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — To Do (`hub_todo` lists, opt-in per row via right-click, drafts until UPDATE) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
 | [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator's claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, ⌘⇧B Ask All Claudes (`hub_reply_broadcast`), `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) or to a sidebar name (`hub_instances` shows names) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
-| [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, `Session::kill`, `pty.rs`'s tty sweep, terminal MCP tools |
+| [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, the daemon's `DSession::kill` + `procs.rs` (tty sweep, kill sequence), terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
 | [docs/explain.md](docs/explain.md) | ⌘⇧E Explain Selection: select text in a claude, the side panel's Explain tab explains it in simple Hebrew; a hidden Sonnet `--fork-session` of the conversation writes it (streamed, markdown sanitized, hard RTL); follow-ups `--resume` that fork (cache: $0.12 vs $0.91 for a re-fork), which Mulpex deletes on close; gated on the transcript file, not `worked`. Replaced `/explain` (2026-10-08) and the Explainer panel before it | `explain.rs`, `explain_prompt.md`, `lib/explain.ts`, `ExplainTab.svelte`, `lib/markdown.ts`, `Core::explain_target` |
 | [docs/saves.md](docs/saves.md) | ⌘S Save Session: a hidden `--fork-session` of the instance writes a handoff doc to `mulpex/saves/` (Hebrew title/description, English body), a memoryless claude checks it, a second fork fills the gaps; why the doc must stand alone (30-day transcript deletion). ⌘L Load (Saves / Guides tabs, continue-the-conversation links in `~/.mulpex/save-links.tsv`). File ▸ Import Docs (Sonnet sorts a repo's `.md` into save / guide / stale / skip; Apply commits once and fixes links) | `saves.rs`, `docs_import.rs`, `save_prompts/*`, `LoadDialog`/`ImportDialog.svelte`, the save row status in `InstanceList.svelte` |
 | [docs/secrets.md](docs/secrets.md) | ⌘K Secrets: KEY=VALUE rows → a 0600 `.env`; only `🔑 KEY` is typed, and the path + rules ride every turn as hidden hook context; one-off (scratch dir, gone when the claude closes) vs saved (`<mulpex home>/secrets/`, global or project-only, refs); the shared file format | `secrets.rs` (both crates), `SecretsDialog.svelte`, `commands.rs` `secrets_*`, the `userpromptsubmit` note |
-| [docs/live-token.md](docs/live-token.md) | Mulpex ▸ Live Token…: an in-app proxy (`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>`) puts the token from a file on every claude's API requests, so an account switch needs no restart; off by default; refresh command every 60 s + on 401/429 with one retry; host-scoped so a remote host's tab configures that host. Named pasted tokens + per-claude pins (base URL `/c/<route>`, changed live), per-token 5h/7d usage from the reply headers. Why not `ANTHROPIC_UNIX_SOCKET` (TLS over the socket), why the env token stays real | `live_token.rs`, `LiveTokenDialog.svelte`, the env lines in `pty.rs`/`saves.rs`/`explain.rs` |
+| [docs/live-token.md](docs/live-token.md) | Mulpex ▸ Live Token…: a proxy in the PTY daemon (`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>`) puts the token from a file on every claude's API requests, so an account switch needs no restart; off by default; refresh command every 60 s + on 401/429 with one retry; host-scoped so a remote host's tab configures that host. Named pasted tokens + per-claude pins (base URL `/c/<route>`, changed live), per-token 5h/7d usage from the reply headers. Why not `ANTHROPIC_UNIX_SOCKET` (TLS over the socket), why the env token stays real | `live_token.rs`, `LiveTokenDialog.svelte`, the env lines in `pty.rs`/`saves.rs`/`explain.rs`/`broadcast.rs`, the daemon's `daemon/live_token.rs` |
 | [docs/remote-control.md](docs/remote-control.md) | ⌘⇧O Remote Control: a phone PWA drives every project through a relay (`mulpex.dreamvps.com`); QR pairing + end-to-end encryption (the relay reads nothing); chat from transcripts; typing via the desktop's prompt check (>900 B → a file); dialogs as buttons → measured keys; terminals as readable text over a hidden same-geometry xterm; start/close; Web Push sent by the Mac; keep-awake; on/off persists | `src-tauri/src/remote/*`, `crates/mulpex-relay`, `remote/`, `RemoteDialog.svelte`, the `remote-*` handlers in `App.svelte`, `OutputSink::tap`, the `dialog/` hook file, `scripts/deploy-relay.sh` |
-| [docs/remote-hosts.md](docs/remote-hosts.md) | File ▸ Connect to Remote Mulpex…: this Mulpex drives another (a Linux VM) over the Remote Control relay — host switcher, handles `slot·2^32+h`, real terminal mirrors (ring + resize markers, xterm-serialized snapshot at an exact stream offset), the geometry lease, the command allowlist, uploads, headless two-app test | `remote/client.rs`, `remote/desktop.rs`, `remote/rpc.rs` (classify every new command!), `hosts.ts`, `remoteHosts.ts`, `HostSwitcher.svelte`, `OutputSink` taps, `scripts/test-remote-hosts.sh` |
+| [docs/remote-hosts.md](docs/remote-hosts.md) | File ▸ Connect to Remote Mulpex…: this Mulpex drives another (a Linux VM) over the Remote Control relay — host switcher, handles `slot·2^32+h`, real terminal mirrors (ring + resize markers, xterm-serialized snapshot at an exact stream offset), the geometry lease, the command allowlist, uploads, headless two-app test; hosts update before the Mac, and only when the link's wire fingerprint changed | `remote/client.rs`, `remote_update.rs`, `wire.rs`, `remote/desktop.rs`, `remote/rpc.rs` (classify every new command!), `hosts.ts`, `remoteHosts.ts`, `HostSwitcher.svelte`, `OutputSink` taps, `scripts/test-remote-hosts.sh` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
-| [docs/linux.md](docs/linux.md) | The Linux port: Super = ⌘, no native menu (the webview claims every shortcut via `lib/linuxKeys.ts` and draws a menu bar, `components/MenuBar.svelte`), Super+C/V clipboard, `/proc` process sweeps, title-bar badge, AppImage + deb signed on the Mac | `menu.rs` (every new shortcut also goes in `linuxKeys.ts`), `pty.rs` process sweeps, `platform.ts`, `tauri.linux.conf.json`, `scripts/release-linux.sh` |
+| [docs/linux.md](docs/linux.md) | The Linux port: Super = ⌘, no native menu (the webview claims every shortcut via `lib/linuxKeys.ts` and draws a menu bar, `components/MenuBar.svelte`), Super+C/V clipboard, `/proc` process sweeps, title-bar badge, AppImage + deb signed on the Mac | `menu.rs` (every new shortcut also goes in `linuxKeys.ts`, every new item in `MenuBar.svelte`), the daemon's `procs.rs` process sweeps, `platform.ts`, `tauri.linux.conf.json`, `scripts/release-linux.sh` |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
 ## The key idea
@@ -91,6 +91,10 @@ src-tauri/            the Tauri app (Rust backend)
   src/explain.rs      ⌘⇧E Explain Selection: a Sonnet fork explains selected text in Hebrew,
                       follow-ups resume it, the fork is deleted on close — docs/explain.md
   src/secrets.rs      ⌘K Secrets: writes the 0600 `.env` files — docs/secrets.md
+  src/live_token.rs   Live Token: settings, named tokens, per-claude pins, pushed to the
+                      daemon's proxy — docs/live-token.md
+  src/remote_update.rs  an update orders connected hosts to update first; wire.rs is the
+                      fingerprint that says whether they must — docs/remote-hosts.md
   src/pins.rs         ⌘⇧P pins, one per instance, saved per project — docs/frontend.md
   src/todos.rs        "To Do" lists (hub_todo): model, drafts, UPDATE diff, store —
                       docs/hub.md + docs/frontend.md
@@ -117,7 +121,8 @@ src/                  Svelte/Vite frontend
   lib/components/*     ProjectTabBar, CommandPalette, TopBar, InstanceList, HubPanel,
                       TerminalPane/View, MessageReader, Rename, RightPanel (TodoTab, PinsTab, ExplainTab),
                       SaveOverlay, SecretsDialog, ContextMenu, UpdateBanner…
-scripts/release.sh    signed build → latest.json → gh release (docs/packaging.md)
+scripts/release.sh    signed build → draft release → Linux build adds itself → publish (docs/packaging.md)
+scripts/tauri-dev.sh  `npm run tauri:dev`: free Vite port + a home per worktree (`~/.mulpex-dev-<folder>`)
 scripts/deploy-relay.sh  Remote Control relay + phone app → the VM (docs/remote-control.md)
 remote/               the phone web app (PWA) for Remote Control
 docs/                 the deferred half of these notes — see the table above
@@ -181,8 +186,9 @@ forks on every Read/Write/Edit/Bash and the MCP server is long-lived per instanc
 must be tiny and fast to exec. It links only `mulpex-core` (~1.8 MB vs the ~29 MB app).
 
 **Path resolution** (`lib.rs::resolve_helper_path`): `current_exe().parent().join("mulpex-helper")`
-— works in `tauri dev` (`target/<profile>/`) and in the bundled `.app` (`Contents/MacOS/`). The
-absolute path is substituted for `__MULPEX_BIN__` in the config templates **before every spawn**,
+— works in `tauri dev` (`target/<profile>/`) and in the bundled `.app` (`Contents/MacOS/`).
+Claudes don't run that one: `ptyd::stable_helper` copies it to `<mulpex home>/bin/` on every launch,
+because a claude outlives the app bundle now (docs/ptyd.md). The absolute path is substituted for `__MULPEX_BIN__` in the config templates **before every spawn**,
 not just when a project opens (`mulpex-core`'s `state_dir.rs::write_state_dir`) — the scratch dir
 lives in `$TMPDIR` and macOS purges it out from under a long-running Mulpex. See
 [docs/sessions.md](docs/sessions.md#the-scratch-dir-is-rebuilt-before-every-spawn).
@@ -194,7 +200,8 @@ helper is SIGKILLed by Gatekeeper and **every hook then fails open silently**. D
 ## Data flow
 
 - **PTY → frontend:** per-session `tauri::ipc::Channel<String>` carrying **base64** chunks
-  (`pty.rs::OutputSink`, decoded in `terminals.ts`). Before the frontend attaches (restored
+  (`pty.rs::OutputSink`, decoded in `terminals.ts`), plus `{`-prefixed `snap`/`r` control frames
+  that rebuild a pane the daemon kept (docs/ptyd.md). Before the frontend attaches (restored
   sessions paint immediately on `--resume`), output is **buffered** and flushed on
   `attach_session` — race-free under the sink mutex.
 - **frontend → PTY:** `send_bytes(id, data)` from xterm `onData` (UTF-8 encoded). The one manual
@@ -225,7 +232,7 @@ helper is SIGKILLed by Gatekeeper and **every hook then fails open silently**. D
 Mulpex hosts **several projects at once in one window** and switches between them instantly. The
 single `Core` is now one of N owned by a `Workspace` (`state.rs`: `Mutex<Workspace>` replacing
 `Mutex<Option<Core>>`), each with a **monotonic `ProjectHandle`** (never reused after close, so a
-stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<pid>/<handle>/`.
+stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<daemon pid>/<project_key>/` (docs/ptyd.md).
 
 - **Hub isolation is free:** the hub is scoped entirely by `MULPEX_STATE_DIR`, passed per session
   in `pty.rs::Session::spawn`, so a per-project `state_dir` isolates each project's hub with no
@@ -388,7 +395,9 @@ and cost real time; each links to the measurement that settled it.
   by `ptyd::project_key`, never by its handle, and the helper runs from `<home>/bin/` — all three
   must outlive the app for a surviving claude's hooks to keep working. Daemon code reaches users
   only after their next real quit (an update never replaces a running daemon), so keep
-  `crates/mulpex-ptyd` small and bump `proto::PROTO` for any wire change. → [docs/ptyd.md](docs/ptyd.md)
+  `crates/mulpex-ptyd` small and bump `proto::PROTO` for any wire change the other side would
+  misread (a purely additive op or reply field, detected at runtime, is not a bump — see
+  `proto.rs` and docs/live-token.md). → [docs/ptyd.md](docs/ptyd.md)
 - **One geometry, or the pane is corrupted forever.** An xterm must never be fed bytes rendered for
   a different size — claude repaints *differentially* and never rewrites a row it believes is
   correct, so debris is permanent. `Workspace::geometry` is the single (cols, rows) every PTY in
@@ -435,7 +444,8 @@ and cost real time; each links to the measurement that settled it.
   each background command as a direct child in its own process group, with no controlling
   terminal. So `killpg` *and* the tty sweep both miss it: the hub listener survived ⌘W, crashes and
   teardown alike, and was found six-deep on one machine, a day old, still spinning.
-  - Since 2026-10-07, `Session::kill` kills those groups first (`kill_child_groups`, by parent pid).
+  - Since 2026-10-07 a kill takes those groups first (`kill_child_groups`, by parent pid) — now in
+    the daemon (`DSession::kill`, `crates/mulpex-ptyd/src/procs.rs`).
   - A `claude` that dies on its own leaves them orphaned and unidentifiable. Such a process
     therefore still has to notice on its own (`pids/<id>`) and be reapable from outside
     (`ppid == 1`). `reap_orphaned_listeners`
@@ -519,4 +529,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`ea1dcc436f6eeb945e8ee0bb75c90d9ec632d028` — 2026-10-12
+`e7f7db69837f7d03fbe6c8aef7a11b24223056a5` — 2026-10-20

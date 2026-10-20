@@ -19,7 +19,7 @@ Mac (src-tauri/src/remote/)  ──wss out──►  relay (crates/mulpex-relay)
 - **`remote/`** — the phone app (Svelte, built with `vite build --config remote/vite.config.ts`
   into `remote/dist`, served by the relay). Shares the repo's `node_modules`; its own `tsconfig.json`
   and `svelte.config.js` so `svelte-check --tsconfig ./remote/tsconfig.json` covers it.
-- **Desktop UI** — `RemoteDialog.svelte` (on/off, QR, relay address, paired phones + Remove), the
+- **Desktop UI** — `RemoteDialog.svelte` (on/off, QR, relay address with a Reset back to `DEFAULT_RELAY` shown only when it differs, paired phones + Remove), the
   `Remote · N phones` chip in `TopBar.svelte`, and the `remote-*` event handlers in `App.svelte`.
 
 ## Security model

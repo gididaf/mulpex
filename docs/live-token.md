@@ -21,7 +21,8 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   environment) on every connect and every change; the reply says where the proxy listens.
 - **When it is on**, Mulpex runs an HTTP proxy on `127.0.0.1:<random port>`. Every claude it spawns
   gets two env vars:
-  - `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>`;
+  - `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>` (plus `/c/<route>` when the daemon
+    supports per-claude pins — see below);
   - `ENABLE_TOOL_SEARCH=true`, unless the user's own env already sets it.
 
   Both are documented Claude Code env vars. This covers interactive claudes (`pty.rs`) and the
@@ -45,7 +46,7 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   from using the proxy to borrow the account. Claude Code keeps a base URL's path on every request
   (measured).
 - **The proxy binds before any project restores** (`lib.rs` `setup` → `live_token::init`), so
-  restored claudes already point at it. Once started it stays up for the life of the app, even if
+  restored claudes already point at it. Once started it stays up for the life of the PTY daemon (which outlives an app restart), even if
   the feature is turned off, so claudes already pointed at it keep working.
 - **Remote Hosts.** `live_token_get` and `live_token_set` are host-scoped. They are in
   `remote/rpc.rs` `ALLOWED`, and `ipc.ts` passes `host`. The dialog opened on a remote host's tab

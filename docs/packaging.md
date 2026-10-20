@@ -24,8 +24,8 @@ freshly built debug helper is overwritten by whatever the last release build sta
 a day-old helper that lacked the new `statusline` subcommand. It now runs `bundle-helper.sh`. For `tauri build`,
 `mulpex-helper` ships as a **signed sidecar** so it lands in `Contents/MacOS/` *and is signed with
 the bundle* — otherwise Gatekeeper SIGKILLs it and **every hook fails-open silently** (no
-coordination, no error). This is **wired**: `bundle.externalBin` is `["binaries/mulpex-helper"]`
-in `tauri.conf.json`, and `beforeBuildCommand` runs `scripts/bundle-helper.sh`, which builds the
+coordination, no error). This is **wired**: `bundle.externalBin` is `["binaries/mulpex-helper", "binaries/mulpex-ptyd"]`
+in `tauri.conf.json` (the PTY daemon ships the same way, docs/ptyd.md), and `beforeBuildCommand` runs `scripts/bundle-helper.sh`, which builds the
 helper in release and copies it to `src-tauri/binaries/mulpex-helper-<target-triple>` (the
 suffix Tauri expects). Tauri strips the suffix, places it at `Contents/MacOS/mulpex-helper`, and
 signs it with the app. Bundle `targets` are `["app", "dmg"]`, so `tauri build` produces both
@@ -199,7 +199,9 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   would have stayed invisible until a runtime upgrade moved the thread. `request_restart` always
   routes through `request_exit(RESTART_EXIT_CODE)`. The leak fix below is a prerequisite for all
   of this, not a nicety.
-- **Busy guard.** `updater.ts::busySessionCount()` counts `working` (mid-turn) and `needs`
+- **Busy guard.** Skipped entirely when `update_survives` says the running PTY daemon is one the
+  new version drives (`latest.json`'s `ptyd`/`ptyd_min`): every claude keeps running through the
+  restart, so there is nothing to stop. Otherwise `updater.ts::busySessionCount()` counts `working` (mid-turn) and `needs`
   (stopped on a question) across **every open project**, not just the visible one; non-zero parks
   the banner in a `confirming` state naming the count. `waiting` sessions don't count — `--resume`
   restores those intact. **One exception, and it is not a status word:** an instance holding a
@@ -226,7 +228,8 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   four artifacts. It then runs `release-linux.sh` (`--linux-host`, default the VM;
   `--mac-only` skips it), and only then makes the release public (`gh release edit --draft=false
   --latest`). The draft is there because the Mac orders its remote hosts to update to its own new
-  version first (docs/remote-hosts.md): a public `latest.json` without Linux in it would fail every
+  version first — only hosts on a different wire fingerprint (`latest.json`'s `wire`, `wire.rs`;
+  docs/remote-hosts.md): a public `latest.json` without Linux in it would fail every
   such update. If the Linux step fails, the release stays a draft and nothing has shipped. The unpushed check exists because `gh release create` is called with **no
   `--target`**, so GitHub creates the tag at the *remote* default branch's HEAD: with local
   commits unpushed, the tag names code the release does not contain — **silently**, since the
