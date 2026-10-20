@@ -1776,6 +1776,9 @@ impl Core {
     /// it a terminal would be *kept* when its shell died, which is the whole
     /// point for a shell that exits on its own but exactly wrong here.
     pub fn close(&mut self, id: usize) {
+        // Gone for good: a later claude with this number starts on the
+        // default Live Token, not on this one's pin.
+        crate::live_token::forget(&crate::live_token::route(&self.project_dir, id));
         self.closing.insert(id);
         self.saving.remove(&id);
         if let Some(session) = self.session_mut(id) {

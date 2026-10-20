@@ -30,6 +30,9 @@
     setSessionCollapsed,
     setAutoCompact,
     setTodosEnabled,
+    liveTokenGet,
+    liveTokenClaudes,
+    liveTokenAssign,
     reparentSession,
     setMuteMenuChecked,
     quitApp,
@@ -515,12 +518,55 @@
     }
   }
 
-  function openRowMenu(e: MouseEvent, s: SessionInfo) {
+  /** The row menu's Token submenu (Live Token): the tokens this machine has,
+   *  ✓ on the one claude#id is pinned to. Absent while Live Token is off, or
+   *  when the answer is slow (a remote host) — the menu must not wait on it. */
+  async function tokenMenu(h: ProjectHandle, id: number): Promise<CtxItem[]> {
+    const host = slotOf(h);
+    const ask = Promise.all([liveTokenGet(host), liveTokenClaudes(host)]);
+    const late = new Promise<null>((r) => setTimeout(() => r(null), 400));
+    const got = await Promise.race([ask, late]).catch(() => null);
+    if (!got) return [];
+    const [status, all] = got;
+    if (!status.token_file) return [];
+    const row = all.claudes.find((c) => c.handle === h && c.id === id);
+    const current = row?.token ?? null;
+    const pick = async (tokenId: string | null, name: string) => {
+      try {
+        await liveTokenAssign(h, id, tokenId);
+        flashToast(
+          row && !row.routed
+            ? `claude#${id} → ${name} after a restart (⌘⇧R): it started before per-claude tokens`
+            : `claude#${id} → ${name}`,
+        );
+      } catch (e) {
+        flashToast(String(e));
+      }
+    };
+    const name = current ? (status.tokens.find((t) => t.id === current)?.name ?? "?") : "Default";
+    return [
+      {
+        label: "Token",
+        hint: name,
+        sub: [
+          { label: "Default (token file)", checked: current == null, run: () => void pick(null, "Default") },
+          ...status.tokens.map((t) => ({
+            label: t.name,
+            checked: current === t.id,
+            run: () => void pick(t.id, t.name),
+          })),
+        ],
+      },
+    ];
+  }
+
+  async function openRowMenu(e: MouseEvent, s: SessionInfo) {
     const h = get(activeProjectHandle);
     if (h == null) return;
+    const shell = s.kind === "shell";
+    const token = shell ? [] : await tokenMenu(h, s.id);
     // Only the focused row's menu carries key hints (see above).
     const key = (k: string) => (get(activeId) === s.id ? k : undefined);
-    const shell = s.kind === "shell";
     const items: CtxItem[] = [
       {
         label: "Rename…",
@@ -588,6 +634,7 @@
                 run: () => void applyAutoCompact(h, s.id, pct),
               })),
             },
+            ...token,
           ]),
       { label: "Close", hint: key("⌘W"), danger: true, run: () => closeInstance(h, s.id) },
     ];
@@ -1663,7 +1710,7 @@
           activeSession: get(activeId),
           hosts: [...get(hosts).values()].map((h) => ({ slot: h.slot, name: h.name, state: h.state, error: h.error, geo: h.geo, update: h.update, version: h.version, wire: h.wire })),
           projects: [...get(projects).values()].map((p) => ({ handle: p.handle, name: p.name, dir: p.dir, sessions: p.sessions.map((s) => s.id) })),
-          text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog]")].map((e) => e.textContent?.trim()),
+          text: [...document.querySelectorAll(".empty, .banner, .toast, .notice, [role=dialog], [role=menu]")].map((e) => e.textContent?.trim()),
           dialogs: { pickerHost, showConnect, renameHostFor: renameHostFor?.slot ?? null },
           compactsHeld: get(compactsHeld),
         };

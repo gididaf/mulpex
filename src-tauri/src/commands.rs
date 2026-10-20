@@ -814,6 +814,86 @@ pub fn live_token_set(
     Ok(crate::live_token::status())
 }
 
+/// Live Token: add a pasted token under a name (checked against the API first).
+/// `async` only so the API check (up to 20 s) runs off the main thread.
+#[tauri::command(async)]
+pub fn live_token_add_token(name: String, token: String) -> Result<crate::live_token::Status, String> {
+    crate::live_token::add_token(&name, &token)?;
+    Ok(crate::live_token::status())
+}
+
+#[tauri::command]
+pub fn live_token_rename_token(token_id: String, name: String) -> Result<crate::live_token::Status, String> {
+    crate::live_token::rename_token(&token_id, &name)?;
+    Ok(crate::live_token::status())
+}
+
+/// Live Token: delete a pasted token; claudes pinned to it go to the default.
+#[tauri::command]
+pub fn live_token_delete_token(token_id: String) -> Result<crate::live_token::Status, String> {
+    crate::live_token::delete_token(&token_id)?;
+    Ok(crate::live_token::status())
+}
+
+/// Live Token: pin claude#id to a pasted token, or (`null`) back to the
+/// default. Takes effect on its next request.
+#[tauri::command]
+pub fn live_token_assign(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    token_id: Option<String>,
+) -> Result<(), String> {
+    let dir = {
+        let ws = state.ws.lock().unwrap();
+        ws.project(project_handle).ok_or("no such project")?.project_dir.clone()
+    };
+    crate::live_token::assign(&crate::live_token::route(&dir, id), token_id.as_deref())
+}
+
+/// Live Token: every live claude of every project on this machine, with the
+/// token it is pinned to and what its last request used, plus per-token stats.
+#[tauri::command]
+pub fn live_token_claudes(state: State<AppState>) -> serde_json::Value {
+    let rows: Vec<(ProjectHandle, String, usize, Option<String>, String)> = {
+        let ws = state.ws.lock().unwrap();
+        ws.projects
+            .iter()
+            .flat_map(|core| {
+                core.live_claude_ids().into_iter().map(move |id| {
+                    (
+                        core.handle,
+                        core.project_name.clone(),
+                        id,
+                        core.label_of(id),
+                        crate::live_token::route(&core.project_dir, id),
+                    )
+                })
+            })
+            .collect()
+    };
+    let stats = crate::live_token::daemon_stats();
+    let claudes: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(handle, project, id, label, route)| {
+            serde_json::json!({
+                "handle": handle,
+                "project": project,
+                "id": id,
+                "label": label,
+                "token": crate::live_token::assigned(&route),
+                "routed": crate::live_token::routed(&route),
+                "last": stats["routes"][&route],
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "claudes": claudes,
+        "tokens": stats.get("tokens").cloned().unwrap_or(serde_json::json!({})),
+        "unrouted": stats["routes"][""],
+    })
+}
+
 /// ⌘K ✎ Save: replace a saved set's rows; `project_only` re-tags it to this project.
 #[tauri::command]
 pub fn secrets_update(

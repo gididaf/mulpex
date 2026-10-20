@@ -456,10 +456,63 @@ export interface LiveTokenStatus {
   refresh_command: string;
   running: boolean;
   token_problem: string | null;
+  /** Pasted tokens a claude can be pinned to (never the token itself). */
+  tokens: LiveTokenInfo[];
+  /** The proxy knows which claude calls; false for a daemon from before that
+   *  (it is replaced at the next real quit). */
+  routes: boolean;
+}
+export interface LiveTokenInfo {
+  id: string;
+  name: string;
+  /** The token's last 4 characters. */
+  tail: string;
+  /** The account's organization id, from the API's check. */
+  org: string | null;
+}
+/** What the proxy last saw for one token (`default` = the token file). */
+export interface LiveTokenStat {
+  at: number;
+  status: number;
+  org: string | null;
+  fp: string | null;
+  /** `anthropic-ratelimit-unified-*` headers, prefix stripped. */
+  limits: Record<string, string>;
+}
+export interface LiveTokenLast {
+  token: string;
+  at: number;
+  status: number;
+}
+export interface LiveTokenClaude {
+  handle: ProjectHandle;
+  project: string;
+  id: number;
+  label: string | null;
+  /** Pinned token id, or null for the default. */
+  token: string | null;
+  /** Spawned with a route; false = started before, restart once to control. */
+  routed: boolean;
+  last: LiveTokenLast | null;
+}
+export interface LiveTokenClaudes {
+  claudes: LiveTokenClaude[];
+  tokens: Record<string, LiveTokenStat>;
+  /** The last request from a claude that sends no route. */
+  unrouted: LiveTokenLast | null;
 }
 export const liveTokenGet = (host: number) => call<LiveTokenStatus>("live_token_get", {}, host);
 export const liveTokenSet = (host: number, tokenFile: string, refreshCommand: string) =>
   call<LiveTokenStatus>("live_token_set", { tokenFile, refreshCommand }, host);
+export const liveTokenAddToken = (host: number, name: string, token: string) =>
+  call<LiveTokenStatus>("live_token_add_token", { name, token }, host);
+export const liveTokenRenameToken = (host: number, tokenId: string, name: string) =>
+  call<LiveTokenStatus>("live_token_rename_token", { tokenId, name }, host);
+export const liveTokenDeleteToken = (host: number, tokenId: string) =>
+  call<LiveTokenStatus>("live_token_delete_token", { tokenId }, host);
+export const liveTokenAssign = (projectHandle: ProjectHandle, id: number, tokenId: string | null) =>
+  call<void>("live_token_assign", { projectHandle, id, tokenId });
+export const liveTokenClaudes = (host: number) => call<LiveTokenClaudes>("live_token_claudes", {}, host);
 
 export const secretsGet = (name: string, projectHandle: ProjectHandle) =>
   call<{ rows: SecretRow[]; project_only: boolean }>("secrets_get", { name }, slotOf(projectHandle));

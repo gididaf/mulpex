@@ -101,7 +101,9 @@ pub fn start(
         // An instance that was loaded from a save, or saved before, updates
         // that file in place instead of starting a second one.
         let existing = save_for_uuid(&read_links(&links_file()), &uuid);
-        let result = save(&dir, &uuid, existing.as_deref(), |stage| emit(stage, None, None));
+        // The forks bill to the token claude#id is pinned to (Live Token).
+        let route = crate::live_token::route(&dir, id);
+        let result = save(&dir, &uuid, &route, existing.as_deref(), |stage| emit(stage, None, None));
         if let Ok(path) = &result {
             link("saved", &uuid, &dir, path);
             if let Some(core) = app.state::<AppState>().ws.lock().unwrap().project_mut(handle) {
@@ -131,6 +133,7 @@ pub fn is_running(handle: ProjectHandle, id: usize) -> bool {
 fn save(
     dir: &Path,
     uuid: &str,
+    route: &str,
     existing: Option<&Path>,
     stage: impl Fn(&str),
 ) -> Result<PathBuf, String> {
@@ -139,11 +142,11 @@ fn save(
         Some(doc) => format!("{WRITE_PROMPT}\n\n{UPDATE_NOTE}\n\n<current_doc>\n{doc}\n</current_doc>\n"),
         None => WRITE_PROMPT.to_string(),
     };
-    let draft = parse_draft(&run_step(dir, Some(uuid), &write)?)?;
+    let draft = parse_draft(&run_step(dir, route, Some(uuid), &write)?)?;
 
     stage("checking");
     let check = format!("{CHECK_PROMPT}\n\n<handoff>\n{}\n</handoff>\n", draft.body);
-    let gaps = run_step(dir, None, &check)?;
+    let gaps = run_step(dir, route, None, &check)?;
     let gaps = gaps.trim();
 
     let draft = if gaps == "NONE" {
@@ -159,7 +162,7 @@ fn save(
         let fix = format!(
             "{FIX_PROMPT}\n\n<draft>\n{draft_json}\n</draft>\n\n<reviewer_questions>\n{gaps}\n</reviewer_questions>\n"
         );
-        parse_draft(&run_step(dir, Some(uuid), &fix)?)?
+        parse_draft(&run_step(dir, route, Some(uuid), &fix)?)?
     };
 
     let root = repo_root(dir);
@@ -176,15 +179,17 @@ fn save(
 /// after, or `-p` waits for EOF forever). Env is scrubbed (`forwarded_env`
 /// drops `MULPEX_*` and `CLAUDE_CODE_CHILD_SESSION`), and no `--bare`: that
 /// can't see the OAuth token.
-fn run_step(dir: &Path, fork: Option<&str>, prompt: &str) -> Result<String, String> {
-    run_claude(dir, "opus", fork, prompt, STEP_TIMEOUT)
+fn run_step(dir: &Path, route: &str, fork: Option<&str>, prompt: &str) -> Result<String, String> {
+    run_claude(dir, "opus", Some(route), fork, prompt, STEP_TIMEOUT)
 }
 
 /// One read-only headless `claude -p` (see [`run_step`]); `model` and
-/// `timeout` are the caller's — the runbook sorter uses Sonnet.
+/// `timeout` are the caller's — the runbook sorter uses Sonnet. `route` is the
+/// Live Token route of the claude it works for (`None`: the default token).
 pub(crate) fn run_claude(
     dir: &Path,
     model: &str,
+    route: Option<&str>,
     fork: Option<&str>,
     prompt: &str,
     timeout: Duration,
@@ -216,7 +221,7 @@ pub(crate) fn run_claude(
         .env_clear()
         .envs(claude_bin::forwarded_env())
         .env("PATH", claude_bin::merged_path())
-        .envs(crate::live_token::spawn_env().unwrap_or_default())
+        .envs(crate::live_token::spawn_env(route).unwrap_or_default())
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -864,7 +869,7 @@ mod tests {
     fn live_save() {
         let dir = PathBuf::from(std::env::var("SAVE_TEST_DIR").unwrap());
         let uuid = std::env::var("SAVE_TEST_UUID").unwrap();
-        let path = save(&dir, &uuid, None, |s| eprintln!("stage: {s}")).unwrap();
+        let path = save(&dir, &uuid, "", None, |s| eprintln!("stage: {s}")).unwrap();
         eprintln!("wrote {}", path.display());
     }
 

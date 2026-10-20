@@ -52,6 +52,40 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   edits **that** machine's settings, and the paths in it are that machine's paths. Each Mulpex runs
   its own proxy for its own claudes.
 
+## Named tokens and per-claude pins (2026-10-19)
+
+- **The default** is the token file + refresh command, exactly as above. **Named tokens** are pasted
+  `sk-ant-…` tokens with a name the user types, kept in `<mulpex home>/live-tokens.json` (0600,
+  `secrets::write_private`). The frontend only ever sees the name, the last 4 characters and the org id.
+- **Adding one** runs a free `POST /v1/messages/count_tokens` with it: a 401/403 refuses it, and the
+  reply's `anthropic-organization-id` is stored (so two tokens of one account look alike). No
+  account name is available: these tokens lack the `user:profile` scope (measured).
+- **Which claude is calling.** A claude's base URL is `…/<secret>/c/<route>`, with
+  `route = <project_key>-<instance id>` (`live_token::route`) — stable across app restarts,
+  adoption and `--resume`. The daemon strips it (`split_route`) before forwarding.
+- **Pins** live in `<mulpex home>/live-token-claudes.json` (`assign`: route → token id) and are
+  pushed to the daemon with the config. The daemon reads them on every request, so a pin changes the
+  claude's **next request**, no restart. A pin to a deleted token falls back to the default.
+  `Core::close` (⌘W, `hub_close`) forgets the route, so a reused number starts on the default.
+- **A pinned token's 401/429 goes back to the claude unchanged.** Only the default is refreshed
+  and retried.
+- **Hidden runs** carry their claude's route (⌘S forks, ⌘⇧E); Ask All and Import Docs use the default.
+- **Stats.** The proxy records, per route, the last request's token and status, and per token the
+  org id, its last status and every `anthropic-ratelimit-unified-*` header (`5h-utilization`,
+  `7d-utilization` are 0–1 fractions; `*-reset` unix seconds). The `live_token_stats` daemon op
+  returns them; `live_token_claudes` joins them with each project's live claudes for the dialog,
+  which polls every 2 s.
+- **`routed`.** `live-token-claudes.json` also lists the routes a claude was spawned with. A claude
+  started before (or against an old daemon) is shown as "restart once (⌘⇧R) to control".
+- **Old daemon.** The `configure` reply carries `routes: true`. A daemon from before has none, and
+  then claudes get the plain `/<secret>` URL (it would forward `/c/…` upstream as a path). The
+  wire change is additive, so `PROTO` was not bumped: per-claude pins start on a user's machine after
+  their next real quit, when the new daemon starts. The dialog says so.
+- **UI.** The dialog: Default (file + refresh), Tokens (rename by clicking the name, ✕ asks and
+  lists who moves to Default, Add), Claudes (a picker per claude). The sidebar row's right-click has
+  a **Token ›** submenu while Live Token is on (`App.svelte::tokenMenu`, which gives up after 400 ms
+  so a slow remote host never delays the menu).
+
 ## Why it's built this way (measured on claude 2.1.301, 2026-10-16)
 
 - **`ANTHROPIC_UNIX_SOCKET` was tried first and fails.** It is the path `claude ssh` uses, with an
@@ -78,4 +112,4 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   says so.
 - 401 and 429 trigger the retry; any other status is passed through untouched.
 - Only one account was available to test with. Swaps were measured as good → invalid → good, not
-  account A → account B.
+  account A → account B; pins were measured with the same token pasted as a second one.

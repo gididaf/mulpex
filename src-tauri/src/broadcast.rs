@@ -437,7 +437,7 @@ pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), S
         .env_clear()
         .envs(claude_bin::forwarded_env())
         .env("PATH", claude_bin::merged_path())
-        .envs(crate::live_token::spawn_env().unwrap_or_default())
+        .envs(crate::live_token::spawn_env(None).unwrap_or_default())
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

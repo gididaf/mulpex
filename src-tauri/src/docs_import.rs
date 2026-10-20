@@ -205,7 +205,7 @@ fn sort(root: &Path, file: &str) -> Result<Sorted, String> {
         cut -= 1;
     }
     let prompt = format!("{SORT_PROMPT}\n\n<file path=\"{file}\">\n{}\n</file>\n", &text[..cut]);
-    let out = saves::run_claude(root, "sonnet", None, &prompt, SORT_TIMEOUT)?;
+    let out = saves::run_claude(root, "sonnet", None, None, &prompt, SORT_TIMEOUT)?;
     parse_sorted(&out)
 }
 

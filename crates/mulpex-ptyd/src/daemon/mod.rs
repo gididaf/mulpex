@@ -350,6 +350,7 @@ fn handle(server: &Arc<Server>, gen: u64, req: Value) {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
+        "live_token_stats" => ok(live_token::stats()),
         "detach" => ok(json!({})),
         other => err(format!("unknown op {other:?}")),
     };

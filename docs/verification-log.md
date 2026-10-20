@@ -2651,3 +2651,34 @@ of the stacked wake cards and the host ⌘⇧O dialog.
     covered by design, since nothing runs from the mount after a copy);
   - a daemon whose protocol is out of range (no second protocol exists yet; the frozen ops are
     covered by a byte fixture).
+
+## 2026-10-19 — Live Token: named tokens and per-claude pins (docs/live-token.md)
+
+Measured with the user's real token (claude 2.1.303):
+
+- **No account name from the API.** `GET /api/oauth/profile` (and `/api/oauth/claude_cli/roles`)
+  with a `claude setup-token` token → `permission_error`, "OAuth token does not meet scope
+  requirement user:profile". Names are typed by the user.
+- **`POST /v1/messages/count_tokens`** (free) with the token → 200 and `anthropic-organization-id`.
+  That is the add-time check and the org id the dialog shows.
+- **Rate-limit headers** on a real `/v1/messages` (OAuth needs the Claude Code system prompt line,
+  or it is a bare 429 with no headers): `anthropic-ratelimit-unified-5h-utilization: 0.05`,
+  `-7d-utilization: 0.48` (0–1 fractions), `-5h-reset`/`-7d-reset` (unix seconds), `-status`,
+  `-representative-claim`, `-overage-*`, `-fallback-percentage`.
+- **The daemon proxy against the real API** (`real_api_routes_pick_their_token`, ignored test): a
+  route pinned to the good token → 200 recorded under its id; pinned to a bad token → **401 passed
+  back, not retried**; an unpinned route and a route-less request → default.
+- **Headless app (hidden window, own home, own daemon), one real claude, `drive/` queue:**
+  - the spawn recorded the route in `live-token-claudes.json`; the first turn went through
+    `default`, with the limits recorded;
+  - `live_token_assign` mid-session → the **next turn used the pinned token**, no restart;
+  - closing and reopening the project (`--resume`) kept the pin and the next turn used it;
+  - the dialog showed both tokens with org id, 5h/7d %, last use, and the claudes table;
+  - ✕ → "Used by proj claude#1 — they move to Default." → Delete emptied `assign` and the tokens file;
+  - right-click ▸ Token › showed ✓ Default and the token; picking it wrote the pin;
+  - `close_session` (⌘W) emptied `assign` and `routed`.
+- **New app, old daemon** (the v0.49.1 `mulpex-ptyd` started by hand on the app's home): the reply
+  had no `routes`, the claude got the plain `/<secret>` URL, nothing was recorded as routed.
+- **NOT measured:** two different real accounts (one available — the second token was the same
+  token pasted again); a real usage-limit 429 on a pinned token; the ⌘S/⌘⇧E forks with a pin
+  (same `spawn_env(route)` call, not driven); a remote host's tab; Linux.

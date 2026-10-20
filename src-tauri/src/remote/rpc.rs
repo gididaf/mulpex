@@ -63,6 +63,11 @@ pub const ALLOWED: &[&str] = &[
     "secrets_delete",
     "live_token_get",
     "live_token_set",
+    "live_token_add_token",
+    "live_token_rename_token",
+    "live_token_delete_token",
+    "live_token_assign",
+    "live_token_claudes",
     "list_guides",
     "delete_guide",
     "load_guide",
@@ -248,6 +253,13 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
         "live_token_set" => {
             out(c::live_token_set(arg(args, "tokenFile")?, arg(args, "refreshCommand")?)?)
         }
+        "live_token_add_token" => out(c::live_token_add_token(arg(args, "name")?, arg(args, "token")?)?),
+        "live_token_rename_token" => {
+            out(c::live_token_rename_token(arg(args, "tokenId")?, arg(args, "name")?)?)
+        }
+        "live_token_delete_token" => out(c::live_token_delete_token(arg(args, "tokenId")?)?),
+        "live_token_assign" => out(c::live_token_assign(st(), h()?, id()?, arg(args, "tokenId")?)?),
+        "live_token_claudes" => out(c::live_token_claudes(st())),
         "list_guides" => out(c::list_guides(st(), h()?)?),
         "delete_guide" => out(c::delete_guide(st(), h()?, arg(args, "file")?)?),
         "load_guide" => out(c::load_guide(st(), h()?, arg(args, "file")?)?),

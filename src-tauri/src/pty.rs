@@ -699,9 +699,11 @@ impl Session {
                 // 2.1.292: `0` emits no ?1049h / ?100xh).
                 cmd.env("CLAUDE_CODE_NO_FLICKER", "0");
                 // Live Token: point the API at the daemon's proxy, which puts
-                // the current token on every request (`live_token.rs`).
-                // Nothing when the feature is off.
-                for (k, v) in crate::live_token::spawn_env().unwrap_or_default() {
+                // the current token (or the one this claude is pinned to) on
+                // every request (`live_token.rs`). Nothing when it is off.
+                for (k, v) in crate::live_token::claude_spawn_env(&crate::live_token::route(dir, id))
+                    .unwrap_or_default()
+                {
                     cmd.env(k, v);
                 }
                 cmd.env("MULPEX_INSTANCE_ID", id.to_string());

@@ -366,6 +366,11 @@ pub fn configure_live_token(config: Value) -> Result<Value, String> {
     client()?.request(json!({"op": "live_token", "config": config}))
 }
 
+/// What the daemon's Live Token proxy has seen, for the dialog's table.
+pub fn live_token_stats() -> Result<Value, String> {
+    client()?.request(json!({"op": "live_token_stats"}))
+}
+
 /// The project's directory name under the state root: stable across app
 /// restarts, unlike a project handle, so a surviving claude's
 /// `MULPEX_STATE_DIR` still names its project's dir after the next launch.

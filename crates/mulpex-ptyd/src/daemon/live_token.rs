@@ -7,9 +7,10 @@
 //! here (`configure`) on every connect and every change. Everything about how
 //! a request is rewritten is unchanged from when this lived in the app.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -41,6 +42,20 @@ pub struct Config {
     /// The refresh command's environment (`PATH` included).
     #[serde(default)]
     pub refresh_env: Vec<(String, String)>,
+    /// Pasted tokens a claude can be pinned to (`assign`). The token file is
+    /// the "default" one, used by every claude that is not pinned.
+    #[serde(default)]
+    pub tokens: Vec<NamedToken>,
+    /// Route (`<project key>-<instance id>`, from the base URL's `/c/<route>`)
+    /// → the id of the token in `tokens` that claude is pinned to.
+    #[serde(default)]
+    pub assign: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NamedToken {
+    pub id: String,
+    pub token: String,
 }
 
 impl Config {
@@ -73,7 +88,9 @@ pub fn configure(v: &Value) -> Result<Value, String> {
         ensure_started()?;
     }
     Ok(match PROXY.get() {
-        Some(p) => json!({"running": true, "port": p.port, "secret": p.secret}),
+        // `routes`: this daemon understands `/c/<route>` (an older one would
+        // forward it upstream as part of the path).
+        Some(p) => json!({"running": true, "port": p.port, "secret": p.secret, "routes": true}),
         None => json!({"running": false}),
     })
 }
@@ -257,6 +274,111 @@ pub fn strip_secret<'a>(path_and_query: &'a str, secret: &str) -> Option<&'a str
     }
 }
 
+/// Split an optional `/c/<route>` off the front of a (secret-stripped) path:
+/// the claude that sent the request. Claudes spawned before routes existed
+/// send none.
+pub fn split_route(rest: &str) -> (Option<&str>, &str) {
+    let Some(after) = rest.strip_prefix("/c/") else {
+        return (None, rest);
+    };
+    let end = after.find(['/', '?']).unwrap_or(after.len());
+    let route = &after[..end];
+    if route.is_empty() {
+        return (None, rest);
+    }
+    let tail = &after[end..];
+    (Some(route), if tail.is_empty() { "/" } else { tail })
+}
+
+/// Which token a request gets: the one its claude is pinned to, else the
+/// default (the token file). `key` names it in the stats: a pinned token's id,
+/// or `default`.
+struct Pick {
+    key: String,
+    token: Option<String>,
+    pinned: bool,
+}
+
+fn pick(route: Option<&str>) -> Pick {
+    let c = config();
+    if let Some(id) = route.and_then(|r| c.assign.get(r)) {
+        if let Some(t) = c.tokens.iter().find(|t| &t.id == id) {
+            return Pick { key: t.id.clone(), token: Some(t.token.clone()), pinned: true };
+        }
+    }
+    Pick { key: "default".into(), token: current_token(), pinned: false }
+}
+
+/// What the proxy last saw, for the dialog (`stats`). Per route: which token
+/// its last request used and how that went. Per token: the account it belongs
+/// to and the rate-limit headers of its last reply.
+#[derive(Default)]
+struct Stats {
+    routes: HashMap<String, RouteStat>,
+    tokens: HashMap<String, TokenStat>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct RouteStat {
+    token: String,
+    at: u64,
+    status: u16,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+struct TokenStat {
+    at: u64,
+    status: u16,
+    org: Option<String>,
+    /// The default token's fingerprint (it changes when the file does).
+    fp: Option<String>,
+    /// Every `anthropic-ratelimit-unified-*` header of the last reply that had any.
+    limits: BTreeMap<String, String>,
+}
+
+static STATS: LazyLock<Mutex<Stats>> = LazyLock::new(Default::default);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn record(route: Option<&str>, pick: &Pick, token: Option<&str>, r: &reqwest::Response) {
+    let at = now_ms();
+    let status = r.status().as_u16();
+    let mut s = STATS.lock().unwrap();
+    s.routes.insert(
+        route.unwrap_or("").to_string(),
+        RouteStat { token: pick.key.clone(), at, status },
+    );
+    let t = s.tokens.entry(pick.key.clone()).or_default();
+    t.at = at;
+    t.status = status;
+    if !pick.pinned {
+        t.fp = token.map(fingerprint);
+    }
+    let h = r.headers();
+    if let Some(org) = h.get("anthropic-organization-id").and_then(|v| v.to_str().ok()) {
+        t.org = Some(org.to_string());
+    }
+    let limits: BTreeMap<String, String> = h
+        .iter()
+        .filter_map(|(k, v)| {
+            let k = k.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
+            Some((k.to_string(), v.to_str().ok()?.to_string()))
+        })
+        .collect();
+    if !limits.is_empty() {
+        t.limits = limits;
+    }
+}
+
+/// The `live_token_stats` op: what [`record`] has seen. Route `""` is the
+/// claudes that send no route.
+pub fn stats() -> Value {
+    let s = STATS.lock().unwrap();
+    json!({"routes": s.routes, "tokens": s.tokens})
+}
+
 fn upstream_base() -> String {
     let u = config().upstream;
     let u = u.trim_end_matches('/');
@@ -275,6 +397,8 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Body>, std::convert::
     let Some(rest) = strip_secret(&pq, &p.secret) else {
         return Ok(plain(StatusCode::FORBIDDEN, "not a Mulpex claude"));
     };
+    let (route, rest) = split_route(rest);
+    let route = route.map(str::to_string);
     let url = format!("{}{}", upstream_base(), rest);
     let (parts, body) = req.into_parts();
     let body = match body.collect().await {
@@ -285,9 +409,14 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Body>, std::convert::
     // rewritten; anything else (an API key, no auth) passes through as sent.
     let rewrite = parts.headers.contains_key(hyper::header::AUTHORIZATION);
 
-    let token = if rewrite { current_token() } else { None };
+    let mut chosen = if rewrite { Some(pick(route.as_deref())) } else { None };
+    let token = chosen.as_ref().and_then(|p| p.token.clone());
+    let mut used = token.clone();
     let mut resp = send(&parts, &url, &body, token.as_deref()).await;
-    if rewrite && matches!(&resp, Ok(r) if r.status() == 401 || r.status() == 429) {
+    // A pinned token's failure goes back to its claude as is: pinned means
+    // pinned. Only the default token is refreshed and retried.
+    let pinned = chosen.as_ref().is_some_and(|p| p.pinned);
+    if rewrite && !pinned && matches!(&resp, Ok(r) if r.status() == 401 || r.status() == 429) {
         // The account may have been switched (or run out): pull a fresh token
         // and, if it is a different one, try this request once more with it.
         refresh_now().await;
@@ -300,7 +429,14 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Body>, std::convert::
                 fresh.as_deref().map(fingerprint).unwrap_or_default(),
             );
             resp = send(&parts, &url, &body, fresh.as_deref()).await;
+            used = fresh;
+            if let Some(p) = chosen.as_mut() {
+                p.token = used.clone();
+            }
         }
+    }
+    if let (Some(p), Ok(r)) = (&chosen, &resp) {
+        record(route.as_deref(), p, used.as_deref(), r);
     }
     Ok(match resp {
         Ok(r) => relay(r),
@@ -420,6 +556,85 @@ mod tests {
         assert_eq!(strip_secret("/abc?x=1", "abc"), Some("?x=1"));
         assert_eq!(strip_secret("/v1/messages", "abc"), None);
         assert_eq!(strip_secret("/abcd/v1/messages", "abc"), None);
+    }
+
+    #[test]
+    fn a_route_is_split_off_the_front() {
+        assert_eq!(split_route("/c/ab12-3/v1/messages?beta=true"), (Some("ab12-3"), "/v1/messages?beta=true"));
+        assert_eq!(split_route("/c/ab12-3"), (Some("ab12-3"), "/"));
+        assert_eq!(split_route("/c/ab12-3?x=1"), (Some("ab12-3"), "?x=1"));
+        assert_eq!(split_route("/v1/messages"), (None, "/v1/messages"));
+        assert_eq!(split_route("/c//v1"), (None, "/c//v1"));
+    }
+
+    #[test]
+    fn a_pinned_route_gets_its_token_and_others_the_default() {
+        *CONFIG.write().unwrap() = Some(Config {
+            tokens: vec![NamedToken { id: "t1".into(), token: "sk-ant-one".into() }],
+            assign: HashMap::from([
+                ("p-1".to_string(), "t1".to_string()),
+                ("p-2".to_string(), "gone".to_string()),
+            ]),
+            ..Default::default()
+        });
+        let p = pick(Some("p-1"));
+        assert!(p.pinned && p.key == "t1" && p.token.as_deref() == Some("sk-ant-one"));
+        // Pinned to a token that no longer exists, unpinned, no route: default
+        // (off here, so no token: the claude's own passes through).
+        for r in [Some("p-2"), Some("p-3"), None] {
+            let p = pick(r);
+            assert!(!p.pinned && p.key == "default" && p.token.is_none());
+        }
+        *CONFIG.write().unwrap() = None;
+    }
+
+    /// Against the real API: `LT_REAL_TOKEN_FILE=<token file> cargo test -p
+    /// mulpex-ptyd real_api -- --ignored --nocapture`. A route pinned to a good
+    /// token, one pinned to a bad token (its 401 must come back as is, not be
+    /// retried with the default), an unpinned route and a route-less request.
+    #[test]
+    #[ignore]
+    fn real_api_routes_pick_their_token() {
+        let file = std::env::var("LT_REAL_TOKEN_FILE").expect("LT_REAL_TOKEN_FILE");
+        let good = read_token_file(std::path::Path::new(&file)).unwrap();
+        configure(&json!({
+            "token_file": file,
+            "tokens": [{"id": "good", "token": good}, {"id": "bad", "token": "sk-ant-oat01-nope"}],
+            "assign": {"p-1": "good", "p-2": "bad"},
+        }))
+        .unwrap();
+        let p = PROXY.get().unwrap();
+        let base = format!("http://127.0.0.1:{}/{}", p.port, p.secret);
+        let ask = |path: String| {
+            runtime().block_on(async move {
+                client()
+                    .post(path)
+                    .header("authorization", "Bearer sk-ant-oat01-spawn-time")
+                    .header("anthropic-beta", "oauth-2025-04-20")
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}]}"#)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        };
+        let url = |route: &str| format!("{base}{route}/v1/messages/count_tokens");
+        assert_eq!(ask(url("/c/p-1")), 200);
+        assert_eq!(ask(url("/c/p-2")), 401);
+        assert_eq!(ask(url("/c/p-3")), 200);
+        assert_eq!(ask(url("")), 200);
+        let s = stats();
+        println!("{}", serde_json::to_string_pretty(&s).unwrap());
+        assert_eq!(s["routes"]["p-1"]["token"], "good");
+        assert_eq!(s["routes"]["p-2"]["token"], "bad");
+        assert_eq!(s["routes"]["p-2"]["status"], 401);
+        assert_eq!(s["routes"]["p-3"]["token"], "default");
+        assert_eq!(s["routes"][""]["token"], "default");
+        assert!(s["tokens"]["good"]["org"].is_string());
+        assert_eq!(s["tokens"]["default"]["fp"], fingerprint(&good));
     }
 
     #[test]
