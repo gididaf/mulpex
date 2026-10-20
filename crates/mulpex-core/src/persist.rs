@@ -61,7 +61,7 @@ pub struct SavedSession {
     /// Its family is folded away in the sidebar (only meaningful on a row that
     /// has `hub_spawn` children).
     pub collapsed: bool,
-    /// Auto-compact this row's sidebar subtree at this context % (set by the
+    /// Auto-compact this row and its sidebar subtree at this context % (set by the
     /// user from the row's context menu; `lib/compact.ts` enforces it).
     pub auto_compact: Option<u8>,
     /// Who gave the row its `name`, so `hub_instances` can still say so after a

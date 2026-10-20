@@ -359,8 +359,8 @@ pub struct Core {
     pub parents: HashMap<usize, usize>,
     /// Rows whose `hub_spawn` family is folded away in the sidebar. Persisted.
     pub collapsed: HashSet<usize>,
-    /// Auto-compact rules: row id → context % at which every claude in its
-    /// sidebar subtree is compacted (`lib/compact.ts` enforces it). Set only by
+    /// Auto-compact rules: row id → context % at which the row itself and every
+    /// claude in its sidebar subtree is compacted (`lib/compact.ts` enforces it). Set only by
     /// the user, from the row's context menu. Persisted.
     pub auto_compact: HashMap<usize, u8>,
     /// Instance ids that have been "worked on" (restored, or fired a hook this
@@ -1590,9 +1590,9 @@ impl Core {
         }
     }
 
-    /// Set (`Some(pct)`) or clear the auto-compact rule on claude#id's sidebar
-    /// subtree — only ever from the user's context menu. Persists, and tells the
-    /// orchestrator once, so a child pausing to compact isn't mistaken for stuck.
+    /// Set (`Some(pct)`) or clear the auto-compact rule on claude#id and its
+    /// sidebar subtree — only ever from the user's context menu. Persists, and
+    /// tells the orchestrator once, so a pause to compact isn't mistaken for stuck.
     /// Returns false (and does nothing) for a terminal, an unknown row, a
     /// percent outside the menu's choices, or no change.
     pub fn set_auto_compact(&mut self, id: usize, pct: Option<u8>) -> bool {
@@ -3165,12 +3165,12 @@ pub const AUTO_COMPACT_CHOICES: [u8; 4] = [50, 60, 70, 80];
 fn auto_compact_message(pct: Option<u8>) -> String {
     match pct {
         Some(p) => format!(
-            "The user enabled auto-compact for your claudes at {p}% context. When one of them \
-             reaches it, Mulpex asks it to stop at a checkpoint, runs /compact, and tells it to \
-             continue. A child may pause briefly while that happens; don't treat it as stuck. \
-             You don't need to do anything."
+            "The user enabled auto-compact for you and your claudes at {p}% context. When you \
+             or one of them reaches it, Mulpex asks that claude to stop at a checkpoint, runs \
+             /compact, and tells it to continue. A child may pause briefly while that happens; \
+             don't treat it as stuck. You don't need to do anything."
         ),
-        None => "The user disabled auto-compact for your claudes.".to_string(),
+        None => "The user disabled auto-compact for you and your claudes.".to_string(),
     }
 }
 

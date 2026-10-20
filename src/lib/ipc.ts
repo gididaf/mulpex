@@ -38,7 +38,7 @@ export interface SessionInfo {
   parent: number | null;
   /** Its family is folded away in the sidebar. */
   collapsed: boolean;
-  /** Auto-compact every claude in this row's sidebar subtree at this context %
+  /** Auto-compact this row and every claude in its sidebar subtree at this context %
    *  (set by the user from the row's menu; `compact.ts` enforces it). */
   auto_compact: number | null;
   kind: SessionKind;

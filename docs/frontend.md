@@ -176,7 +176,7 @@ widget — one level of submenu at most, no icons — and `App.svelte::openRowMe
   for a shell, and a shell has no conversation to resume, so both would be dead weight. Close does
   not confirm, matching ⌘W; **Restart does**, because it kills a process that may be mid-turn and
   sits one shift away from Rename (see [sessions.md](sessions.md#restarting-an-instance-in-place-r)).
-- **Auto-compact its claudes ›** (claude rows only) — a submenu of Off / 50% / 60% / 70% / 80%, ✓
+- **Auto-compact (self + claudes) ›** (claude rows only) — a submenu of Off / 50% / 60% / 70% / 80%, ✓
   on the current one, which also shows as the item's hint. Five flat items read as noise (the user
   rejected them), so `ContextMenu` gained **one level** of submenu (`CtxItem.sub`): hover, → or
   Enter opens it, ← / Esc steps back out, and it flips left/up at the window edge. The row then shows a `⟳ 70%` badge after its

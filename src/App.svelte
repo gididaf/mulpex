@@ -621,11 +621,11 @@
               hint: key("⌘K"),
               run: () => openSecrets(h, s.id),
             },
-            // Auto-compact this row's claudes (`compact.ts`). Only ever set here,
+            // Auto-compact this row and its claudes (`compact.ts`). Only ever set here,
             // by the user — no model can turn it on. A submenu; the current
             // choice carries a ✓.
             {
-              label: "Auto-compact its claudes",
+              label: "Auto-compact (self + claudes)",
               hint: s.auto_compact != null ? `${s.auto_compact}%` : undefined,
               sub: ([null, ...AUTO_COMPACT_CHOICES] as (number | null)[]).map((pct) => ({
                 label: pct == null ? "Off" : `${pct}%`,

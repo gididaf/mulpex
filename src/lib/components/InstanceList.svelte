@@ -389,7 +389,7 @@
           {#if !shell && s.auto_compact != null}
             <span
               class="auto"
-              title="Auto-compact: Mulpex compacts this row's claudes at {s.auto_compact}% context (right-click to change)"
+              title="Auto-compact: Mulpex compacts this row and its claudes at {s.auto_compact}% context (right-click to change)"
               >⟳ {s.auto_compact}%</span
             >
           {/if}

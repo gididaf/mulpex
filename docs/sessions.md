@@ -912,10 +912,12 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
 
 ### Auto-compact an orchestrator's claudes
 
-Right-click a claude row → **Auto-compact its claudes: Off / 50 / 60 / 70 / 80 %**. Mulpex then
-runs the ⌘⇧K flow above on every claude in that row's **sidebar subtree** (its `hub_spawn`
-children, theirs, and rows dragged under it; never the row itself) whose context % reaches the
-threshold. A child already over it goes at once.
+Right-click a claude row → **Auto-compact (self + claudes): Off / 50 / 60 / 70 / 80 %**. Mulpex
+then runs the ⌘⇧K flow above on **the row itself** and every claude in its **sidebar subtree** (its
+`hub_spawn` children, theirs, and rows dragged under it) whose context % reaches the threshold. A
+claude already over it goes at once. (Until 2026-10-20 the row itself was excluded — "its claudes"
+only; the user asked for the orchestrator to compact itself too, and existing rules picked that up
+with no migration. Its own line reads `auto-compact: …`, without the `(claude#N)`.)
 
 - **The user is the only one who can turn it on.** There is no MCP tool and no `HUB_RULES` text: a
   model never decides to compact anything. The rule is a persisted column on the row
@@ -927,6 +929,6 @@ threshold. A child already over it goes at once.
 - **One attempt per crossing.** After an attempt, success or "didn't run", the child is
   `suppressed` until its context reads below the threshold again (or reads nothing). That covers a
   failed compact looping, and the ctx file still showing the old number right after a good one —
-  the statusline only rewrites it on its next draw. With nested rules the lowest threshold above a
-  child decides when it is released.
+  the statusline only rewrites it on its next draw. With nested rules the lowest threshold on a claude
+  (its own rule or an ancestor's) decides when it is released.
 - The child's sidebar line says who asked: `auto-compact (claude#3): waiting for checkpoint…`.

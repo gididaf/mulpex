@@ -56,7 +56,7 @@ interface Req {
   /** The refusal text was already on screen when `/compact` was typed, so
    *  seeing it proves nothing. */
   refusedBefore: boolean;
-  /** The orchestrator whose auto-compact rule started this, if one did. */
+  /** The row whose auto-compact rule started this (maybe the claude itself), if one did. */
   by: number | null;
 }
 
@@ -120,9 +120,9 @@ function startCompact(h: ProjectHandle, id: number, by: number | null) {
 
 // ---- Auto-compact (a row's context-menu rule) ----
 //
-// The user sets "auto-compact its claudes at X%" on a row; every claude in its
+// The user sets "auto-compact at X%" on a row; that row and every claude in its
 // sidebar subtree whose context reaches X gets the ⌘⇧K flow above, run by Mulpex
-// itself — no model ever decides to compact. One attempt per crossing: a child
+// itself — no model ever decides to compact. One attempt per crossing: a claude
 // is `suppressed` after its attempt (success or not) until its context reads
 // below X again, which covers both a failed compact and the ctx file still
 // showing the old number right after a good one.
@@ -140,7 +140,7 @@ export function autoCompactTick(h: ProjectHandle) {
   for (const orch of p.sessions) {
     const pct = orch.auto_compact;
     if (pct == null || orch.kind === "shell") continue;
-    for (const c of descendantsOf(p.sessions, orch.id)) {
+    for (const c of [orch, ...descendantsOf(p.sessions, orch.id)]) {
       if (c.kind === "shell" || c.exited || c.failed) continue;
       const k = keyOf(h, c.id);
       const ctx = p.ctx.get(c.id);
@@ -152,12 +152,12 @@ export function autoCompactTick(h: ProjectHandle) {
   }
 }
 
-/** The lowest threshold any ancestor rule puts on claude#id, if any. */
+/** The lowest threshold claude#id's own rule or any ancestor's puts on it, if any. */
 function ruleFor(list: SessionInfo[], id: number): number | null {
   let best: number | null = null;
   for (const o of list) {
     if (o.auto_compact == null) continue;
-    if (descendantsOf(list, o.id).some((d) => d.id === id)) {
+    if (o.id === id || descendantsOf(list, o.id).some((d) => d.id === id)) {
       best = best == null ? o.auto_compact : Math.min(best, o.auto_compact);
     }
   }
@@ -293,8 +293,13 @@ export const compactLines = derived([reqs, activeProjectHandle, projects], ([$m,
   for (const [k, r] of $m) {
     const [h, id] = parse(k);
     if (h !== $h) continue;
-    // An auto-compact names the orchestrator whose rule fired it.
-    const text = r.by != null ? `auto-compact (claude#${r.by}): ${AUTO_LABEL[r.phase]}` : LABEL[r.phase];
+    // An auto-compact names the orchestrator whose rule fired it (unless it's its own).
+    const text =
+      r.by == null
+        ? LABEL[r.phase]
+        : r.by === id
+          ? `auto-compact: ${AUTO_LABEL[r.phase]}`
+          : `auto-compact (claude#${r.by}): ${AUTO_LABEL[r.phase]}`;
     out.set(id, { text, failed: r.phase === "failed" });
   }
   return out;
