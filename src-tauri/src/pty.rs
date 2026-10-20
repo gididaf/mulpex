@@ -577,6 +577,9 @@ pub struct Session {
     killed: bool,
     rows: u16,
     cols: u16,
+    /// The spawn fingerprint this claude was started with (`spawnprint.rs`);
+    /// empty if it was spawned before Mulpex recorded one.
+    spawn_print: String,
 }
 
 /// Where a spawn's child runs and with what — the app builds all of it, the
@@ -752,7 +755,7 @@ impl Session {
                 "cols": cols,
                 "ring_cap": tail_cap(kind == SessionKind::Shell),
                 "record": record,
-                "meta": meta_of(kind, id, &session_id),
+                "meta": meta_of(kind, id, &session_id, SPAWN_PRINT),
             }))
             .map_err(anyhow::Error::msg)?;
         let sid = reply["sid"].as_u64().unwrap_or(0) as u32;
@@ -873,6 +876,7 @@ impl Session {
             killed: false,
             rows,
             cols,
+            spawn_print: SPAWN_PRINT.to_string(),
         })
     }
 
@@ -942,7 +946,14 @@ impl Session {
             killed: false,
             rows,
             cols,
+            spawn_print: info["meta"]["print"].as_str().unwrap_or("").to_string(),
         })
+    }
+
+    /// Started on a build whose spawn-frozen code differs from this one: it
+    /// runs old hub rules/tools until ⌘⇧R. Never true for a terminal.
+    pub fn outdated(&self) -> bool {
+        self.kind == SessionKind::Claude && self.spawn_print != SPAWN_PRINT
     }
 
     /// The daemon's handle for this PTY.
@@ -955,7 +966,7 @@ impl Session {
     /// conversation uuid changes under it (`reconcile_session_ids`).
     pub fn publish_meta(&self) {
         let _ = self.client.request(serde_json::json!({
-            "op": "set_meta", "sid": self.sid, "meta": meta_of(self.kind, self.id, &self.session_id),
+            "op": "set_meta", "sid": self.sid, "meta": meta_of(self.kind, self.id, &self.session_id, &self.spawn_print),
         }));
     }
 
@@ -1061,13 +1072,19 @@ impl Session {
 }
 
 /// What the daemon keeps about a session for the next app to recognise it.
-fn meta_of(kind: SessionKind, id: usize, session_id: &str) -> serde_json::Value {
+/// `print` is the spawn fingerprint the session started with — the session's
+/// own, never this build's on a republish, or a rename would clear the badge.
+fn meta_of(kind: SessionKind, id: usize, session_id: &str, print: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": if kind == SessionKind::Shell { "shell" } else { "claude" },
         "id": id,
         "session_id": session_id,
+        "print": print,
     })
 }
+
+/// This build's spawn fingerprint (`spawnprint.rs`, baked in by `build.rs`).
+pub const SPAWN_PRINT: &str = env!("MULPEX_SPAWNPRINT");
 /// Why `dir` cannot be used as a working directory, in words for the user — or
 /// `None` if it is usable.
 ///
@@ -1279,7 +1296,16 @@ fn b64encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
-
+    /// The daemon meta carries the spawn fingerprint the session was given —
+    /// what an adopting app reads back to decide the ↻ badge.
+    #[test]
+    fn meta_carries_the_spawn_fingerprint() {
+        let m = meta_of(SessionKind::Claude, 3, "u", SPAWN_PRINT);
+        assert_eq!(m["print"], SPAWN_PRINT);
+        assert_eq!(SPAWN_PRINT.len(), 16);
+        let old = meta_of(SessionKind::Claude, 3, "u", "0123456789abcdef");
+        assert_eq!(old["print"], "0123456789abcdef", "a republish must keep the old print");
+    }
 
     /// A Remote Control tap gets the recent output, then every byte after it;
     /// the tail is bounded; a phone that went away is forgotten; and a claude

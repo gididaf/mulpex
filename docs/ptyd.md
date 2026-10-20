@@ -144,6 +144,26 @@ snapshot is cut at the right byte. Text the app writes into a pane
 - A new app that meets a daemon outside its range: logs it, sends `shutdown`
   (frozen), starts its own, and the store's `--resume` brings the claudes back.
 
+## What a surviving claude does not get: the ↻ badge
+
+An adopted claude keeps what it got at spawn: the appended system prompt
+(`HUB_RULES`/`PLANNING_RULES`), the settings/mcp/plugin files it read once, and
+its long-lived `helper mcp` and `helper listen` processes — still the old inode
+after `stable_helper` renamed a new helper over the path. Hooks and the
+statusline are *not* frozen: each call execs the current helper, and app-side
+code (sidebar, poll loop, Board UI) is the new app's.
+
+So `build.rs` hashes the files that define the frozen part
+(`spawnprint.rs::FILES`: mulpex-core's `rules.rs`, `config.rs`, `mcp.rs`,
+`listen.rs`, `registry.rs`; comment-only edits don't count, same `normalize` as
+`wire.rs`) into `MULPEX_SPAWNPRINT`. Every claude's daemon `meta` carries
+`print` = the value it was spawned with (`pty.rs::meta_of`; `publish_meta`
+republishes the session's own, never the current build's). `Session::adopt`
+reads it back — no daemon change, `meta` is opaque to it, and it survives a
+crash too. A mismatch, or no `print` at all (spawned before this existed), is
+`SessionInfo.outdated` → a ↻ badge in the row; clicking it is ⌘⇧R. A file that
+changes something a running claude froze at spawn belongs in `FILES`.
+
 ## If the daemon dies under a running app
 
 The client's reader sees EOF and every session gets `Event::Lost`: they die in

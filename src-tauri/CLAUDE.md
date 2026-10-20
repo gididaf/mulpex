@@ -33,6 +33,10 @@ Traps that live in this directory specifically:
   `remote_update.rs`, `commands.rs`; comment-only edits don't count). Changing a serialized shape
   a remote desktop reads that lives *outside* those files is not seen — touch a wire file in the
   same release. → [../docs/remote-hosts.md](../docs/remote-hosts.md)
+- **`spawnprint.rs::FILES` is what marks running claudes ↻ outdated.** It lists the mulpex-core
+  files a claude freezes at spawn (rules, config templates, MCP server, listener). A new file that
+  changes what a running claude froze belongs there, or claudes that survive the update never learn
+  they're behind. → [../docs/ptyd.md](../docs/ptyd.md)
 - **`lib.rs::is_forwarded` is an allowlist.** A menu item not listed there builds, appears, shows its
   accelerator and even ticks itself, while the frontend never hears a thing. Same for
   `capabilities/default.json` and the notification plugin.

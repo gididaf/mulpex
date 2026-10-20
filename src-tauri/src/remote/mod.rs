@@ -2082,6 +2082,8 @@ mod tests {
             board_open: 0,
             board_unread: 0,
             board_urgent: 0,
+            outdated: false,
+            worked: false,
         };
         let sessions = vec![
             mk(1, SessionKind::Claude, None),

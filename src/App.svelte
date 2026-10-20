@@ -930,9 +930,13 @@
     }
     const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
     const ok = await confirm(
-      `Quit ${who} and start it again, resuming the same conversation?\n\n` +
-        `It comes back with its number, name and unread messages intact, but ` +
-        `anything it is doing right now is lost.`,
+      s.worked
+        ? `Quit ${who} and start it again, resuming the same conversation?\n\n` +
+            `It comes back with its number, name and unread messages intact, but ` +
+            `anything it is doing right now is lost.`
+        : `Quit ${who} and start it again fresh?\n\n` +
+            `It has no conversation yet, so nothing is resumed. It keeps its ` +
+            `number, name and unread messages.`,
       {
         title: "Restart Session",
         kind: "warning",
@@ -1878,6 +1882,10 @@
         oncontext={openRowMenu}
         oncontextempty={openEmptyMenu}
         onsaveretry={retrySave}
+        onrestart={(id) => {
+          const h = get(activeProjectHandle);
+          if (h != null) void restartInstance(h, id);
+        }}
       />
       <HubPanel />
     </aside>

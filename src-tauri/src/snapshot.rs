@@ -95,6 +95,13 @@ pub struct SessionInfo {
     pub board_unread: u32,
     /// Its cards a claude marked urgent (the badge turns red).
     pub board_urgent: u32,
+    /// A claude started on a build whose spawn-frozen code (rules, hub tools,
+    /// listener — `spawnprint.rs`) differs from this one: the sidebar's ↻
+    /// badge, cleared by ⌘⇧R. Always false for a terminal.
+    pub outdated: bool,
+    /// It has taken a prompt, so ⌘⇧R resumes its conversation; otherwise ⌘⇧R
+    /// starts it fresh.
+    pub worked: bool,
 }
 
 /// A locked file → holder, for the hub panel's Locks view.

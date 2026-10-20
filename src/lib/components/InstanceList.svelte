@@ -28,6 +28,7 @@
     oncontext,
     oncontextempty,
     onsaveretry,
+    onrestart,
   }: {
     onselect: (id: number) => void;
     /** Toggle mute for any row, without selecting it first. */
@@ -48,6 +49,8 @@
     oncontextempty: (e: MouseEvent) => void;
     /** Re-run a failed ⌘S save for this row. */
     onsaveretry: (id: number) => void;
+    /** ⌘⇧R this row (the ↻ badge) — the same confirm as the menu. */
+    onrestart: (id: number) => void;
   } = $props();
 
   const SAVE_LABEL = {
@@ -401,6 +404,19 @@
               onclick={() => openPanel("board")}>▦ {s.board_open}{#if s.board_unread}<span class="pdot"></span>{/if}</span
             >
           {/if}
+          {#if !shell && s.outdated && !s.failed}
+            <!-- Started on an older build's hub rules/tools (spawnprint.rs).
+                 Its own click: restarting must not also select the row. -->
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
+              class="outdated"
+              title="Started on an older Mulpex — restart (⌘⇧R) to get new hub features."
+              onclick={(e) => {
+                e.stopPropagation();
+                onrestart(s.id);
+              }}>↻</span
+            >
+          {/if}
         </div>
         {#if s.name || (!shell && $tasks.get(s.id)) || pct != null}
           <!-- Name/task on the left, context % under the status word. -->
@@ -664,6 +680,20 @@
     height: 0.35rem;
     border-radius: 50%;
     background: var(--accent);
+  }
+  .outdated {
+    flex-shrink: 0;
+    margin-left: 0.3rem;
+    padding: 0 0.3rem;
+    border-radius: 0.6rem;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--text);
+    font-size: 0.7rem;
+    line-height: 1.05rem;
+    cursor: pointer;
+  }
+  .outdated:hover {
+    background: color-mix(in srgb, var(--accent) 40%, transparent);
   }
   .auto {
     flex-shrink: 0;

@@ -529,6 +529,14 @@ item's *auto* minimum lets it grow past its track and the children's `overflow-y
 engages.
 
 
+## ↻ Outdated claudes
+
+A claude started on a build whose hub rules/tools/listener differ from this one (it survived an
+update, docs/ptyd.md) shows a small **↻** in its status line (`SessionInfo.outdated`). Hover says
+why; a click opens the ⌘⇧R confirm (its own click — it does not also select the row). The confirm
+says "start it again fresh" when the claude has never had a prompt (`SessionInfo.worked`). Per row
+only, never automatic: restarting loses whatever the claude is doing.
+
 ## Context window % in the sidebar
 
 Each claude row shows how full its context window is, under the status word: gray, **yellow from

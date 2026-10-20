@@ -58,6 +58,11 @@ export interface SessionInfo {
   board_unread: number;
   /** Its cards a claude marked urgent — the badge turns red. */
   board_urgent: number;
+  /** A claude started on an older build's hub rules/tools (`spawnprint.rs`):
+   *  the ↻ badge, cleared by ⌘⇧R. False for a terminal. */
+  outdated: boolean;
+  /** It has taken a prompt: ⌘⇧R resumes it rather than starting it fresh. */
+  worked: boolean;
 }
 export interface StatusEntry {
   id: number;

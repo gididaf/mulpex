@@ -771,6 +771,8 @@ impl Core {
                     board_open: board.open,
                     board_unread: board.unread,
                     board_urgent: board.urgent,
+                    outdated: s.outdated(),
+                    worked: self.worked.contains(&s.id),
                 }
             })
             .collect()
@@ -962,6 +964,8 @@ impl Core {
             board_open: 0,
             board_unread: 0,
             board_urgent: 0,
+            outdated: false,
+            worked: false,
         })
     }
 
@@ -1016,6 +1020,8 @@ impl Core {
             board_open: 0,
             board_unread: 0,
             board_urgent: 0,
+            outdated: false,
+            worked: false,
         })
     }
 
@@ -1875,12 +1881,14 @@ impl Core {
     /// therefore its hub address, its name, its mute, its place in the sidebar,
     /// and its undelivered mail — and replaces only the process.
     ///
-    /// It **refuses** rather than kills when there is nothing to resume. An
-    /// instance that has never had a prompt submitted has no transcript on disk,
-    /// so `claude --resume <uuid>` exits within seconds (measured — see the
-    /// ghost-uuid test below) and the row would come back dead, having killed a
-    /// perfectly good claude to get there. `worked` answers exactly that question:
-    /// it latches when the first `UserPromptSubmit` hook writes the status file.
+    /// An instance that has never had a prompt submitted has no transcript on
+    /// disk, so `claude --resume <uuid>` would exit within seconds (measured —
+    /// see the ghost-uuid test below). Such a claude is restarted **fresh**
+    /// instead: same row, a new conversation uuid, no `--resume` — it had no
+    /// conversation to lose. `worked` answers exactly that question: it latches
+    /// when the first `UserPromptSubmit` hook writes the status file. This is
+    /// what lets the ↻ badge (an outdated spawn, `spawnprint.rs`) be cleared on
+    /// any claude.
     pub fn restart_instance(&mut self, id: usize) -> anyhow::Result<()> {
         let pos = self
             .sessions
@@ -1893,13 +1901,9 @@ impl Core {
         if self.saving.contains(&id) {
             anyhow::bail!("claude#{id} was saved — continue it from ⌘L instead");
         }
-        let session_id = self.sessions[pos].session_id.clone();
-        if session_id.is_empty() || !self.worked.contains(&id) {
-            anyhow::bail!(
-                "claude#{id} has no conversation to resume yet — send it a prompt first, \
-                 or close it with ⌘W and open a new one"
-            );
-        }
+        let old_session_id = self.sessions[pos].session_id.clone();
+        let resume = !old_session_id.is_empty() && self.worked.contains(&id);
+        let session_id = if resume { old_session_id } else { persist::new_uuid() };
         // Same check ⌘T makes, for the same reason: if macOS is withholding the
         // folder, the respawn would fail *after* we had already killed the
         // instance the user still has.
@@ -1914,8 +1918,15 @@ impl Core {
         // and `persist_sessions` still writes its `session_id`. Without them the
         // dead session is an ordinary exit — removed from the list, and the
         // conversation's uuid gone from the store along with it.
+        //
+        // A fresh restart has no conversation to keep, so it is an ordinary
+        // start: an early death fails the row, and the store keeps nothing.
         self.started.insert(id, Instant::now());
-        self.restored.insert(id, Instant::now());
+        if resume {
+            self.restored.insert(id, Instant::now());
+        } else {
+            self.restored.remove(&id);
+        }
 
         // Kill first, and finish killing before spawning: two claudes appending
         // to one transcript is not a state `--resume` can be asked to make sense
@@ -1948,11 +1959,20 @@ impl Core {
         // itself after an app update). This flag is the exception: it tells the
         // hook that *this* wake was asked for, so the instance comes back armed
         // with its inbox drained instead of silently deaf to hub mail.
-        let _ = std::fs::create_dir_all(self.state_dir.join(mulpex_core::RESUMED_DIR));
-        let _ = std::fs::write(
-            mulpex_core::resumed_in_place_path(&self.state_dir, id),
-            "",
-        );
+        //
+        // A fresh claude needs none of that: nothing is resumed, and its listener
+        // is armed at session start like any new instance's. Its old process's
+        // uuid report is dropped too, or `reconcile_session_ids` would hand the
+        // new process the old uuid back.
+        if resume {
+            let _ = std::fs::create_dir_all(self.state_dir.join(mulpex_core::RESUMED_DIR));
+            let _ = std::fs::write(
+                mulpex_core::resumed_in_place_path(&self.state_dir, id),
+                "",
+            );
+        } else {
+            let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
+        }
 
         let settings_path = self.settings_path.clone();
         let state_dir = self.state_dir.clone();
@@ -1967,7 +1987,7 @@ impl Core {
                 state_dir: &state_dir,
                 helper_path: &helper_path,
                 session_id: &session_id,
-                resume: true,
+                resume,
                 initial_task: None,
                 plain_prompt: None,
             },
@@ -4335,35 +4355,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// ⌘⇧R must never kill what it cannot bring back.
+    /// ⌘⇧R on a claude nobody has prompted starts it fresh.
     ///
-    /// An instance that has never had a prompt submitted has no transcript on
-    /// disk, so `--resume` would exit within seconds and the row would come back
-    /// dead — having killed a working claude to get there. The refusal has to
-    /// happen before anything is touched.
+    /// It has no transcript on disk, so `--resume` would exit within seconds and
+    /// the row would come back dead. Instead it gets a new uuid and a plain
+    /// start, on the same row — and a fresh spawn carries this build's spawn
+    /// fingerprint, which is how the ↻ badge clears on it.
     #[test]
-    fn restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it() {
+    fn restarting_an_unprompted_instance_starts_it_fresh_on_the_same_row() {
         let saved = [record("nothing to resume", Some(1))];
         let (_env, root, mut core) = core_from_store("restartguard", &saved);
         let id = core.sessions[0].id;
         let sid = core.sessions[0].session_id.clone();
         // The restore path seeds `worked`; a claude nobody has prompted yet is
-        // exactly the case this guards, so put it back in that state.
+        // exactly the case this covers, so put it back in that state.
         core.worked.remove(&id);
+        let stale = mulpex_core::session_id_path(&core.state_dir, id);
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, &sid).unwrap();
 
-        let err = core
-            .restart_instance(id)
-            .expect_err("it agreed to resume a conversation that does not exist");
-        assert!(
-            err.to_string().contains("no conversation to resume"),
-            "unexpected refusal: {err}"
-        );
-        assert_eq!(core.sessions.len(), 1, "the row it refused to restart is gone");
-        assert_eq!(core.sessions[0].session_id, sid, "the conversation was replaced");
-        assert!(
-            core.sessions[0].is_alive(),
-            "it killed the instance it had just refused to restart"
-        );
+        core.restart_instance(id).expect("the fresh restart failed");
+
+        assert_eq!(core.sessions.len(), 1, "the restart changed the row count");
+        assert_eq!(core.sessions[0].id, id, "the instance was renumbered");
+        assert_ne!(core.sessions[0].session_id, sid, "it reused a uuid with no transcript");
+        assert!(core.sessions[0].is_alive(), "nothing was spawned in its place");
+        assert!(!core.restored.contains_key(&id), "a fresh start read as a restore");
+        assert!(!stale.exists(), "the old process's uuid report would be adopted back");
+        assert!(!core.session_infos()[0].outdated, "a fresh spawn is not outdated");
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

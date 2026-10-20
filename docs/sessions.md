@@ -757,11 +757,13 @@ hub address, its name and mute, its position in the sidebar, its `inbox/<id>` ma
 
 Five things it does that are not obvious:
 
-- **It refuses rather than kills when there is nothing to resume.** An instance that has never had a
-  prompt submitted has no transcript, so `--resume` would print `No conversation found` and exit in
-  ~1.6 s — the row would come back dead, having killed a working claude to get there. `worked` is
-  exactly that question (it latches when the first `UserPromptSubmit` hook writes the status file),
-  so it is the guard, and the refusal happens before anything is touched.
+- **With nothing to resume it starts fresh instead.** An instance that has never had a prompt
+  submitted has no transcript, so `--resume` would print `No conversation found` and exit in
+  ~1.6 s — the row would come back dead. `worked` is exactly that question (it latches when the
+  first `UserPromptSubmit` hook writes the status file). Unworked, the row is respawned with a
+  **new** uuid and no `--resume`: no `restored` stamp, no `resumed` marker, and its old
+  `sessionid/<id>` report deleted so `reconcile_session_ids` can't hand the old uuid back. It used
+  to refuse; it changed (2026-10-20) so the ↻ outdated badge (docs/ptyd.md) clears on any claude.
 - **`started`/`restored` are stamped BEFORE the kill.** If the respawn then fails, that is what makes
   `reap_dead` read the corpse as a *failed restore* — row kept with the reason in its own pane,
   `session_id` still written to the store. Stamped after a successful spawn instead, a failed
