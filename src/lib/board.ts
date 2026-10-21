@@ -22,7 +22,8 @@ import {
   type BoardCard,
   type BoardEdit,
 } from "./ipc";
-import { flashToast } from "./stores";
+import { flashToast, projects } from "./stores";
+import { addrIn } from "./agents";
 import { hostUpload, slotOf } from "./hosts";
 
 /** Boards per project handle. */
@@ -93,7 +94,7 @@ export async function sendBoard(handle: number) {
   try {
     const r = await boardUpdate(handle);
     if (r.refused.length) flashToast(r.refused.join(" · "));
-    else if (r.sent.length) flashToast(r.sent.length === 1 ? `Sent to claude#${r.sent[0]}` : `Sent to ${r.sent.length} claudes`);
+    else if (r.sent.length) flashToast(r.sent.length === 1 ? `Sent to ${addrIn(get(projects).get(handle)?.sessions ?? [], r.sent[0])}` : `Sent to ${r.sent.length} claudes`);
   } catch (err) {
     flashToast(String(err));
   }

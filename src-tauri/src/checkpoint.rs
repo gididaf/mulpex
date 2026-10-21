@@ -170,7 +170,7 @@ impl Workspace {
                     id: s.id,
                     alive,
                     unread: s.file.as_ref().is_some_and(|f| f.exists()),
-                    listener: core.is_some_and(|c| c.listener_ready(s.id)),
+                    listener: core.is_some_and(|c| c.wake_ready(s.id)),
                 }
             })
             .collect()
@@ -307,7 +307,7 @@ impl Workspace {
                 let stopped = stopped_rule(
                     unread,
                     word.trim(),
-                    core.listener_alive(s.id),
+                    core.wake_alive(s.id),
                     mulpex_core::only_background_work(&core.state_dir, s.id),
                 );
                 (!stopped).then(|| Target {
@@ -335,7 +335,7 @@ impl Workspace {
             if !core.live_claude_ids().contains(&id) {
                 continue;
             }
-            if core.listener_ready(id) || at.elapsed() >= WAKE_WAIT {
+            if core.wake_ready(id) || at.elapsed() >= WAKE_WAIT {
                 core.send_app_message(id, WAKE_BODY);
             } else {
                 self.checkpoint.wake.push((handle, id, at));

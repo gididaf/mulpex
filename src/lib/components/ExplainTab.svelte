@@ -4,6 +4,7 @@
   import { terminals } from "../terminals";
   import { renderMarkdown } from "../markdown";
   import { activeProjectHandle, activeId, sessions } from "../stores";
+  import { addr } from "../agents";
 
   // The side panel's Explain tab (⌘⇧E): the active claude's explanation. A tab,
   // so it never closes — Clear discards the thread (and its fork); hiding the
@@ -11,6 +12,7 @@
   const handle = $derived($activeProjectHandle);
   const id = $derived($activeId);
   const kind = $derived(id != null ? $sessions.find((s) => s.id === id)?.kind : undefined);
+  const who = $derived(id != null ? addr(kind, id) : "");
 
   const ex = $derived(handle != null && id != null ? $explains.get(explainKey(handle, id)) : undefined);
   const busy = $derived(ex ? isStreaming(ex) : false);
@@ -65,7 +67,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="panel" role="region" tabindex="-1" {onkeydown} aria-label="Explanation">
     <div class="bar">
-      <span class="who">claude#{id}</span>
+      <span class="who">{who}</span>
       <button class="clear" title="Discard this explanation" onclick={clear}>Clear</button>
     </div>
     <blockquote dir="auto">{ex.quote}</blockquote>
@@ -98,9 +100,9 @@
     {#if id == null}
       No instance selected.
     {:else if kind === "shell"}
-      Explain works on claudes only.
+      Explain works on claudes and codexes only.
     {:else}
-      Nothing explained for claude#{id}.<br />Select text in the conversation and press ⌘⇧E.
+      Nothing explained for {who}.<br />Select text in the conversation and press ⌘⇧E.
     {/if}
   </div>
 {/if}

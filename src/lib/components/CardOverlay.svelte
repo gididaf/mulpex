@@ -12,6 +12,7 @@
   import type { Board, BoardCard, SessionInfo } from "../ipc";
   import { editBoard, uploadImage, importImages, pickImages, setDropTarget, MAX_IMAGES, IMAGE_TYPES } from "../board";
   import { flashToast } from "../stores";
+  import { addr, addrIn } from "../agents";
   import { renderMarkdownAuto } from "../markdown";
   import ImageStrip from "./ImageStrip.svelte";
 
@@ -137,7 +138,7 @@
   }
 
   const colName = (id: number) => board.columns.find((c) => c.id === id)?.name ?? "?";
-  const who = (c: { by: string; who: number | null }) => (c.by === "user" ? "you" : c.who != null ? `claude#${c.who}` : "claude");
+  const who = (c: { by: string; who: number | null }) => (c.by === "user" ? "you" : c.who != null ? addrIn(claudes, c.who) : "claude");
   const assigneeGone = $derived(card.assignee != null && !claudes.some((s) => s.id === card.assignee));
 
   // ── editing an unsent comment of the user's ─────────────────────────────────
@@ -202,13 +203,13 @@
         <span>Assignee</span>
         <select value={card.assignee ?? ""} onchange={(e) => { const v = (e.currentTarget as HTMLSelectElement).value; editBoard(handle, { op: "assign", n: card.n, to: v === "" ? null : Number(v) }); }}>
           <option value="">Nobody</option>
-          {#each claudes as s (s.id)}<option value={s.id}>claude#{s.id}{s.name ? ` · ${s.name}` : ""}</option>{/each}
-          {#if assigneeGone}<option value={card.assignee}>claude#{card.assignee} (closed)</option>{/if}
+          {#each claudes as s (s.id)}<option value={s.id}>{addr(s.kind, s.id)}{s.name ? ` · ${s.name}` : ""}</option>{/each}
+          {#if assigneeGone}<option value={card.assignee}>#{card.assignee} (closed)</option>{/if}
         </select>
       </label>
     </div>
     <div class="meta">
-      {card.author === "user" ? "Added by you" : `Added by claude#${card.by ?? "?"}`} · in {colName(card.col)}{card.archived ? " · archived" : ""}
+      {card.author === "user" ? "Added by you" : `Added by ${card.by != null ? addrIn(claudes, card.by) : "?"}`} · in {colName(card.col)}{card.archived ? " · archived" : ""}
     </div>
 
     <section>
@@ -283,7 +284,7 @@
     <textarea
       dir="auto"
       rows="2"
-      placeholder={card.assignee != null ? `Comment to claude#${card.assignee}… paste or drop images (⌘↩ adds; UPDATE tells it)` : "Comment… (no assignee: nobody is told)"}
+      placeholder={card.assignee != null ? `Comment to ${addrIn(claudes, card.assignee)}… paste or drop images (⌘↩ adds; UPDATE tells it)` : "Comment… (no assignee: nobody is told)"}
       bind:value={text}
       onpaste={onpaste}
       onkeydown={onComposerKey}

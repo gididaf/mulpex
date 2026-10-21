@@ -219,6 +219,21 @@ pub struct StatusEntry {
     /// Between `PreCompact` and the `SessionStart` that ends it — the hook's own
     /// flag. Lets the app tell a `/compact` that ran from one that was refused.
     pub compacting: bool,
+    /// The last time the app rang this codex about unread mail (`wake.rs`), and
+    /// how that went. Always `None` for a claude, whose listener wakes it.
+    pub wake: Option<WakeMark>,
+}
+
+/// One wake attempt as the row shows it. `state` is `rang` (sent, ack not seen
+/// yet), `delivered` (the codex's own hook acked it), `unanswered` (no ack in
+/// time, or `codex queue` failed) or `refused` (the typed fallback found a
+/// draft in the box). `at_ms` is wall-clock milliseconds.
+#[derive(Clone, PartialEq, Eq, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeMark {
+    pub at_ms: u64,
+    pub state: String,
+    pub detail: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -264,6 +279,22 @@ pub struct ClaudeStatus {
     pub found: bool,
     pub path: Option<String>,
     pub searched_path: String,
+}
+
+/// `agent_status`: the same probe for each agent CLI.
+#[derive(Clone, Serialize)]
+pub struct AgentStatus {
+    pub claude: ClaudeStatus,
+    pub codex: ClaudeStatus,
+}
+
+/// `codex-wake` event payload: type `line` into codex#`id`'s box if it is
+/// empty, and answer with `wake_typed` (`wake.rs`).
+#[derive(Clone, Serialize)]
+pub struct CodexWake {
+    pub handle: ProjectHandle,
+    pub id: usize,
+    pub line: String,
 }
 
 /// `save-progress` event payload (⌘S, `saves.rs`). `state` is one of

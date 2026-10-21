@@ -27,6 +27,9 @@ import { slotOf, hostClipboardImage } from "./hosts";
 import { pastePaths } from "./paths";
 import type { SessionKind } from "./ipc";
 import { readPromptBox } from "./promptbox";
+import { agentOf, isAgent } from "./agents";
+import { projects } from "./stores";
+import { get } from "svelte/store";
 import type { PromptBox } from "./promptbox";
 import { captureSelection, plainText } from "./pins";
 import { IS_LINUX, isSuper } from "./platform";
@@ -272,12 +275,16 @@ class TerminalManager {
     // Ctrl+V in a remote claude: Claude Code would read the clipboard of the
     // machine IT runs on. The image on this Mac's clipboard goes there first
     // and its path is pasted; with no image, the Ctrl+V goes through as is.
+    // Both agents: codex reads its own machine's clipboard on Ctrl+V too, and
+    // takes ESC+CR as a newline in its composer (measured, codex 0.149.1). A
+    // row keeps its pane when ⌘⌥S swaps its agent, so this is by agent-ness.
+    const agent = isAgent(kind);
     const isImagePaste = (e: KeyboardEvent): boolean =>
-      slot > 0 && kind === "claude" && e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyV";
-    if (kind === "claude" || IS_LINUX) {
+      slot > 0 && agent && e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyV";
+    if (agent || IS_LINUX) {
       term.attachCustomKeyEventHandler((e) => {
         if (IS_LINUX && isSuper(e)) return false;
-        if (kind !== "claude") return true;
+        if (!agent) return true;
         if (isImagePaste(e)) {
           if (e.type === "keydown") {
             e.preventDefault();
@@ -495,12 +502,15 @@ class TerminalManager {
     if (changed || force) this.onGeometry?.(this.cols, this.rows);
   }
 
-  /** Whether (handle, id)'s claude input box is empty, holds a draft, or can't
-   *  be found on screen. See `promptbox.ts`. */
+  /** Whether (handle, id)'s input box is empty, holds a draft, or can't be
+   *  found on screen — read the way its agent draws it, looked up now rather
+   *  than at create (⌘⌥S swaps a row's agent under the same pane). A terminal
+   *  has no box. See `promptbox.ts`. */
   promptBox(handle: number, id: number): PromptBox {
     const e = this.entries.get(keyOf(handle, id));
-    if (!e) return "none";
-    return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols);
+    const agent = agentOf(get(projects).get(handle)?.sessions.find((s) => s.id === id)?.kind);
+    if (!e || !agent) return "none";
+    return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols, agent);
   }
 
   /** (handle, id)'s visible screen as plain text, one line per row. */

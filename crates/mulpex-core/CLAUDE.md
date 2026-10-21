@@ -25,11 +25,19 @@ the reason that outlived it.)
 
 Traps that live in this crate specifically:
 
+- **Codex rows run the same helper in a different dialect** (`Agent::from_env()`, `MULPEX_AGENT`).
+  Agent-specific behaviour goes in one function per concern taking an `Agent` (`codex.rs`,
+  `rules::system_prompt_for`, `hook.rs` `patch_guard`/`write_codex_session`/`codex_asked_the_user`),
+  never an inline `if codex`; the Claude path is golden-tested (`rules::tests::claude_rules_are_golden`,
+  `remote_launch_command_for(Claude)` == the old string). A row's address is `crate::addr` —
+  `claude#N` or `codex#N` from `agents/<id>` — never a hand-written `format!("claude#{id}")`.
+  → [../../docs/codex.md](../../docs/codex.md)
+
 - **A bare integer filename at the state-dir root is scanned as an instance status file**
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `watching/`, `compacting/`,
   `armed/`, `relisten/`, `pids/`, `listeners/`,
   `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, `ctx/`,
-  `dialog/`, `secrets/`, like `peers/` already does.
+  `dialog/`, `secrets/`, `agents/`, `transcript/`, `agentready/`, `wake/`, like `peers/` already does.
 - **A re-arm-only wake must leave no trace, and proving it *is* re-arm-only is the whole job.**
   `quietturn/<id>` is written when a `<task-notification>` turn starts and cleared by the first
   tool call that is not `is_listener_rearm` — so surviving to `Stop` is evidence, not a guess.
@@ -42,7 +50,8 @@ Traps that live in this crate specifically:
   gated on it (`nudges_welcome`) — an arm nudge injected there made the instance start the very
   Monitor whose death causes the next one. The peer snapshot is the deliberate exception: a hub
   wake *is* a task-notification. → [../../docs/hub.md](../../docs/hub.md)
-- **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed]]]]]`). Only
+- **`persist.rs`'s store columns are positional** (`<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\tauto_compact[\tname_by[\ttodos[\tagent]]]]]]]]]`,
+  `agent` written only as `codex`, so a claude line is unchanged). Only
   *trailing* empties may be dropped, or the id is read back as the name.
 - **`SessionStore::new` picks the home from the ambient `MULPEX_HOME`, so anything that is not the
   desktop app must not use it.** Leave that variable unset and the first write lands in the app's
@@ -104,3 +113,6 @@ Traps that live in this crate specifically:
   they survive compaction — that is why contracts with instances live there and not in an injected
   prompt. Anything whose grammar is also parsed in code (the remote `<<<MPX …>>>` marker) has a test
   asserting the rules' own example parses, so the two halves cannot drift.
+
+**Codex rows** (a second agent kind beside claude): anything that takes an `Agent` — read
+[../../docs/codex.md](../../docs/codex.md) first; the Claude path must stay byte-identical.

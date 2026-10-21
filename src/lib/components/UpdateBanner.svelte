@@ -12,6 +12,12 @@
   } from "../updater";
   import { startCheckpoint } from "../checkpoint";
   import { hosts, hostUpdateCancel, hostUpdateClear, type HostUpdate } from "../hosts";
+  import { projects } from "../stores";
+  import { addrIn } from "../agents";
+
+  /** `claude#3` / `codex#3` for a row the host names by project + number. */
+  const addrOf = (project: string, id: number) =>
+    addrIn([...$projects.values()].find((x) => x.name === project)?.sessions ?? [], id);
 
   /** One line per remote host being updated. */
   function stepText(u: HostUpdate | null | undefined): string {
@@ -26,7 +32,7 @@
         return n === 0
           ? "all claudes stopped"
           : `checkpointing — ${n} still working: ${u.pending
-              .map((p) => (p.name ? `${p.name} (claude#${p.id})` : `claude#${p.id}`))
+              .map((p) => (p.name ? `${p.name} (${addrOf(p.project, p.id)})` : addrOf(p.project, p.id)))
               .join(", ")}`;
       }
       case "downloading":

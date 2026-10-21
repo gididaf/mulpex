@@ -14,8 +14,12 @@
     treeDepths,
     hiddenIds,
     descendantsOf,
+    activeProject,
+    wakeStuck,
   } from "../stores";
-  import type { SessionInfo, Status } from "../ipc";
+  import type { SessionInfo, Status, WakeMark } from "../ipc";
+  import { rowLabel } from "../agents";
+  import { onMount } from "svelte";
   import { compactLines } from "../compact";
 
   let {
@@ -59,6 +63,7 @@
     fixing: "saving… fixing",
     done: "saved ✓",
     error: "save failed",
+    "handed-off": "handed off ✓",
   } as const;
 
   const DOT: Record<Status, string> = {
@@ -88,8 +93,32 @@
   }
   /** How a row names itself. Instances and terminals draw from one id space, so
    *  the number alone is unambiguous — the word says which kind it is. */
-  const label = (s: { id: number; kind: string }) =>
-    s.kind === "shell" ? `term #${s.id}` : `claude #${s.id}`;
+  const label = (s: SessionInfo) => rowLabel(s.kind, s.id);
+
+  /** A codex's wake mark (`StatusEntry.wake`, `wake.rs`). Mail reaches a codex
+   *  only when the app rings it, so every ring shows: 🔔 while a ring is fresh
+   *  (fading out over WAKE_FRESH_MS), and an amber ⚠ that stays for one that
+   *  did not get through — never nothing, which would look like no mail. */
+  const WAKE_FRESH_MS = 30_000;
+  let now = $state(Date.now());
+  onMount(() => {
+    const t = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
+  function wakeMark(id: number): { stuck: boolean; fade: number; title: string } | null {
+    const m: WakeMark | undefined = $activeProject?.wake?.get(id);
+    if (!m) return null;
+    const when = new Date(m.atMs).toLocaleTimeString();
+    const detail = m.detail ? `: ${m.detail}` : "";
+    if (wakeStuck(m)) {
+      const what = m.state === "refused" ? "Not woken" : "Rang, no answer";
+      return { stuck: true, fade: 1, title: `${what} (${when})${detail} — it has unread mail. Retried every 30 s.` };
+    }
+    const age = now - m.atMs;
+    if (age >= WAKE_FRESH_MS) return null;
+    const what = m.state === "delivered" ? "Woken for new mail" : "Ringing for new mail";
+    return { stuck: false, fade: 1 - age / WAKE_FRESH_MS, title: `${what} (${when})${detail}` };
+  }
 
   /** How far each row is indented: a `hub_spawn` child sits one step under its
    *  spawner, at any depth. */
@@ -104,7 +133,9 @@
     const kids = descendantsOf($sessions, id);
     return {
       count: kids.length,
-      needs: kids.some((k) => !k.muted && !k.failed && $statuses.get(k.id) === "needs"),
+      needs: kids.some(
+        (k) => !k.muted && !k.failed && ($statuses.get(k.id) === "needs" || wakeStuck($activeProject?.wake?.get(k.id))),
+      ),
     };
   }
 
@@ -371,6 +402,10 @@
             <span class="dot" style:background={DOT[st]}></span>
           {/if}
           <span class="id">{label(s)}</span>
+          {#if s.kind === "codex"}
+            <!-- Codex's own prompt mark; the word in the label says it too. -->
+            <span class="agent" title="OpenAI Codex">&gt;_</span>
+          {/if}
           {#if s.collapsed && fam.count > 0}
             <span class="folded" class:needs={fam.needs} title={fam.needs ? "one of them needs you" : ""}>
               +{fam.count}
@@ -378,6 +413,14 @@
           {/if}
           {#if !shell && !s.failed && !s.muted && waitOn(s.id) != null}
             <span class="wait" title="waiting on #{waitOn(s.id)}">⏳</span>
+          {/if}
+          {#if s.kind === "codex" && !s.failed && !s.muted}
+            {@const wm = wakeMark(s.id)}
+            {#if wm}
+              <span class="wake" class:stuck={wm.stuck} style:opacity={wm.fade} title={wm.title}
+                >{wm.stuck ? "⚠" : "🔔"}</span
+              >
+            {/if}
           {/if}
           {#if shell}
             <span class="st">{s.exited ? "exited" : "running"}</span>
@@ -439,7 +482,7 @@
           class="mute"
           class:on={s.muted}
           aria-pressed={s.muted}
-          title="{s.muted ? 'Unmute' : 'Mute'} claude #{s.id}{s.id === $activeId
+          title="{s.muted ? 'Unmute' : 'Mute'} {label(s)}{s.id === $activeId
             ? ' (⌘M)'
             : ''}"
           onclick={() => onmute(s.id, !s.muted)}
@@ -632,6 +675,21 @@
   }
   .wait {
     font-size: 0.8rem;
+  }
+  .agent {
+    color: var(--text-faint);
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 0.66rem;
+    line-height: 1;
+  }
+  .wake {
+    font-size: 0.72rem;
+    line-height: 1;
+    transition: opacity 1s linear;
+  }
+  .wake.stuck {
+    color: var(--label);
+    font-weight: 600;
   }
   .st {
     margin-left: auto;

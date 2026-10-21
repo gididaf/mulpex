@@ -23,6 +23,10 @@
 //! transcript behind, and a save takes ~2.5 min / ~$2–4 on Opus. The check step
 //! is worth its cost: on the first real save it found an unmentioned crash path.
 //!
+//! **Codex rows** (docs/codex.md) run the same three steps through
+//! `codex exec fork <thread> --ephemeral` (`headless.rs`): the agent that had
+//! the conversation forks it. The check step is a blank run of the same agent.
+//!
 //! Every step is read-only — `Read/Grep/Glob` plus read-only git — and Mulpex,
 //! not the child, writes the file. Each save runs on its own thread; there is no
 //! queue, because saves are rare and a second ⌘S on the same instance is refused
@@ -35,10 +39,12 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use mulpex_core::agent::Agent;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::claude_bin;
+use crate::headless::{self, Job};
 use crate::state::AppState;
 use crate::snapshot::{ProjectHandle, SaveProgress};
 
@@ -56,7 +62,7 @@ update what changed, and drop what is no longer true. Keep its `slug`.";
 
 /// Per step. A fork re-reads the whole conversation and then explores the repo;
 /// the measured steps took 30–70 s, so this only catches a hung child.
-const STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Where saves live, relative to the repo root.
 pub const SAVES_DIR: &str = "mulpex/saves";
@@ -64,6 +70,18 @@ pub const SAVES_DIR: &str = "mulpex/saves";
 /// Instances with a save in flight, so a second ⌘S is refused instead of
 /// racing the first one to the same slug.
 static RUNNING: Mutex<Option<HashSet<(ProjectHandle, usize)>>> = Mutex::new(None);
+
+/// Claim (handle, id) for a save or a handoff; false when one is under way.
+pub(crate) fn claim(handle: ProjectHandle, id: usize) -> bool {
+    RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).insert((handle, id))
+}
+
+/// Release what [`claim`] took.
+pub(crate) fn release(handle: ProjectHandle, id: usize) {
+    if let Some(running) = RUNNING.lock().unwrap().as_mut() {
+        running.remove(&(handle, id));
+    }
+}
 
 /// What the fork returns. `body` is the English doc; the rest is the header.
 #[derive(Debug, Deserialize, PartialEq)]
@@ -85,11 +103,17 @@ pub fn start(
     dir: PathBuf,
     uuid: String,
 ) -> Result<(), String> {
-    {
-        let mut running = RUNNING.lock().unwrap();
-        if !running.get_or_insert_with(HashSet::new).insert((handle, id)) {
-            return Err(format!("claude#{id} is already being saved"));
-        }
+    // The row's own agent forks its conversation; a held row still knows it.
+    let agent = app
+        .state::<AppState>()
+        .ws
+        .lock()
+        .unwrap()
+        .project(handle)
+        .and_then(|core| core.agent_of(id))
+        .unwrap_or_default();
+    if !claim(handle, id) {
+        return Err(format!("{}#{id} is already being saved", agent.word()));
     }
     std::thread::spawn(move || {
         let emit = |state: &str, detail: Option<String>, title: Option<String>| {
@@ -103,20 +127,18 @@ pub fn start(
         let existing = save_for_uuid(&read_links(&links_file()), &uuid);
         // The forks bill to the token claude#id is pinned to (Live Token).
         let route = crate::live_token::route(&dir, id);
-        let result = save(&dir, &uuid, &route, existing.as_deref(), |stage| emit(stage, None, None));
+        let result = save(agent, &dir, &uuid, &route, existing.as_deref(), |stage| emit(stage, None, None));
         if let Ok(path) = &result {
-            link("saved", &uuid, &dir, path);
+            link_agent("saved", agent, &uuid, &dir, path);
             if let Some(core) = app.state::<AppState>().ws.lock().unwrap().project_mut(handle) {
                 core.save_succeeded(id);
             }
         }
-        if let Some(running) = RUNNING.lock().unwrap().as_mut() {
-            running.remove(&(handle, id));
-        }
+        release(handle, id);
         match result {
             Ok(path) => emit("done", Some(path.display().to_string()), title_of(&path)),
             Err(reason) => {
-                eprintln!("[saves] claude#{id} failed: {reason}");
+                eprintln!("[saves] {}#{id} failed: {reason}", agent.word());
                 emit("error", Some(reason), None);
             }
         }
@@ -131,6 +153,7 @@ pub fn is_running(handle: ProjectHandle, id: usize) -> bool {
 
 /// The three steps, then the file. Returns the path written.
 fn save(
+    agent: Agent,
     dir: &Path,
     uuid: &str,
     route: &str,
@@ -138,15 +161,11 @@ fn save(
     stage: impl Fn(&str),
 ) -> Result<PathBuf, String> {
     stage("writing");
-    let write = match existing.and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(doc) => format!("{WRITE_PROMPT}\n\n{UPDATE_NOTE}\n\n<current_doc>\n{doc}\n</current_doc>\n"),
-        None => WRITE_PROMPT.to_string(),
-    };
-    let draft = parse_draft(&run_step(dir, route, Some(uuid), &write)?)?;
+    let draft = parse_draft(&run_step(agent, dir, route, Some(uuid), &write_prompt(existing))?)?;
 
     stage("checking");
     let check = format!("{CHECK_PROMPT}\n\n<handoff>\n{}\n</handoff>\n", draft.body);
-    let gaps = run_step(dir, route, None, &check)?;
+    let gaps = run_step(agent, dir, route, None, &check)?;
     let gaps = gaps.trim();
 
     let draft = if gaps == "NONE" {
@@ -162,30 +181,50 @@ fn save(
         let fix = format!(
             "{FIX_PROMPT}\n\n<draft>\n{draft_json}\n</draft>\n\n<reviewer_questions>\n{gaps}\n</reviewer_questions>\n"
         );
-        parse_draft(&run_step(dir, route, Some(uuid), &fix)?)?
+        parse_draft(&run_step(agent, dir, route, Some(uuid), &fix)?)?
     };
+    store(dir, &draft, existing)
+}
 
+/// The write step's prompt: [`WRITE_PROMPT`], plus the current doc when this
+/// conversation already has a save.
+pub(crate) fn write_prompt(existing: Option<&Path>) -> String {
+    match existing.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(doc) => format!("{WRITE_PROMPT}\n\n{UPDATE_NOTE}\n\n<current_doc>\n{doc}\n</current_doc>\n"),
+        None => WRITE_PROMPT.to_string(),
+    }
+}
+
+/// Write `draft` as a save of `dir`'s repo: over `existing`, or as a new file.
+pub(crate) fn store(dir: &Path, draft: &Draft, existing: Option<&Path>) -> Result<PathBuf, String> {
     let root = repo_root(dir);
     // The latest saver is the author: the list shows who touched it last.
     let author = git_user_name(&root);
     match existing {
-        Some(path) => update_save(path, &draft, &author, &today()),
-        None => write_save(&root.join(SAVES_DIR), &draft, &author, &today()),
+        Some(path) => update_save(path, draft, &author, &today()),
+        None => write_save(&root.join(SAVES_DIR), draft, &author, &today()),
     }
 }
 
-/// One headless step. `fork` = `Some(uuid)` resumes that conversation as a
-/// throwaway fork; `None` is a blank claude. The prompt goes on stdin (closed
-/// after, or `-p` waits for EOF forever). Env is scrubbed (`forwarded_env`
-/// drops `MULPEX_*` and `CLAUDE_CODE_CHILD_SESSION`), and no `--bare`: that
-/// can't see the OAuth token.
-fn run_step(dir: &Path, route: &str, fork: Option<&str>, prompt: &str) -> Result<String, String> {
-    run_claude(dir, "opus", Some(route), fork, prompt, STEP_TIMEOUT)
+/// The save conversation `uuid` last saved or was loaded from, if any.
+pub(crate) fn existing_save(uuid: &str) -> Option<PathBuf> {
+    save_for_uuid(&read_links(&links_file()), uuid)
+}
+
+/// One headless step on `agent`. `fork` = `Some(id)` forks that conversation
+/// as a throwaway; `None` is a blank run. Read-only, scrubbed env, prompt on
+/// stdin (`headless.rs`).
+fn run_step(agent: Agent, dir: &Path, route: &str, fork: Option<&str>, prompt: &str) -> Result<String, String> {
+    headless::run(
+        agent,
+        &Job { dir, model: "opus", route: Some(route), fork, prompt, timeout: STEP_TIMEOUT },
+    )
 }
 
 /// One read-only headless `claude -p` (see [`run_step`]); `model` and
 /// `timeout` are the caller's — the runbook sorter uses Sonnet. `route` is the
 /// Live Token route of the claude it works for (`None`: the default token).
+#[allow(dead_code)] // the Claude-only entry point; callers now pick an agent
 pub(crate) fn run_claude(
     dir: &Path,
     model: &str,
@@ -194,77 +233,7 @@ pub(crate) fn run_claude(
     prompt: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    let claude = claude_bin::resolve_claude().ok_or("claude not found")?;
-    let mut args: Vec<&str> = vec![
-        "-p",
-        "--model",
-        model,
-        "--setting-sources",
-        "",
-        "--strict-mcp-config",
-        "--no-session-persistence",
-        "--output-format",
-        "json",
-        "--tools",
-        "Read,Grep,Glob,Bash",
-        "--allowedTools",
-        "Read,Grep,Glob,Bash(git log:*),Bash(git status:*),Bash(git diff:*),\
-         Bash(git show:*),Bash(git branch:*)",
-        "--disallowedTools",
-        "Edit,Write,NotebookEdit",
-    ];
-    if let Some(uuid) = fork {
-        args.extend(["--resume", uuid, "--fork-session"]);
-    }
-    let mut child = Command::new(claude)
-        .args(&args)
-        .env_clear()
-        .envs(claude_bin::forwarded_env())
-        .env("PATH", claude_bin::merged_path())
-        .envs(crate::live_token::spawn_env(route).unwrap_or_default())
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
-    // Both pipes drained on their own threads: a child that fills one pipe while
-    // we block reading the other deadlocks until the timeout.
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut f) = pipe {
-                let _ = f.read_to_string(&mut s);
-            }
-            s
-        })
-    };
-    let out_reader = drain(child.stdout.take().map(|p| Box::new(p) as _));
-    let err_reader = drain(child.stderr.take().map(|p| Box::new(p) as _));
-
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("timeout after {} min", timeout.as_secs() / 60));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
-            Err(e) => return Err(format!("wait: {e}")),
-        }
-    };
-    let out = out_reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
-    if !status.success() {
-        return Err(failure_reason(status.code(), &out, &err));
-    }
-    result_text(&out)
+    headless::run(Agent::Claude, &Job { dir, model, route, fork, prompt, timeout })
 }
 
 /// Why a headless `claude -p` step died, for the error the user sees.
@@ -310,7 +279,7 @@ pub(crate) fn result_text(out: &str) -> Result<String, String> {
 
 /// The fork is told to answer with one JSON object and nothing else, but a
 /// model may still wrap it in a fence or a sentence — take the outermost braces.
-fn parse_draft(text: &str) -> Result<Draft, String> {
+pub(crate) fn parse_draft(text: &str) -> Result<Draft, String> {
     let (start, end) = match (text.find('{'), text.rfind('}')) {
         (Some(s), Some(e)) if e > s => (s, e),
         _ => return Err(format!("no JSON in the answer: {}", first_chars(text, 200))),
@@ -618,8 +587,9 @@ pub fn guide_prompt(pointer: &Path, source: &Path) -> String {
 // ---- local links: save file <-> conversation, never in the repo ----
 //
 // `<mulpex home>/save-links.tsv` (so a debug build uses `~/.mulpex-dev`), one
-// line per event: `kind \t uuid \t project dir \t save path`, all paths
-// canonical. `saved` = that conversation wrote the save; `loaded` = a fresh
+// line per event: `kind \t uuid \t project dir \t save path [\t agent]`, all
+// paths canonical. The agent column is written only for codex (a missing one
+// means claude), so claude lines stay what older builds wrote and read. `saved` = that conversation wrote the save; `loaded` = a fresh
 // claude was started on it. A conversation id means nothing on a coworker's
 // machine, which is why this is not in the doc's header. Append-only and read
 // newest-last; a line whose save file is gone is simply skipped.
@@ -630,6 +600,7 @@ struct Link {
     uuid: String,
     dir: PathBuf,
     save: PathBuf,
+    agent: Agent,
 }
 
 fn links_file() -> PathBuf {
@@ -640,19 +611,28 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Record that conversation `uuid` (running in `dir`) saved or loaded `save`.
+/// Record that claude conversation `uuid` (running in `dir`) saved or loaded `save`.
 pub fn link(kind: &str, uuid: &str, dir: &Path, save: &Path) {
-    append_link(&links_file(), kind, uuid, dir, save);
+    link_agent(kind, Agent::Claude, uuid, dir, save);
 }
 
-fn append_link(file: &Path, kind: &str, uuid: &str, dir: &Path, save: &Path) {
+/// [`link`] for a conversation of `agent`.
+pub fn link_agent(kind: &str, agent: Agent, uuid: &str, dir: &Path, save: &Path) {
+    append_link(&links_file(), kind, agent, uuid, dir, save);
+}
+
+fn append_link(file: &Path, kind: &str, agent: Agent, uuid: &str, dir: &Path, save: &Path) {
     if uuid.is_empty() {
         return;
     }
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let line = format!("{kind}\t{uuid}\t{}\t{}\n", canon(dir).display(), canon(save).display());
+    let tail = match agent {
+        Agent::Claude => String::new(),
+        other => format!("\t{}", other.word()),
+    };
+    let line = format!("{kind}\t{uuid}\t{}\t{}{tail}\n", canon(dir).display(), canon(save).display());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
         let _ = f.write_all(line.as_bytes());
     }
@@ -669,6 +649,7 @@ fn read_links(file: &Path) -> Vec<Link> {
                 uuid: f.next()?.to_string(),
                 dir: PathBuf::from(f.next()?),
                 save: PathBuf::from(f.next()?),
+                agent: f.next().and_then(Agent::parse).unwrap_or_default(),
             })
         })
         .collect()
@@ -684,40 +665,42 @@ fn save_for_uuid(links: &[Link], uuid: &str) -> Option<PathBuf> {
 /// still has its transcript here — the one "Continue conversation" resumes. A
 /// merely `loaded` conversation doesn't count: it may never have saved, so the
 /// doc can be newer than anything it holds.
-fn resumable(links: &[Link], save: &Path, dir: &Path, exists: impl Fn(&str, &Path) -> bool) -> Option<String> {
+fn resumable(
+    links: &[Link],
+    save: &Path,
+    dir: &Path,
+    exists: impl Fn(Agent, &str, &Path) -> bool,
+) -> Option<(String, Agent)> {
     let (save, dir) = (canon(save), canon(dir));
     links
         .iter()
         .rev()
-        .find(|l| l.kind == "saved" && l.save == save && l.dir == dir && exists(&l.uuid, &l.dir))
-        .map(|l| l.uuid.clone())
+        .find(|l| l.kind == "saved" && l.save == save && l.dir == dir && exists(l.agent, &l.uuid, &l.dir))
+        .map(|l| (l.uuid.clone(), l.agent))
 }
 
-/// Public face of [`resumable`] against the real links file and transcripts.
+/// Public face of [`resumable`] against the real links file and transcripts:
+/// the conversation to continue, and which agent it belongs to.
+pub fn resumable_session(save: &Path, dir: &Path) -> Option<(String, Agent)> {
+    resumable(&read_links(&links_file()), save, dir, |agent, uuid, dir| match agent {
+        Agent::Claude => transcript_path(dir, uuid).is_file(),
+        Agent::Codex => crate::agent_transcript::find_rollout(
+            &crate::agent_transcript::codex_home().join("sessions"),
+            uuid,
+        )
+        .is_some(),
+    })
+}
+
+/// [`resumable_session`]'s id alone.
 pub fn resumable_uuid(save: &Path, dir: &Path) -> Option<String> {
-    resumable(&read_links(&links_file()), save, dir, |uuid, dir| transcript_path(dir, uuid).is_file())
+    resumable_session(save, dir).map(|(uuid, _)| uuid)
 }
 
-/// Where Claude Code keeps conversation `uuid` of project `dir`: the canonical
-/// dir with every non-alphanumeric byte turned into `-` (checked against the
-/// real `~/.claude/projects/` names, e.g. `/private/tmp/...` → `-private-tmp-...`).
+/// Where Claude Code keeps conversation `uuid` of project `dir`
+/// (`agent_transcript::claude_path`).
 pub(crate) fn transcript_path(dir: &Path, uuid: &str) -> PathBuf {
-    let slug: String = canon(dir)
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    claude_config_dir().join("projects").join(slug).join(format!("{uuid}.jsonl"))
-}
-
-fn claude_config_dir() -> PathBuf {
-    claude_bin::forwarded_env()
-        .into_iter()
-        .find(|(k, v)| k == "CLAUDE_CONFIG_DIR" && !v.is_empty())
-        .map(|(_, v)| PathBuf::from(v))
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
-        })
+    crate::agent_transcript::claude_path(dir, uuid)
 }
 
 /// Lowercase kebab-case, `[a-z0-9-]` only, ≤ 60 chars; `session` if nothing
@@ -863,13 +846,15 @@ mod tests {
 
     /// The whole pipeline against a real conversation — three Opus calls, so
     /// manual only: `SAVE_TEST_DIR=<project dir> SAVE_TEST_UUID=<uuid> cargo test
-    /// live_save -- --ignored --nocapture`. Writes into that repo's saves dir.
+    /// live_save -- --ignored --nocapture` (`SAVE_TEST_AGENT=codex` for a codex
+    /// thread id). Writes into that repo's saves dir.
     #[test]
     #[ignore]
     fn live_save() {
         let dir = PathBuf::from(std::env::var("SAVE_TEST_DIR").unwrap());
         let uuid = std::env::var("SAVE_TEST_UUID").unwrap();
-        let path = save(&dir, &uuid, "", None, |s| eprintln!("stage: {s}")).unwrap();
+        let agent = std::env::var("SAVE_TEST_AGENT").ok().and_then(|a| Agent::parse(&a)).unwrap_or_default();
+        let path = save(agent, &dir, &uuid, "", None, |s| eprintln!("stage: {s}")).unwrap();
         eprintln!("wrote {}", path.display());
     }
 
@@ -914,11 +899,11 @@ mod tests {
         let a = write_save(&saves, &draft("a"), "x", "d").unwrap();
         let b = write_save(&saves, &draft("b"), "x", "d").unwrap();
         let file = dir.join("links.tsv");
-        append_link(&file, "saved", "u1", &dir, &a);
-        append_link(&file, "loaded", "u2", &dir, &a);
-        append_link(&file, "saved", "u3", &dir, &a);
-        append_link(&file, "saved", "u4", &dir, &b);
-        append_link(&file, "saved", "", &dir, &b); // ignored
+        append_link(&file, "saved", Agent::Claude, "u1", &dir, &a);
+        append_link(&file, "loaded", Agent::Claude, "u2", &dir, &a);
+        append_link(&file, "saved", Agent::Codex, "u3", &dir, &a);
+        append_link(&file, "saved", Agent::Claude, "u4", &dir, &b);
+        append_link(&file, "saved", Agent::Claude, "", &dir, &b); // ignored
         let links = read_links(&file);
         assert_eq!(links.len(), 4);
 
@@ -928,12 +913,16 @@ mod tests {
         assert_eq!(save_for_uuid(&links, "nope"), None);
 
         // Continue: the latest SAVER with a transcript; a loader never counts.
-        let all = |_: &str, _: &Path| true;
-        assert_eq!(resumable(&links, &a, &dir, all).as_deref(), Some("u3"));
-        let only_u1 = |u: &str, _: &Path| u == "u1";
-        assert_eq!(resumable(&links, &a, &dir, only_u1).as_deref(), Some("u1"));
-        let only_u2 = |u: &str, _: &Path| u == "u2";
+        let all = |_: Agent, _: &str, _: &Path| true;
+        assert_eq!(resumable(&links, &a, &dir, all), Some(("u3".into(), Agent::Codex)));
+        let only_u1 = |_: Agent, u: &str, _: &Path| u == "u1";
+        assert_eq!(resumable(&links, &a, &dir, only_u1), Some(("u1".into(), Agent::Claude)));
+        let only_u2 = |_: Agent, u: &str, _: &Path| u == "u2";
         assert_eq!(resumable(&links, &a, &dir, only_u2), None);
+        // Claude lines are what older builds wrote; codex adds a column.
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text.lines().next().unwrap().split('\t').count(), 4);
+        assert!(text.lines().nth(2).unwrap().ends_with("\tcodex"));
         // Another project's conversation can't be resumed from here.
         assert_eq!(resumable(&links, &a, &saves, all), None);
 

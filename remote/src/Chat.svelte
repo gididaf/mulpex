@@ -17,6 +17,7 @@
 
   let {
     title,
+    agent = "claude",
     status,
     ctx = null,
     items,
@@ -34,6 +35,8 @@
     onboard,
   }: {
     title: string;
+    /** Which agent this row runs — only its word in the text here. */
+    agent?: "claude" | "codex";
     status: string | null;
     /** Context window used, with its color level ("", "warn", "crit"). */
     ctx?: { pct: number; level: string } | null;
@@ -158,7 +161,7 @@
     {#if loading}
       <div class="note">Loading…</div>
     {:else if gone}
-      <div class="note">This claude is no longer running.</div>
+      <div class="note">This {agent} is no longer running.</div>
     {:else if shown.length === 0 && queued.length === 0}
       <div class="note">Nothing here yet.</div>
     {/if}
@@ -206,7 +209,7 @@
           oninput={grow}
           rows="1"
           dir="auto"
-          placeholder="Message claude…"
+          placeholder="Message {agent}…"
         ></textarea>
         <button class="send" disabled={!draft.trim() || sending} onclick={send}>
           {sending ? "…" : "Send"}

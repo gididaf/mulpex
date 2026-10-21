@@ -14,6 +14,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::agent::Agent;
+
 /// Generate a random RFC-4122 v4 UUID string, dependency-free, from
 /// `/dev/urandom`. Used as the `--session-id` for a new Claude instance so we
 /// can later `--resume` exactly that session. If the random read fails (very
@@ -72,6 +74,10 @@ pub struct SavedSession {
     /// The "To Do" list is ON for this row's sidebar subtree (set by the user
     /// from the row's context menu). Off by default.
     pub todos: bool,
+    /// Which agent the row runs. The 10th column, written only for a codex
+    /// (`codex`), so every claude line stays byte-identical to the older format
+    /// and a line without it loads as a claude.
+    pub agent: Agent,
 }
 
 /// Who set an instance's sidebar name — reported by `hub_instances` as
@@ -178,7 +184,7 @@ impl SessionStore {
     /// error, if there is no store yet, or if the recorded project path doesn't
     /// match (guards against a hash collision clobbering another project).
     ///
-    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos]]]]]]]]`, so every older format
+    /// Each line is `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos[\t<agent>]]]]]]]]]`, so every older format
     /// still loads: a bare uuid (before names existed) yields no name and
     /// unmuted, a `<uuid>\t<name>` line (before mute existed) yields unmuted, and
     /// a three-column line (before ids were persisted) yields `id: None` and is
@@ -203,7 +209,7 @@ impl SessionStore {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(|l| {
-                let mut parts = l.splitn(9, '\t');
+                let mut parts = l.splitn(10, '\t');
                 let session_id = parts.next().unwrap_or("").to_string();
                 let name = parts
                     .next()
@@ -217,6 +223,7 @@ impl SessionStore {
                 let auto_compact = parts.next().map(str::trim).and_then(|v| v.parse().ok());
                 let name_by = parts.next().map(str::trim).and_then(NameSource::parse);
                 let todos = matches!(parts.next().map(str::trim), Some(TODOS_FLAG | OLD_TODOS_FLAG));
+                let agent = parts.next().and_then(Agent::parse).unwrap_or_default();
                 SavedSession {
                     session_id,
                     name,
@@ -227,6 +234,7 @@ impl SessionStore {
                     auto_compact,
                     name_by,
                     todos,
+                    agent,
                 }
             })
             .filter(|s| !s.session_id.is_empty())
@@ -234,7 +242,7 @@ impl SessionStore {
     }
 
     /// Persist `sessions` (in order) for this project as
-    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos]]]]]]]]`. Trailing empty columns are dropped, so
+    /// `<uuid>[\t<name>[\tmuted[\t<id>[\t<parent>[\tcollapsed[\t<auto_compact>[\t<name_by>[\ttodos[\t<agent>]]]]]]]]]`. Trailing empty columns are dropped, so
     /// a store with nothing new in it is written byte-identically to the older
     /// format. Best-effort: any I/O failure is silently ignored.
     pub fn save(&self, sessions: &[SavedSession]) {
@@ -269,6 +277,10 @@ impl SessionStore {
                 s.auto_compact.map(|p| p.to_string()).unwrap_or_default(),
                 name_by,
                 if s.todos { TODOS_FLAG.into() } else { String::new() },
+                match s.agent {
+                    Agent::Claude => String::new(),
+                    a => a.word().to_string(),
+                },
             ];
             // Positional columns, so only trailing empties can be dropped — an
             // id with no name still needs its empty name and muted fields
@@ -299,6 +311,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Agent::Claude,
         }
     }
 
@@ -396,6 +409,27 @@ mod tests {
         let lines: Vec<&str> = text.lines().skip(1).collect();
         assert_eq!(lines, vec!["u1", "u2\tnamed", "u3\t\tmuted"]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A codex row writes `codex` in the 10th column; a claude row writes
+    /// nothing there, so its line is unchanged; a 9-column line loads as claude.
+    #[test]
+    fn the_agent_column_is_written_only_for_codex() {
+        let dir = std::env::temp_dir().join(format!("mulpex-agentcol-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionStore::in_home(&dir, &dir.join("proj"));
+        let rows = vec![
+            SavedSession { agent: Agent::Codex, ..numbered("c1", None, false, 4) },
+            SavedSession { todos: true, ..numbered("u1", Some("x"), false, 5) },
+            SavedSession { agent: Agent::Codex, todos: true, ..numbered("c2", Some("y"), true, 6) },
+        ];
+        store.save(&rows);
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(text.contains("c1\t\t\t4\t\t\t\t\t\tcodex\n"), "{text}");
+        assert!(text.contains("u1\tx\t\t5\t\t\t\t\ttodos\n"), "{text}");
+        assert!(text.contains("c2\ty\tmuted\t6\t\t\t\t\ttodos\tcodex\n"), "{text}");
+        assert_eq!(store.load(), rows);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

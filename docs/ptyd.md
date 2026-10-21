@@ -208,3 +208,5 @@ spawned or attached it.
 - No `systemd-run --scope` on Linux: an XFCE/xrdp session does not put apps in
   their own scopes, and a setsid'd child outlives the AppImage there. A desktop
   that kills an app's whole scope on exit would take the daemon with it.
+
+**Codex rows need no daemon change and no `PROTO` bump:** the daemon reads `meta.kind` only as `== "shell"`, so a `"codex"` row is killed like a claude (child process groups included). Adoption maps the word back with `SessionKind::from_word`; an *older* app adopting a codex row would label it a claude (downgrade only). → [codex.md](codex.md)

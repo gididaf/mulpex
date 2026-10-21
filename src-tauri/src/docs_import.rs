@@ -205,7 +205,9 @@ fn sort(root: &Path, file: &str) -> Result<Sorted, String> {
         cut -= 1;
     }
     let prompt = format!("{SORT_PROMPT}\n\n<file path=\"{file}\">\n{}\n</file>\n", &text[..cut]);
-    let out = saves::run_claude(root, "sonnet", None, None, &prompt, SORT_TIMEOUT)?;
+    // Claude's Sonnet when claude is installed, else codex on its own model.
+    let job = crate::headless::Job { dir: root, model: "sonnet", route: None, fork: None, prompt: &prompt, timeout: SORT_TIMEOUT };
+    let out = crate::headless::run(crate::headless::preferred_agent(), &job)?;
     parse_sorted(&out)
 }
 

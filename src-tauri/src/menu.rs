@@ -99,6 +99,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let new_session = MenuItemBuilder::with_id("new_session", "New Session")
         .accelerator("Cmd+T")
         .build(app)?;
+    // ⌘⌥T: the same as ⌘T, running Codex instead of Claude (docs/codex.md).
+    let new_codex_session = MenuItemBuilder::with_id("new_codex_session", "New Codex Session")
+        .accelerator("Cmd+Alt+T")
+        .build(app)?;
     let new_terminal = MenuItemBuilder::with_id("new_terminal", "New Terminal")
         .accelerator("Cmd+Shift+T")
         .build(app)?;
@@ -144,6 +148,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let file_menu = file_builder
         .separator()
         .item(&new_session)
+        .item(&new_codex_session)
         .item(&new_terminal)
         .item(&close_session)
         .separator()
@@ -181,6 +186,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // (`saves.rs`). Confirmed in the frontend, like Restart.
     let save = MenuItemBuilder::with_id("save_session", "Save Session…")
         .accelerator("Cmd+S")
+        .build(app)?;
+    // ⌘⌥S: hand the focused row's work to the other agent — "Continue in Codex"
+    // from a claude, "Continue in Claude" from a codex (`handoff.rs`). Beside
+    // ⌘S because it is a save that ends in the other agent picking it up.
+    let continue_other = MenuItemBuilder::with_id("continue_other_agent", "Continue in Other Agent…")
+        .accelerator("Cmd+Alt+S")
         .build(app)?;
     // ⌘L: the list of saves in this project's repo; Enter starts a claude on one.
     let load = MenuItemBuilder::with_id("load_session", "Load Session…")
@@ -251,6 +262,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&rename)
         .item(&restart)
         .item(&save)
+        .item(&continue_other)
         .item(&load)
         .item(&mute)
         .item(&messages)

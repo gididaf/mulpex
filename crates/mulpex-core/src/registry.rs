@@ -315,7 +315,7 @@ pub enum Address {
     Foreign { qualifier: String, id: usize },
 }
 
-const ADDRESS_HELP: &str = "Use a number (\"3\") or \"claude#3\" for an instance in THIS project, \
+const ADDRESS_HELP: &str = "Use a number (\"3\"), \"claude#3\" or \"codex#3\" for an instance in THIS project, \
      \"<project>#<n>\" (e.g. \"central-one#3\") for one in another open project, or \"all\" to \
      reach every other instance in this project.";
 
@@ -347,7 +347,8 @@ pub fn parse_address(raw: &str) -> Result<Address, String> {
              instead."
         ));
     }
-    if qual.eq_ignore_ascii_case("claude") && rest.eq_ignore_ascii_case("all") {
+    let kind_word = crate::agent::Agent::parse(qual).is_some();
+    if kind_word && rest.eq_ignore_ascii_case("all") {
         return Ok(Address::LocalAll);
     }
     if rest.eq_ignore_ascii_case("all") {
@@ -361,7 +362,10 @@ pub fn parse_address(raw: &str) -> Result<Address, String> {
     let Ok(id) = rest.parse::<usize>() else {
         return Err(format!("\"{t}\" is not a valid address. {ADDRESS_HELP}"));
     };
-    if qual.eq_ignore_ascii_case("claude") {
+    // `claude#3` and `codex#3` both name local row 3 (one number space); the
+    // word is not checked against the row's agent — a peer that guessed wrong
+    // still reaches the instance it meant.
+    if kind_word {
         return Ok(Address::Local(id));
     }
     if qual.is_empty() {
@@ -479,6 +483,9 @@ mod tests {
         assert_eq!(parse_address("claude#3").unwrap(), Address::Local(3));
         assert_eq!(parse_address("Claude#3").unwrap(), Address::Local(3));
         assert_eq!(parse_address("claude # 3").unwrap(), Address::Local(3));
+        // A codex row shares the number space and the rule.
+        assert_eq!(parse_address("codex#3").unwrap(), Address::Local(3));
+        assert_eq!(parse_address("Codex#all").unwrap(), Address::LocalAll);
     }
 
     #[test]

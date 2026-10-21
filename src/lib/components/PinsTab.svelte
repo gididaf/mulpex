@@ -8,11 +8,12 @@
   import { pins, pinKey, removePin, togglePin, clearPins } from "../pins";
   import type { PinRun } from "../pins";
   import { FONT_FAMILY, FONT_SIZE, LINE_HEIGHT, terminals } from "../terminals";
+  import { addr } from "../agents";
 
   const h = $derived($activeProjectHandle);
   const id = $derived($activeId);
   const kind = $derived(id != null ? $sessions.find((s) => s.id === id)?.kind : undefined);
-  const label = $derived(id == null ? "" : `${kind === "shell" ? "term" : "claude"}#${id}`);
+  const label = $derived(id == null ? "" : addr(kind, id));
   const list = $derived(h != null && id != null ? ($pins.get(pinKey(h, id)) ?? []) : []);
 
   let listEl: HTMLDivElement | undefined = $state();
@@ -96,7 +97,7 @@
         {#if id == null}
           No instance selected.
         {:else if kind === "shell"}
-          Pins work on claudes only.
+          Pins work on claudes and codexes only.
         {:else}
           No pins for {label}.<br />Select text in the conversation and press ⌘⇧P.
         {/if}

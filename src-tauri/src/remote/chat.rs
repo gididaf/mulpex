@@ -22,6 +22,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+use mulpex_core::agent::Agent;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -241,14 +242,33 @@ impl Queue {
 /// halfway through writing waits for the next read.
 pub struct Tail {
     pub path: PathBuf,
+    /// Whose transcript format this is: a claude `.jsonl` or a codex rollout
+    /// (`chat_codex`).
+    pub agent: Agent,
     offset: u64,
     queue: Queue,
 }
 
+/// One transcript line's items, in `agent`'s format.
+fn parse_for(agent: Agent, line: &str) -> Vec<Item> {
+    match agent {
+        Agent::Claude => parse_line(line),
+        Agent::Codex => super::chat_codex::parse_line(line),
+    }
+}
+
 impl Tail {
-    /// Start at the end of `path`, returning its recent history, then the queue.
+    /// Start at the end of claude transcript `path`, returning its recent
+    /// history, then the queue.
+    #[cfg(test)]
     pub fn open(path: PathBuf) -> (Tail, Vec<Item>) {
-        let mut tail = Tail { path, offset: 0, queue: Queue::default() };
+        Tail::open_for(Agent::Claude, path)
+    }
+
+    /// [`Tail::open`] for a transcript in `agent`'s format. A codex has no
+    /// queue in its rollout, so its queue stays empty.
+    pub fn open_for(agent: Agent, path: PathBuf) -> (Tail, Vec<Item>) {
+        let mut tail = Tail { path, agent, offset: 0, queue: Queue::default() };
         let mut items = Vec::new();
         if let Ok(mut f) = std::fs::File::open(&tail.path) {
             let size = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -264,7 +284,7 @@ impl Tail {
                 let end = buf.iter().rposition(|&b| b == b'\n').map_or(from, |i| i + 1).max(from);
                 for line in String::from_utf8_lossy(&buf[from..end]).lines() {
                     tail.queue.apply(line);
-                    items.extend(parse_line(line));
+                    items.extend(parse_for(agent, line));
                 }
                 tail.offset = start + end as u64;
             }
@@ -297,7 +317,7 @@ impl Tail {
         let mut queued = false;
         for line in String::from_utf8_lossy(&buf[..end]).lines() {
             queued |= self.queue.apply(line);
-            items.extend(parse_line(line));
+            items.extend(parse_for(self.agent, line));
         }
         if queued {
             items.push(self.queue.item());

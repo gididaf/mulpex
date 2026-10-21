@@ -12,6 +12,8 @@
     type Row,
     type RowState,
   } from "../checkpoint";
+  import { projects } from "../stores";
+  import { addrIn } from "../agents";
 
   let { onfocus }: { onfocus: (handle: number, id: number) => void } = $props();
 
@@ -80,7 +82,7 @@
           <button class="row" class:stuck={r.stuck} onclick={() => onfocus(r.handle, r.id)}>
             <span class="dot {r.state}"></span>
             <span class="who">
-              <span class="id">claude#{r.id}</span>
+              <span class="id">{addrIn($projects.get(r.handle)?.sessions ?? [], r.id)}</span>
               {#if r.name}<span class="name">{r.name}</span>{/if}
             </span>
             <span class="state {r.state}">

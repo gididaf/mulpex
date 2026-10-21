@@ -138,7 +138,7 @@ pub(crate) fn tool_defs() -> Value {
     json!([
         {
             "name": "hub_instances",
-            "description": "List every parallel Claude instance Mulpex is running in THIS project (claude#1, claude#2, …), with each one's status (working/waiting/needs), current task, its sidebar `name` (null if unnamed) and `name_set_by` (who set it: `user` = the user named it, so treat it as a role they assigned; `instance` = it named itself; `spawn` = cut from its hub_spawn task; `auto` = a label Mulpex made up), the files it currently holds a lock on, and the `address` to message it at. Also reports how many unread hub messages you have; every shell terminal open in this project (term#1, term#2 — whether opened by you, by another instance, or by the user) with how much output is waiting for you to read; and `other_projects`: the OTHER projects open in Mulpex right now with their instances and cross-project addresses, which is the only way to discover them. Call this to coordinate before starting overlapping work.",
+            "description": "List every parallel instance Mulpex is running in THIS project — claudes and codexes (claude#1, codex#2, …), each with its `agent`, with each one's status (working/waiting/needs), current task, its sidebar `name` (null if unnamed) and `name_set_by` (who set it: `user` = the user named it, so treat it as a role they assigned; `instance` = it named itself; `spawn` = cut from its hub_spawn task; `auto` = a label Mulpex made up), the files it currently holds a lock on, and the `address` to message it at. Also reports how many unread hub messages you have; every shell terminal open in this project (term#1, term#2 — whether opened by you, by another instance, or by the user) with how much output is waiting for you to read; and `other_projects`: the OTHER projects open in Mulpex right now with their instances and cross-project addresses, which is the only way to discover them. Call this to coordinate before starting overlapping work.",
             "inputSchema": empty,
         },
         {
@@ -187,7 +187,7 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "hub_spawn",
-            "description": "Start one or more NEW Claude instances in this same project, each seeded with its own task that it begins working on immediately and autonomously. Use this to fan work out — e.g. fetch a list of tickets/items and spawn one instance per item to handle it in parallel. Each new instance is a full sibling on the coordination hub; it is told you are its spawner and will hub_send its result back to you when done. Returns the new instances' ids so you can track them (hub_instances) or message them (hub_send). Max 8 per call — for more, call again in batches. Seeding is NOT instant: the task is typed into each new instance once its UI is up, so this call waits for that and reports it. Read the reply: `ok` is true ONLY when every task actually reached its instance. `tasks_not_delivered_yet` means still starting (leave them alone, re-check with hub_instances); `tasks_never_delivered` means the task was LOST and you must hub_send it yourself. A brand-new instance reporting `status: waiting` with no visible activity is normal while delivery is pending — do not read it as a failure.",
+            "description": "Start one or more NEW instances (claude by default for a claude, codex for a codex — see `agent`) in this same project, each seeded with its own task that it begins working on immediately and autonomously. Use this to fan work out — e.g. fetch a list of tickets/items and spawn one instance per item to handle it in parallel. Each new instance is a full sibling on the coordination hub; it is told you are its spawner and will hub_send its result back to you when done. Returns the new instances' ids so you can track them (hub_instances) or message them (hub_send). Max 8 per call — for more, call again in batches. Seeding is NOT instant: the task is typed into each new instance once its UI is up, so this call waits for that and reports it. Read the reply: `ok` is true ONLY when every task actually reached its instance. `tasks_not_delivered_yet` means still starting (leave them alone, re-check with hub_instances); `tasks_never_delivered` means the task was LOST and you must hub_send it yourself. A brand-new instance reporting `status: waiting` with no visible activity is normal while delivery is pending — do not read it as a failure.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -196,6 +196,7 @@ pub(crate) fn tool_defs() -> Value {
                         "items": { "type": "string" },
                         "description": "One task per new instance to create. Each string is the full assignment that instance will start on (e.g. one ticket's title + details).",
                     },
+                    "agent": { "type": "string", "enum": ["claude", "codex"], "description": "Optional: which coding agent the new instances run — \"claude\" (Claude Code) or \"codex\" (OpenAI Codex CLI). Defaults to your own kind." },
                 },
                 "required": ["tasks"],
             },
@@ -293,6 +294,7 @@ pub(crate) fn tool_defs() -> Value {
                     "ssh_target": { "type": "string", "description": "Where to ssh, e.g. \"root@10.0.0.5\" or an ~/.ssh/config alias. Key-based auth must already work — there is nowhere to type a password. Optional ONLY when 'terminal_id' names a terminal that is already logged in to the remote machine." },
                     "terminal_id": { "type": "integer", "description": "Use an EXISTING terminal instead of opening a new one. Two uses: a terminal sitting at a local shell (give ssh_target too and it will ssh from there), or one the user has ALREADY ssh'd in on (omit ssh_target — only claude is started, on the far side). Useful when the login needed a password, a VPN or a jump host. Refused if that terminal is busy or already running a claude." },
                     "cwd": { "type": "string", "description": "Directory ON THE REMOTE machine to start in (its project dir). Defaults to the login directory." },
+                    "agent": { "type": "string", "enum": ["claude", "codex"], "description": "Optional: which agent to start on the remote — \"claude\" (default) or \"codex\" (OpenAI Codex CLI, which must be installed there)." },
                     "task": { "type": "string", "description": "What the remote should do. Include everything it needs: it cannot see your conversation, your files, or the user. Delivered on the remote claude's command line, so it cannot be truncated however long it is - up to a hard 32,000 characters, past which this call is REFUSED rather than sent in part (open with a short task and hub_terminal_send the rest). Note the reply says task_started, not delivered: a remote has no Mulpex hook, so nothing here can read back what it received." },
                 },
                 "required": ["ssh_target"],
@@ -408,7 +410,8 @@ fn hub_instances(ctx: &Ctx) -> String {
                 "id": id,
                 // Every instance reported here carries the string you would put
                 // in hub_send's `to`, so nothing has to be assembled by hand.
-                "address": format!("claude#{id}"),
+                "address": crate::addr(&ctx.state_dir, id),
+                "agent": crate::agent_of(&ctx.state_dir, id).word(),
                 "is_me": id == ctx.instance,
                 "status": status_of(ctx, id),
                 "task": task_of(ctx, id),
@@ -475,7 +478,7 @@ fn resolve_name(ctx: &Ctx, reg: &Registry, word: &str) -> Result<Option<usize>, 
         [] => Ok(None),
         [id] => Ok(Some(*id)),
         many => {
-            let who: Vec<String> = many.iter().map(|id| format!("claude#{id}")).collect();
+            let who: Vec<String> = many.iter().map(|id| crate::addr(&ctx.state_dir, *id)).collect();
             Err(format!(
                 "\"{}\" is the sidebar name of {} instances ({}) — nothing was sent. Address \
                  the one you mean by number.",
@@ -514,6 +517,7 @@ fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
                     json!({
                         "id": i.id,
                         "address": p.address(i.id),
+                        "agent": crate::agent_of(Path::new(&p.state_dir), i.id).word(),
                         "status": i.status,
                         "task": i.task,
                         "name": i.name,
@@ -712,17 +716,19 @@ fn hub_send(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // that's gone.
             if id == ctx.instance && registry::parse_address(&to_raw).is_err() {
                 return Err(format!(
-                    "\"{to_raw}\" is your own sidebar name (claude#{id}) — nothing was sent."
+                    "\"{to_raw}\" is your own sidebar name ({}) — nothing was sent.",
+                    crate::addr(&ctx.state_dir, id)
                 ));
             }
             if !live_ids(ctx).contains(&id) {
                 return Err(format!(
-                    "claude#{id} is not a running instance — it has closed, so it can't receive \
+                    "{} is not a running instance — it has closed, so it can't receive \
                      messages and nothing was sent. Call mcp__mulpex__hub_instances to see who is \
-                     still active."
+                     still active.",
+                    crate::addr(&ctx.state_dir, id)
                 ));
             }
-            send_local(ctx, vec![id], &format!("claude#{id}"), message)
+            send_local(ctx, vec![id], &crate::addr(&ctx.state_dir, id), message)
         }
         Address::Foreign { qualifier, id } => send_foreign(ctx, &qualifier, id, message),
     }
@@ -757,7 +763,7 @@ fn send_local(
     if !delivered.is_empty() {
         log_message(
             &ctx.state_dir.join("messages.log"),
-            &format!("claude#{}", ctx.instance),
+            &crate::addr(&ctx.state_dir, ctx.instance),
             to_label,
             message,
         );
@@ -782,7 +788,11 @@ impl ListTarget {
     /// This recipient's address as an instance in `from_dir` would write it.
     fn label_from(&self, from_dir: &str) -> String {
         if registry::same_dir(Path::new(&self.dir), Path::new(from_dir)) {
-            format!("claude#{}", self.id)
+            // `<state_dir>/inbox/<id>` → the state dir, where `agents/` lives.
+            match self.inbox.parent().and_then(Path::parent) {
+                Some(sd) => crate::addr(sd, self.id),
+                None => format!("claude#{}", self.id),
+            }
         } else {
             format!("{}#{}", self.project, self.id)
         }
@@ -837,7 +847,7 @@ fn send_many(ctx: &Ctx, entries: &[Value], message: &str) -> Result<String, Stri
                 let reason = if id == ctx.instance {
                     Some("that is you".to_string())
                 } else if !live.contains(&id) {
-                    Some(format!("claude#{id} is not a running instance — it has closed"))
+                    Some(format!("{} is not a running instance — it has closed", crate::addr(&ctx.state_dir, id)))
                 } else {
                     None
                 };
@@ -926,7 +936,7 @@ fn send_many(ctx: &Ctx, entries: &[Value], message: &str) -> Result<String, Stri
 
     // One line per project's feed, each naming the recipients as that project
     // reads them.
-    let me_here = format!("claude#{}", ctx.instance);
+    let me_here = crate::addr(&ctx.state_dir, ctx.instance);
     let me_there = format!("{my_name}#{}", ctx.instance);
     let to_from = |dir: &str| {
         delivered.iter().map(|t| t.label_from(dir)).collect::<Vec<_>>().join(", ")
@@ -978,12 +988,13 @@ fn send_foreign(ctx: &Ctx, qualifier: &str, id: usize, message: &str) -> Result<
     if target.is_dir(&ctx.project_dir) {
         if !live_ids(ctx).contains(&id) {
             return Err(format!(
-                "claude#{id} is not a running instance in this project ({}). Call \
+                "{} is not a running instance in this project ({}). Call \
                  mcp__mulpex__hub_instances to see who is still active.",
+                crate::addr(&ctx.state_dir, id),
                 target.name
             ));
         }
-        return send_local(ctx, vec![id], &format!("claude#{id}"), message);
+        return send_local(ctx, vec![id], &crate::addr(&ctx.state_dir, id), message);
     }
 
     if !target.has_instance(id) {
@@ -1109,7 +1120,7 @@ fn hub_reply_broadcast(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .map_err(|e| format!("could not save the answer: {e}"))?;
     log_message(
         &ctx.state_dir.join("messages.log"),
-        &format!("claude#{me}"),
+        &crate::addr(&ctx.state_dir, me),
         APP_SENDER,
         answer,
     );
@@ -1160,10 +1171,17 @@ fn hub_spawn(ctx: &Ctx, args: &Value) -> Result<String, String> {
         ));
     }
 
+    // Which agent the new instances run: as asked, else the spawner's own.
+    let agent = match args.get("agent").and_then(|a| a.as_str()) {
+        None => ctx.agent,
+        Some(word) => crate::agent::Agent::parse(word)
+            .ok_or_else(|| format!("unknown agent \"{word}\" — use \"claude\" or \"codex\"."))?,
+    };
+
     let spawn_dir = ctx.state_dir.join("spawn");
     std::fs::create_dir_all(&spawn_dir).map_err(|e| format!("could not queue spawn: {e}"))?;
     let token = new_uuid();
-    let body = json!({ "from": ctx.instance, "ts": now(), "tasks": tasks });
+    let body = json!({ "from": ctx.instance, "ts": now(), "tasks": tasks, "agent": agent.word() });
     std::fs::write(spawn_dir.join(format!("{token}.json")), body.to_string())
         .map_err(|e| format!("could not queue spawn: {e}"))?;
 
@@ -1437,9 +1455,10 @@ fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
             }
             Address::Local(id) if id == ctx.instance => {
                 return Err(format!(
-                    "claude#{id} is YOU, and an instance cannot close itself: this call would \
+                    "{} is YOU, and an instance cannot close itself: this call would \
                      never return and whatever you were about to report would be lost. Finish \
-                     your turn and let whoever spawned you close you."
+                     your turn and let whoever spawned you close you.",
+                    crate::addr(&ctx.state_dir, id)
                 ))
             }
             // Dedup: "40" and "claude#40" are one row, and asking Mulpex to close
@@ -1787,8 +1806,15 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         }
     }
 
+    // The remote's agent: Claude unless asked — the far box is someone else's,
+    // and claude is what every remote had before Codex existed.
+    let agent = match args.get("agent").and_then(|a| a.as_str()) {
+        None => crate::agent::Agent::Claude,
+        Some(word) => crate::agent::Agent::parse(word)
+            .ok_or_else(|| format!("unknown agent \"{word}\" — use \"claude\" or \"codex\"."))?,
+    };
     let token = remote::new_token(ctx.instance, now_ms());
-    let rules_b64 = remote::b64(remote::peer_rules(&token).as_bytes());
+    let rules_b64 = remote::rules_b64_for(agent, &token);
     // The task goes on the remote claude's command line, not into its TUI. See
     // `remote::remote_launch_command` for the measurement that forced this.
     let task_b64 = task.map(|t| remote::b64(t.as_bytes()));
@@ -1798,10 +1824,10 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
     // side, so only the `claude` half is launched. Both attach the rules at
     // launch, which is the only thing that actually matters.
     let command = match ssh_target {
-        Some(target) => remote::ssh_command(target, cwd, &rules_b64, task_b64),
+        Some(target) => remote::ssh_command_for(agent, target, cwd, &rules_b64, task_b64),
         // No ssh hop means this terminal is the user's own remote session, so
         // the launch must NOT exec: their shell has to survive the claude.
-        None => remote::remote_launch_command(cwd, &rules_b64, false, task_b64),
+        None => remote::remote_launch_command_for(agent, cwd, &rules_b64, false, task_b64),
     };
 
     // The command carries NO completion marker. `; printf …` marks the end of a
@@ -1841,6 +1867,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
         opener: ctx.instance,
     }
     .write(&ctx.state_dir, id)
+    .and_then(|()| remote::write_agent(&ctx.state_dir, id, agent))
     .map_err(|e| format!("could not record the remote terminal: {e}"))?;
 
     clear_mark(ctx, id);
@@ -1866,7 +1893,7 @@ fn hub_remote_open(ctx: &Ctx, args: &Value) -> Result<String, String> {
             // finished and signalled — a very short turn can beat the first poll.
             let signalled = remote::RemoteMeta::read(&ctx.state_dir, id)
                 .is_some_and(|m| !remote::find_signals(&screen, &m.token).is_empty());
-            if remote::looks_like_claude_tui(&screen) || remote::has_spinner(&screen) || signalled {
+            if remote::looks_like_tui(agent, &screen) || remote::has_spinner_for(agent, &screen) || signalled {
                 started = true;
                 break;
             }
@@ -2706,13 +2733,20 @@ pub(crate) fn peers_context_within(ctx: &Ctx, budget: usize) -> Option<String> {
     }
 
     let mut s = String::from(
-        "[Mulpex hub] You are one of several parallel Claude instances in this project.",
+        match ctx.agent {
+            crate::agent::Agent::Claude => {
+                "[Mulpex hub] You are one of several parallel Claude instances in this project."
+            }
+            crate::agent::Agent::Codex => {
+                "[Mulpex hub] You are one of several parallel agent instances in this project."
+            }
+        },
     );
     let mut lines = Vec::new();
     for &id in &peers {
         let task = task_of(ctx, id).split_whitespace().collect::<Vec<_>>().join(" ");
         let held = holds.get(&id).cloned().unwrap_or_default();
-        let mut l = format!("\n  - claude#{id}");
+        let mut l = format!("\n  - {}", crate::addr(&ctx.state_dir, id));
         if let Some(name) = local_name(reg.project_for_dir(&ctx.project_dir), id)
             .and_then(|i| i.name.as_deref())
         {
@@ -2890,7 +2924,14 @@ fn locks_by_holder(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
 /// **remote claude**, which has no instance id at all: the app writes its wake on
 /// its behalf and tags it with the terminal it came from, so the recipient is
 /// never told to reply to a peer number that does not exist.
+#[cfg(test)]
 fn sender_label(v: &Value) -> String {
+    sender_label_in(None, v)
+}
+
+/// [`sender_label`], with the local sender written by its agent word
+/// (`codex#2`), read from `agents/` in this project's state dir.
+fn sender_label_in(state_dir: Option<&Path>, v: &Value) -> String {
     // The app itself (⌘⇧Q Checkpoint & Quit, and the wake after relaunch).
     // `from` is 0, so without this it would read as a "claude#0" to reply to.
     if v.get("from_app").and_then(|x| x.as_bool()) == Some(true) {
@@ -2902,7 +2943,10 @@ fn sender_label(v: &Value) -> String {
     let id = v.get("from").and_then(|x| x.as_u64()).unwrap_or(0);
     match v.get("from_project").and_then(|x| x.as_str()) {
         Some(p) if !p.is_empty() => format!("{p}#{id}"),
-        _ => format!("claude#{id}"),
+        _ => match state_dir {
+            Some(sd) => crate::addr(sd, id as usize),
+            None => format!("claude#{id}"),
+        },
     }
 }
 
@@ -2915,7 +2959,7 @@ fn take_inbox(ctx: &Ctx, id: usize) -> Vec<(u64, String, String)> {
             if let Ok(content) = std::fs::read_to_string(&file) {
                 if let Ok(v) = serde_json::from_str::<Value>(&content) {
                     let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let from = sender_label(&v);
+                    let from = sender_label_in(Some(&ctx.state_dir), &v);
                     let mut body =
                         v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
                     // A list send names the other recipients, so no two of them
@@ -3311,6 +3355,7 @@ mod tests {
             bg_dir: state_dir.join("bg"),
             compacting_dir: state_dir.join("compacting"),
             state_dir,
+            agent: crate::agent::Agent::Claude,
         }
     }
 
@@ -3394,6 +3439,7 @@ mod tests {
             bg_dir: a_state.join("bg"),
             compacting_dir: a_state.join("compacting"),
             state_dir: a_state,
+            agent: crate::agent::Agent::Claude,
         };
         (root, ctx, b_state)
     }

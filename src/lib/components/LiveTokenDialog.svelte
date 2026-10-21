@@ -12,6 +12,7 @@
     type LiveTokenStat,
     type LiveTokenLast,
   } from "../ipc";
+  import { projects } from "../stores";
 
   // Mulpex ▸ Live Token… (`live_token.rs`): the token file every claude's API
   // requests take their token from by default, the command that refreshes it,
@@ -196,9 +197,17 @@
 
   const short = (org: string | null | undefined) => (org ? org.slice(0, 8) : "");
 
+  /** Live Token is Claude-only (a codex uses its own account, docs/codex.md):
+   *  a codex row is never listed, whatever an older backend reports. */
+  const claudeRows = $derived(
+    (usage?.claudes ?? []).filter(
+      (c) => $projects.get(c.handle)?.sessions.find((s) => s.id === c.id)?.kind !== "codex",
+    ),
+  );
+
   /** Who uses a token: the claudes pinned to it. */
   function users(id: string): string {
-    return (usage?.claudes ?? [])
+    return claudeRows
       .filter((c) => c.token === id)
       .map((c) => `${c.project} claude#${c.id}`)
       .join(", ");
@@ -356,7 +365,7 @@
 
       <div class="section">Claudes</div>
       <div class="claudes">
-        {#each usage?.claudes ?? [] as c (`${c.handle}:${c.id}`)}
+        {#each claudeRows as c (`${c.handle}:${c.id}`)}
           <div class="crow">
             <span class="who">
               <span class="faint">{c.project}</span> claude#{c.id}{#if c.label}<span class="faint">

@@ -15,7 +15,10 @@
 
   type Row = {
     id: number;
+    /** "claude" for every agent row — an older phone opens anything else as
+     *  a terminal — with `agent` saying which (absent from an older Mac). */
     kind: "claude" | "shell";
+    agent?: "claude" | "codex" | null;
     name: string | null;
     task: string | null;
     status: "working" | "waiting" | "needs" | null;
@@ -262,18 +265,18 @@
   /** Start a claude or terminal in a project, then open it. The Mac adds the
    *  row without moving its own focus. */
   let starting = $state<string | null>(null);
-  async function startInstance(handle: number, kind: "claude" | "shell") {
+  async function startInstance(handle: number, kind: "claude" | "codex" | "shell") {
     starting = null;
     const r = await request({ t: "new-instance", handle, kind }, 20_000);
     if (!r.ok || r.id == null) {
       starting = r.why ?? "Couldn't start it";
       return;
     }
-    openChat(handle, { id: r.id, kind } as Row);
+    openChat(handle, { id: r.id, kind: kind === "shell" ? "shell" : "claude", agent: kind === "shell" ? null : kind } as Row);
   }
 
-  async function closeInstance(handle: number, id: number, kind: "claude" | "shell") {
-    const label = kind === "shell" ? `term#${id}` : `claude#${id}`;
+  async function closeInstance(handle: number, id: number, kind: "claude" | "codex" | "shell") {
+    const label = `${kind === "shell" ? "term" : kind}#${id}`;
     if (!confirm(`Close ${label}?`)) return;
     const r = await request({ t: "close-instance", handle, id });
     if (r.ok) history.back();
@@ -434,7 +437,7 @@
   }
 
   function label(r: Row): string {
-    return r.kind === "shell" ? `term#${r.id}` : `claude#${r.id}`;
+    return r.kind === "shell" ? `term#${r.id}` : `${r.agent === "codex" ? "codex" : "claude"}#${r.id}`;
   }
 
   /** Context window used, as the desktop colors it: gray, then yellow at 50%,
@@ -536,7 +539,8 @@
     />
   {:else if chat}
     <Chat
-      title={chatRow ? `${label(chatRow)}${chatRow.name || chatRow.task ? " · " + (chatRow.name ?? chatRow.task) : ""}` : `claude#${chat.id}`}
+      title={chatRow ? `${label(chatRow)}${chatRow.name || chatRow.task ? " · " + (chatRow.name ?? chatRow.task) : ""}` : `#${chat.id}`}
+      agent={chatRow?.agent === "codex" ? "codex" : "claude"}
       status={chatRow?.status ?? null}
       ctx={chatRow?.ctx_pct != null ? { pct: chatRow.ctx_pct, level: ctxLevel(chatRow) } : null}
       items={chat.items}
@@ -544,7 +548,7 @@
       loading={chat.loading}
       onback={() => history.back()}
       onsend={sendText}
-      onclose={() => chat && closeInstance(chat.handle, chat.id, "claude")}
+      onclose={() => chat && closeInstance(chat.handle, chat.id, chatRow?.agent === "codex" ? "codex" : "claude")}
       compact={chatRow?.compact ?? null}
       oncompact={() => chat && toggleCompact(chat.handle, chat.id)}
       onkey={sendKey}
@@ -602,6 +606,7 @@
         <div class="page" use:swipePages={{ can: canSwipe, go: swipeTo }}>
         <div class="actions">
           <button onclick={() => startInstance(shown.handle, "claude")}>+ Claude</button>
+          <button onclick={() => startInstance(shown.handle, "codex")}>+ Codex</button>
           <button onclick={() => startInstance(shown.handle, "shell")}>+ Terminal</button>
           {#if starting}<span class="err" dir="auto">{starting}</span>{/if}
         </div>

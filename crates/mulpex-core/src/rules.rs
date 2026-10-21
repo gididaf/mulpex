@@ -271,6 +271,115 @@ pub fn append_system_prompt(helper: &std::path::Path) -> String {
     format!("{hub}\n{PLANNING_RULES}")
 }
 
+/// The rules text for an agent. Claude gets exactly [`append_system_prompt`]
+/// (golden-tested); Codex gets the same contract rewritten where Codex differs —
+/// it has no `Monitor` (Mulpex rings it), no `AskUserQuestion` (it asks in plain
+/// text and ends on [`crate::codex::WAITING_MARKER`]) and no plan dialog.
+pub fn system_prompt_for(helper: &std::path::Path, agent: crate::agent::Agent) -> String {
+    match agent {
+        crate::agent::Agent::Claude => append_system_prompt(helper),
+        crate::agent::Agent::Codex => {
+            let hub = codex_hub_rules().replace("__MULPEX_BIN__", &helper.to_string_lossy());
+            format!("{hub}\n{CODEX_PLANNING_RULES}")
+        }
+    }
+}
+
+/// Where Codex's text departs from `HUB_RULES`: (claude text, codex text).
+/// Every pair must match exactly once (a test asserts it), so an edit to
+/// `HUB_RULES` that moves one of these sentences fails loudly instead of
+/// leaving a codex reading Claude's instructions.
+const CODEX_SWAPS: &[(&str, &str)] = &[
+    (
+        "You are one of several parallel Claude Code instances that Mulpex is running",
+        "You are an OpenAI Codex CLI agent, one of several parallel coding-agent instances \
+(Claude Code and Codex) that Mulpex is running",
+    ),
+    (
+        "a claude, written claude#1, claude#2, or a terminal, written term#1, term#5.",
+        "a claude, written claude#1, claude#2, a codex (like you), written codex#3, codex#4, or a \
+terminal, written term#1, term#5. Claudes and codexes share one number space and are peers on the \
+same hub.",
+    ),
+    (
+        "(to: \"3\", or equivalently \"claude#3\")",
+        "(to: \"3\", or equivalently \"claude#3\" / \"codex#3\")",
+    ),
+    (
+        "It returns the new instances' ids;",
+        "Each new instance runs your own agent (a codex) unless you pass agent: \"claude\". It \
+returns the new instances' ids;",
+    ),
+];
+
+/// The listener section of `HUB_RULES`, which Codex replaces whole: from this
+/// heading to the end.
+const LISTENER_SECTION: &str = "INCOMING MESSAGES (hub listener) —";
+
+/// How mail reaches a codex, and how it asks the user anything.
+const CODEX_INCOMING: &str = "INCOMING MESSAGES — when another instance messages you while you are \
+idle, Mulpex itself starts a turn for you whose user message begins \"mulpex: N new hub \
+message(s)\" (for example \"mulpex: 1 new hub message(s) — call mcp__mulpex__hub_inbox now and act \
+on them\"). That is Mulpex ringing on a peer's behalf, NOT something I typed: your FIRST action in \
+that turn is mcp__mulpex__hub_inbox. You have no listener to arm and nothing to set up or keep alive. \
+When it happens, handle it immediately and autonomously: (1) call mcp__mulpex__hub_inbox to read \
+and clear the message(s); (2) act on them yourself — a message may ask you to do something, may \
+coordinate, or may just inform you; use your judgment and carry it out; (3) reply to the sender via \
+mcp__mulpex__hub_send ONLY if it genuinely adds value (they asked a question, or would want \
+confirmation) — never send a bare acknowledgement, which just causes needless back-and-forth; (4) \
+because that turn was triggered by the hub and not by me, START your visible response with a marker \
+line exactly of the form \"⟳ hub message from <sender> →\" — fill in the sender exactly as hub_inbox \
+reported it (claude#2 or codex#2 for an instance here, central-one#3 for one in another project) — \
+so that when I look at your pane I can tell you acted on a hub message rather than on my prompt, and \
+from whom. Mid-turn, Mulpex may also tell you that unread messages are waiting: read them with \
+hub_inbox before you finish. A message whose sender is \"Mulpex\" comes from the Mulpex app itself, \
+not from an instance: do what it asks, and never hub_send a reply to it — there is no instance there \
+to receive one.\n\
+ASKING ME SOMETHING — you have no question dialog. When you need an answer from me before you can \
+go on (a decision, a confirmation, information only I have), ask it in plain text, end your turn, \
+and make the exact line [waiting for you] the very LAST line of your reply. Mulpex shows me that \
+you are blocked on me only from that line, so never leave it out when you are waiting on me, and \
+never write it when you are not.";
+
+/// Codex's planning discipline: the same zero-assumptions rule, asked in plain
+/// text instead of through `AskUserQuestion`.
+const CODEX_PLANNING_RULES: &str = "PLANNING — before you finalize a plan or implement anything, \
+identify ALL potential assumptions your plan/implementation would rely on (about requirements, \
+scope, file/library choices, edge cases, expected behavior). Verify those assumptions with me FIRST \
+by asking in plain text (see ASKING ME SOMETHING: end the turn with the line [waiting for you]), so \
+the resulting plan or implementation is perfectly aligned with my requirements — aim for zero \
+unverified assumptions. Do not silently pick a default on anything that could reasonably go more \
+than one way; ask.";
+
+fn codex_hub_rules() -> String {
+    let mut text = HUB_RULES.to_string();
+    for (from, to) in CODEX_SWAPS {
+        text = text.replacen(from, to, 1);
+    }
+    match text.find(LISTENER_SECTION) {
+        Some(at) => format!("{}{CODEX_INCOMING}", &text[..at]),
+        None => format!("{text}\n{CODEX_INCOMING}"),
+    }
+}
+
+/// The Board rule for an agent. Codex has no `AskUserQuestion`, so the one
+/// sentence that names it says how a codex asks instead.
+pub fn board_rule(agent: crate::agent::Agent) -> std::borrow::Cow<'static, str> {
+    match agent {
+        crate::agent::Agent::Claude => std::borrow::Cow::Borrowed(BOARD_RULE),
+        crate::agent::Agent::Codex => std::borrow::Cow::Owned(
+            BOARD_RULE
+                .replacen("BUT THE BOARD NEVER REPLACES AskUserQuestion", "BUT THE BOARD NEVER REPLACES ASKING ME DIRECTLY", 1)
+                .replacen(
+                    "you ask with the AskUserQuestion tool, exactly as you would without the board",
+                    "you ask in plain text ending with the line [waiting for you], exactly as you \
+would without the board",
+                    1,
+                ),
+        ),
+    }
+}
+
 /// The command `HUB_RULES` tells an instance to arm, spelled out for anything
 /// that has to name it outside the rules text — the arm nudge, which repeats it
 /// so a model has no reason to reach back into its own history for one.
@@ -302,13 +411,19 @@ pub fn listener_command(helper: &std::path::Path) -> String {
 /// The whitespace collapse stays. It is no longer load-bearing for delivery, but a
 /// single-line prompt is what keeps the pane readable and the auto-name sane.
 pub fn spawn_prompt(task: Option<&SpawnTask>) -> Option<String> {
+    spawn_prompt_for(task, crate::agent::Agent::Claude)
+}
+
+/// [`spawn_prompt`], naming the parent by its own agent word (`codex#4`
+/// spawned this one). The text is otherwise identical for both agents.
+pub fn spawn_prompt_for(task: Option<&SpawnTask>, parent_agent: crate::agent::Agent) -> Option<String> {
     let t = task?;
     let task = t.task.split_whitespace().collect::<Vec<_>>().join(" ");
-    let parent = t.parent_id;
+    let parent = format!("{}#{}", parent_agent.word(), t.parent_id);
     Some(format!(
-        "[mulpex:hub] Begin the following task, which was assigned to you by claude#{parent}: \
+        "[mulpex:hub] Begin the following task, which was assigned to you by {parent}: \
          {task} Work on it autonomously through to completion. When you finish — or if you get \
-         blocked and need input — use mcp__mulpex__hub_send to send claude#{parent} a concise \
+         blocked and need input — use mcp__mulpex__hub_send to send {parent} a concise \
          summary of the outcome."
     ))
 }
@@ -451,6 +566,63 @@ mod tests {
     #[test]
     fn no_task_means_no_injected_prompt() {
         assert!(spawn_prompt(None).is_none());
+    }
+
+
+    /// Claude's rules are byte-identical to what they were before Codex existed:
+    /// `system_prompt_for(Claude)` IS `append_system_prompt`, and the hash pins
+    /// the text itself (update it only on a deliberate Claude rules change).
+    #[test]
+    fn claude_rules_are_golden() {
+        let helper = std::path::Path::new("/opt/mulpex-helper");
+        let claude = system_prompt_for(helper, crate::agent::Agent::Claude);
+        assert_eq!(claude, append_system_prompt(helper));
+        assert_eq!(claude, format!("{HUB_RULES}\n{PLANNING_RULES}"));
+        assert_eq!(
+            format!("{:016x}", crate::persist::fnv1a(claude.as_bytes())),
+            CLAUDE_RULES_FNV,
+            "the Claude rules text changed"
+        );
+    }
+
+    const CLAUDE_RULES_FNV: &str = "cddb72572c560459";
+
+    #[test]
+    fn codex_rules_drop_claude_only_tools_and_explain_the_ring() {
+        for (from, _) in CODEX_SWAPS {
+            assert_eq!(HUB_RULES.matches(from).count(), 1, "swap anchor drifted: {from}");
+        }
+        assert_eq!(HUB_RULES.matches(LISTENER_SECTION).count(), 1);
+        let text = system_prompt_for(std::path::Path::new("/opt/h"), crate::agent::Agent::Codex);
+        for banned in ["Monitor", "AskUserQuestion", "ExitPlanMode", "listen\""] {
+            assert!(!text.contains(banned), "codex rules mention {banned}");
+        }
+        assert!(text.contains(&crate::codex::wake_line(1)));
+        assert!(text.contains("FIRST action"));
+        assert!(text.contains(crate::codex::WAITING_MARKER));
+        assert!(text.contains("codex#3"));
+        assert!(text.contains("⟳ hub message from <sender> →"));
+        assert!(text.contains("\nPLANNING —"));
+        // The tools it names all exist, as for Claude.
+        let listed = crate::mcp::tool_defs().to_string();
+        for n in text.split("mcp__mulpex__").skip(1) {
+            let n = n.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap();
+            if !n.is_empty() {
+                assert!(listed.contains(&format!("\"{n}\"")), "codex rules name {n}");
+            }
+        }
+        let board = board_rule(crate::agent::Agent::Codex);
+        assert!(!board.contains("AskUserQuestion"), "{board}");
+        assert_eq!(board_rule(crate::agent::Agent::Claude), BOARD_RULE);
+    }
+
+    #[test]
+    fn a_spawn_prompt_names_the_parent_by_its_agent() {
+        let t = SpawnTask { parent_id: 4, task: "x".into() };
+        let p = spawn_prompt_for(Some(&t), crate::agent::Agent::Codex).unwrap();
+        assert!(p.contains("assigned to you by codex#4:"));
+        assert!(p.contains("send codex#4 a concise"));
+        assert_eq!(spawn_prompt(Some(&t)), spawn_prompt_for(Some(&t), crate::agent::Agent::Claude));
     }
 
     #[test]

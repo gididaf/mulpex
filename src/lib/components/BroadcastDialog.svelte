@@ -6,6 +6,8 @@
   import { broadcastTargets, type BroadcastRowState, type BroadcastTarget } from "../ipc";
   import { endBroadcast, noSummary, resumeBroadcast, rounds, sendBroadcast, summarize, summaries } from "../broadcast";
   import { hostName } from "../hosts";
+  import { projects } from "../stores";
+  import { addrIn } from "../agents";
   import { renderMarkdown, renderMarkdownAuto } from "../markdown";
   import { onMount } from "svelte";
 
@@ -171,7 +173,7 @@
               <label class="row pick">
                 <input type="checkbox" checked={picked.has(key(t.handle, t.id))} onchange={() => toggle(key(t.handle, t.id))} />
                 <span class="dot {t.status}"></span>
-                <span class="id">claude#{t.id}</span>
+                <span class="id">{addrIn($projects.get(t.handle)?.sessions ?? [], t.id)}</span>
                 {#if t.name}<span class="name" dir="auto">{t.name}</span>{/if}
               </label>
             {/each}
@@ -189,7 +191,7 @@
             <div class="row">
               <button class="who" disabled={!x.reply} onclick={() => toggleOpen(k)}>
                 <span class="caret">{x.reply ? (open.has(k) ? "▾" : "▸") : " "}</span>
-                <span class="id">claude#{x.id}</span>
+                <span class="id">{addrIn($projects.get(x.handle)?.sessions ?? [], x.id)}</span>
                 {#if x.name}<span class="name" dir="auto">{x.name}</span>{/if}
               </button>
               <span class="state {x.state}">{LABEL[x.state as BroadcastRowState]}</span>

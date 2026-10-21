@@ -24,6 +24,7 @@
 //! it is open.
 
 pub(crate) mod chat;
+pub(crate) mod chat_codex;
 pub mod client;
 mod crypto;
 mod desktop;
@@ -43,7 +44,9 @@ use tauri::{AppHandle, Emitter};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use crate::snapshot::{HubSnapshot, ProjectHandle, SessionInfo, SessionKind};
+use mulpex_core::agent::Agent;
+
+use crate::snapshot::{HubSnapshot, ProjectHandle, SessionInfo};
 use crypto::{b64, Channel, Key32};
 
 /// The hosted relay. A different one (a local `mulpex-relay` while
@@ -555,7 +558,10 @@ pub fn project_view(
             json!({
                 "dialog": dialog,
                 "id": s.id,
+                // Every agent row stays "claude" on the wire: an old cached
+                // PWA opens anything else as a terminal. `agent` says which.
                 "kind": if claude { "claude" } else { "shell" },
+                "agent": s.kind.agent().map(|a| a.word()),
                 "name": s.name,
                 "task": snap.tasks.iter().find(|t| t.id == s.id).map(|t| t.task.clone()),
                 // A terminal has no status, and a failed claude is absent from
@@ -940,18 +946,24 @@ fn state_dir_of(handle: ProjectHandle) -> Option<PathBuf> {
 
 /// Where claude `id` of project `handle` writes its transcript, if it is a
 /// live claude.
-fn transcript_of(handle: ProjectHandle, id: usize) -> Option<PathBuf> {
+fn transcript_of(handle: ProjectHandle, id: usize) -> Option<(PathBuf, Agent)> {
     use tauri::Manager;
     #[cfg(test)]
     if let Some(p) = tests::TRANSCRIPT.lock().unwrap().clone() {
-        return Some(p);
+        return Some((p, Agent::Claude));
     }
     let app = inner().lock().unwrap().app.clone()?;
     let state = app.state::<crate::state::AppState>();
     let ws = state.ws.lock().unwrap();
     let core = ws.project(handle)?;
     let s = core.sessions.iter().find(|s| s.id == id && s.kind.is_agent())?;
-    Some(crate::saves::transcript_path(&core.project_dir, &s.session_id))
+    let agent = s.kind.agent()?;
+    let path = crate::agent_transcript::path(agent, &core.project_dir, &s.session_id, &core.state_dir, id)
+        // A codex writes no rollout until its first prompt (docs/codex.md
+        // S10). It is still a live agent, so follow a file that doesn't exist
+        // yet — an empty chat — and look again every RESOLVE_EVERY.
+        .unwrap_or_else(|| core.state_dir.join("transcript").join(format!("{id}.none")));
+    Some((path, agent))
 }
 
 /// One relay connection's state.
@@ -1546,7 +1558,7 @@ impl Server {
                     }
                     return Ok(());
                 }
-                Some(path) if w.tail.as_ref().map(|t| &t.path) != Some(&path) => reload = Some(path),
+                Some((path, agent)) if w.tail.as_ref().map(|t| &t.path) != Some(&path) => reload = Some((path, agent)),
                 Some(_) => {}
             }
         }
@@ -1554,15 +1566,15 @@ impl Server {
             (_, Some(path)) => Err(path),
             (Some(t), None) => match t.read_new() {
                 Some(items) => Ok(items),
-                None => Err(t.path.clone()),
+                None => Err((t.path.clone(), t.agent)),
             },
             (None, None) => Ok(vec![]),
         };
         let msg = match appended {
             Ok(items) if items.is_empty() => return Ok(()),
             Ok(items) => json!({"t": "chat", "handle": handle, "id": id, "items": items}),
-            Err(path) => {
-                let (tail, items) = chat::Tail::open(path);
+            Err((path, agent)) => {
+                let (tail, items) = chat::Tail::open_for(agent, path);
                 w.tail = Some(tail);
                 w.gone = false;
                 json!({"t": "chat", "handle": handle, "id": id, "reset": true, "items": items})
@@ -1648,6 +1660,7 @@ pub fn remote_revoke_device(id: String) -> RemoteStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::SessionKind;
 
     fn cfg(url: &str) -> Config {
         Config {
@@ -2089,6 +2102,7 @@ mod tests {
             mk(1, SessionKind::Claude, None),
             mk(2, SessionKind::Claude, Some("boom")),
             mk(3, SessionKind::Shell, None),
+            mk(4, SessionKind::Codex, None),
         ];
         let snap = HubSnapshot {
             statuses: vec![StatusEntry {
@@ -2099,6 +2113,7 @@ mod tests {
                 ctx_pct: Some(40),
                 compact_phase: Some("requested".into()),
                 compacting: false,
+                wake: None,
             }],
             tasks: vec![],
             locks: vec![],
@@ -2113,5 +2128,10 @@ mod tests {
         assert!(v["sessions"][1]["status"].is_null());
         assert!(v["sessions"][2]["status"].is_null());
         assert_eq!(v["sessions"][2]["kind"], "shell");
+        // An agent row is "claude" on the wire whatever it runs (an old cached
+        // PWA opens anything else as a terminal); `agent` says which.
+        assert_eq!((&v["sessions"][0]["kind"], &v["sessions"][0]["agent"]), (&json!("claude"), &json!("claude")));
+        assert_eq!((&v["sessions"][3]["kind"], &v["sessions"][3]["agent"]), (&json!("claude"), &json!("codex")));
+        assert!(v["sessions"][2]["agent"].is_null());
     }
 }

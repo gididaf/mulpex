@@ -34,6 +34,11 @@ Driven on a real `codex` in tmux and with `codex exec`; nothing below is from do
 | S20 | Codex sets `CODEX_CI=1`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID` in commands it runs — stripped from every child we spawn (`mulpex_core::codex::CHILD_ENV_DENY`). |
 | — | Startup shows a blocking "Update available" picker unless `-c check_for_update_on_startup=false`. |
 | — | The real binary is `~/.local/bin/codex` (→ `~/.codex/packages/standalone/releases/<v>/bin/codex`). The user's shell aliases `codex` to add flags — never resolve through the alias. |
+| — | A directory Codex has not been told to trust opens a blocking "Do you trust the contents of this directory?" picker — **even with the yolo flag**. The dotted `-c 'projects."<dir>".trust_level="trusted"'` does **not** skip it; the inline table `-c 'projects={"<dir>"={trust_level="trusted"}}'` does, for this launch only (`config.toml` untouched). Trust is keyed by the **git root** for a subdirectory or worktree, so `launch_args` lists both. |
+| — | **Typing into codex:** one write of `text\r` does not submit — its paste-burst detection turns the CR into a newline and leaves a draft. Bracketed paste + CR in one write (`\e[200~text\e[201~\r`) submits. So `/compact` is sent that way, and Shift/Option+Enter's `\e\r` is a newline as in claude. History echoes of past prompts are bold+dim `›`; the live composer's `›` is bold, undimmed. |
+| — | `codex delete <id>` refuses outside a TTY; `codex delete --force <id>` (Explain's fork cleanup). A failed `codex exec` reports on **stderr**, the reason being the **last `ERROR:` line** (after retry noise). |
+| — | A turn that ends in an API error (OpenAI 429 after retries) or an interrupt fires **no Stop hook** — the app reads the rollout tail to bring such a row back to `waiting`. |
+| — | `codex queue` → ack measured 8.2–8.5 s on a just-resumed codex (fast on a warm one), so the ack window is 15 s and a late ack still upgrades "unanswered" to "delivered". |
 | S21 | Not installed on the Linux VM yet; a host without `codex` disables ⌘⌥T there with a toast. |
 
 ## Contracts between the parts
@@ -41,7 +46,7 @@ Driven on a real `codex` in tmux and with `codex exec`; nothing below is from do
 ### Scratch-dir files (per project state dir)
 | Path | Writer | Reader | Meaning |
 |---|---|---|---|
-| `agents/<id>` | app at spawn | helper (labels), app | contents `codex`; absent ⇒ claude |
+| `agents/<id>` | app at spawn | helper (labels, `hub_instances` agent/address — the registry entry itself has no agent field), app | contents `codex`; absent ⇒ claude |
 | `sessionid/<id>` | codex SessionStart/Stop/UserPromptSubmit hook (payload `session_id`) | app `reconcile_session_ids` | same file Claude uses |
 | `transcript/<id>` | codex hooks (payload `transcript_path`) | app transcript resolver | absolute rollout path |
 | `agentready/<id>` | codex SessionStart hook | app `wake_ready` | the codex has a thread id and hooks work |
@@ -55,7 +60,8 @@ Driven on a real `codex` in tmux and with `codex exec`; nothing below is from do
 - `codex::launch_args(helper, state_dir, project_dir, id) -> Vec<String>` — every codex option (yolo, hook-trust bypass, `--no-alt-screen`, update check off, the `-c hooks.*`, `-c mcp_servers.mulpex.*` with env, `-c developer_instructions=`). The app appends `resume <uuid>` and/or the positional prompt.
 - `codex::wake_line(n)` / `codex::is_wake_line(prompt)` — `mulpex: N new hub message(s)`, the text `listen.rs` prints for Claude.
 - `codex::ctx_pct(rollout) -> Option<u8>`; `codex::CHILD_ENV_DENY`.
-- `rules::system_prompt_for(helper, Agent)` — Claude ⇒ exactly `append_system_prompt(helper)`.
+- `rules::system_prompt_for(helper, Agent)` — Claude ⇒ exactly `append_system_prompt(helper)` (golden hash). `rules::spawn_prompt_for(task, parent_agent)`, `rules::board_rule(agent)`.
+- `remote::remote_launch_command_for(agent, …)`, `looks_like_tui`/`has_spinner_for(agent)` — `hub_remote_open` takes `agent`, default **claude** (codex may not be installed on the far box).
 - `persist::SavedSession.agent` — 10th column, written only for codex.
 
 ### App commands / events (frontend ↔ backend)
@@ -75,7 +81,9 @@ hub message(s)"` — a declared CLI, not typing into a TUI, and it never touches
 counts only when the codex's own UserPromptSubmit hook acks it (`wake/<id>.ack`); an unacked ring is
 retried every 30 s and shown on the row as amber ⚠ — a ring that does not arrive is as visible as
 one that does. Before the first prompt there is no thread id; then (only then) the frontend types
-the line into an **empty** box, and refuses visibly over a draft.
+the line (bracketed paste + CR) into an **empty** box, and refuses visibly over a draft (`wake_typed`
+is denied over Remote Hosts: two windows would type twice). A resumed codex has a thread id but no
+`agentready` until its next prompt, so queue is used once the codex has been up ≥ 4 s.
 
 ## Documented gaps
 No Read lock for codex (it reads through `Bash`, which the bash guard covers by path); no

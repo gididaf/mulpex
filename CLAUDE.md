@@ -36,6 +36,7 @@ reasoning in `docs/`.
 | [docs/remote-hosts.md](docs/remote-hosts.md) | File ▸ Connect to Remote Mulpex…: this Mulpex drives another (a Linux VM) over the Remote Control relay — host switcher, handles `slot·2^32+h`, real terminal mirrors (ring + resize markers, xterm-serialized snapshot at an exact stream offset), the geometry lease, the command allowlist, uploads, headless two-app test; hosts update before the Mac, and only when the link's wire fingerprint changed | `remote/client.rs`, `remote_update.rs`, `wire.rs`, `remote/desktop.rs`, `remote/rpc.rs` (classify every new command!), `hosts.ts`, `remoteHosts.ts`, `HostSwitcher.svelte`, `OutputSink` taps, `scripts/test-remote-hosts.sh` |
 | [docs/packaging.md](docs/packaging.md) | Helper sidecar bundling, TCC + signing identity, the DMG Finder race (`CI=true`), auto-update, teardown | `tauri.conf.json`, `scripts/release.sh`, `lib.rs` `RunEvent`, anything about shipping |
 | [docs/linux.md](docs/linux.md) | The Linux port: Super = ⌘, no native menu (the webview claims every shortcut via `lib/linuxKeys.ts` and draws a menu bar, `components/MenuBar.svelte`), Super+C/V clipboard, `/proc` process sweeps, title-bar badge, AppImage + deb signed on the Mac | `menu.rs` (every new shortcut also goes in `linuxKeys.ts`, every new item in `MenuBar.svelte`), the daemon's `procs.rs` process sweeps, `platform.ts`, `tauri.linux.conf.json`, `scripts/release-linux.sh` |
+| [docs/codex.md](docs/codex.md) | Codex as a second agent kind: the `Agent` abstraction (one function per concern, Claude golden-tested), the measured Codex 0.149.1 facts (per-launch `-c hooks.*`, MCP `env` table, `developer_instructions`, the trust-table and update-check flags, `Bash`/`apply_patch` tool names), the scratch-dir files codex hooks write, waking via `codex queue` + the ack, ⌘⌥T new codex, ⌘⌥S Continue in Codex/Claude (handoff), the documented gaps | `agent.rs`, `codex.rs`, any `Agent`-taking function, `wake.rs`, `handoff.rs`, `headless.rs`, `agent_transcript.rs`, `chat_codex.rs`, `promptbox.ts` |
 | [docs/verification-log.md](docs/verification-log.md) | What was actually measured/driven, and what was NOT | Before claiming something is verified, or re-testing something |
 
 ## The key idea
@@ -258,7 +259,7 @@ stale reference resolves to a no-op) and its **own scratch dir** `temp/mulpex-<d
 ## Keyboard
 
 Native macOS menu accelerators (⌘T/**⌘⇧T**/⌘W/⌘R/**⌘⇧R** restart instance/**⌘S** save instance/**⌘L** load save/**⌘⇧E** explain selection/**⌘K** secrets/**⌘⇧P** pin selection/**⌘⇧L** side panel/**⌘⇧K** request compact/**⌘⇧Q** checkpoint & quit/**⌘⇧B** ask all claudes/**⌘⇧O** remote control/⌘M/⌘⇧M/⌘[ ⌘]/⌘O/⌘Q, plus **⌘⇧W** close project,
-**⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
+**⌘⌥T** new codex, **⌘⌥S** continue in the other agent (both also claimed in the webview by `e.code`), **⌘⇧] / ⌘⇧[** next/prev project, **⌘⇧← / ⌘⇧→** move the active project's tab and
 **⌘⇧↑ / ⌘⇧↓** move the focused instance's sidebar row, **⌘⌥[ / ⌘⌥]** previous/next remote host —
 claimed in the webview by `e.code` too, since Option changes the bracket's character) are intercepted
 by the menu before xterm; Claude never uses ⌘, so there's zero collision. **⌘P** (the project
@@ -328,7 +329,8 @@ Copy/paste/select-all are predefined Edit-menu items macOS routes to the focused
 ## Vocabulary (fixed — use these words)
 
 - **project** — one entry in the project tab bar, named by its folder (`cloud`, `central-one`).
-- **instance** — one sidebar row: a claude **or** a terminal. Written **`claude#1`**, **`term#5`**,
+- **instance** — one sidebar row: a claude, a **codex** or a terminal. Written **`claude#1`**,
+  **`codex#2`**, **`term#5`** (one number space — the hub accepts `codex#2`, `claude#2` or `2` alike),
   no space, in prose, tool descriptions, `HUB_RULES` and error strings. Not "session", not "peer
   #3".
 
@@ -480,6 +482,10 @@ and cost real time; each links to the measurement that settled it.
 - **Every command in `lib.rs`'s `generate_handler!` is classified in `remote/rpc.rs`** (allowed from a
   remote desktop, or denied with a reason) — a test fails otherwise. An unclassified command is a
   button that silently does nothing on a remote host's tab. → [docs/remote-hosts.md](docs/remote-hosts.md)
+- **Agent-specific behaviour lives in one function that takes an `Agent`, never an inline `if codex`.**
+  The Claude path is golden-tested (rules hash, argv), so a codex change that leaks into it fails a
+  test instead of every user's claude. Codex facts are measured per CLI version and listed with
+  their probe in [docs/codex.md](docs/codex.md) — re-measure after a Codex update before trusting one.
 - **`to: "all"` and locks stay project-local**, and `hub_spawn`/`hub_close` only create and close
   instances in their own project. Only `hub_send`/`hub_inbox`/`hub_instances` cross the boundary.
   → [docs/hub.md](docs/hub.md)

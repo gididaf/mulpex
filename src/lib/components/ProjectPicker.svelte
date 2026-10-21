@@ -4,6 +4,7 @@
   let {
     recents,
     claude,
+    codex = null,
     error,
     onpick,
     onopen,
@@ -11,6 +12,8 @@
     recents: string[];
     /** null until the startup probe answers. */
     claude: ClaudeStatus | null;
+    /** Same probe for `codex` — optional, so its absence is only a note. */
+    codex?: ClaudeStatus | null;
     /** Last open-project failure, shown inline instead of dying in the console. */
     error: string | null;
     onpick: () => void;
@@ -50,6 +53,13 @@
         <strong>Couldn't open that project</strong>
         <pre>{error}</pre>
       </div>
+    {/if}
+
+    {#if codex !== null && !codex.found && !missingClaude}
+      <p class="note">
+        Codex CLI not found, so ⌘⌥T (New Codex Session) is off. Install <code>codex</code> and
+        restart Mulpex to use it.
+      </p>
     {/if}
 
     {#if recents.length}
@@ -92,6 +102,11 @@
   .tag {
     margin: 0.25rem 0 1rem;
     color: var(--text-dim);
+  }
+  .note {
+    margin: 0 0 1rem;
+    color: var(--text-dim);
+    font-size: 0.8rem;
   }
   .alert {
     margin-bottom: 1rem;

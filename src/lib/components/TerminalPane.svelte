@@ -62,6 +62,7 @@
       {@const id = $activeId}
       <SaveOverlay
         {id}
+        kind={$activeProject?.sessions.find((s) => s.id === id)?.kind}
         status={activeSave}
         onclose={() => onsaveclose(id)}
         onretry={() => onsaveretry(id)}
@@ -79,7 +80,7 @@
       </div>
     {:else if activeEmpty}
       <div class="empty">
-        Nothing running — press ⌘T for a Claude instance, ⌘⇧T for a terminal
+        Nothing running — press ⌘T for a Claude instance, ⌘⌥T for Codex, ⌘⇧T for a terminal
       </div>
     {/if}
     {#if $activeProject && $activeHost && !$activeHostOnline}

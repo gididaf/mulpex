@@ -22,6 +22,7 @@
 // claude is still starting — is "none", and ⌘⇧E does nothing.
 
 import type { IBuffer } from "@xterm/xterm";
+import type { Agent } from "./ipc";
 
 export type PromptBox = "empty" | "draft" | "none";
 
@@ -44,8 +45,13 @@ function isPromptRow(text: string): boolean {
   return text.startsWith(PROMPT + " ") || text.startsWith(PROMPT + " ");
 }
 
-/** The state of claude's input box on the visible screen of `buf`. */
-export function readPromptBox(buf: IBuffer, rows: number, cols: number): PromptBox {
+/** The state of `agent`'s input box on the visible screen of `buf`. */
+export function readPromptBox(buf: IBuffer, rows: number, cols: number, agent: Agent = "claude"): PromptBox {
+  return agent === "codex" ? readCodexBox(buf, rows, cols) : readClaudeBox(buf, rows, cols);
+}
+
+/** claude's box (the rules at the top of this file). */
+function readClaudeBox(buf: IBuffer, rows: number, cols: number): PromptBox {
   const top = buf.viewportY;
   const lineText = (y: number) => buf.getLine(y)?.translateToString(true) ?? "";
 
@@ -65,6 +71,48 @@ export function readPromptBox(buf: IBuffer, rows: number, cols: number): PromptB
     }
     // No closing rule on screen: not a box we understand, so don't type.
     return "none";
+  }
+  return "none";
+}
+
+// Codex's composer, measured on codex-cli 0.149.1 (raw PTY streams recorded
+// with tmux `pipe-pane`, `--no-alt-screen`; the fixtures beside this file):
+//
+//   › Ask Codex to do anything      ← EMPTY: bold "›", a space, DIM placeholder
+//   › fix the bug                   ← a DRAFT: the same "›", then normal text
+//     second line                   ← a multi-line draft continues indented
+//     gpt-5.6-terra medium · /cwd   ← the footer (also indented — so it can't
+//                                     be told from a continuation line)
+//
+// There are no rules around it. Past prompts echoed into the history are also
+// "› …" rows, but drawn bold AND dim, and pickers (the directory-trust dialog's
+// "› 1. Yes, continue", the slash-command list) color their "›" — so the
+// composer is the bottom-most row whose first cell is a bold, undimmed "›" in
+// the default color, followed by a blank cell. Its state is read from that row
+// alone: a dim placeholder there means empty, any undimmed text means a draft
+// (whatever follows below), and a row with neither — no placeholder, nothing
+// typed, perhaps a draft that starts with a newline — is not a state we know,
+// so it is "none" and nothing is typed. While codex is busy the composer still
+// shows its placeholder: callers gate on the row's status, not on this.
+const CODEX_PROMPT = "›";
+
+function readCodexBox(buf: IBuffer, rows: number, cols: number): PromptBox {
+  const top = buf.viewportY;
+  const cell = buf.getNullCell();
+  for (let y = top + rows - 1; y >= top; y--) {
+    const line = buf.getLine(y);
+    if (!line?.getCell(0, cell)) continue;
+    if (cell.getChars() !== CODEX_PROMPT || !cell.isBold() || cell.isDim() || !cell.isFgDefault()) continue;
+    if (!line.getCell(1, cell) || cell.getChars().trim() !== "") continue;
+    let placeholder = false;
+    for (let x = 2; x < cols; x++) {
+      if (!line.getCell(x, cell)) break;
+      const ch = cell.getChars();
+      if (ch === "" || ch.trim() === "") continue;
+      if (!cell.isDim()) return "draft";
+      placeholder = true;
+    }
+    return placeholder ? "empty" : "none";
   }
   return "none";
 }

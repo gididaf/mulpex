@@ -82,3 +82,5 @@ one stray fork. That is the known residue.
   English snippet doesn't reorder the Hebrew around it. Unlike the terminal, the prompt *allows* a
   key English term with a short explanation, which the user asked for. The panel is HTML, so the
   terminal's first-strong-character row rule ([rendering.md](rendering.md)) does not apply.
+
+**Codex rows:** the fork is `codex exec fork <id> --json` (kept, so follow-ups `codex exec resume <fork>`), removed with `codex delete --force <fork>`. Codex emits no text deltas, so the panel gets the answer in one piece. → [codex.md](codex.md)

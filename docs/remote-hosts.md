@@ -343,3 +343,5 @@ already on the new release's wire is not touched.
   ordered is still running (needed for hosts still on ≤ v0.47.1).
 
   `CLAUDE=1` adds a busy real claude in A, which must get both the stop and the wake.
+
+**Codex on a host:** `create_session` takes an optional `agent` (absent = claude, so an older host still works); `agent_status` and `continue_in_other_agent` are allowed; `wake_typed` is denied — `codex-wake` is not forwarded, or two windows would type the same wake. A host without `codex` installed disables ⌘⌥T on its tab with a notice.

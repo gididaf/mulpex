@@ -8,8 +8,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::project;
 use crate::snapshot::{
-    BootstrapInfo, ClaudeStatus, HubSnapshot, ProjectHandle, SessionInfo, WorkspaceInfo,
+    AgentStatus, BootstrapInfo, ClaudeStatus, HubSnapshot, ProjectHandle, SessionInfo, WorkspaceInfo,
 };
+use mulpex_core::agent::Agent;
 use crate::state::{AppState, Core};
 
 /// Every open project + the active handle, for the frontend's initial paint.
@@ -34,17 +35,29 @@ pub fn list_recent_projects() -> Vec<String> {
 /// that works fine in the user's terminal.
 #[tauri::command]
 pub fn claude_status() -> ClaudeStatus {
-    match crate::claude_bin::resolve_claude() {
-        Some(p) => ClaudeStatus {
-            found: true,
-            path: Some(p.to_string_lossy().into_owned()),
-            searched_path: crate::claude_bin::merged_path().to_string(),
-        },
-        None => ClaudeStatus {
-            found: false,
-            path: None,
-            searched_path: crate::claude_bin::merged_path().to_string(),
-        },
+    cli_status(Agent::Claude)
+}
+
+/// `claude_status` for both agent CLIs. `claude_status` stays for remote hosts
+/// that predate this.
+#[tauri::command]
+pub fn agent_status() -> AgentStatus {
+    AgentStatus { claude: cli_status(Agent::Claude), codex: cli_status(Agent::Codex) }
+}
+
+fn cli_status(agent: Agent) -> ClaudeStatus {
+    ClaudeStatus {
+        found: crate::claude_bin::resolve(agent).is_some(),
+        path: crate::claude_bin::resolve(agent).map(|p| p.to_string_lossy().into_owned()),
+        searched_path: crate::claude_bin::merged_path().to_string(),
+    }
+}
+
+/// `agent` from the frontend: `"claude"` / `"codex"`, missing means claude.
+pub(crate) fn parse_agent(agent: Option<&str>) -> Result<Agent, String> {
+    match agent {
+        None => Ok(Agent::Claude),
+        Some(a) => Agent::parse(a).ok_or_else(|| format!("unknown agent {a:?}")),
     }
 }
 
@@ -130,15 +143,33 @@ pub fn attach_session(
     }
 }
 
-/// Spawn a fresh Claude instance (⌘T) in the given project and return its info.
+/// Spawn a fresh agent instance in the given project and return its info: a
+/// claude (⌘T, `agent` missing) or a codex (⌘⌥T, `agent: "codex"`).
 #[tauri::command]
 pub fn create_session(
     state: State<AppState>,
     project_handle: ProjectHandle,
+    agent: Option<String>,
 ) -> Result<SessionInfo, String> {
+    let agent = parse_agent(agent.as_deref())?;
     let mut ws = state.ws.lock().unwrap();
     let core = ws.project_mut(project_handle).ok_or("no such project")?;
-    core.spawn_instance().map_err(|e| e.to_string())
+    core.spawn_agent(agent).map_err(|e| e.to_string())
+}
+
+/// The frontend's answer to a `codex-wake` event: it typed the wake line into
+/// codex#`id`'s empty box (`ok`), or refused and says why (a draft was there).
+#[tauri::command]
+pub fn wake_typed(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    ok: bool,
+    reason: String,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project_mut(project_handle) {
+        core.wake_typed(id, ok, &reason);
+    }
 }
 
 /// Open a plain shell terminal (⌘⇧T) in the given project and focus it.
@@ -1098,7 +1129,7 @@ pub fn load_save(
     let path = crate::saves::resolve(&dir, &file)?;
     let title = crate::saves::title_of(&path);
     if mode == "continue" {
-        let uuid = crate::saves::resumable_uuid(&path, &dir)
+        let (uuid, agent) = crate::saves::resumable_session(&path, &dir)
             .ok_or("that conversation is no longer on this machine — start fresh from the doc")?;
         let mut ws = state.ws.lock().unwrap();
         let core = ws.project_mut(project_handle).ok_or("no such project")?;
@@ -1108,7 +1139,7 @@ pub fn load_save(
             core.set_active(id);
             return Ok(LoadResult { info, existing: true });
         }
-        let info = core.spawn_instance_resuming(uuid, title).map_err(|e| e.to_string())?;
+        let info = core.spawn_instance_resuming(agent, uuid, title).map_err(|e| e.to_string())?;
         return Ok(LoadResult { info, existing: false });
     }
     let mut ws = state.ws.lock().unwrap();

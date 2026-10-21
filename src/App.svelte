@@ -10,13 +10,15 @@
   import {
     bootstrap,
     listRecentProjects,
-    claudeStatus,
     openProject,
     closeProject,
     switchProject,
     reorderProjects,
     reorderSessions,
     createSession,
+    agentStatus,
+    continueInOtherAgent,
+    wakeTyped,
     createTerminal,
     closeSession,
     restartSession,
@@ -49,7 +51,8 @@
     type SessionExitedEvent,
     type ProjectHandle,
   } from "./lib/ipc";
-  import type { SessionInfo } from "./lib/ipc";
+  import type { Agent, CodexWakeEvent, SessionInfo } from "./lib/ipc";
+  import { addr, addrIn, agentOf, agentTitle, otherAgent, rowLabel } from "./lib/agents";
   import {
     projects,
     activeProjectHandle,
@@ -145,6 +148,9 @@
   let recents: string[] = $state([]);
   let ready = $state(false);
   let claude: ClaudeStatus | null = $state(null);
+  /** Whether `codex` was found here: the picker notes when it isn't (⌘⌥T then
+   *  says so too). */
+  let codex: ClaudeStatus | null = $state(null);
   let openError: string | null = $state(null);
 
   /** Build one project's UI state + xterms, then activate it if asked. */
@@ -163,6 +169,7 @@
       statuses: new Map(),
       watching: new Set(),
       ctx: new Map(),
+      wake: new Map(),
       tasks: new Map(),
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,
@@ -309,7 +316,7 @@
     const busy: string[] = [];
     for (const p of get(projects).values()) {
       if (slotOf(p.handle) !== slot) continue;
-      for (const [id, status] of p.statuses) if (status === "working") busy.push(`${p.name} claude#${id}`);
+      for (const [id, status] of p.statuses) if (status === "working") busy.push(`${p.name} ${addrIn(p.sessions, id)}`);
     }
     const msg = busy.length
       ? `${busy.length} ${busy.length === 1 ? "claude is" : "claudes are"} working on ${name}: ${busy.join(", ")}. ` +
@@ -483,7 +490,7 @@
   function instanceAddress(s: SessionInfo): string {
     const h = get(activeProjectHandle);
     const shell = s.kind === "shell";
-    const bare = `${shell ? "term" : "claude"}#${s.id}`;
+    const bare = addr(s.kind, s.id);
     if (h == null || !claudeInAnotherProject(h)) return bare;
     const name = get(projects).get(h)?.name;
     if (!name) return bare;
@@ -574,7 +581,9 @@
     const h = get(activeProjectHandle);
     if (h == null) return;
     const shell = s.kind === "shell";
-    const token = shell ? [] : await tokenMenu(h, s.id);
+    const agent = agentOf(s.kind);
+    // Live Token is Claude-only: a codex uses its own account (docs/codex.md).
+    const token = agent === "claude" ? await tokenMenu(h, s.id) : [];
     // Only the focused row's menu carries key hints (see above).
     const key = (k: string) => (get(activeId) === s.id ? k : undefined);
     const items: CtxItem[] = [
@@ -617,6 +626,11 @@
               run: () => void saveInstance(h, s.id),
             },
             {
+              label: `Continue in ${agentTitle(otherAgent(agent ?? "claude"))}`,
+              hint: key("⌘⌥S"),
+              run: () => void continueInOther(h, s.id),
+            },
+            {
               label: "Secrets…",
               hint: key("⌘K"),
               run: () => openSecrets(h, s.id),
@@ -649,6 +663,7 @@
       y: e.clientY,
       items: [
         { label: "New Session", hint: "⌘T", run: () => void newSession() },
+        { label: "New Codex Session", hint: "⌘⌥T", run: () => void newSession("codex") },
         { label: "New Terminal", hint: "⌘⇧T", run: () => void newTerminal() },
       ],
     };
@@ -855,18 +870,38 @@
     if (get(projects).size === 0 && get(hosts).size === 0) recents = await listRecentProjects();
   }
 
-  async function newSession() {
+  /** Whether each host found a `codex`, asked once per host (the backend
+   *  checks once at startup too). */
+  const codexFound = new Map<number, Promise<boolean>>();
+  function hasCodex(host: number): Promise<boolean> {
+    let p = codexFound.get(host);
+    if (!p) {
+      p = agentStatus(host).then((st) => st.codex.found, () => false);
+      codexFound.set(host, p);
+      // A miss is asked again next time: the user may have just installed it.
+      p.then((ok) => ok || codexFound.delete(host));
+    }
+    return p;
+  }
+
+  /** ⌘T (a claude) or ⌘⌥T (a codex). */
+  async function newSession(agent: Agent = "claude") {
     const h = get(activeProjectHandle);
     if (h == null) return;
+    if (agent === "codex" && !(await hasCodex(slotOf(h)))) {
+      const where = isRemote(h) ? ` on ${hostName(slotOf(h))}` : "";
+      flashNotice(`Codex isn't installed${where} — no \`codex\` was found (looked in ~/.local/bin and your login shell's PATH).`, 6000);
+      return;
+    }
     let info;
     try {
-      info = await createSession(h);
+      info = await createSession(h, agent);
     } catch (e) {
       // Spawning can be refused before it starts — most often because macOS is
       // withholding the project's folder from this app, which the backend
       // checks for by name. Without this the rejection was unhandled and ⌘T
       // simply did nothing at all, which is the failure it exists to explain.
-      flashNotice(`Could not start Claude: ${e}`, 8000);
+      flashNotice(`Could not start ${agentTitle(agent)}: ${e}`, 8000);
       return;
     }
     const p = get(projects).get(h);
@@ -923,12 +958,12 @@
       // The menu item is always enabled, so a ⌘⇧R on a terminal has to say why
       // nothing happened rather than look like a dead key.
       flashNotice(
-        `term #${id} can't be restarted — only a claude has a conversation to resume.`,
+        `term #${id} can't be restarted — only a claude or a codex has a conversation to resume.`,
         4000,
       );
       return;
     }
-    const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
+    const who = s.name ? `${rowLabel(s.kind, id)} (${s.name})` : rowLabel(s.kind, id);
     const ok = await confirm(
       s.worked
         ? `Quit ${who} and start it again, resuming the same conversation?\n\n` +
@@ -954,7 +989,7 @@
       // The backend refuses without killing anything when there is no transcript
       // to resume yet, which is the message worth showing — the instance the user
       // was about to lose is still running.
-      flashNotice(`Could not restart claude #${id}: ${e}`, 8000);
+      flashNotice(`Could not restart ${rowLabel(s.kind, id)}: ${e}`, 8000);
       terminals.refocus();
       return;
     }
@@ -977,7 +1012,7 @@
     try {
       await saveSession(h, id);
     } catch (e) {
-      flashNotice(`Could not save claude #${id}: ${e}`, 8000);
+      flashNotice(`Could not save ${rowLabel(get(projects).get(h)?.sessions.find((x) => x.id === id)?.kind, id)}: ${e}`, 8000);
     }
   }
 
@@ -1069,7 +1104,8 @@
     action: "new" | "close" | "compact";
     handle: ProjectHandle;
     id: number | null;
-    kind: "claude" | "shell" | null;
+    /** `codex` from a phone that offers ⌘⌥T; an older phone sends only these two. */
+    kind: "claude" | "codex" | "shell" | null;
     rid: string;
   };
   async function remoteAction({ action, handle, id, kind, rid }: RemoteActionEvent) {
@@ -1091,8 +1127,9 @@
       }
       return;
     }
+    if (kind === "codex" && !(await hasCodex(slotOf(handle)))) return remoteReply(rid, false, "Codex isn't installed on the Mac");
     try {
-      const info = kind === "shell" ? await createTerminal(handle) : await createSession(handle);
+      const info = kind === "shell" ? await createTerminal(handle) : await createSession(handle, kind === "codex" ? "codex" : "claude");
       const cur = get(projects).get(handle);
       if (cur && !cur.sessions.some((s) => s.id === info.id)) setSessionsFor(handle, [...cur.sessions, info]);
       remoteReply(rid, true, null, info.id);
@@ -1134,7 +1171,7 @@
     const s = get(projects).get(handle)?.sessions.find((x) => x.id === id);
     if (!s) return;
     if (s.kind === "shell") {
-      flashToast("Explain works on claudes only");
+      flashToast("Explain works on claudes and codexes only");
       return;
     }
     const text = terminals.selectionText(handle, id);
@@ -1157,7 +1194,7 @@
     const lines = s.kind === "shell" ? null : terminals.pinSelection(handle, id);
     if (!lines) {
       if (s.kind === "shell" && terminals.hasSelection(handle, id)) {
-        flashToast("Pins work on claudes only");
+        flashToast("Pins work on claudes and codexes only");
         return;
       }
       toggleTab("pins");
@@ -1182,7 +1219,7 @@
     const s = p?.sessions.find((x) => x.id === id);
     if (!p || !s) return;
     if (s.kind === "shell") {
-      flashNotice(`term #${id} can't be saved — only a claude has a conversation.`, 4000);
+      flashNotice(`term #${id} can't be saved — only a claude or a codex has a conversation.`, 4000);
       return;
     }
     const sv = get(saves).get(id);
@@ -1199,7 +1236,7 @@
       flashToast(why);
       return;
     }
-    const who = s.name ? `claude #${id} (${s.name})` : `claude #${id}`;
+    const who = s.name ? `${rowLabel(s.kind, id)} (${s.name})` : rowLabel(s.kind, id);
     const bg = p.statuses.get(id) === "working" ? "\n\nIts background commands will be stopped too." : "";
     const ok = await confirm(`Save ${who}? It will stop now and close once saved.${bg}`, {
       title: "Save Session",
@@ -1212,8 +1249,85 @@
     try {
       await saveSession(handle, id);
     } catch (e) {
-      flashNotice(`Could not save claude #${id}: ${e}`, 8000);
+      flashNotice(`Could not save ${rowLabel(s.kind, id)}: ${e}`, 8000);
     }
+  }
+
+  /**
+   * ⌘⌥S: hand this row's work to the other agent — "Continue in Codex" from a
+   * claude, "Continue in Claude" from a codex (`handoff.rs`, docs/codex.md).
+   * The source agent writes a handoff doc (or, when it is rate-limited, the
+   * target writes one from the transcript), then the row is replaced in place:
+   * same number, name and parent, the doc as the new agent's first prompt.
+   * Progress shows as a save (`SaveOverlay`), which `handed-off` clears.
+   * Asked first, and refused where ⌘S is, since the row stops at once.
+   */
+  async function continueInOther(handle: ProjectHandle, id: number) {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    if (!p || !s) return;
+    const from = agentOf(s.kind);
+    if (!from) {
+      flashNotice(`term #${id} has no conversation to continue — only a claude or a codex does.`, 4000);
+      return;
+    }
+    const to = otherAgent(from);
+    if (get(saves).get(id)) {
+      flashToast("Already saving");
+      return;
+    }
+    const host = slotOf(handle);
+    const found = await agentStatus(host).then((st) => st[to].found, () => false);
+    if (!found) {
+      flashNotice(`${agentTitle(to)} isn't installed${host ? ` on ${hostName(host)}` : ""} — nothing to continue in.`, 6000);
+      return;
+    }
+    const why = await saveCheck(handle, id).catch((e) => String(e));
+    if (why) {
+      flashToast(why);
+      return;
+    }
+    const who = s.name ? `${rowLabel(s.kind, id)} (${s.name})` : rowLabel(s.kind, id);
+    const ok = await confirm(
+      `Continue ${who} in ${agentTitle(to)}?\n\n` +
+        `It stops now and writes a handoff doc; then ${rowLabel(to, id)} takes its place ` +
+        `on the same row and carries on from the doc.`,
+      { title: `Continue in ${agentTitle(to)}`, kind: "info", okLabel: "Continue", cancelLabel: "Cancel" },
+    );
+    terminals.refocus();
+    if (!ok) return;
+    try {
+      await continueInOtherAgent(handle, id);
+    } catch (e) {
+      flashNotice(`Could not continue ${rowLabel(s.kind, id)} in ${agentTitle(to)}: ${e}`, 8000);
+    }
+  }
+
+  /**
+   * `codex-wake`: the backend could not ring a codex through `codex queue`
+   * (it has no thread id yet — docs/codex.md "Wake"), so it asks us to type
+   * the wake line. Only into an idle codex whose box is EMPTY: over a draft
+   * the line would be glued to the user's text, so that is refused — and the
+   * refusal is reported, so the row shows it rather than mail silently not
+   * arriving. One write, as a bracketed paste plus CR: codex's paste-burst
+   * turns a plain `line\r` into a newline in the box, not a submit (measured,
+   * codex 0.149.1).
+   */
+  function codexWake({ handle, id, line }: CodexWakeEvent) {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    let why: string | null = null;
+    if (!p || !s || s.kind !== "codex" || s.exited || s.failed) why = "not a running codex";
+    else if (saveStatusOf(handle, id)) why = "it is being saved";
+    else if (p.statuses.get(id) !== "waiting") why = "it is not idle";
+    else {
+      const box = terminals.promptBox(handle, id);
+      if (box === "draft") why = "a draft is in its box";
+      else if (box === "none") why = "no input box on screen";
+    }
+    const clean = line.replace(/[\x00-\x1f\x7f]/g, "");
+    if (!why) sendBytes(handle, id, new TextEncoder().encode(`\x1b[200~${clean}\x1b[201~\r`));
+    wakeTyped(handle, id, why == null, why ?? "").catch(() => {});
   }
 
   /**
@@ -1329,9 +1443,17 @@
       case "new_session":
         if (h != null) await newSession();
         break;
+      case "new_codex_session":
+        if (h != null) await newSession("codex");
+        break;
       case "new_terminal":
         if (h != null) await newTerminal();
         break;
+      case "continue_other_agent": {
+        const cur = get(activeId);
+        if (h != null && cur != null) await continueInOther(h, cur);
+        break;
+      }
       case "close_session": {
         const cur = get(activeId);
         if (h != null && cur != null) closeInstance(h, cur);
@@ -1525,6 +1647,14 @@
         cycleHost(back ? -1 : 1);
         return;
       }
+      // ⌘⌥T — New Codex Session, ⌘⌥S — Continue in Claude/Codex. Declared in
+      // the menu too; Option turns the letter into † / ß, so the physical key
+      // decides here, and a key the menu takes never reaches this arm.
+      if (e.code === "KeyT" || e.code === "KeyS") {
+        e.preventDefault();
+        void handleMenu(e.code === "KeyT" ? "new_codex_session" : "continue_other_agent");
+        return;
+      }
     }
     if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
       // ⌘⇧P — Pin Selection. Declared in the menu too; if the menu takes the
@@ -1637,7 +1767,12 @@
         applyHubFor(e.payload.handle, e.payload.snapshot);
         autoCompactTick(e.payload.handle);
       }),
-      listen<SaveProgressEvent>("save-progress", (e) => applySaveProgress(e.payload)),
+      // `handed-off`: ⌘⌥S finished and the row runs the other agent now, so it
+      // is live again — not a save to show (`session-restarted` rebinds the pane).
+      listen<SaveProgressEvent>("save-progress", (e) =>
+        e.payload.state === "handed-off" ? clearSaveState(e.payload.handle, e.payload.id) : applySaveProgress(e.payload),
+      ),
+      listen<CodexWakeEvent>("codex-wake", (e) => codexWake(e.payload)),
       // Every window holding a restarted row rebinds it from this one event:
       // this Mulpex's own panes reattach to the new PTY; a remote host's mirror
       // is re-snapshotted by its host instead.
@@ -1833,7 +1968,9 @@
       void checkResume();
       // Non-blocking: the probe shells out to the login shell, so let the UI
       // paint first. Only matters for the picker's banner.
-      claude = await claudeStatus();
+      const st = await agentStatus();
+      claude = st.claude;
+      codex = st.codex;
     })();
 
     return () => {
@@ -2083,6 +2220,7 @@
   <ProjectPicker
     {recents}
     {claude}
+    {codex}
     error={openError}
     onpick={pickAndOpen}
     onopen={openOrFocusProject}

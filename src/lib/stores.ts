@@ -16,7 +16,9 @@ import type {
   SaveState,
   SessionInfo,
   Status,
+  WakeMark,
 } from "./ipc";
+import { isAgent } from "./agents";
 
 import { activeHost, slotOf } from "./hosts";
 
@@ -35,6 +37,8 @@ export interface ProjectState {
   watching: Set<number>;
   /** id → context window used, whole percent. Claudes that have replied only. */
   ctx: Map<number, number>;
+  /** id → the codex's last wake attempt (`StatusEntry.wake`); codexes only. */
+  wake: Map<number, WakeMark>;
   tasks: Map<number, string>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
@@ -350,10 +354,20 @@ function mutedIds(p: ProjectState): Set<number> {
   return new Set(p.sessions.filter((s) => s.muted).map((s) => s.id));
 }
 
-/** Sessions of `p` stopped on a question, muted ones excluded (the tab's red badge). */
+/** A wake that did not get through: the codex was rung about unread mail and
+ *  never took it (`unanswered`), or the typed fallback found a draft in its box
+ *  (`refused`). It stays until a later ring is delivered. */
+export function wakeStuck(m: WakeMark | null | undefined): boolean {
+  return m?.state === "unanswered" || m?.state === "refused";
+}
+
+/** Sessions of `p` stopped on a question — or a codex whose mail could not be
+ *  delivered, which waits on the user just the same — muted ones excluded (the
+ *  tab's red badge, and through it the dock badge). */
 export function needsCount(p: ProjectState): number {
-  return p.sessions.filter((s) => !s.muted && p.statuses.get(s.id) === "needs")
-    .length;
+  return p.sessions.filter(
+    (s) => !s.muted && (p.statuses.get(s.id) === "needs" || wakeStuck(p.wake?.get(s.id))),
+  ).length;
 }
 
 /**
@@ -402,7 +416,7 @@ export function claudeInAnotherProject(handle: ProjectHandle | null): boolean {
   // ambiguous.
   const host = handle == null ? 0 : slotOf(handle);
   return [...get(projects).values()].some(
-    (p) => p.handle !== handle && slotOf(p.handle) === host && p.sessions.some((s) => s.kind === "claude"),
+    (p) => p.handle !== handle && slotOf(p.handle) === host && p.sessions.some((s) => isAgent(s.kind)),
   );
 }
 
@@ -622,6 +636,7 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
     ctx: new Map(
       snap.statuses.filter((e) => e.ctx_pct != null).map((e) => [e.id, e.ctx_pct!]),
     ),
+    wake: new Map(snap.statuses.filter((e) => e.wake).map((e) => [e.id, e.wake!])),
     tasks: new Map(snap.tasks.map((e) => [e.id, e.task])),
   });
 }

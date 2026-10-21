@@ -167,3 +167,5 @@ and the `.deb` path needs a root password dialog on the Linux screen.
 The deb key matters: on a deb install the updater looks up
 `linux-x86_64-deb` *first* and would otherwise fall back to the AppImage entry
 and hand an AppImage to dpkg.
+
+**Codex chords:** Super+Alt+T (new codex) and Super+Alt+S (continue in the other agent) are `A-KeyT` / `A-KeyS` in `linuxKeys.ts`. `platform.ts::isSuper` used to return false whenever Alt was held, which silently killed **every** Super+Alt chord (including next/prev host); Alt is now part of the chord. Not yet driven on Linux.

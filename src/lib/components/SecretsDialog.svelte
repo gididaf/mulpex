@@ -1,6 +1,8 @@
 <script lang="ts">
   import { confirm } from "@tauri-apps/plugin-dialog";
   import type { SavedSet, SecretRow } from "../ipc";
+  import { rowLabel } from "../agents";
+  import { projects } from "../stores";
   import {
     secretsAttach,
     secretsCreateEphemeral,
@@ -25,6 +27,8 @@
     onclose: () => void;
     onsent: (keys: string[]) => void;
   } = $props();
+
+  const who = $derived(rowLabel($projects.get(handle)?.sessions.find((s) => s.id === id)?.kind, id));
 
   type Row = SecretRow & { shown: boolean };
   let rows = $state<Row[]>([{ key: "", value: "", shown: false }]);
@@ -174,7 +178,7 @@
     onclick={(e) => e.stopPropagation()}
     onkeydown={onKey}
   >
-    <div class="label">Secrets for claude #{id}</div>
+    <div class="label">Secrets for {who}</div>
     {#if saved.length > 0}
       <div class="saved">
         {#each saved as set (set.name)}
@@ -183,7 +187,7 @@
               class="set"
               class:current={editing === set.name}
               disabled={busy || editing != null}
-              title="Send to claude #{id}"
+              title="Send to {who}"
               onclick={() => void sendSaved(set)}
             >
               <span class="set-name">{set.name}</span>

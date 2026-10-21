@@ -31,7 +31,7 @@ use crate::ptyd;
 /// builds a `SpawnTask`.
 pub use mulpex_core::rules::SpawnTask;
 use mulpex_core::agent::Agent;
-use mulpex_core::rules::{append_system_prompt, spawn_prompt};
+use mulpex_core::rules::{append_system_prompt, spawn_prompt_for};
 
 /// What is running on a session's PTY. The two kinds share every mechanism that
 /// keys off `(project, id)` — attach, input, resize, close, process-group
@@ -99,6 +99,9 @@ pub enum SpawnSpec<'a> {
         /// Reopen an existing session id rather than creating it.
         resume: bool,
         initial_task: Option<SpawnTask>,
+        /// The agent of `initial_task`'s parent, which its prompt names
+        /// (`codex#4` assigned this). Unused without a task.
+        parent_agent: Agent,
         /// A prompt handed over exactly as written — no `[mulpex:hub]` wrapper,
         /// no whitespace collapsing — as if the user had typed it (⌘L Load).
         /// Still argv, never typed into the TUI. Ignored when `initial_task` is set.
@@ -681,13 +684,35 @@ impl Session {
         // this point is kind-agnostic.
         let (cmd, state_dir, session_id, initial_task, seed) = match spec {
             SpawnSpec::Agent {
-                agent: _,
+                agent: Agent::Codex,
+                settings_path: _,
+                state_dir,
+                helper_path,
+                session_id,
+                resume,
+                initial_task,
+                parent_agent,
+                plain_prompt,
+            } => {
+                let prompt = spawn_prompt_for(initial_task.as_ref(), parent_agent);
+                let cmd = codex_command(dir, state_dir, helper_path, id, session_id, resume, prompt, plain_prompt)?;
+                (
+                    cmd,
+                    state_dir.to_path_buf(),
+                    session_id.to_string(),
+                    initial_task,
+                    None,
+                )
+            }
+            SpawnSpec::Agent {
+                agent: Agent::Claude,
                 settings_path,
                 state_dir,
                 helper_path,
                 session_id,
                 resume,
                 initial_task,
+                parent_agent,
                 plain_prompt,
             } => {
                 let mut cmd = claude_command()?;
@@ -719,7 +744,7 @@ impl Session {
                 // TUI: the prompt is submitted before the process finishes
                 // starting, and the `UserPromptSubmit` hook fires with the whole
                 // text (verified against a real `claude` at 12,000 characters).
-                if let Some(prompt) = spawn_prompt(initial_task.as_ref()) {
+                if let Some(prompt) = spawn_prompt_for(initial_task.as_ref(), parent_agent) {
                     publish_expected_prompt(state_dir, id, &prompt);
                     cmd.arg(prompt);
                 } else if let Some(prompt) = plain_prompt {
@@ -835,6 +860,23 @@ impl Session {
             let dir = state_dir.join(mulpex_core::PIDS_DIR);
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(dir.join(id.to_string()), pid.to_string());
+        }
+        // Which agent this row runs, for the helper's labels and the app's own
+        // readers (`agents/<id>`: `codex`, absent ⇒ claude). Removed for a
+        // claude, since a row can change agent in place (`replace_with_agent`).
+        if let Some(agent) = kind.agent() {
+            let p = mulpex_core::agents_path(&state_dir, id);
+            match agent {
+                Agent::Codex => {
+                    if let Some(d) = p.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    let _ = std::fs::write(&p, agent.word());
+                }
+                Agent::Claude => {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
         }
 
         // A seeded terminal (`hub_terminal_open` with a command): type the command
@@ -1219,6 +1261,67 @@ impl Drop for Session {
 /// omits `~/.local/bin` where the installer puts `claude` (see `claude_bin`).
 /// The same reconstructed `PATH` is handed to the child so tools it runs
 /// (`node`, `git`, Homebrew) resolve as they do in the user's terminal.
+/// A `codex` for an agent row: every option Mulpex needs from
+/// `mulpex_core::codex::launch_args` (hooks, MCP server, rules, no approvals, no
+/// alt screen), then `resume <id>` when reopening, then the first prompt — the
+/// task is on the command line here exactly as for a claude.
+///
+/// The env is the claude's minus everything that describes a Claude Code
+/// child (`CLAUDE_CODE_*`) or a codex's own command (`CODEX_CI`, its thread id —
+/// a Mulpex launched from inside a codex would hand those down), and without
+/// Live Token, which is Claude-only. `MULPEX_AGENT=codex` is what tells the
+/// helper which dialect it is serving.
+#[allow(clippy::too_many_arguments)]
+fn codex_command(
+    dir: &Path,
+    state_dir: &Path,
+    helper_path: &Path,
+    id: usize,
+    session_id: &str,
+    resume: bool,
+    task_prompt: Option<String>,
+    plain_prompt: Option<String>,
+) -> anyhow::Result<Cmd> {
+    let bin = claude_bin::resolve(Agent::Codex).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Codex CLI not found. Mulpex launches your own `codex`, but no `codex` \
+             executable was found on your PATH (searched: {}) or by your login shell. \
+             Install it (https://developers.openai.com/codex/cli), then reopen Mulpex.",
+            claude_bin::merged_path()
+        )
+    })?;
+    let mut cmd = Cmd::new(bin);
+    base_env(&mut cmd);
+    let strip: Vec<String> = cmd
+        .env
+        .keys()
+        .filter(|k| k.starts_with("CLAUDE_CODE_") || mulpex_core::codex::CHILD_ENV_DENY.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for k in strip {
+        cmd.env_remove(&k);
+    }
+    let project = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    for a in mulpex_core::codex::launch_args(helper_path, state_dir, &project, id) {
+        cmd.arg(a);
+    }
+    if resume && !session_id.is_empty() {
+        cmd.arg("resume");
+        cmd.arg(session_id);
+    }
+    if let Some(prompt) = task_prompt {
+        publish_expected_prompt(state_dir, id, &prompt);
+        cmd.arg(prompt);
+    } else if let Some(prompt) = plain_prompt {
+        cmd.arg(prompt);
+    }
+    cmd.env(mulpex_core::agent::AGENT_ENV, Agent::Codex.word());
+    cmd.env("MULPEX_INSTANCE_ID", id.to_string());
+    cmd.env("MULPEX_STATE_DIR", state_dir);
+    cmd.env("MULPEX_PROJECT_DIR", project);
+    Ok(cmd)
+}
+
 fn claude_command() -> anyhow::Result<Cmd> {
     let bin = claude_bin::resolve_claude().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1339,6 +1442,7 @@ fn b64encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mulpex_core::rules::spawn_prompt;
 
     /// The daemon meta carries the spawn fingerprint the session was given —
     /// what an adopting app reads back to decide the ↻ badge.

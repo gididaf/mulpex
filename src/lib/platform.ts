@@ -14,8 +14,11 @@ export const IS_LINUX = /Linux/.test(navigator.userAgent);
  * `("Super")` and `("Meta")` all false — the only trace of Super is its own
  * keydown/keyup, `key: "Super"`, `code: "OSLeft"`. So it is tracked here.
  *
- * Alt does not leak into `metaKey` (also measured), but Alt still excludes a
- * chord below, cheaply: no Mulpex shortcut uses Super+Alt.
+ * Alt does not leak into `metaKey` (also measured). Alt is part of a chord,
+ * not a reason to drop it: Super+Alt+[ / ] (hosts) and Super+Alt+T / S (codex)
+ * are shortcuts (`linuxKeys.ts::chordId` keys them with an `A-` prefix). An
+ * earlier version returned false on `altKey`, which left every one of those
+ * dead on Linux.
  */
 let superHeld = false;
 
@@ -40,6 +43,6 @@ if (IS_LINUX) {
 /** Super (the Windows/⌘ key) is held for this event, on Linux. The Super key's
  *  own keydown is not itself a chord. */
 export function isSuper(e: KeyboardEvent): boolean {
-  if (!IS_LINUX || e.altKey || isSuperKey(e)) return false;
+  if (!IS_LINUX || isSuperKey(e)) return false;
   return superHeld || e.metaKey || e.getModifierState("OS") || e.getModifierState("Super");
 }

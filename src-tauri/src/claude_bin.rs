@@ -41,6 +41,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use mulpex_core::agent::Agent;
+
 /// How long we let the login shell run before giving up on it. Some rc files
 /// are slow (or block outright); the fallback list covers us if this trips.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -264,6 +266,7 @@ pub fn forwarded_env() -> Vec<EnvPair> {
 pub fn warm_and_refresh() {
     std::thread::spawn(|| {
         let _ = resolve_claude();
+        let _ = resolve(Agent::Codex);
         loop {
             std::thread::sleep(ENV_REFRESH_INTERVAL);
             refresh_login_env();
@@ -321,15 +324,74 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// anywhere we can see. Resolved once — the answer can't change mid-run in a
 /// way we'd want to act on, and this keeps the shell probe to a single spawn.
 pub fn resolve_claude() -> Option<&'static PathBuf> {
-    static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            merged_path()
-                .split(':')
-                .map(|d| PathBuf::from(d).join("claude"))
-                .find(|c| is_executable(c))
-        })
-        .as_ref()
+    resolve(Agent::Claude)
+}
+
+/// Absolute path of the agent's CLI (`claude` or `codex`), or `None` if it
+/// isn't installed anywhere we can see. Each is resolved once per run.
+///
+/// Both search [`merged_path`] (the login shell's `PATH` plus the fallback
+/// install dirs). `codex` gets one more chance: its installer puts it in
+/// `~/.local/bin`, Homebrew or an npm prefix, but a user can keep it anywhere
+/// their rc files point — so the login shell is asked where `codex` is with any
+/// alias removed first. The user's shell aliases `codex` to add flags of its
+/// own (docs/codex.md), and Mulpex passes every flag it needs itself; resolving
+/// through the alias would hand the child someone else's argv.
+pub fn resolve(agent: Agent) -> Option<&'static PathBuf> {
+    static CLAUDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static CODEX: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let cell = match agent {
+        Agent::Claude => &CLAUDE,
+        Agent::Codex => &CODEX,
+    };
+    cell.get_or_init(|| {
+        let name = agent.word();
+        let on_path = merged_path()
+            .split(':')
+            .map(|d| PathBuf::from(d).join(name))
+            .find(|c| is_executable(c));
+        match agent {
+            Agent::Claude => on_path,
+            Agent::Codex => on_path.or_else(|| probe_login_shell_which(name)),
+        }
+    })
+    .as_ref()
+}
+
+/// Ask the login shell where `name` is, ignoring any alias or function of that
+/// name — only an absolute path to an executable file counts as an answer.
+fn probe_login_shell_which(name: &str) -> Option<PathBuf> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL.to_string());
+    let script = format!(
+        "unalias {name} 2>/dev/null; unset -f {name} 2>/dev/null; \
+         printf '%s' '{MARK_BEGIN}'; command -v {name}; printf '%s' '{MARK_END}'"
+    );
+    let mut child = Command::new(&shell)
+        .args(["-lic", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let begin = find(&out.stdout, MARK_BEGIN.as_bytes())? + MARK_BEGIN.len();
+    let rest = &out.stdout[begin..];
+    let body = std::str::from_utf8(&rest[..rfind(rest, MARK_END.as_bytes())?]).ok()?;
+    let p = PathBuf::from(body.trim());
+    (p.is_absolute() && is_executable(&p)).then_some(p)
 }
 
 #[cfg(test)]

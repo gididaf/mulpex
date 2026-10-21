@@ -26,6 +26,7 @@ pub const ALLOWED: &[&str] = &[
     "bootstrap",
     "list_recent_projects",
     "claude_status",
+    "agent_status",
     "open_project",
     "close_project",
     "reorder_projects",
@@ -51,6 +52,7 @@ pub const ALLOWED: &[&str] = &[
     "get_hub_snapshot",
     "save_check",
     "save_session",
+    "continue_in_other_agent",
     "explain_start",
     "explain_followup",
     "explain_close",
@@ -105,6 +107,9 @@ pub const ALLOWED: &[&str] = &[
 ///   (`compact.ts`), reached through `fa`; writing the phase from afar would
 ///   race it.
 /// - `set_mute_menu_checked`: this Mulpex's own menu.
+/// - `wake_typed`: answers a `codex-wake` event, which only THIS Mulpex's own
+///   window hears (it is not in `desktop.rs::EVENT_NAMES`) — two windows typing
+///   one wake line would submit it twice.
 /// - `quit_app`: nobody could start this Mulpex again from afar. A remote
 ///   ⌘⇧Q ends in `restart_app` instead.
 /// - `remote_set_enabled`, `remote_set_relay_url`: either one cuts the very
@@ -122,6 +127,7 @@ pub const DENIED: &[&str] = &[
     "resize_terminals",
     "set_compact_phase",
     "set_mute_menu_checked",
+    "wake_typed",
     "quit_app",
     // A detached restart's pane snapshots come from THIS window's xterms; the
     // survival check is for this machine's own updater.
@@ -184,10 +190,11 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
         "bootstrap" => out(c::bootstrap(st())),
         "list_recent_projects" => out(c::list_recent_projects()),
         "claude_status" => out(c::claude_status()),
+        "agent_status" => out(c::agent_status()),
         "open_project" => out(c::open_project(st(), app.clone(), arg(args, "path")?)?),
         "close_project" => out(c::close_project(st(), app.clone(), h()?)),
         "reorder_projects" => out(c::reorder_projects(st(), app.clone(), arg(args, "handles")?)),
-        "create_session" => out(c::create_session(st(), h()?)?),
+        "create_session" => out(c::create_session(st(), h()?, arg(args, "agent")?)?),
         "create_terminal" => out(c::create_terminal(st(), h()?)?),
         "close_session" => out(c::close_session(st(), h()?, id()?)?),
         "restart_session" => out(c::restart_session(st(), app.clone(), h()?, id()?)?),
@@ -219,6 +226,7 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
         "get_hub_snapshot" => out(c::get_hub_snapshot(st(), h()?)),
         "save_check" => out(c::save_check(st(), h()?, id()?)),
         "save_session" => out(c::save_session(app.clone(), st(), h()?, id()?)?),
+        "continue_in_other_agent" => out(crate::handoff::continue_in_other_agent(app.clone(), st(), h()?, id()?)?),
         "explain_start" => out(c::explain_start(
             app.clone(),
             st(),

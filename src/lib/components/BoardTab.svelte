@@ -11,6 +11,7 @@
   // events — Tauri's native drag-drop swallows HTML5 DnD (`InstanceList.svelte`).
   import { tick } from "svelte";
   import { activeProjectHandle, activeId, sessions } from "../stores";
+  import { addrIn, isAgent } from "../agents";
   import { boards, boardAll, editBoard, setBoardOn, sendBoard, imageCount, unreadCount, pendingCards } from "../board";
   import type { Board, BoardCard, BoardColumn, BoardColChange, BoardColRef } from "../ipc";
   import { terminals } from "../terminals";
@@ -19,7 +20,8 @@
   const h = $derived($activeProjectHandle);
   const id = $derived($activeId);
   const board = $derived(h != null ? $boards.get(h) : undefined);
-  const claudes = $derived($sessions.filter((s) => s.kind === "claude"));
+  const claudes = $derived($sessions.filter((s) => isAgent(s.kind)));
+  const at = (n: number) => addrIn($sessions, n);
   const focusedClaude = $derived(id != null && claudes.some((s) => s.id === id) ? id : null);
 
   let showArchived = $state(false);
@@ -254,7 +256,7 @@
     openN = c.n;
   }
 
-  const assigneeLabel = (a: number | null) => (a == null ? "" : `claude#${a}`);
+  const assigneeLabel = (a: number | null) => (a == null ? "" : at(a));
   const gone = (a: number | null) => a != null && !claudes.some((s) => s.id === a);
   const sending = $derived(board?.sending.length ?? 0);
   const pendingSet = $derived(pendingCards(board));
@@ -294,7 +296,7 @@
   {:else}
     <div class="bar">
       <div class="seg" role="radiogroup" aria-label="Show">
-        <button class:on={!$boardAll} disabled={focusedClaude == null} title="This claude's cards and unassigned ones" onclick={() => boardAll.set(false)}>{focusedClaude != null ? `claude#${focusedClaude}` : "This one"}</button>
+        <button class:on={!$boardAll} disabled={focusedClaude == null} title="This claude's cards and unassigned ones" onclick={() => boardAll.set(false)}>{focusedClaude != null ? at(focusedClaude) : "This one"}</button>
         <button class:on={$boardAll} onclick={() => boardAll.set(true)}>All</button>
       </div>
       <button class="link" class:on={showArchived} onclick={() => (showArchived = !showArchived)}>
@@ -306,7 +308,7 @@
       <div class="props">
         {#each board.proposals as p (p.id)}
           <div class="prop">
-            <div class="phead"><b>claude#{p.by}</b> wants to change the columns <span class="num">P{p.id}</span></div>
+            <div class="phead"><b>{at(p.by)}</b> wants to change the columns <span class="num">P{p.id}</span></div>
             {#if p.why}<div class="pwhy" dir="auto">{p.why}</div>{/if}
             <ul>
               {#each p.changes as ch, i (i)}
@@ -323,7 +325,7 @@
             </ul>
             {#if rejecting === p.id}
               <!-- svelte-ignore a11y_autofocus -->
-              <textarea dir="auto" rows="2" bind:value={rejectWhy} autofocus placeholder="Why not? (optional — claude#{p.by} reads it)"
+              <textarea dir="auto" rows="2" bind:value={rejectWhy} autofocus placeholder="Why not? (optional — {at(p.by)} reads it)"
                 onkeydown={(e) => { if (e.key === "Escape") rejecting = null; else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void reject(p.id); } }}></textarea>
               <div class="row-end">
                 <button class="link" onclick={() => (rejecting = null)}>Cancel</button>
@@ -348,7 +350,7 @@
         {#each archived as c (c.n)}
           <div class="arow">
             <button class="atitle" dir="auto" onclick={() => (openN = c.n)}>#{c.n} {c.title}</button>
-            <span class="ameta">{board.columns.find((x) => x.id === c.col)?.name}{c.assignee != null ? ` · claude#${c.assignee}` : ""}</span>
+            <span class="ameta">{board.columns.find((x) => x.id === c.col)?.name}{c.assignee != null ? ` · ${at(c.assignee)}` : ""}</span>
             <button class="link" onclick={() => edit({ op: "archive", n: c.n, on: false })}>Restore</button>
           </div>
         {/each}
@@ -450,7 +452,7 @@
                 <div class="row-end">
                   <select bind:value={addAssignee} title="Assignee">
                     <option value="">Nobody</option>
-                    {#each claudes as s (s.id)}<option value={String(s.id)}>claude#{s.id}</option>{/each}
+                    {#each claudes as s (s.id)}<option value={String(s.id)}>{at(s.id)}</option>{/each}
                   </select>
                   <button class="link" onclick={() => { addingIn = null; terminals.refocus(); }}>✕</button>
                   <button class="btn" disabled={!addTitle.trim()} onclick={add}>Add</button>
@@ -476,11 +478,11 @@
 
     <footer>
       <span class="status">
-        {#if pendingSet.size}{pendingSet.size} card{pendingSet.size === 1 ? "" : "s"} not sent{:else if sending}sending to {sending === 1 ? `claude#${board.sending[0]}` : `${sending} claudes`}…{:else}up to date{/if}
+        {#if pendingSet.size}{pendingSet.size} card{pendingSet.size === 1 ? "" : "s"} not sent{:else if sending}sending to {sending === 1 ? at(board.sending[0]) : `${sending} claudes`}…{:else}up to date{/if}
         {#if unreadCount(board)}<span class="unread"> · {unreadCount(board)} updated</span>{/if}
       </span>
       <button class="update" disabled={!pendingClaudes.length || updating} onclick={update} title="Tell the claudes what you changed">
-        {pendingClaudes.length === 1 ? `UPDATE claude#${pendingClaudes[0]}` : pendingClaudes.length > 1 ? `UPDATE · ${pendingClaudes.length} claudes` : "UPDATE"}
+        {pendingClaudes.length === 1 ? `UPDATE ${at(pendingClaudes[0])}` : pendingClaudes.length > 1 ? `UPDATE · ${pendingClaudes.length} claudes` : "UPDATE"}
       </button>
     </footer>
 

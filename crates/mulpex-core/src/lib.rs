@@ -15,6 +15,7 @@
 #![recursion_limit = "256"]
 
 pub mod agent;
+pub mod codex;
 pub mod config;
 pub mod hook;
 pub mod listen;
@@ -176,9 +177,10 @@ pub fn close_busy_reason(state_dir: &std::path::Path, id: usize) -> Option<Strin
         .map(|s| s.trim().to_string());
     if delivery.as_deref() == Some("pending") {
         return Some(format!(
-            "claude#{id} was spawned with a task that has not reached it yet — it is still \
+            "{} was spawned with a task that has not reached it yet — it is still \
              starting up, not idle, and closing it now would lose the brief. Wait for it to \
-             begin, or pass force: true."
+             begin, or pass force: true.",
+            addr(state_dir, id)
         ));
     }
     let status = std::fs::read_to_string(state_dir.join(id.to_string()))
@@ -186,9 +188,10 @@ pub fn close_busy_reason(state_dir: &std::path::Path, id: usize) -> Option<Strin
         .map(|w| w.trim().to_string());
     if status.as_deref() == Some("working") {
         return Some(format!(
-            "claude#{id} is mid-turn — closing it now would kill the task it is running. Wait \
+            "{} is mid-turn — closing it now would kill the task it is running. Wait \
              for it to finish (hub_instances shows when it goes idle), or pass force: true if \
-             you mean to interrupt it."
+             you mean to interrupt it.",
+            addr(state_dir, id)
         ));
     }
     None
@@ -328,6 +331,59 @@ pub const QUIETTURN_DIR: &str = "quietturn";
 /// `quietturn/<id>` for one instance.
 pub fn quiet_turn_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
     state_dir.join(QUIETTURN_DIR).join(id.to_string())
+}
+
+/// `agents/<id>` = which agent that row runs, written by the app at spawn:
+/// `codex`, or absent for a claude (every row from before Codex support).
+/// The helper reads it to label rows `codex#N` (docs/codex.md).
+pub const AGENTS_DIR: &str = "agents";
+/// `transcript/<id>` = the absolute path of a codex's rollout file, from the
+/// `transcript_path` of its hook payloads. A rollout is not named by its id
+/// alone, so the app cannot derive it the way it does a claude's transcript.
+pub const TRANSCRIPT_DIR: &str = "transcript";
+/// `agentready/<id>` = the codex has a thread id and its hooks work (touched by
+/// its `SessionStart`, which Codex fires only at the first prompt).
+pub const AGENTREADY_DIR: &str = "agentready";
+/// `wake/<id>.ack` (mtime = the codex's own `UserPromptSubmit` saw a wake
+/// line) and `wake/<id>.log` (the app's ring ledger).
+pub const WAKE_DIR: &str = "wake";
+
+/// `agents/<id>` for one instance.
+pub fn agents_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(AGENTS_DIR).join(id.to_string())
+}
+
+/// The agent a row runs, per `agents/<id>`. Missing or unreadable → Claude.
+pub fn agent_of(state_dir: &std::path::Path, id: usize) -> agent::Agent {
+    std::fs::read_to_string(agents_path(state_dir, id))
+        .ok()
+        .and_then(|s| agent::Agent::parse(&s))
+        .unwrap_or_default()
+}
+
+/// The written address of a row: `claude#3` or `codex#3`.
+pub fn addr(state_dir: &std::path::Path, id: usize) -> String {
+    format!("{}#{id}", agent_of(state_dir, id).word())
+}
+
+/// `transcript/<id>` for one instance.
+pub fn transcript_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(TRANSCRIPT_DIR).join(id.to_string())
+}
+
+/// `agentready/<id>` for one instance.
+pub fn agentready_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(AGENTREADY_DIR).join(id.to_string())
+}
+
+/// `wake/<id>.ack` for one instance.
+pub fn wake_ack_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(WAKE_DIR).join(format!("{id}.ack"))
+}
+
+/// `wake/<id>.log` for one instance.
+pub fn wake_log_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(WAKE_DIR).join(format!("{id}.log"))
 }
 
 /// The conversation uuid a `transcript_path` names — its file stem.

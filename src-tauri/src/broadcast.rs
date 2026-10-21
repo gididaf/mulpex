@@ -17,17 +17,18 @@
 //! One round at a time, in memory only: a new one replaces it, a relaunch
 //! forgets it.
 
-use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom, Write as _};
+use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mulpex_core::agent::Agent;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use crate::claude_bin;
+use crate::headless;
 use crate::saves::failure_reason;
 use crate::snapshot::ProjectHandle;
 use crate::state::Workspace;
@@ -155,28 +156,11 @@ fn new_bid() -> String {
     mulpex_core::persist::new_uuid().chars().filter(|c| *c != '-').take(12).collect()
 }
 
-/// The last assistant text in a transcript, read from its end.
-fn last_assistant_text(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.lines();
-    if start > 0 {
-        lines.next(); // a partial line
-    }
-    let mut last = None;
-    for line in lines {
-        for item in crate::remote::chat::parse_line(line) {
-            if let crate::remote::chat::Item::Text { text } = item {
-                last = Some(text);
-            }
-        }
-    }
-    last.map(|t| strip_hub_marker(&t)).filter(|t| !t.is_empty())
+/// The last assistant text in a transcript of `agent`, read from its end.
+fn last_assistant_text(agent: Agent, path: &Path) -> Option<String> {
+    crate::agent_transcript::last_assistant_text(agent, path, TAIL_BYTES)
+        .map(|t| strip_hub_marker(&t))
+        .filter(|t| !t.is_empty())
 }
 
 /// Drop the "⟳ hub message from … →" line `HUB_RULES` has a hub-woken turn
@@ -291,7 +275,8 @@ impl Workspace {
             }
             let since = *r.idle_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= SETTLE {
-                let text = core.transcript_of(r.id).and_then(|p| last_assistant_text(&p));
+                let agent = core.agent_of(r.id).unwrap_or_default();
+                let text = core.transcript_of(r.id).and_then(|p| last_assistant_text(agent, &p));
                 r.done = Some(match text {
                     Some(t) => Done { state: "fallback", reply: Some(t) },
                     None => Done { state: "noanswer", reply: None },
@@ -414,12 +399,15 @@ fn take_if_ours(req_id: &str) -> bool {
 
 /// Run Sonnet over `prompt` and stream its answer as `broadcast-summary`
 /// events. Same headless child as ⌘⇧E (`explain.rs`), minus the fork: no
-/// tools, no session saved, scrubbed env.
+/// tools, no session saved, scrubbed env. Without claude installed, codex
+/// writes it (`headless::preferred_agent`) — one chunk at the end, since its
+/// `--json` stream has no text deltas.
 pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), String> {
     cancel_summary();
-    let claude = claude_bin::resolve_claude().ok_or("claude not found")?;
-    let mut child = Command::new(claude)
-        .args([
+    let agent = headless::preferred_agent();
+    let mut cmd = headless::command(agent, &std::env::temp_dir(), None)?;
+    match agent {
+        Agent::Claude => cmd.args([
             "-p",
             "--model",
             "sonnet",
@@ -433,12 +421,10 @@ pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), S
             "stream-json",
             "--verbose",
             "--include-partial-messages",
-        ])
-        .env_clear()
-        .envs(claude_bin::forwarded_env())
-        .env("PATH", claude_bin::merged_path())
-        .envs(crate::live_token::spawn_env(None).unwrap_or_default())
-        .current_dir(std::env::temp_dir())
+        ]),
+        Agent::Codex => cmd.arg("exec").args(headless::codex_exec_opts(true)).args(["--json", "-"]),
+    };
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -480,6 +466,11 @@ pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), S
         if let Some(out) = stdout {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(v) if agent == Agent::Codex => match crate::explain::codex_event(&v) {
+                        Some(crate::explain::CodexEvent::Message(t)) => result = Some((false, t)),
+                        Some(crate::explain::CodexEvent::Failed(t)) => result = Some((true, t)),
+                        _ => {}
+                    },
                     Ok(v) => {
                         if let Some(t) = crate::explain::text_delta(&v) {
                             emit("delta", t.to_string());
@@ -513,8 +504,16 @@ pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), S
             return;
         }
         match (status, result) {
-            (Some(s), Some((false, _))) if s.success() => emit("done", String::new()),
+            (Some(s), Some((false, text))) if s.success() => {
+                if agent == Agent::Codex {
+                    emit("delta", text);
+                }
+                emit("done", String::new())
+            }
             (_, Some((true, text))) => emit("error", text),
+            (Some(s), _) if agent == Agent::Codex => {
+                emit("error", headless::codex_failure_reason(s.code(), &plain, &err))
+            }
             (Some(s), _) => emit("error", failure_reason(s.code(), &plain, &err)),
             (None, _) => emit("error", "lost the summarizing process".into()),
         }
@@ -525,6 +524,8 @@ pub fn summarize(app: AppHandle, req_id: String, prompt: String) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_bin;
+    use std::process::Command;
 
     #[test]
     fn row_states() {
@@ -571,8 +572,8 @@ mod tests {
             r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent"}]}}"#,
         ];
         std::fs::write(&p, lines.join("\n")).unwrap();
-        assert_eq!(last_assistant_text(&p).as_deref(), Some("I touched auth.rs"));
-        assert_eq!(last_assistant_text(&dir.join("missing")), None);
+        assert_eq!(last_assistant_text(Agent::Claude, &p).as_deref(), Some("I touched auth.rs"));
+        assert_eq!(last_assistant_text(Agent::Claude, &dir.join("missing")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -620,7 +621,7 @@ mod tests {
         // Let both boot and their hub listeners come up.
         let up = (0..120).any(|_| {
             std::thread::sleep(Duration::from_millis(500));
-            ws.projects.iter().all(|c| c.live_claude_ids().iter().all(|&id| c.listener_ready(id)))
+            ws.projects.iter().all(|c| c.live_claude_ids().iter().all(|&id| c.wake_ready(id)))
         });
         eprintln!("listeners up: {up}");
         let targets = ws.broadcast_targets();

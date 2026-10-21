@@ -15,7 +15,7 @@ use mulpex_core::registry::Registry;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::snapshot::{
-    HubSnapshot, HubUpdate, ProjectHandle, SessionExited, SessionInfo, SessionsChanged,
+    CodexWake, HubSnapshot, HubUpdate, ProjectHandle, SessionExited, SessionInfo, SessionsChanged,
 };
 use crate::state::AppState;
 
@@ -45,6 +45,8 @@ pub fn start(app: AppHandle) {
             // Boards that changed this tick, by whoever: a claude's `hub_board`,
             // a desktop/phone edit, a delivered message.
             let mut boards_changed: Vec<ProjectHandle> = Vec::new();
+            // Codex rows with no thread yet, whose wake line the window types.
+            let mut wakes: Vec<CodexWake> = Vec::new();
             // What every project publishes about itself to the others. This loop
             // is the only context that holds every `Core` at once, so it is the
             // only thing that can describe the workspace honestly.
@@ -98,6 +100,14 @@ pub fn start(app: AppHandle) {
                 // advertising it as running. Writes only on change.
                 core.sync_terminal_index();
                 core.sync_adopt_manifest();
+                // A codex turn that failed or was interrupted fires no Stop;
+                // un-stick its `working` before the wake decides who is idle.
+                core.settle_codex_turns();
+                // Ring idle codexes that have mail (`wake.rs`). Before the
+                // snapshot, which carries each ring's mark.
+                for (id, line) in core.tick_wakes() {
+                    wakes.push(CodexWake { handle: core.handle, id, line });
+                }
                 let snap = core.hub_snapshot();
                 // An instance that ended a turn still unnamed gets a provisional
                 // label from its own task, so the row stops showing the user's
@@ -134,6 +144,9 @@ pub fn start(app: AppHandle) {
                 Registry::write_if_changed(&state_root, &reg);
             }
 
+            for w in wakes {
+                let _ = app.emit("codex-wake", w);
+            }
             for handle in boards_changed {
                 let _ = app.emit("board-changed", serde_json::json!({ "handle": handle }));
             }

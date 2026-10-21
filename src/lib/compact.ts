@@ -10,6 +10,11 @@
 //   resume      the compaction's `SessionStart` arrived (the hook flips the file);
 //               Mulpex types RESUME and the request is done
 //
+// A codex runs the same three steps (docs/codex.md S9: `/compact` typed into an
+// empty box compacts, PreCompact/PostCompact fire, and the hook ends the phase
+// the way claude's SessionStart does). Only the typing differs — see
+// `compactBytes`.
+//
 // The phase lives in `compactreq/<id>` so the hook and the phone see it; this
 // module drives the typing, because only the frontend can read the input box
 // (`promptbox.ts`). Nothing here survives a reload — a request is in-memory by
@@ -25,9 +30,11 @@ import { activeProjectHandle, descendantsOf, projects, saveStatusOf } from "./st
 import { terminals } from "./terminals";
 import { compactsHeld } from "./checkpoint";
 import { isRemote } from "./hosts";
+import { addrIn, agentOf } from "./agents";
 import {
   sendBytes,
   setCompactPhase,
+  type Agent,
   type CompactPhase,
   type ProjectHandle,
   type SessionInfo,
@@ -35,6 +42,15 @@ import {
 
 const RESUME =
   "The conversation was just compacted at your checkpoint. Continue the task from where you stopped.";
+
+/** What types `/compact` into `agent`'s empty box and submits it, in ONE write.
+ *  claude: the plain keys. codex: a bracketed paste, then CR — typed fast, a
+ *  plain `/compact\r` lands in codex's paste-burst and the CR becomes a newline
+ *  in the box instead of a submit (measured, codex 0.149.1; the paste form
+ *  compacted and printed `• Context compacted`). */
+function compactBytes(agent: Agent): Uint8Array {
+  return new TextEncoder().encode(agent === "codex" ? "\x1b[200~/compact\x1b[201~\r" : "/compact\r");
+}
 
 /** No `PreCompact` this long after typing `/compact` = it never started. */
 const START_TIMEOUT_MS = 15_000;
@@ -94,7 +110,7 @@ function fail(h: ProjectHandle, id: number, r: Req) {
  *  compaction itself — it only skips the resume prompt. */
 export function toggleCompact(h: ProjectHandle, id: number): string | null {
   const s = get(projects).get(h)?.sessions.find((x) => x.id === id);
-  if (!s || s.kind === "shell" || s.exited || s.failed) return "No claude to compact";
+  if (!s || s.kind === "shell" || s.exited || s.failed) return "Nothing to compact — no running claude or codex";
   if (active(h, id)) {
     put(h, id, null);
     void setCompactPhase(h, id, null);
@@ -213,7 +229,7 @@ function step(h: ProjectHandle, id: number) {
 
   if (r.phase === "requested") {
     if (!ready(h, id)) return;
-    sendBytes(h, id, new TextEncoder().encode("/compact\r"));
+    sendBytes(h, id, compactBytes(agentOf(s.kind) ?? "claude"));
     const refusedBefore = REFUSED.test(terminals.screenText(h, id));
     put(h, id, { ...r, phase: "compacting", typedAt: Date.now(), sawStart: false, refusedBefore });
     void setCompactPhase(h, id, "compacting");
@@ -299,7 +315,7 @@ export const compactLines = derived([reqs, activeProjectHandle, projects], ([$m,
         ? LABEL[r.phase]
         : r.by === id
           ? `auto-compact: ${AUTO_LABEL[r.phase]}`
-          : `auto-compact (claude#${r.by}): ${AUTO_LABEL[r.phase]}`;
+          : `auto-compact (${addrIn($p.get(h)?.sessions ?? [], r.by)}): ${AUTO_LABEL[r.phase]}`;
     out.set(id, { text, failed: r.phase === "failed" });
   }
   return out;

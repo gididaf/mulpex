@@ -169,3 +169,5 @@ dialog's relay address to `http://<lan ip>:8787`.
   `CLAUDE_CONFIG_DIR` and the token resolved through zsh — see
   [verification-log.md](verification-log.md) habits; read answers from the transcript's
   `tool_result`, never the screen.
+
+**Codex rows on the phone:** the wire keeps `kind:"claude"` for every agent row (an old cached PWA opens anything else as a terminal) and adds `agent`. Chat for a codex comes from its rollout through `remote/chat_codex.rs`; there are no dialog buttons for codex (it has no AskUserQuestion). The PWA labels `codex#N` and has a "+ Codex" button. → [codex.md](codex.md)

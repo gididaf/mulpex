@@ -32,6 +32,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::agent::Agent;
 use crate::persist::fnv1a;
 
 /// Hard ceiling on how long a blocked edit waits for a *continuously-hot* holder
@@ -75,6 +76,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "precompact" => precompact(&ctx),
         "sessionstart" => sessionstart(&ctx),
         "userpromptsubmit" => userpromptsubmit(&ctx),
+        // Codex only: Claude Code ends a compaction with `SessionStart[compact]`.
+        "postcompact" => postcompact(&ctx),
         _ => Ok(()),
     }
 }
@@ -106,6 +109,9 @@ pub(crate) struct Ctx {
     /// compaction can run for minutes with no hook in between, so without it the
     /// 60 s idle notification lands mid-compaction and reports "needs you".
     pub(crate) compacting_dir: PathBuf,
+    /// Which agent this helper serves (`MULPEX_AGENT`; missing → Claude), so the
+    /// handlers can speak its dialect. See `docs/codex.md`.
+    pub(crate) agent: Agent,
 }
 
 impl Ctx {
@@ -140,11 +146,20 @@ impl Ctx {
             waiting_dir,
             bg_dir,
             compacting_dir,
+            agent: Agent::from_env(),
         })
     }
 
     pub(crate) fn id_str(&self) -> String {
         self.instance.to_string()
+    }
+
+    /// How another row of this project is written: `claude#3` or `codex#3`.
+    pub(crate) fn addr_of(&self, id: &str) -> String {
+        match id.parse::<usize>() {
+            Ok(n) => crate::addr(&self.state_dir, n),
+            Err(_) => format!("claude#{id}"),
+        }
     }
 }
 
@@ -175,6 +190,13 @@ fn pretooluse(ctx: &Ctx) -> anyhow::Result<()> {
             {
                 edit_guard(ctx, fp);
             }
+        }
+        // Codex edits through one tool, with the targets inside the patch text.
+        "apply_patch" => {
+            let patch = tool_input
+                .and_then(|t| t.get("command").and_then(|v| v.as_str()).or_else(|| t.as_str()))
+                .unwrap_or("");
+            patch_guard(ctx, patch);
         }
         // Reading a file another instance is actively editing would give a STALE
         // snapshot — and Claude Code then rejects the follow-up edit with "file
@@ -260,7 +282,8 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
     // Awareness: did a *different* instance edit this earlier this session?
     let note = match read_field(&hist_file, "instance") {
         Some(prev) if prev != ctx.id_str() => Some(format!(
-            "claude#{prev} modified this file earlier this session — read its current state before editing."
+            "{} modified this file earlier this session — read its current state before editing.",
+            ctx.addr_of(&prev)
         )),
         _ => None,
     };
@@ -291,6 +314,81 @@ fn edit_guard(ctx: &Ctx, file_path: &str) {
     }
 }
 
+/// The files a Codex `apply_patch` touches, as written in its headers:
+/// `*** Update File: <p>`, `*** Add File: <p>`, `*** Delete File: <p>` and a
+/// rename's `*** Move to: <p>` (S5: Codex writes them absolute).
+pub(crate) fn patch_targets(patch: &str) -> Vec<String> {
+    const HEADERS: &[&str] = &["*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: "];
+    patch
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_end();
+            HEADERS.iter().find_map(|h| l.strip_prefix(h)).map(|p| p.trim().to_string())
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The lock coordinator for a Codex `apply_patch`: every file it names, locked
+/// together. Taken in sorted key order — so two patches that share files can
+/// never each hold the half the other waits for — against ONE deadline. If any
+/// file is still held when that runs out (or its holder is blocked on the
+/// user), the locks this call took are given back and the patch proceeds
+/// contended with the usual note: all, or none newly held.
+fn patch_guard(ctx: &Ctx, patch: &str) {
+    let mut targets: Vec<(String, PathBuf)> = patch_targets(patch)
+        .iter()
+        .filter_map(|raw| canonical_target(ctx, raw))
+        .filter(|p| p.starts_with(&ctx.project_dir))
+        .map(|p| (format!("{:016x}", fnv1a(p.to_string_lossy().as_bytes())), p))
+        .collect();
+    targets.sort();
+    targets.dedup_by(|a, b| a.0 == b.0);
+    if targets.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + LOCK_WAIT;
+    let mut taken: Vec<PathBuf> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for (key, path) in &targets {
+        let lock_file = ctx.locks_dir.join(key);
+        let already_ours = read_field(&lock_file, "instance").as_deref() == Some(ctx.id_str().as_str());
+        match acquire_or_wait_until(ctx, &lock_file, path, deadline) {
+            AcquireOutcome::Acquired => {
+                if !already_ours {
+                    taken.push(lock_file);
+                }
+                let hist_file = ctx.history_dir.join(key);
+                if let Some(prev) = read_field(&hist_file, "instance").filter(|p| *p != ctx.id_str()) {
+                    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    notes.push(format!(
+                        "{} modified {name} earlier this session — read its current state before editing.",
+                        ctx.addr_of(&prev)
+                    ));
+                }
+            }
+            AcquireOutcome::Contended(owner) => {
+                for lock in &taken {
+                    if read_field(lock, "instance").as_deref() == Some(ctx.id_str().as_str()) {
+                        let _ = std::fs::remove_file(lock);
+                    }
+                }
+                allow_contended(ctx, path, &owner);
+                return;
+            }
+        }
+    }
+    for (key, path) in &targets {
+        let _ = std::fs::write(
+            ctx.history_dir.join(key),
+            format!("instance={}\nts={}\npath={}\n", ctx.instance, now(), path.display()),
+        );
+    }
+    if !notes.is_empty() {
+        emit("allow", None, Some(&notes.join(" ")));
+    }
+}
+
 /// Outcome of trying to acquire a file's lock (possibly after waiting).
 enum AcquireOutcome {
     /// We hold the lock (freshly acquired, already ours, or a stale/stray we
@@ -307,7 +405,13 @@ enum AcquireOutcome {
 /// `O_EXCL` create is the atomic test-and-set; on conflict we re-check every
 /// `LOCK_POLL`. Gives up early if the holder is itself blocked on the user.
 fn acquire_or_wait(ctx: &Ctx, lock_file: &Path, path: &Path) -> AcquireOutcome {
-    let deadline = Instant::now() + LOCK_WAIT;
+    acquire_or_wait_until(ctx, lock_file, path, Instant::now() + LOCK_WAIT)
+}
+
+/// `acquire_or_wait` against a deadline the caller owns — a patch that takes
+/// several locks shares one budget across all of them, so the hook still ends
+/// inside its timeout.
+fn acquire_or_wait_until(ctx: &Ctx, lock_file: &Path, path: &Path, deadline: Instant) -> AcquireOutcome {
     let mut marked = false;
     let result = loop {
         match std::fs::OpenOptions::new()
@@ -455,6 +559,9 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // `watchers.txt`) is not work in flight, so it is subtracted here — read
     // fresh, so an edit to that file lands at the next turn end.
     write_session_uuid(ctx, payload.as_ref());
+    if ctx.agent == Agent::Codex {
+        write_codex_ctx(ctx, payload.as_ref(), true);
+    }
     let patterns = user_watcher_patterns();
     let busy = background_work_running(ctx, payload.as_ref(), &patterns);
     // ...but a watcher is still a reason not to restart the app underneath this
@@ -465,7 +572,9 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     set_watching_flag(ctx, watcher_running(payload.as_ref(), &patterns));
     // Same payload, same reason it can only be read here: this is the only hook
     // that is told which listeners are running.
-    note_listener_needs_replacing(ctx, payload.as_ref());
+    if ctx.agent == Agent::Claude {
+        note_listener_needs_replacing(ctx, payload.as_ref());
+    }
     // A turn boundary is proof we are not mid-compaction.
     clear_compacting(ctx);
 
@@ -499,7 +608,13 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // unless work this instance started is still running, in which case the turn
     // ended but the instance did not, and `waiting` (a green "ready" dot, and 60 s
     // later a red "needs you") would be a lie.
-    let status = if busy { "working" } else { "waiting" };
+    let status = if busy {
+        "working"
+    } else if codex_asked_the_user(ctx, payload.as_ref()) {
+        "needs"
+    } else {
+        "waiting"
+    };
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), status);
     // AFTER the status here (before it on the block path): `bg/<id>` no older than the status file
     // is how the app tells "turn over, only background work left" from a turn in
@@ -588,6 +703,10 @@ fn write_needs(ctx: &Ctx) {
 /// A payload with no usable `transcript_path` writes nothing: leaving the last
 /// known-good answer in place beats replacing it with a guess.
 fn write_session_uuid(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    if ctx.agent == Agent::Codex {
+        write_codex_session(ctx, payload);
+        return;
+    }
     let Some(uuid) = payload
         .and_then(|j| j.get("transcript_path"))
         .and_then(|v| v.as_str())
@@ -600,6 +719,88 @@ fn write_session_uuid(ctx: &Ctx, payload: Option<&serde_json::Value>) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(file, uuid);
+}
+
+/// A codex's rollout is `rollout-<timestamp>-<uuid>.jsonl`, so its id is not
+/// the file stem: it comes from the payload's `session_id`, and the rollout's
+/// path is recorded beside it (`transcript/<id>`) because the app cannot derive
+/// it. Same "leave the last good answer" rule as for Claude.
+fn write_codex_session(ctx: &Ctx, payload: Option<&serde_json::Value>) {
+    let field = |k: &str| payload.and_then(|j| j.get(k)).and_then(|v| v.as_str()).map(str::trim);
+    let write = |file: PathBuf, body: &str| {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::read_to_string(&file).is_ok_and(|old| old == body) {
+            return;
+        }
+        let _ = std::fs::write(file, body);
+    };
+    if let Some(sid) = field("session_id").filter(|s| is_session_id(s)) {
+        write(crate::session_id_path(&ctx.state_dir, ctx.instance), sid);
+    }
+    if let Some(t) = field("transcript_path").filter(|t| Path::new(t).is_absolute()) {
+        write(crate::transcript_path(&ctx.state_dir, ctx.instance), t);
+    }
+}
+
+/// A thread id is a uuid (Codex uses v7); anything else is not worth a
+/// `codex resume` argument.
+fn is_session_id(s: &str) -> bool {
+    s.len() == 36 && crate::uuid_from_transcript_path(&format!("{s}.jsonl")).is_some()
+}
+
+/// The rollout path for this codex: the payload's, else the one on record.
+fn codex_rollout(ctx: &Ctx, payload: Option<&serde_json::Value>) -> Option<PathBuf> {
+    payload
+        .and_then(|j| j.get("transcript_path"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| {
+            read_field_or_line(&crate::transcript_path(&ctx.state_dir, ctx.instance))
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+/// How long `PostToolUse` waits between two context-% refreshes: it fires on
+/// every tool call, and each refresh reads the rollout's tail.
+const CODEX_CTX_THROTTLE: Duration = Duration::from_secs(5);
+
+/// `ctx/<id>` for a codex, computed from its rollout (Claude's comes from the
+/// statusline, which Codex does not have). Same format as `statusline.rs`.
+fn write_codex_ctx(ctx: &Ctx, payload: Option<&serde_json::Value>, force: bool) {
+    let path = crate::ctx_path(&ctx.state_dir, ctx.instance);
+    if !force {
+        let fresh = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < CODEX_CTX_THROTTLE);
+        if fresh {
+            return;
+        }
+    }
+    let Some(pct) = codex_rollout(ctx, payload).and_then(|r| crate::codex::ctx_pct(&r)) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, format!("{:.1}", pct as f64)).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// A codex turn that ended on the `[waiting for you]` line is a question for the
+/// user — Codex's only way to say `needs` (it has no dialog tool).
+fn codex_asked_the_user(ctx: &Ctx, payload: Option<&serde_json::Value>) -> bool {
+    ctx.agent == Agent::Codex
+        && payload
+            .and_then(|j| j.get("last_assistant_message"))
+            .and_then(|v| v.as_str())
+            .is_some_and(crate::codex::ends_waiting)
 }
 
 /// Does this `Stop` payload say work the instance started is still running?
@@ -1074,6 +1275,16 @@ fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
     // knowing whatever started it, and a `clear` or a `resume` is exactly when
     // the answer changes.
     write_session_uuid(ctx, payload.as_ref());
+    if ctx.agent == Agent::Codex {
+        // Codex fires this only at the first prompt (S10): from here on it has a
+        // thread id and working hooks, which is what the app waits for before it
+        // rings it through `codex queue`.
+        let ready = crate::agentready_path(&ctx.state_dir, ctx.instance);
+        if let Some(dir) = ready.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(ready, "");
+    }
     let source = payload
         .as_ref()
         .and_then(|j| j.get("source").and_then(|v| v.as_str()).map(str::to_owned))
@@ -1083,9 +1294,24 @@ fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
         // with it. Their ids must not keep excusing this session's tasks.
         return Ok(());
     }
+    end_compaction(ctx);
+    Ok(())
+}
+
+/// A compaction finished: a real status again, the flag gone, and a ⌘⇧K
+/// request handed back to the app. Claude says so with `SessionStart[compact]`,
+/// Codex with `PostCompact` (S9).
+fn end_compaction(ctx: &Ctx) {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), compaction_end_status(ctx));
     clear_compacting(ctx);
     mark_compact_resume(ctx);
+}
+
+/// Codex's `PostCompact`: the end of a compaction (`end_compaction`).
+fn postcompact(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    end_compaction(ctx);
     Ok(())
 }
 
@@ -1274,6 +1500,10 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     }
     clear_quiet_turn(ctx);
     write_working_unless_a_dialog_waits(ctx, &input);
+    if ctx.agent == Agent::Codex {
+        // Parsed only when the throttle lets a refresh through.
+        write_codex_ctx(ctx, None, false);
+    }
     drop(input);
 
     let mut notes: Vec<String> = Vec::new();
@@ -1298,7 +1528,7 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     // (b) Did a peer this instance knew about close mid-turn?
     let departed = departed_peers(ctx);
     if !departed.is_empty() {
-        notes.push(departed_nudge(&departed));
+        notes.push(departed_nudge(ctx, &departed));
     }
 
     // (c) Still unnamed a few tool calls into the turn?
@@ -1328,6 +1558,10 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The first line of a codex wake turn's context (see `codex::wake_line`).
+const CODEX_WAKE_NOTE: &str = "[Mulpex hub] This turn is Mulpex ringing you for hub mail: call \
+     mcp__mulpex__hub_inbox FIRST, before anything else, then act on what it returns.";
+
 /// What a claude is told, mid-turn, after the user asks for a compact (⌘⇧K).
 pub(crate) const COMPACT_NOTE: &str = "[Mulpex] The user wants to /compact this conversation \
      now. Stop at the NEXT safe checkpoint: finish only the step you are on (leave nothing \
@@ -1349,11 +1583,11 @@ fn compact_requested(ctx: &Ctx) -> bool {
 
 /// A one-line nudge naming the instances that have just closed, told to the
 /// surviving instance so it drops any coordination that involved them.
-fn departed_nudge(ids: &[usize]) -> String {
-    let list = ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ");
+fn departed_nudge(ctx: &Ctx, ids: &[usize]) -> String {
+    let list = ids.iter().map(|i| ctx.addr_of(&i.to_string())).collect::<Vec<_>>().join(", ");
     let verb = if ids.len() == 1 { "has" } else { "have" };
     format!(
-        "Instance(s) claude {list} {verb} closed and are no longer running. Disregard any \
+        "Instance(s) {list} {verb} closed and are no longer running. Disregard any \
          earlier coordination, waiting, or plans that involve them — they can't reply or act, \
          and their file locks are released. Call mcp__mulpex__hub_instances if you need the \
          current instance list."
@@ -1449,6 +1683,7 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // gate `system_turn` closes — without it the exemption buys a turn that still
     // never re-arms, which is the whole thing it exists to prevent.
     let mut sanctioned_resume = false;
+    let mut codex_wake_turn = false;
     if std::io::stdin().read_to_string(&mut input).is_ok() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
             // Claude Code's UserPromptSubmit payload carries the text under
@@ -1461,8 +1696,24 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 // job completion arrives as a synthetic `<task-notification>…`
                 // prompt. Neither should overwrite the task.
                 let p = prompt.trim_start();
-                system_turn = p.starts_with("<task-notification");
-                if system_turn {
+                if ctx.agent == Agent::Codex {
+                    write_codex_session(ctx, Some(&json));
+                }
+                // Codex has no task-notification: its hub wake is Mulpex ringing
+                // with a `codex::wake_line` (`codex queue`). It is a system turn —
+                // no task capture, no unmute, no nudges — but never a silent one:
+                // it exists only because mail is waiting, so it is real work.
+                let codex_wake = ctx.agent == Agent::Codex && crate::codex::is_wake_line(p);
+                if codex_wake {
+                    let ack = crate::wake_ack_path(&ctx.state_dir, ctx.instance);
+                    if let Some(dir) = ack.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(ack, now().to_string());
+                }
+                codex_wake_turn = codex_wake;
+                system_turn = codex_wake || p.starts_with("<task-notification");
+                if system_turn && !codex_wake {
                     // Provisionally silent, and the status write above is undone
                     // with it: the overwhelming majority of these wakes are a
                     // Monitor expiry the instance can only answer by re-arming,
@@ -1504,8 +1755,9 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                     let _ = std::fs::write(crate::user_prompt_path(&ctx.state_dir, ctx.instance), "");
                 }
                 // The restart wake. Swallow it unless ⌘⇧R asked for it — see
-                // `orphaned_task_wake` for why this is the whole bug.
-                if orphaned_task_wake(p) {
+                // `orphaned_task_wake` for why this is the whole bug. A Claude
+                // Code shape; Codex has no background tasks to orphan.
+                if ctx.agent == Agent::Claude && orphaned_task_wake(p) {
                     sanctioned_resume = take_resumed_in_place(ctx);
                     if !sanctioned_resume {
                         match prior_status {
@@ -1546,20 +1798,29 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // it is the turn that most needs to know about unread mail.
     let welcome = nudges_welcome(system_turn, sanctioned_resume);
     let mut parts: Vec<String> = Vec::new();
+    // A codex wake leads with the one thing the turn is for. Measured: a codex
+    // once acked the ring and never called hub_inbox.
+    if codex_wake_turn {
+        parts.push(CODEX_WAKE_NOTE.to_string());
+    }
     // The Board, only while the user has it on. A standing rule, not a one-off
     // ask, so it rides every turn like the peer snapshot: a board change arrives
     // as a hub wake, which is exactly the turn that needs it. It cannot feed
     // itself — following it never writes `board_on`. The columns ride with it,
     // so a column the user just renamed is the one the claude reads.
     if let Some(columns) = board_columns(&ctx.state_dir) {
-        parts.push(format!("{}\nThe board's columns, in order:\n{columns}", crate::rules::BOARD_RULE));
+        parts.push(format!(
+            "{}\nThe board's columns, in order:\n{columns}",
+            crate::rules::board_rule(ctx.agent)
+        ));
     }
     // Information rather than a request, so like the peer snapshot it rides every
     // turn: a hub wake may be the turn that needs the password.
     if let Some(context) = crate::secrets::context(&ctx.state_dir, ctx.instance) {
         parts.push(context);
     }
-    if welcome && !listener_armed(ctx) {
+    // A codex has no listener: Mulpex rings it (`codex::wake_line`).
+    if welcome && ctx.agent == Agent::Claude && !listener_armed(ctx) {
         parts.push(arm_listener_nudge(ctx));
     }
     if welcome && !instance_named(ctx) {
@@ -1850,8 +2111,9 @@ fn deny_edit(ctx: &Ctx, path: &Path, owner: &str) {
         .filter(|t| !t.is_empty())
         .map(|t| format!(", who is working on: \"{t}\""))
         .unwrap_or_default();
+    let holder = ctx.addr_of(owner);
     let reason = format!(
-        "{name} is locked by claude#{owner}{doing} (editing it now). This is normal \
+        "{name} is locked by {holder}{doing} (editing it now). This is normal \
          multi-instance coordination, not an error — do NOT try to bypass it (no shell \
          workarounds) and do NOT ask the user about it. Work on a different file/task, or \
          stop and let that instance finish; the lock releases when its turn ends. You can \
@@ -1875,8 +2137,9 @@ fn allow_contended(ctx: &Ctx, path: &Path, owner: &str) {
         .filter(|t| !t.is_empty())
         .map(|t| format!(", who is working on: \"{t}\""))
         .unwrap_or_default();
+    let holder = ctx.addr_of(owner);
     let note = format!(
-        "{name} is being edited concurrently by claude#{owner}{doing}. Proceeding anyway: \
+        "{name} is being edited concurrently by {holder}{doing}. Proceeding anyway: \
          re-read {name} RIGHT NOW immediately before you write it, so your edit applies to \
          its current contents. If Claude Code reports \"File has been modified since read\", \
          that's expected coordination between parallel instances — just re-read and retry, \
@@ -2034,7 +2297,153 @@ mod tests {
             bg_dir: state_dir.join("bg"),
             compacting_dir: state_dir.join("compacting"),
             state_dir,
+            agent: Agent::Claude,
         }
+    }
+
+    fn codex_ctx(dir: &Path, instance: usize) -> Ctx {
+        Ctx { agent: Agent::Codex, ..test_ctx(dir, instance) }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mulpex-{tag}-{}", crate::persist::new_uuid()));
+        for sub in ["locks", "history", "tasks", "inbox", "waiting", "bg", "compacting"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// A Codex patch names its files in headers, absolute (S5), renames included.
+    #[test]
+    fn patch_targets_read_every_header() {
+        let patch = "*** Begin Patch\n*** Update File: /p/a.rs\n@@\n-x\n+y\n*** Add File: /p/new.rs\n+hi\n\
+                     *** Delete File: /p/old.rs\n*** Update File: /p/b.rs\n*** Move to: /p/c.rs\n@@\n*** End Patch\n";
+        assert_eq!(patch_targets(patch), vec!["/p/a.rs", "/p/new.rs", "/p/old.rs", "/p/b.rs", "/p/c.rs"]);
+        assert!(patch_targets("+*** Update File: inside a hunk is still a header line? no: starts with +").is_empty());
+    }
+
+    /// All the patch's files are locked together; if one is held by an instance
+    /// that is blocked on the user, the locks this call took are given back.
+    #[test]
+    fn a_patch_locks_all_its_files_or_none_new() {
+        let dir = tmpdir("patch");
+        let me = codex_ctx(&dir, 2);
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n*** Add File: {}\n*** End Patch\n", b.display(), a.display());
+        patch_guard(&me, &patch);
+        let key = |p: &Path| me.locks_dir.join(format!("{:016x}", fnv1a(p.to_string_lossy().as_bytes())));
+        assert_eq!(read_field(&key(&a), "instance").as_deref(), Some("2"));
+        assert_eq!(read_field(&key(&b), "instance").as_deref(), Some("2"));
+        assert_eq!(read_field(&me.history_dir.join(key(&a).file_name().unwrap()), "instance").as_deref(), Some("2"));
+        release_my_locks(&me);
+
+        // claude#1 holds b.rs and is blocked on the user: no waiting, and a.rs
+        // (sorted before b.rs or not) must not stay locked by 2.
+        let other = test_ctx(&dir, 1);
+        std::fs::write(key(&b), lock_token(1, &b)).unwrap();
+        std::fs::write(dir.join("1"), "needs").unwrap();
+        patch_guard(&me, &patch);
+        assert_eq!(read_field(&key(&b), "instance").as_deref(), Some("1"), "the holder keeps its lock");
+        assert!(read_field(&key(&a), "instance").as_deref() != Some("2"), "a partial lock leaked");
+        release_my_locks(&other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock already held from earlier in the turn is not given back by a
+    /// patch that then hits contention.
+    #[test]
+    fn a_contended_patch_keeps_locks_it_already_had() {
+        let dir = tmpdir("patch2");
+        let me = codex_ctx(&dir, 2);
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        let key = |p: &Path| me.locks_dir.join(format!("{:016x}", fnv1a(p.to_string_lossy().as_bytes())));
+        std::fs::write(key(&a), lock_token(2, &a)).unwrap();
+        std::fs::write(key(&b), lock_token(1, &b)).unwrap();
+        std::fs::write(dir.join("1"), "needs").unwrap();
+        patch_guard(&me, &format!("*** Update File: {}\n*** Update File: {}\n", a.display(), b.display()));
+        assert_eq!(read_field(&key(&a), "instance").as_deref(), Some("2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex's session id comes from the payload, the rollout path is recorded,
+    /// and a non-uuid id is ignored.
+    #[test]
+    fn a_codex_records_its_thread_id_and_rollout() {
+        let dir = tmpdir("cxsid");
+        let ctx = codex_ctx(&dir, 5);
+        let sid = "01a15d0e-4909-7120-8db3-0a31309b9004";
+        let rollout = format!("/Users/x/.codex/sessions/2026/10/21/rollout-2026-10-21T09-02-59-{sid}.jsonl");
+        write_session_uuid(&ctx, Some(&serde_json::json!({ "session_id": sid, "transcript_path": rollout })));
+        assert_eq!(std::fs::read_to_string(crate::session_id_path(&dir, 5)).unwrap(), sid);
+        assert_eq!(std::fs::read_to_string(crate::transcript_path(&dir, 5)).unwrap(), rollout);
+        write_session_uuid(&ctx, Some(&serde_json::json!({ "session_id": "nope" })));
+        assert_eq!(std::fs::read_to_string(crate::session_id_path(&dir, 5)).unwrap(), sid);
+        // A claude keeps reading the transcript stem, and never writes transcript/.
+        let claude = test_ctx(&dir, 6);
+        write_session_uuid(&claude, Some(&serde_json::json!({ "session_id": sid, "transcript_path": rollout })));
+        assert!(!crate::session_id_path(&dir, 6).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[waiting for you]` as the last line is a codex's `needs`; a claude is
+    /// never read that way.
+    #[test]
+    fn the_waiting_marker_is_codex_needs() {
+        let dir = tmpdir("cxneeds");
+        let p = serde_json::json!({ "last_assistant_message": "A or B?\n\n[waiting for you]" });
+        assert!(codex_asked_the_user(&codex_ctx(&dir, 1), Some(&p)));
+        assert!(!codex_asked_the_user(&test_ctx(&dir, 1), Some(&p)));
+        let q = serde_json::json!({ "last_assistant_message": "done." });
+        assert!(!codex_asked_the_user(&codex_ctx(&dir, 1), Some(&q)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Context % from the recorded rollout, throttled unless forced.
+    #[test]
+    fn a_codex_ctx_comes_from_its_rollout() {
+        let dir = tmpdir("cxctx");
+        let ctx = codex_ctx(&dir, 3);
+        let rollout = dir.join("rollout.jsonl");
+        std::fs::write(&rollout, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":25840},\"model_context_window\":258400}}}\n").unwrap();
+        std::fs::create_dir_all(dir.join(crate::TRANSCRIPT_DIR)).unwrap();
+        std::fs::write(crate::transcript_path(&dir, 3), rollout.display().to_string()).unwrap();
+        write_codex_ctx(&ctx, None, false);
+        assert_eq!(std::fs::read_to_string(crate::ctx_path(&dir, 3)).unwrap(), "10.0");
+        std::fs::write(&rollout, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":129200},\"model_context_window\":258400}}}\n").unwrap();
+        write_codex_ctx(&ctx, None, false);
+        assert_eq!(std::fs::read_to_string(crate::ctx_path(&dir, 3)).unwrap(), "10.0", "throttled");
+        write_codex_ctx(&ctx, None, true);
+        assert_eq!(std::fs::read_to_string(crate::ctx_path(&dir, 3)).unwrap(), "50.0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex's PostCompact ends a compaction exactly as Claude's
+    /// SessionStart[compact] does, including handing a ⌘⇧K back to the app.
+    #[test]
+    fn end_compaction_is_shared() {
+        let dir = tmpdir("cxcompact");
+        let ctx = codex_ctx(&dir, 4);
+        std::fs::create_dir_all(dir.join(crate::COMPACTREQ_DIR)).unwrap();
+        std::fs::write(compacting_flag(&ctx), "manual").unwrap();
+        std::fs::write(compactreq_file(&ctx), "compacting").unwrap();
+        end_compaction(&ctx);
+        assert_eq!(std::fs::read_to_string(dir.join("4")).unwrap(), "waiting");
+        assert!(!compacting_flag(&ctx).exists());
+        assert_eq!(std::fs::read_to_string(compactreq_file(&ctx)).unwrap(), "resume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lock notes and departures name a codex as codex#N.
+    #[test]
+    fn labels_follow_the_rows_agent() {
+        let dir = tmpdir("cxlabel");
+        std::fs::create_dir_all(dir.join(crate::AGENTS_DIR)).unwrap();
+        std::fs::write(crate::agents_path(&dir, 7), "codex").unwrap();
+        let ctx = test_ctx(&dir, 1);
+        assert_eq!(ctx.addr_of("7"), "codex#7");
+        assert_eq!(ctx.addr_of("2"), "claude#2");
+        assert!(departed_nudge(&ctx, &[7, 2]).contains("Instance(s) codex#7, claude#2 have closed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The exact payloads Claude Code v2.1.234 hands the `Stop` hook, captured

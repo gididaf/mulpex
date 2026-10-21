@@ -83,3 +83,6 @@ Traps that live in this directory specifically:
   nothing looked wrong until the next ⌘T. New scratch state goes in `mulpex-core`'s
   `state_dir.rs::write_state_dir` — it lives there so the helper reads back the same layout the
   app writes — which every spawn re-runs. → [../docs/sessions.md](../docs/sessions.md)
+
+**Codex rows** (a second agent kind beside claude): anything that takes an `Agent` — read
+[../docs/codex.md](../docs/codex.md) first; the Claude path must stay byte-identical.

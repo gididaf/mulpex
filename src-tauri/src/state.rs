@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use mulpex_core::agent::Agent;
 use mulpex_core::persist::{self, NameSource, SessionStore};
 use mulpex_core::registry;
 
@@ -422,6 +423,10 @@ pub struct Core {
     last_spawn_at: Option<Instant>,
     /// The project's Board (`board.rs`), cached; the app is its only writer.
     pub board: crate::board::BoardStore,
+    /// Each codex row's wake ring (`wake.rs`).
+    wakes: crate::wake::Wakes,
+    /// When `settle_codex_turns` last looked.
+    codex_settled_at: Option<Instant>,
 }
 
 /// Minimum gap between launching two `hub_spawn` children. Each `claude` cold
@@ -429,6 +434,19 @@ pub struct Core {
 /// batch at once made them contend badly enough that none was ready to be typed
 /// into in time. Spacing them keeps each start fast enough to be usable.
 const SPAWN_STAGGER: Duration = Duration::from_millis(500);
+
+/// How long a codex's TUI takes to come up far enough to take a typed line or
+/// a queued one, when its `SessionStart` has not said so yet (a fresh codex
+/// fires that only at its first prompt).
+const CODEX_UP: Duration = Duration::from_secs(4);
+
+/// How often `settle_codex_turns` reads the rollouts of `working` codexes.
+const CODEX_SETTLE_EVERY: Duration = Duration::from_secs(3);
+/// How long a rollout must have been quiet after a turn's end before the app
+/// takes over the `Stop` hook's job of writing `waiting`.
+const CODEX_SETTLE_QUIET: Duration = Duration::from_secs(3);
+/// How much of a rollout's end `settle_codex_turns` reads.
+const CODEX_TAIL_BYTES: u64 = 64 * 1024;
 
 /// How long a due Board message waits for its claude's listener before it is
 /// left in the inbox regardless — `checkpoint.rs`'s `WAKE_WAIT`, for the same reason.
@@ -469,6 +487,8 @@ struct PendingSpawn {
     token: String,
     /// Instance that asked for the spawn (each child is told who assigned it).
     from: usize,
+    /// The agent to run, or `None` for the spawner's own.
+    agent: Option<Agent>,
     /// Tasks not yet launched.
     remaining: VecDeque<String>,
     /// Ids launched so far, reported together once the batch finishes.
@@ -614,13 +634,14 @@ impl Core {
                 geometry.1,
                 geometry.0,
                 SpawnSpec::Agent {
-                    agent: mulpex_core::agent::Agent::Claude,
+                    agent: saved.agent,
                     settings_path: &settings_path,
                     state_dir: &state_dir,
                     helper_path,
                     session_id: &saved.session_id,
                     resume: true,
                     initial_task: None,
+                    parent_agent: Agent::Claude,
                     plain_prompt: None,
                 },
             ) {
@@ -723,6 +744,8 @@ impl Core {
             geometry,
             pending_spawns: VecDeque::new(),
             last_spawn_at: None,
+            wakes: Default::default(),
+            codex_settled_at: None,
         };
         // The row that had focus before the restart has it again.
         if let Some(id) = adopted_active {
@@ -781,8 +804,26 @@ impl Core {
 
     /// Spawn a fresh Claude in the project dir and focus it (⌘T / the frontend
     /// `create_session` command). Ports `App::spawn_instance`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn_instance(&mut self) -> anyhow::Result<SessionInfo> {
-        self.spawn_with(None, None, None, true)
+        self.spawn_agent(Agent::Claude)
+    }
+
+    /// Spawn a fresh agent of either kind and focus it — ⌘T (claude) or ⌘⌥T
+    /// (codex).
+    pub fn spawn_agent(&mut self, agent: Agent) -> anyhow::Result<SessionInfo> {
+        self.spawn_with(agent, None, None, None, true)
+    }
+
+    /// The agent `id` runs, or `None` for a terminal or an unknown id.
+    pub fn agent_of(&self, id: usize) -> Option<Agent> {
+        self.sessions.iter().find(|s| s.id == id)?.kind.agent()
+    }
+
+    /// The conversation id `id` resumes (empty for a codex before its first
+    /// prompt), or `None` for an unknown id.
+    pub fn session_id_of(&self, id: usize) -> Option<String> {
+        self.sessions.iter().find(|s| s.id == id).map(|s| s.session_id.clone())
     }
 
     /// Spawn a fresh Claude that starts on `prompt` exactly as written, as if the
@@ -797,7 +838,7 @@ impl Core {
         name: Option<String>,
         user_owned: bool,
     ) -> anyhow::Result<SessionInfo> {
-        let info = self.spawn_with(None, Some(prompt), None, true)?;
+        let info = self.spawn_with(Agent::Claude, None, Some(prompt), None, true)?;
         Ok(self.name_row(info, name, user_owned))
     }
 
@@ -809,10 +850,11 @@ impl Core {
     /// than vanishing.
     pub fn spawn_instance_resuming(
         &mut self,
+        agent: Agent,
         uuid: String,
         name: Option<String>,
     ) -> anyhow::Result<SessionInfo> {
-        let info = self.spawn_with(None, None, Some(uuid), true)?;
+        let info = self.spawn_with(agent, None, None, Some(uuid), true)?;
         self.worked.insert(info.id);
         self.restored.insert(info.id, Instant::now());
         Ok(self.name_row(info, name, true))
@@ -836,16 +878,23 @@ impl Core {
         }
     }
 
-    /// Spawn a fresh Claude that starts immediately on `task`, assigned by
+    /// Spawn a fresh agent that starts immediately on `task`, assigned by
     /// `parent_id` (an instance's `hub_spawn` call, dispatched by the poll loop).
     /// The child is auto-named from the task so the sidebar labels it, is told its
     /// parent (so it can report back via `hub_send`), and is NOT focused — the user
     /// stays on their current pane while children appear in the sidebar.
-    pub fn spawn_instance_with_task(
+    ///
+    /// `agent` is `hub_spawn`'s `agent`. `None` is the spawner's own kind — a codex
+    /// fans out codexes unless it asks otherwise — and a claude when the spawner
+    /// is gone.
+    pub fn spawn_instance_with_task_as(
         &mut self,
         parent_id: usize,
         task: String,
+        agent: Option<Agent>,
     ) -> anyhow::Result<SessionInfo> {
+        let parent_agent = self.agent_of(parent_id).unwrap_or_default();
+        let agent = agent.unwrap_or(parent_agent);
         let name = name_from_task(&task);
         // Publish the assignment BEFORE the child exists, both because injection
         // is asynchronous and because a spawn child's task is never captured by
@@ -859,7 +908,7 @@ impl Core {
         let _ = std::fs::create_dir_all(&tasks_dir);
         let _ = std::fs::write(tasks_dir.join(id.to_string()), task.trim());
         pty::mark_delivery_pending(&self.state_dir, id);
-        let info = match self.spawn_with(Some(SpawnTask { parent_id, task }), None, None, false) {
+        let info = match self.spawn_with_parent(agent, Some(SpawnTask { parent_id, task }), parent_agent, None, None, false) {
             Ok(info) => info,
             Err(e) => {
                 // Nothing to deliver to; don't leave the markers behind for a
@@ -913,7 +962,20 @@ impl Core {
     /// initial task), append it, optionally focus it, and republish the peer list.
     fn spawn_with(
         &mut self,
+        agent: Agent,
         initial_task: Option<SpawnTask>,
+        plain_prompt: Option<String>,
+        resume_uuid: Option<String>,
+        focus: bool,
+    ) -> anyhow::Result<SessionInfo> {
+        self.spawn_with_parent(agent, initial_task, Agent::Claude, plain_prompt, resume_uuid, focus)
+    }
+
+    fn spawn_with_parent(
+        &mut self,
+        agent: Agent,
+        initial_task: Option<SpawnTask>,
+        parent_agent: Agent,
         plain_prompt: Option<String>,
         resume_uuid: Option<String>,
         focus: bool,
@@ -929,20 +991,21 @@ impl Core {
         self.ensure_state_dir()?;
         let id = self.next_id;
         let resume = resume_uuid.is_some();
-        let session_id = resume_uuid.unwrap_or_else(persist::new_uuid);
+        let session_id = resume_uuid.unwrap_or_else(|| fresh_session_id(agent));
         let session = Session::spawn(
             id,
             &self.project_dir,
             self.geometry.1,
             self.geometry.0,
             SpawnSpec::Agent {
-                agent: mulpex_core::agent::Agent::Claude,
+                agent,
                 settings_path: &self.settings_path,
                 state_dir: &self.state_dir,
                 helper_path: &self.helper_path,
                 session_id: &session_id,
                 resume,
                 initial_task,
+                parent_agent,
                 plain_prompt,
             },
         )?;
@@ -960,7 +1023,7 @@ impl Core {
             parent: None,
             collapsed: false,
             auto_compact: None,
-            kind: SessionKind::Claude,
+            kind: SessionKind::from(agent),
             exited: false,
             failed: None,
             board_open: 0,
@@ -1054,7 +1117,7 @@ impl Core {
                 let _ = std::fs::remove_file(&req);
                 continue;
             };
-            let parsed: Option<(usize, Vec<String>)> = serde_json::from_str::<serde_json::Value>(
+            let parsed: Option<(usize, Vec<String>, Option<Agent>)> = serde_json::from_str::<serde_json::Value>(
                 &content,
             )
             .ok()
@@ -1067,10 +1130,13 @@ impl Core {
                     .filter_map(|t| t.as_str().map(str::to_string))
                     .filter(|t| !t.trim().is_empty())
                     .collect::<Vec<_>>();
-                Some((from, tasks))
+                // Optional; missing (every spawn before Codex) means the
+                // spawner's own agent.
+                let agent = v.get("agent").and_then(|a| a.as_str()).and_then(Agent::parse);
+                Some((from, tasks, agent))
             });
             let _ = std::fs::remove_file(&req);
-            let Some((from, tasks)) = parsed else { continue };
+            let Some((from, tasks, agent)) = parsed else { continue };
 
             // Queue the batch rather than launching it here: firing every child in
             // one tick makes N `claude` cold starts fight for CPU, and a child that
@@ -1081,6 +1147,7 @@ impl Core {
             self.pending_spawns.push_back(PendingSpawn {
                 token: stem.to_string(),
                 from,
+                agent,
                 remaining: tasks.into(),
                 ids: Vec::new(),
             });
@@ -1095,7 +1162,7 @@ impl Core {
         if due {
             if let Some(mut batch) = self.pending_spawns.pop_front() {
                 if let Some(task) = batch.remaining.pop_front() {
-                    if let Ok(info) = self.spawn_instance_with_task(batch.from, task) {
+                    if let Ok(info) = self.spawn_instance_with_task_as(batch.from, task, batch.agent) {
                         batch.ids.push(info.id);
                         spawned_any = true;
                     }
@@ -1821,13 +1888,14 @@ impl Core {
             .iter()
             .find(|s| s.id == id)
             .ok_or(format!("claude#{id} is not open"))?;
-        if s.is_shell() {
-            return Err("Explain works on claudes only".into());
-        }
+        let Some(agent) = s.kind.agent() else {
+            return Err("Explain works on claudes and codexes only".into());
+        };
         if s.session_id.is_empty()
-            || !crate::saves::transcript_path(&self.project_dir, &s.session_id).is_file()
+            || !crate::agent_transcript::path(agent, &self.project_dir, &s.session_id, &self.state_dir, id)
+                .is_some_and(|p| p.is_file())
         {
-            return Err("Nothing to explain yet — this claude has no conversation".into());
+            return Err(format!("Nothing to explain yet — this {} has no conversation", agent.word()));
         }
         Ok((self.project_dir.clone(), s.session_id.clone()))
     }
@@ -1897,15 +1965,58 @@ impl Core {
             .iter()
             .position(|s| s.id == id)
             .ok_or_else(|| anyhow::anyhow!("claude#{id} is not open"))?;
-        if self.sessions[pos].is_shell() {
+        let Some(agent) = self.sessions[pos].kind.agent() else {
             anyhow::bail!("term#{id} is a terminal — only a claude can be restarted");
-        }
+        };
+        let me = format!("{}#{id}", agent.word());
         if self.saving.contains(&id) {
-            anyhow::bail!("claude#{id} was saved — continue it from ⌘L instead");
+            anyhow::bail!("{me} was saved — continue it from ⌘L instead");
         }
         let old_session_id = self.sessions[pos].session_id.clone();
         let resume = !old_session_id.is_empty() && self.worked.contains(&id);
-        let session_id = if resume { old_session_id } else { persist::new_uuid() };
+        let session_id = if resume { old_session_id } else { fresh_session_id(agent) };
+        self.respawn(pos, agent, session_id, resume, None)
+    }
+
+    /// Replace the agent on `id`'s row with a fresh `agent` that starts on
+    /// `plain_prompt` (⌘⌥S Continue in Codex/Claude, `handoff.rs`). Everything
+    /// that identifies the row — id and hub address, name, mute, parent and
+    /// children, undelivered mail — is kept, exactly as ⌘⇧R keeps it; only the
+    /// process and its conversation change. The caller emits
+    /// `session-restarted`, as `restart_session` does.
+    ///
+    /// A ⌘S-style hold (`saving`) is released: the handoff that held the row is
+    /// what calls this.
+    pub fn replace_with_agent(&mut self, id: usize, agent: Agent, plain_prompt: String) -> anyhow::Result<()> {
+        let pos = self
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| anyhow::anyhow!("#{id} is not open"))?;
+        if self.sessions[pos].is_shell() {
+            anyhow::bail!("term#{id} is a terminal — only an agent row can continue in another agent");
+        }
+        self.saving.remove(&id);
+        // A new conversation: nothing of the old one's may be adopted by it.
+        let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::transcript_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::resumed_in_place_path(&self.state_dir, id));
+        self.worked.remove(&id);
+        self.respawn(pos, agent, fresh_session_id(agent), false, Some(plain_prompt))
+    }
+
+    /// Kill row `pos` and start `agent` in its place with the same id —
+    /// `restart_instance` (same agent, resuming) and `replace_with_agent` (the
+    /// other agent, fresh) share it.
+    fn respawn(
+        &mut self,
+        pos: usize,
+        agent: Agent,
+        session_id: String,
+        resume: bool,
+        plain_prompt: Option<String>,
+    ) -> anyhow::Result<()> {
+        let id = self.sessions[pos].id;
         // Same check ⌘T makes, for the same reason: if macOS is withholding the
         // folder, the respawn would fail *after* we had already killed the
         // instance the user still has.
@@ -1953,6 +2064,11 @@ impl Core {
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         // A compact request was for the old process's conversation turn.
         let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        // A codex's "has a thread, hooks work" mark and its wake ledger describe
+        // the old process too; the new one earns its own (`wake.rs`).
+        let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::wake_ack_path(&self.state_dir, id));
+        self.wakes.forget(id);
         // ...and because it was cleared, the resumed child has to re-arm — which,
         // with no task on its command line, only happens if it takes a turn. The
         // one thing that makes it take one is the "orphaned background task" wake
@@ -1966,13 +2082,16 @@ impl Core {
         // is armed at session start like any new instance's. Its old process's
         // uuid report is dropped too, or `reconcile_session_ids` would hand the
         // new process the old uuid back.
-        if resume {
+        //
+        // A codex has no listener to re-arm (the app rings it, `wake.rs`), so
+        // the flag is a claude's only.
+        if resume && agent == Agent::Claude {
             let _ = std::fs::create_dir_all(self.state_dir.join(mulpex_core::RESUMED_DIR));
             let _ = std::fs::write(
                 mulpex_core::resumed_in_place_path(&self.state_dir, id),
                 "",
             );
-        } else {
+        } else if !resume {
             let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         }
 
@@ -1985,14 +2104,15 @@ impl Core {
             self.geometry.1,
             self.geometry.0,
             SpawnSpec::Agent {
-                agent: mulpex_core::agent::Agent::Claude,
+                agent,
                 settings_path: &settings_path,
                 state_dir: &state_dir,
                 helper_path: &helper_path,
                 session_id: &session_id,
                 resume,
                 initial_task: None,
-                plain_prompt: None,
+                parent_agent: Agent::Claude,
+                plain_prompt,
             },
         )?;
         // Dropping the old `Session` here `kill`s it a second time, which is
@@ -2062,7 +2182,7 @@ impl Core {
                 // record why, and say so in its own pane. The child's own last
                 // words (if it managed any) are already on screen above this.
                 if self.needs_failure_mark(&session) {
-                    let reason = self.start_failure_reason();
+                    let reason = self.start_failure_reason(&session);
                     session.notice(&format!("⚠  {reason}"));
                     newly_failed.push((session.id, reason));
                 }
@@ -2101,7 +2221,8 @@ impl Core {
                     // Said out loud: a row the user believes closed coming back
                     // at the next launch was reported once and never reproduced.
                     eprintln!(
-                        "[restore] claude#{} died unasked {:?} after its restore — kept for the next launch",
+                        "[restore] {}#{} died unasked {:?} after its restore — kept for the next launch",
+                        session.kind.word(),
                         session.id,
                         self.restored.get(&session.id).map(|t| t.elapsed()),
                     );
@@ -2115,6 +2236,7 @@ impl Core {
                         auto_compact: self.auto_compact.get(&session.id).copied(),
                         name_by: self.name_by.get(&session.id).copied(),
                         todos: false,
+                        agent: session.kind.agent().unwrap_or_default(),
                     };
                     if !self
                         .sticky
@@ -2233,13 +2355,27 @@ impl Core {
     /// symptom — macOS refusing the app access to the folder, which the child
     /// can only report as a `getcwd` error nobody sees. When the directory is
     /// fine we say only what we actually know.
-    fn start_failure_reason(&self) -> String {
+    fn start_failure_reason(&self, s: &Session) -> String {
+        let agent = s.kind.agent().unwrap_or_default();
         match pty::dir_access_error(&self.project_dir) {
-            Some(reason) => format!("Claude could not start here. {reason}"),
-            None => "Claude exited immediately, before this session was usable. \
-                     Its output above is all it managed to say. Press ⌘W to \
-                     dismiss this, or ⌘T to try again."
-                .to_string(),
+            Some(reason) => format!("{} could not start here. {reason}", agent.title()),
+            None => match agent {
+                Agent::Claude => "Claude exited immediately, before this session was usable. \
+                                  Its output above is all it managed to say. Press ⌘W to \
+                                  dismiss this, or ⌘T to try again."
+                    .to_string(),
+                // `codex resume <id>` on a thread Codex no longer has prints
+                // "No saved session found" and exits 1 (measured, docs/codex.md).
+                Agent::Codex if self.restored.contains_key(&s.id) && !s.session_id.is_empty() => format!(
+                    "Codex could not reopen this conversation ({}). Its output above says why. \
+                     Press ⌘W to dismiss this, or ⌘⌥T to start a new Codex session.",
+                    s.session_id
+                ),
+                Agent::Codex => "Codex exited immediately, before this session was usable. \
+                                 Its output above is all it managed to say. Press ⌘W to \
+                                 dismiss this, or ⌘⌥T to try again."
+                    .to_string(),
+            },
         }
     }
 
@@ -2257,6 +2393,9 @@ impl Core {
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::transcript_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::wake_ack_path(&self.state_dir, id));
         crate::pty::clear_delivery(&self.state_dir, id);
         let _ = std::fs::remove_file(crate::pty::terminal_log_path(&self.state_dir, id));
         let _ = std::fs::remove_file(crate::pty::terminal_screen_path(&self.state_dir, id));
@@ -2337,6 +2476,8 @@ impl Core {
                         .last()
                 });
 
+            // Which TUI to read the screen as: a remote claude or a codex.
+            let remote_agent = mulpex_core::remote::agent_of(&self.state_dir, id);
             // Idleness comes from the log header the recorder maintains, not
             // from the Session: the recorder is what actually sees the bytes.
             let idle_ms = mulpex_core::termlog::parse_header(&log_bytes)
@@ -2344,8 +2485,8 @@ impl Core {
                 .unwrap_or(0);
             let quiet = session.is_alive()
                 && idle_ms >= mulpex_core::remote::IDLE_TURN_END_MS
-                && mulpex_core::remote::looks_like_claude_tui(&screen)
-                && !mulpex_core::remote::has_spinner(&screen);
+                && mulpex_core::remote::looks_like_tui(remote_agent, &screen)
+                && !mulpex_core::remote::has_spinner_for(remote_agent, &screen);
 
             let to_send = match signal {
                 Some(sig) => mulpex_core::remote::take_if_new(&self.state_dir, id, "watch", &sig)
@@ -2538,7 +2679,7 @@ impl Core {
             }
             let working = std::fs::read_to_string(self.state_dir.join(id.to_string()))
                 .is_ok_and(|w| w.trim() == "working");
-            if !(self.listener_ready(id) || working || waited >= TODOS_WAIT) {
+            if !(self.wake_ready(id) || working || waited >= TODOS_WAIT) {
                 continue;
             }
             let img_dir = self.board.img_dir().to_path_buf();
@@ -2604,7 +2745,7 @@ impl Core {
         if s.session_id.is_empty() {
             return None;
         }
-        let p = crate::saves::transcript_path(&self.project_dir, &s.session_id);
+        let p = crate::agent_transcript::path(s.kind.agent()?, &self.project_dir, &s.session_id, &self.state_dir, id)?;
         p.is_file().then_some(p)
     }
 
@@ -2630,6 +2771,122 @@ impl Core {
         let fresh = age(meta.modified()).is_some_and(|a| a < Duration::from_secs(30));
         let settled = age(meta.created()).is_none_or(|a| a >= Duration::from_secs(2));
         fresh && settled
+    }
+
+    /// Whether a message dropped into `id`'s inbox now will wake it: a claude's
+    /// listener is up (`listener_ready`); a codex is woken by the app itself
+    /// (`wake.rs`), so it is ready once its TUI is — it has a thread and working
+    /// hooks (`agentready/<id>`), or has been up a few seconds (the typed
+    /// fallback reaches a codex that has no thread yet).
+    pub fn wake_ready(&self, id: usize) -> bool {
+        match self.agent_of(id) {
+            Some(Agent::Codex) => {
+                mulpex_core::agentready_path(&self.state_dir, id).exists()
+                    || self.started.get(&id).is_none_or(|t| t.elapsed() >= CODEX_UP)
+            }
+            _ => self.listener_ready(id),
+        }
+    }
+
+    /// `listener_alive` per agent: something will wake `id` for mail at all —
+    /// a claude's listener heartbeat is fresh; a codex's TUI is up, since the
+    /// app rings it (`wake_ready`).
+    pub fn wake_alive(&self, id: usize) -> bool {
+        match self.agent_of(id) {
+            Some(Agent::Codex) => self.wake_ready(id),
+            _ => self.listener_alive(id),
+        }
+    }
+
+    /// Ring the codex rows that have unread mail and sit idle (`wake.rs`).
+    /// Returns the rows whose wake line the frontend must type (`codex-wake`).
+    pub fn tick_wakes(&mut self) -> Vec<(usize, String)> {
+        let codexes: Vec<(usize, String)> = self
+            .live_instances()
+            .filter(|s| s.kind == pty::SessionKind::Codex && s.is_alive())
+            .map(|s| (s.id, s.session_id.clone()))
+            .collect();
+        self.wakes.retain(|id| codexes.iter().any(|(c, _)| *c == id));
+        if codexes.is_empty() {
+            return Vec::new();
+        }
+        let inputs: Vec<crate::wake::Input> = codexes
+            .into_iter()
+            .map(|(id, sid)| {
+                let unread = std::fs::read_dir(self.state_dir.join("inbox").join(id.to_string()))
+                    .map(|d| d.flatten().count())
+                    .unwrap_or(0);
+                let waiting = std::fs::read_to_string(self.state_dir.join(id.to_string()))
+                    .map(|w| Status::from_word(w.trim()) == Some(Status::Waiting))
+                    // No status file yet: a codex that has never had a prompt,
+                    // idle at its first box.
+                    .unwrap_or(true);
+                let up = mulpex_core::agentready_path(&self.state_dir, id).exists()
+                    || self.started.get(&id).is_none_or(|t| t.elapsed() >= CODEX_UP);
+                crate::wake::Input { id, unread, waiting, thread: (!sid.is_empty() && up).then_some(sid) }
+            })
+            .collect();
+        let bin = crate::claude_bin::resolve(Agent::Codex).cloned();
+        let cwd = self.project_dir.clone();
+        let queue = |thread: &str, line: &str| match &bin {
+            Some(bin) => crate::wake::spawn_queue(bin.clone(), cwd.clone(), thread, line),
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(Err("codex is not installed".to_string()));
+                rx
+            }
+        };
+        self.wakes.tick(&self.state_dir, &inputs, &queue)
+    }
+
+    /// Put back to `waiting` a codex whose turn ended without a `Stop` hook.
+    ///
+    /// Codex fires none on a turn that FAILED (a 429 that ran out of retries,
+    /// measured) or was interrupted, so its status stayed `working` forever: the
+    /// row looked busy and `tick_wakes` never rang it. Its rollout still records
+    /// the end (`wake::rollout_turn_over`). Every `CODEX_SETTLE_EVERY`, a codex
+    /// still `working` whose rollout says the turn is over and has been quiet
+    /// for `CODEX_SETTLE_QUIET` — long past when a real `Stop` writes, so this
+    /// never races one that writes `needs` or blocks for mail — is set
+    /// `waiting`, and its per-turn locks are released as `Stop` would.
+    pub fn settle_codex_turns(&mut self) {
+        if self.codex_settled_at.is_some_and(|t| t.elapsed() < CODEX_SETTLE_EVERY) {
+            return;
+        }
+        self.codex_settled_at = Some(Instant::now());
+        for s in self.live_instances().filter(|s| s.kind == pty::SessionKind::Codex && s.is_alive()) {
+            let status = self.state_dir.join(s.id.to_string());
+            if !std::fs::read_to_string(&status).is_ok_and(|w| w.trim() == "working") || s.session_id.is_empty() {
+                continue;
+            }
+            let Some(rollout) =
+                crate::agent_transcript::path(Agent::Codex, &self.project_dir, &s.session_id, &self.state_dir, s.id)
+            else {
+                continue;
+            };
+            let quiet = std::fs::metadata(&rollout)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|a| a >= CODEX_SETTLE_QUIET);
+            if !quiet || !read_tail(&rollout, CODEX_TAIL_BYTES).is_some_and(|t| crate::wake::rollout_turn_over(&t)) {
+                continue;
+            }
+            eprintln!("[codex] codex#{}: its turn ended with no Stop hook (failed or interrupted) — now waiting", s.id);
+            let _ = std::fs::write(&status, "waiting");
+            if let Ok(entries) = std::fs::read_dir(self.state_dir.join("locks")) {
+                for e in entries.flatten() {
+                    if read_lock(&e.path()).is_some_and(|(holder, _)| holder == s.id) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The frontend typed (or refused to type) a `codex-wake` line.
+    pub fn wake_typed(&mut self, id: usize, ok: bool, reason: &str) {
+        self.wakes.typed(&self.state_dir, id, ok, reason);
     }
 
     /// Whether `claude#id`'s hub listener is running at all (its heartbeat is
@@ -2732,14 +2989,16 @@ impl Core {
             };
             if taken {
                 eprintln!(
-                    "[sessionid] claude#{id}: refusing {uuid} — another row already resumes it; \
+                    "[sessionid] {}#{id}: refusing {uuid} — another row already resumes it; \
                      keeping {}",
+                    session.kind.word(),
                     session.session_id
                 );
                 continue;
             }
             eprintln!(
-                "[sessionid] claude#{id}: transcript is {uuid}, not {} — store follows the file",
+                "[sessionid] {}#{id}: transcript is {uuid}, not {:?} — store follows the file",
+                session.kind.word(),
                 session.session_id
             );
             session.session_id = uuid;
@@ -2799,6 +3058,7 @@ impl Core {
                     ctx_pct,
                     compact_phase,
                     compacting,
+                    wake: self.wakes.mark(s.id),
                 }
             })
             .collect();
@@ -2990,7 +3250,9 @@ impl Core {
     fn persist_sessions(&self) {
         let mut sessions: Vec<persist::SavedSession> = self
             .instances()
-            .filter(|s| self.worked.contains(&s.id))
+            // A codex has no id until its first prompt (Codex mints it then,
+            // docs/codex.md) — nothing to resume yet, so nothing to keep.
+            .filter(|s| self.worked.contains(&s.id) && !s.session_id.is_empty())
             .map(|s| persist::SavedSession {
                 session_id: s.session_id.clone(),
                 name: self.names.get(&s.id).cloned(),
@@ -3003,6 +3265,7 @@ impl Core {
                 auto_compact: self.auto_compact.get(&s.id).copied(),
                 todos: false,
                 name_by: self.name_by.get(&s.id).copied(),
+                agent: s.kind.agent().unwrap_or_default(),
             })
             .collect();
         // Records whose session is gone but must not be forgotten — a restore
@@ -3192,6 +3455,17 @@ fn auto_compact_message(pct: Option<u8>) -> String {
              don't treat it as stuck. You don't need to do anything."
         ),
         None => "The user disabled auto-compact for you and your claudes.".to_string(),
+    }
+}
+
+/// The conversation id a brand-new row starts with: a claude takes the one
+/// Mulpex mints (`--session-id`); a codex has none until Codex mints it at the
+/// first prompt, which the hook reports to `sessionid/<id>` and
+/// `reconcile_session_ids` adopts (docs/codex.md S10).
+fn fresh_session_id(agent: Agent) -> String {
+    match agent {
+        Agent::Claude => persist::new_uuid(),
+        Agent::Codex => String::new(),
     }
 }
 
@@ -4064,7 +4338,7 @@ mod tests {
     }
 
     /// END-TO-END: the task a spawner hands `hub_spawn` must reach the child's
-    /// process WHOLE, through the real production path — `spawn_instance_with_task`
+    /// process WHOLE, through the real production path — `spawn_instance_with_task_as`
     /// -> `Session::spawn` -> `CommandBuilder` -> `exec`.
     ///
     /// This is the regression that ate two instances' briefs. The task used to be
@@ -4118,7 +4392,7 @@ mod tests {
         // Comfortably past the 1022-character cap that used to eat it.
         let task: String = (0..1000).map(|i| format!("{i:05} ")).collect();
         assert_eq!(task.len(), 6000);
-        core.spawn_instance_with_task(2, task.clone()).unwrap();
+        core.spawn_instance_with_task_as(2, task.clone(), None).unwrap();
 
         assert!(
             wait_until(|| argv_out.exists()),
@@ -4280,6 +4554,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }
     }
 
@@ -4340,6 +4615,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }];
         let (_env, root, mut core) = core_from_store("sidfollow", &saved);
 
@@ -4389,6 +4665,7 @@ mod tests {
                 auto_compact: None,
                 name_by: None,
                 todos: false,
+                agent: Default::default(),
             },
             record("copycat", Some(2)),
         ];
@@ -4665,6 +4942,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }]);
         let mut core = Core::open(
             1,
@@ -5083,6 +5361,7 @@ mod tests {
             auto_compact: None,
             name_by,
             todos: false,
+            agent: Default::default(),
         };
         SessionStore::new(&project_dir).save(&[
             saved(1, "Deployer", Some(NameSource::User)),
@@ -5187,11 +5466,11 @@ mod tests {
         let parent = core.spawn_instance().unwrap().id;
         let term = core.spawn_terminal(None, None, false).unwrap().id;
 
-        let child = core.spawn_instance_with_task(parent, "do a thing".into()).unwrap();
+        let child = core.spawn_instance_with_task_as(parent, "do a thing".into(), None).unwrap();
         assert_eq!(child.parent, Some(parent));
-        let by_term = core.spawn_instance_with_task(term, "do a thing".into()).unwrap();
+        let by_term = core.spawn_instance_with_task_as(term, "do a thing".into(), None).unwrap();
         assert_eq!(by_term.parent, None, "a terminal cannot be a parent");
-        let by_ghost = core.spawn_instance_with_task(999, "do a thing".into()).unwrap();
+        let by_ghost = core.spawn_instance_with_task_as(999, "do a thing".into(), None).unwrap();
         assert_eq!(by_ghost.parent, None, "an unknown spawner makes a root");
 
         let infos = core.session_infos();
@@ -5210,15 +5489,15 @@ mod tests {
     fn mute_follows_the_family() {
         let (_env, root, mut core) = scratch_core("famute");
         let a = core.spawn_instance().unwrap().id;
-        let b = core.spawn_instance_with_task(a, "x".into()).unwrap().id;
-        let c = core.spawn_instance_with_task(b, "x".into()).unwrap().id;
+        let b = core.spawn_instance_with_task_as(a, "x".into(), None).unwrap().id;
+        let c = core.spawn_instance_with_task_as(b, "x".into(), None).unwrap().id;
         let other = core.spawn_instance().unwrap().id;
 
         core.set_muted(a, true);
         assert!([a, b, c].iter().all(|id| core.muted.contains(id)));
         assert!(!core.muted.contains(&other));
 
-        let d = core.spawn_instance_with_task(a, "x".into()).unwrap();
+        let d = core.spawn_instance_with_task_as(a, "x".into(), None).unwrap();
         assert!(d.muted && core.muted.contains(&d.id), "a child of a muted parent starts muted");
 
         core.set_muted(c, false);
@@ -5269,7 +5548,7 @@ mod tests {
     fn reparent_moves_a_family_and_refuses_cycles() {
         let (_env, root, mut core) = scratch_core("renest");
         let a = core.spawn_instance().unwrap().id;
-        let b = core.spawn_instance_with_task(a, "x".into()).unwrap().id;
+        let b = core.spawn_instance_with_task_as(a, "x".into(), None).unwrap().id;
         let other = core.spawn_instance().unwrap().id;
         let term = core.spawn_terminal(None, None, false).unwrap().id;
         core.set_muted(other, true);
@@ -5644,6 +5923,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }]);
 
         let mut core = Core::open(
@@ -6053,6 +6333,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }]);
         eprintln!("seeded store at {:?}", store.path());
 
@@ -6114,6 +6395,7 @@ mod tests {
             auto_compact: None,
             name_by: None,
             todos: false,
+            agent: Default::default(),
         }]);
         let dump = || std::fs::read_to_string(store.path()).unwrap_or_default();
         assert!(dump().contains(&uuid), "seed failed");
@@ -6759,5 +7041,248 @@ mod remote_watcher {
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Live tests on a real `codex` on the daemon's PTY. `#[ignore]`d: each one
+/// starts codex, spends real turns and takes a minute or two. They use a
+/// throwaway `CODEX_HOME` (your `auth.json` copied in) so nothing is written
+/// into your own Codex history, and a throwaway `MULPEX_HOME`. Run:
+///   cargo build -p mulpex-helper && cargo test -p mulpex --lib -- \
+///     --ignored --nocapture --test-threads=1 codex_live
+#[cfg(test)]
+mod codex_live {
+    use super::tests::env_guard;
+    use super::*;
+
+    struct Live {
+        root: PathBuf,
+        project_dir: PathBuf,
+        helper: PathBuf,
+    }
+
+    fn setup(tag: &str) -> Live {
+        let root = std::env::temp_dir().join(format!("mulpex-codexlive-{tag}-{}", persist::new_uuid()));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("MULPEX_HOME", root.join("mulpex-home"));
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        // One per test process, not per test: the login-shell environment
+        // `claude_bin` forwards to every child is probed once and inherits OUR
+        // env, so it pins whatever CODEX_HOME the first test set.
+        static CODEX_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let codex_home = CODEX_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("mulpex-codexlive-home-{}", persist::new_uuid())))
+            .clone();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::copy(home.join(".codex/auth.json"), codex_home.join("auth.json"))
+            .expect("codex must be logged in (~/.codex/auth.json)");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let built = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("target/debug/mulpex-helper");
+        assert!(built.exists(), "build mulpex-helper first: {built:?}");
+        let helper = root.join("mulpex-helper");
+        std::fs::copy(&built, &helper).unwrap();
+        Live { root, project_dir, helper }
+    }
+
+    fn done(l: Live) {
+        std::env::remove_var("MULPEX_HOME");
+        let _ = std::fs::remove_dir_all(&l.root);
+    }
+
+    /// One poll-loop tick's worth of what `hub.rs` runs, until `f` holds.
+    fn poll(core: &mut Core, secs: u64, f: &dyn Fn(&Core) -> bool) -> bool {
+        for _ in 0..(secs * 5) {
+            std::thread::sleep(Duration::from_millis(200));
+            core.reap_dead();
+            core.refresh_worked();
+            core.reconcile_session_ids();
+            let _ = core.tick_wakes();
+            if f(core) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn status(core: &Core, id: usize) -> String {
+        std::fs::read_to_string(core.state_dir.join(id.to_string())).unwrap_or_default().trim().to_string()
+    }
+
+    fn listing(core: &Core) -> String {
+        let mut out = String::new();
+        for s in &core.sessions {
+            let ring = s.desktop_tap().ring;
+            let tail = String::from_utf8_lossy(&ring[ring.len().saturating_sub(3000)..]).into_owned();
+            out.push_str(&format!("pane #{} (failed: {:?}):\n{tail}\n", s.id, core.failed.get(&s.id)));
+        }
+        for d in ["", "agents", "agentready", "sessionid", "spawning", "wake", "inbox"] {
+            let names: Vec<String> = std::fs::read_dir(core.state_dir.join(d))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            out.push_str(&format!("{d}/: {names:?}\n"));
+        }
+        out
+    }
+
+    /// The whole lifecycle of one codex row: a 12 KB `hub_spawn` task arrives
+    /// whole on its command line and is verified by its own hook; Codex's
+    /// thread id is adopted into the row and the store; ⌘⇧R resumes that same
+    /// thread; and a hub message to the idle, resumed codex is rung through
+    /// `codex queue` and acked by its hook.
+    #[test]
+    #[ignore]
+    fn codex_live_spawn_reconcile_restart_and_queue_wake() {
+        let _env = env_guard();
+        let l = setup("life");
+        let mut core = Core::open(1, l.project_dir.clone(), &l.helper, l.root.join("state"), (100, 40)).unwrap();
+
+        // Padding the model is told to ignore; the hook compares every byte.
+        let pad: String = (0..240).map(|i| format!("filler-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ")).collect();
+        let task = format!("Reply with exactly the word READY and nothing else. Ignore this padding: {pad}");
+        assert!(task.len() > 12_000, "{}", task.len());
+        let info = core.spawn_instance_with_task_as(42, task, Some(Agent::Codex)).unwrap();
+        let id = info.id;
+        assert_eq!(info.kind, SessionKind::Codex);
+        assert_eq!(core.sessions[0].session_id, "", "a codex has no id before its first prompt");
+        assert_eq!(std::fs::read_to_string(mulpex_core::agents_path(&core.state_dir, id)).unwrap(), "codex");
+        eprintln!("root {:?}", l.root);
+
+        // The task reached the hook whole (no verdict file = delivered + verified),
+        // Codex minted a thread and Mulpex adopted it.
+        let ok = poll(&mut core, 150, &|c| {
+            !c.sessions[0].session_id.is_empty()
+                && !mulpex_core::spawn_delivery_path(&c.state_dir, id).exists()
+                && status(c, id) == "waiting"
+        });
+        assert!(
+            ok,
+            "spawn never settled: alive={} sid={:?} status={:?} verdict={:?}\n{}",
+            core.sessions[0].is_alive(),
+            core.sessions[0].session_id,
+            status(&core, id),
+            std::fs::read_to_string(mulpex_core::spawn_delivery_path(&core.state_dir, id)).ok(),
+            listing(&core),
+        );
+        let thread = core.sessions[0].session_id.clone();
+        eprintln!("codex#{id} thread {thread}");
+        let stored = core.store.load();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].session_id, thread);
+        assert_eq!(stored[0].agent, Agent::Codex);
+
+        // ⌘⇧R: same row, same thread, resumed.
+        core.restart_instance(id).unwrap();
+        assert_eq!(core.sessions[0].session_id, thread);
+        assert_eq!(core.sessions[0].kind, pty::SessionKind::Codex);
+        std::thread::sleep(Duration::from_secs(12));
+        core.reap_dead();
+        assert!(core.sessions[0].is_alive(), "the resumed codex died");
+        assert!(!core.failed.contains_key(&id), "{:?}", core.failed.get(&id));
+
+        // Mail to the idle, resumed codex: rung via codex queue, acked by its hook.
+        core.send_app_message(id, "Test message. Read it with hub_inbox, then reply with the word DONE.");
+        let rung = poll(&mut core, 90, &|c| c.wakes.mark(id).is_some_and(|m| m.state == "delivered"));
+        let log = std::fs::read_to_string(mulpex_core::wake_log_path(&core.state_dir, id)).unwrap_or_default();
+        assert!(rung, "the wake was never acked: {:?}\nlog:\n{log}\n{}", core.wakes.mark(id), listing(&core));
+        eprintln!("wake ledger:\n{log}");
+        // ...and it read the mail.
+        let read = poll(&mut core, 120, &|c| {
+            std::fs::read_dir(c.state_dir.join("inbox").join(id.to_string())).map(|d| d.count()).unwrap_or(0) == 0
+        });
+        assert!(read, "the woken codex never read its inbox\n{}", listing(&core));
+        assert_eq!(core.sessions[0].session_id, thread, "the resumed codex moved to another thread");
+
+        core.teardown();
+        done(l);
+    }
+
+    /// `hub_spawn` from a codex makes a codex by default and hangs it under its
+    /// spawner; ⌘⌥S's `replace_with_agent` swaps the row's agent in place,
+    /// keeping its id, name, parent and mail, and the swap survives the store.
+    #[test]
+    #[ignore]
+    fn codex_live_spawn_default_and_replace_with_agent() {
+        let _env = env_guard();
+        let l = setup("swap");
+        // A claude that cannot log in or write into your own ~/.claude: it
+        // only has to be the process on the row.
+        let cfg = l.root.join("claude-cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        let mut core = Core::open(1, l.project_dir.clone(), &l.helper, l.root.join("state"), (100, 40)).unwrap();
+        let parent = core.spawn_agent(Agent::Codex).unwrap().id;
+        let child = core.spawn_instance_with_task_as(parent, "Reply with exactly READY.".into(), None).unwrap();
+        assert_eq!(child.kind, SessionKind::Codex, "a codex's hub_spawn defaults to codex");
+        assert_eq!(child.parent, Some(parent));
+        let ok = poll(&mut core, 120, &|c| c.session_id_of(child.id).is_some_and(|s| !s.is_empty()));
+        assert!(ok, "the child never got a thread\n{}", listing(&core));
+
+        core.send_app_message(child.id, "kept across the swap");
+        core.names.insert(child.id, "swapped row".into());
+        core.replace_with_agent(child.id, Agent::Claude, "say hi".into()).unwrap();
+        let s = core.sessions.iter().find(|s| s.id == child.id).unwrap();
+        assert_eq!(s.kind, pty::SessionKind::Claude);
+        assert!(!s.session_id.is_empty(), "a claude gets a minted id");
+        assert_eq!(core.parents.get(&child.id), Some(&parent));
+        assert_eq!(core.display_name(child.id).as_deref(), Some("swapped row"));
+        assert!(!mulpex_core::agents_path(&core.state_dir, child.id).exists(), "agents/<id> still says codex");
+        assert!(!mulpex_core::session_id_path(&core.state_dir, child.id).exists());
+        assert_eq!(
+            std::fs::read_dir(core.state_dir.join("inbox").join(child.id.to_string())).unwrap().count(),
+            1,
+            "the mail went with the old agent"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        core.reap_dead();
+        assert!(core.sessions.iter().any(|s| s.id == child.id && s.is_alive()), "{}", listing(&core));
+
+        core.teardown();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        done(l);
+    }
+
+    /// A codex restored from the store whose thread Codex does not have exits
+    /// 1 ("No saved session found") and becomes a failed row that says so,
+    /// with its record kept.
+    #[test]
+    #[ignore]
+    fn codex_live_a_bad_thread_id_restores_as_a_failed_row() {
+        let _env = env_guard();
+        let l = setup("bad");
+        let bogus = persist::new_uuid();
+        SessionStore::new(&l.project_dir).save(&[persist::SavedSession {
+            session_id: bogus.clone(),
+            name: Some("gone".into()),
+            muted: false,
+            id: Some(5),
+            parent: None,
+            collapsed: false,
+            auto_compact: None,
+            name_by: None,
+            todos: false,
+            agent: Agent::Codex,
+        }]);
+        let mut core = Core::open(1, l.project_dir.clone(), &l.helper, l.root.join("state"), (100, 40)).unwrap();
+        assert_eq!(core.sessions.len(), 1);
+        assert_eq!(core.sessions[0].kind, pty::SessionKind::Codex);
+        let failed = poll(&mut core, 30, &|c| c.failed.contains_key(&5));
+        assert!(failed, "the bad resume never failed: alive={}", core.sessions[0].is_alive());
+        let reason = core.failed[&5].clone();
+        eprintln!("reason: {reason}");
+        assert!(reason.contains("Codex could not reopen") && reason.contains(&bogus), "{reason}");
+        // The record is kept for a later try, as a codex.
+        let stored = core.store.load();
+        assert!(stored.iter().any(|s| s.session_id == bogus && s.agent == Agent::Codex), "{stored:?}");
+        core.teardown();
+        done(l);
     }
 }

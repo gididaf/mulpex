@@ -50,3 +50,6 @@ open dialog is the failure.
 ⌘⇧E's tab (`ExplainTab.svelte`) renders model output through `{@html}` — only ever via
 `lib/markdown.ts`'s sanitizer, since this webview can invoke Tauri commands.
 → [../docs/explain.md](../docs/explain.md)
+
+**Codex rows** (a second agent kind beside claude): anything that takes an `Agent` — read
+[../docs/codex.md](../docs/codex.md) first; the Claude path must stay byte-identical.

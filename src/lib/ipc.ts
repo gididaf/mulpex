@@ -24,8 +24,11 @@ export type Status = "working" | "waiting" | "needs";
 export type ProjectHandle = number;
 
 /** What a session runs. Terminals share the list, the id space and every
- *  (project, id)-keyed mechanism with instances. */
-export type SessionKind = "claude" | "shell";
+ *  (project, id)-keyed mechanism with instances. A claude and a codex are both
+ *  agents — hub peers sharing one number space (`agents.ts`, docs/codex.md). */
+export type SessionKind = "claude" | "codex" | "shell";
+/** The two agent kinds. */
+export type Agent = "claude" | "codex";
 
 export interface SessionInfo {
   id: number;
@@ -83,6 +86,25 @@ export interface StatusEntry {
   compact_phase: CompactPhase | null;
   /** Between `PreCompact` and the `SessionStart` that ends it. */
   compacting: boolean;
+  /** The last time the app rang this codex about unread mail, and how it went
+   *  (`wake.rs`). Null for a claude — its listener wakes it — and absent from
+   *  an older remote host's snapshot. */
+  wake?: WakeMark | null;
+}
+/** One wake attempt: `rang` (sent, no ack yet), `delivered` (the codex's own
+ *  hook acked it), `unanswered` (no ack in time) or `refused` (the typed
+ *  fallback found a draft in the box). */
+export interface WakeMark {
+  atMs: number;
+  state: "rang" | "delivered" | "unanswered" | "refused";
+  detail: string;
+}
+/** `codex-wake`: type `line` into codex#`id`'s box if it is empty, then answer
+ *  with `wakeTyped`. Sent only before the codex has a thread id. */
+export interface CodexWakeEvent {
+  handle: ProjectHandle;
+  id: number;
+  line: string;
 }
 export type CompactPhase = "requested" | "compacting" | "resume";
 export interface TaskEntry {
@@ -155,7 +177,7 @@ export interface HubUpdateEvent {
 }
 /** `save-progress`: one step of a ⌘S save. `detail` is the path on `done` and
  *  the reason on `error`; `title` is the save's title on `done`. */
-export type SaveState = "writing" | "checking" | "fixing" | "done" | "error";
+export type SaveState = "writing" | "checking" | "fixing" | "done" | "error" | "handed-off";
 export interface SaveProgressEvent {
   handle: ProjectHandle;
   id: number;
@@ -189,6 +211,17 @@ export const listRecentProjects = (host = 0) =>
 
 /** Whether the user's `claude` CLI was found (checked once, at startup). */
 export const claudeStatus = (host = 0) => call<ClaudeStatus>("claude_status", {}, host);
+
+/** Whether each agent's CLI was found on `host`. An older host has only
+ *  `claude_status`; it then reports no codex. */
+export async function agentStatus(host = 0): Promise<{ claude: ClaudeStatus; codex: ClaudeStatus }> {
+  try {
+    return await call<{ claude: ClaudeStatus; codex: ClaudeStatus }>("agent_status", {}, host);
+  } catch {
+    const claude = await claudeStatus(host);
+    return { claude, codex: { found: false, path: null, searched_path: "" } };
+  }
+}
 
 /** One folder's subfolders on `host` — the remote project picker's browser
  *  (a remote disk has no native folder dialog). Empty `path`: the home folder. */
@@ -232,8 +265,19 @@ export const attachSession = (
   channel: Channel<string>,
 ) => invoke<void>("attach_session", { projectHandle, id, channel });
 
-export const createSession = (projectHandle: ProjectHandle) =>
-  call<SessionInfo>("create_session", { projectHandle });
+/** ⌘T (a claude) or ⌘⌥T (`agent: "codex"`). The field is left out for a
+ *  claude, so an older remote host that doesn't know it still takes the call. */
+export const createSession = (projectHandle: ProjectHandle, agent: Agent = "claude") =>
+  call<SessionInfo>("create_session", agent === "claude" ? { projectHandle } : { projectHandle, agent });
+
+/** ⌘⌥S: hand this row's work to the other agent — the row is replaced in
+ *  place (same number, name, parent) once the handoff doc is written. */
+export const continueInOtherAgent = (projectHandle: ProjectHandle, id: number) =>
+  call<void>("continue_in_other_agent", { projectHandle, id });
+
+/** The answer to a `codex-wake`: the line was typed (`ok`), or why not. */
+export const wakeTyped = (projectHandle: ProjectHandle, id: number, ok: boolean, reason: string) =>
+  call<void>("wake_typed", { projectHandle, id, ok, reason });
 
 /** Open a plain shell terminal (⌘⇧T) in the project dir. */
 export const createTerminal = (projectHandle: ProjectHandle) =>

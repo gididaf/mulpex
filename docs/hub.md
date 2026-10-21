@@ -481,7 +481,7 @@ sessions itself, so `hub_spawn` (`mcp.rs`) is a **file handshake** through the p
 - **Fulfilment:** the 200 ms poll loop calls `Core::process_spawn_requests()` (`state.rs`), which
   consumes the request file into a `pending_spawns` queue and then **drip-feeds** it — at most one
   child per tick, and no closer together than `SPAWN_STAGGER` (500 ms) — spawning each via
-  `spawn_instance_with_task(parent_id, task)`. `<token>.done` is written only once the batch's
+  `spawn_instance_with_task_as(parent_id, task, agent)`. `<token>.done` is written only once the batch's
   last child is up, so the caller still gets every id in one reply. If anything spawned it emits
   `sessions-changed` so the frontend builds the new xterms (the existing reap path already
   republishes on removal; added sessions ride the same event via `TerminalPane`'s keyed
@@ -574,7 +574,7 @@ lost task would say:
 
 So the spawn path now publishes what it knows, and the API stops asserting what it doesn't:
 
-- **`spawn_instance_with_task` seeds `tasks/<id>` with the assignment before the child exists**, so
+- **`spawn_instance_with_task_as` seeds `tasks/<id>` with the assignment before the child exists**, so
   `hub_instances` shows what it was sent instead of `""`. (Removed again if the spawn itself
   fails, so a number handed to somebody else can't inherit it.)
 - **Delivery publishes a verdict to `spawning/<id>`** (`mulpex_core::spawn_delivery_path`):
@@ -619,7 +619,7 @@ a status file, so they are indistinguishable without the marker),
 
 The one that actually guards the mechanism is
 `state::a_spawned_child_receives_its_whole_task_on_its_command_line`: it runs the real production
-path (`spawn_instance_with_task` → `Session::spawn` → `CommandBuilder` → `exec`) against a stub
+path (`spawn_instance_with_task_as` → `Session::spawn` → `CommandBuilder` → `exec`) against a stub
 `claude` on `PATH` that records its argv, and asserts a 6,000-character task arrives whole. A unit
 test on the prompt builder cannot catch a return to typing — only reading the child's real argv
 can. It is `#[ignore]`d because it must own the process (`claude_bin`'s `merged_path` and
@@ -805,3 +805,7 @@ by the user). Comments always count. The outbox is **saved in the board file**, 
   old file is renamed `.migrated`.
 - **Every change marks the store dirty**; the poll loop emits `board-changed {handle}` (forwarded
   to remote desktops) and bumps `board_rev` in the phone's view.
+
+## Codex instances
+
+A codex is a full hub peer: same MCP server (tool names are `mcp__mulpex__hub_*` there too, but the server gets its `MULPEX_*` through an explicit `env` table — it does not inherit), hooks passed per launch, `codex#N` addresses in the shared number space (`parse_address` accepts it; `hub_instances` reports `agent` and `address`, read from `agents/<id>`). `hub_spawn` takes `agent` (default: the spawner's), `hub_remote_open` takes `agent` (default claude). Codex has no monitors, so the **app** wakes it: `wake.rs` runs `codex queue` and counts a ring only when the codex's UserPromptSubmit hook acks it (`wake/<id>.ack`), shown on the row either way. → [codex.md](codex.md)

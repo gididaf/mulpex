@@ -233,7 +233,7 @@ and terminals are never nested.
   sibling" impossible.
 
 - **The link is backend state.** `Core::parents` (child → spawner) is recorded in
-  `spawn_instance_with_task`, but only when the spawner is a live claude here — a terminal or an
+  `spawn_instance_with_task_as`, but only when the spawner is a live claude here — a terminal or an
   unknown id makes a root. It reaches the frontend as `SessionInfo.parent`, and is saved as the
   store's 5th column (see `docs/sessions.md`); on restore a parent that did not come back is dropped.
   When a parent closes, `reap_dead` hands its children up one level (grandparent, or top), so a
@@ -555,3 +555,7 @@ the snapshot. Counting tokens off the transcript instead would mean guessing the
 To leave their pane looking the same, the helper finds their own `statusLine.command` (project
 `settings.local.json`, then project `settings.json`, then user `settings.json`) and runs it with
 the same stdin, printing what it prints (5 s timeout, and an env guard against running itself).
+
+## Codex rows
+
+A row is `claude`, `codex` or `shell` (`SessionInfo.kind`); every label and address goes through `lib/agents.ts` (`rowLabel` → `codex #2`, `addr` → `codex#2`), and codexes share the claude block in the sidebar order. A codex row carries a small `>_` glyph. **⌘⌥T** opens a codex (after `agentStatus` confirms one is installed, else a notice); **⌘⌥S** "Continue in Codex / Continue in Claude" hands the row's work to the other agent in the same row (confirm first). The wake mark comes from `StatusEntry.wake`: 🔔 rang/delivered (fades in 30 s), amber ⚠ unanswered/refused (stays, counts toward the red badges). `promptbox.ts::readPromptBox(…, agent)` has a codex reader keyed on the composer's bold `›`. → [codex.md](codex.md)

@@ -1,16 +1,20 @@
 <script lang="ts">
   import type { SaveStatus } from "../stores";
+  import type { SessionKind } from "../ipc";
+  import { rowLabel } from "../agents";
 
   // ⌘S stopped this claude (`Core::begin_save`); its pane stays locked under
   // this card until the save ends and the user closes the row. Covering the
   // whole pane is also what keeps clicks off the dead xterm.
   let {
     id,
+    kind = "claude",
     status,
     onclose,
     onretry,
   }: {
     id: number;
+    kind?: SessionKind;
     status: SaveStatus;
     onclose: () => void;
     onretry: () => void;
@@ -20,12 +24,12 @@
   const running = $derived(status.state in STEP);
 </script>
 
-<div class="lock" role="dialog" aria-label="Saving claude #{id}">
+<div class="lock" role="dialog" aria-label="Saving {rowLabel(kind, id)}">
   <div class="card">
     {#if running}
-      <div class="head">Saving claude #{id}…</div>
+      <div class="head">Saving {rowLabel(kind, id)}…</div>
       <div class="step">{status.state}</div>
-      <div class="note">This claude is stopped. You can close it once the save is done.</div>
+      <div class="note">It is stopped. You can close it once the save is done.</div>
     {:else if status.state === "done"}
       <div class="head ok">Saved ✓</div>
       {#if status.title}<div class="title" dir="rtl">{status.title}</div>{/if}

@@ -932,3 +932,7 @@ with no migration. Its own line reads `auto-compact: …`, without the `(claude#
   the statusline only rewrites it on its next draw. With nested rules the lowest threshold on a claude
   (its own rule or an ancestor's) decides when it is released.
 - The child's sidebar line says who asked: `auto-compact (claude#3): waiting for checkpoint…`.
+
+## Codex rows
+
+A codex row stores its agent in the store's 10th column (`codex`; absent = claude) and starts with an **empty** session id: Codex mints its own, and its SessionStart hook (which fires only at the first prompt) reports it to `sessionid/<id>`, where `reconcile_session_ids` adopts it as for a claude. A row with no id yet is not persisted. Restore and ⌘⇧R keep the agent and run `codex resume <id>`; an unknown id exits 1 and lands in the usual failed-start row with Codex wording. A turn that errors fires no Stop hook, so the app reads the rollout tail to return the row to `waiting`. → [codex.md](codex.md)

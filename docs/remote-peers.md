@@ -227,3 +227,5 @@ model, so it must not stop at a permission prompt no human will ever see — but
 real and worth stating plainly: **a remote claude runs unsupervised, with permissions skipped, doing
 whatever the driving instance asks of it.**
 
+
+**Codex peers:** `hub_remote_open` takes `agent: "codex"`; the launch line passes the rules as `developer_instructions` and the trust table, and the watcher reads the codex screen with `looks_like_tui`/`has_spinner_for(Agent::Codex)` (fixtures in `crates/mulpex-core/tests/fixtures`). Default stays claude.

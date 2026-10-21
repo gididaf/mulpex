@@ -47,6 +47,8 @@ const CHORDS: Record<string, string> = {
   KeyQ: "quit",
   "A-BracketRight": "next_host",
   "A-BracketLeft": "prev_host",
+  "A-KeyT": "new_codex_session",
+  "A-KeyS": "continue_other_agent",
 };
 for (let n = 1; n <= 9; n++) CHORDS[`Digit${n}`] = `project_${n}`;
 

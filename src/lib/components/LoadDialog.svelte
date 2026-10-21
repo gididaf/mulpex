@@ -10,6 +10,8 @@
     loadGuide,
   } from "../ipc";
   import type { LoadResult, GuideEntry, ProjectHandle, SaveEntry } from "../ipc";
+  import { rowLabel } from "../agents";
+  import { projects } from "../stores";
 
   // ⌘L: two tabs over the active project's repo.
   // - Saves (`mulpex/saves/`): unfinished work. Enter starts a claude on one.
@@ -263,7 +265,10 @@
                 disabled={busy}
               >
                 {saves?.find((e) => e.file === r.file)?.open_as != null
-                  ? `Go to claude #${saves?.find((e) => e.file === r.file)?.open_as}`
+                  ? `Go to ${rowLabel(
+                      $projects.get(handle)?.sessions.find((s) => s.id === saves?.find((e) => e.file === r.file)?.open_as)?.kind,
+                      saves?.find((e) => e.file === r.file)?.open_as ?? 0,
+                    )}`
                   : "Continue conversation"}
               </button>
               <button

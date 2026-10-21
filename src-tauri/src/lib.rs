@@ -1,6 +1,7 @@
 //! Tauri app wiring: managed state, command surface, native menu + event
 //! forwarding, the poll-loop startup, and deterministic teardown on exit.
 
+mod agent_transcript;
 mod broadcast;
 mod checkpoint;
 mod remote_update;
@@ -23,6 +24,9 @@ mod saves;
 mod secrets;
 mod snapshot;
 mod state;
+mod wake;
+mod headless;
+mod handoff;
 pub(crate) use mulpex_ptyd::vtgrid;
 // Read by `build.rs`; the app itself only needs `env!("MULPEX_WIRE")`.
 #[cfg(test)]
@@ -60,6 +64,8 @@ fn is_forwarded(id: &str) -> bool {
             | "move_project_left"
             | "move_project_right"
             | "new_session"
+            | "new_codex_session"
+            | "continue_other_agent"
             | "new_terminal"
             | "close_session"
             | "rename"
@@ -145,6 +151,9 @@ pub fn run() {
             commands::bootstrap,
             commands::list_recent_projects,
             commands::claude_status,
+            commands::agent_status,
+            commands::wake_typed,
+            handoff::continue_in_other_agent,
             commands::open_project,
             commands::close_project,
             commands::switch_project,

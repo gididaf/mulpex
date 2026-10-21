@@ -22,4 +22,6 @@ pub const FILES: &[&str] = &[
     "../crates/mulpex-core/src/mcp.rs",
     "../crates/mulpex-core/src/listen.rs",
     "../crates/mulpex-core/src/registry.rs",
+    // A codex's hooks, MCP server env and rules ride its argv (`launch_args`).
+    "../crates/mulpex-core/src/codex.rs",
 ];

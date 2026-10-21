@@ -252,3 +252,7 @@ The full chain was run on real conversations with a Python probe, then through `
   **includes the original conversation's cost**, so read `modelUsage` for the real number.
 - **The check step earns its cost.** On the first real save it found a crash path the draft never
   mentioned, and the fix step made it item #1 of "Left".
+
+## Codex rows and the handoff
+
+⌘S on a codex forks it with `codex exec fork <id> --ephemeral -c sandbox_mode="read-only"` (`headless.rs`; the original rollout is left byte-identical). `save-links.tsv` gains a 5th column `codex`. **⌘⌥S Continue in Codex / Claude** (`handoff.rs`) runs only the write step: the source agent forks and writes the doc; if it is out of quota / unauthorized / missing, the target agent writes it from a rendered transcript (`agent_transcript::render`, last 120 KB); then `Core::replace_with_agent` respawns the same row as the other agent with the doc as its first prompt. → [codex.md](codex.md)

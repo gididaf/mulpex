@@ -30,6 +30,7 @@
     type ProjectHandle,
   } from "../stores";
   import type { Status } from "../ipc";
+  import { isAgent, rowLabel } from "../agents";
   import { terminals } from "../terminals";
   import { hosts, slotOf } from "../hosts";
 
@@ -138,10 +139,10 @@
       out.push({
         key: `s${s.id}`,
         group: "Sessions",
-        title: shell ? `term #${s.id}` : `claude #${s.id}`,
+        title: rowLabel(s.kind, s.id),
         sub: s.name || task || fallback,
         keys: "",
-        hay: `${shell ? "term" : "claude"} #${s.id} ${s.name} ${task}`,
+        hay: `${rowLabel(s.kind, s.id)} ${s.name} ${task}`,
         dot: shell || s.muted ? undefined : DOT[st],
         sigil: shell,
         current: s.id === $activeId,
@@ -154,15 +155,22 @@
     // without a confirmation step, matching ⌘W / ⌘⇧W exactly — the palette is a
     // second door to the same command, not a different one.
     const cur = $sessions.find((s) => s.id === $activeId) ?? null;
-    const isClaude = cur != null && cur.kind !== "shell";
+    const isClaude = cur != null && isAgent(cur.kind);
     const acts: Array<[string, string, string, boolean]> = [
       ["new_session", "New Session", "⌘T", true],
+      ["new_codex_session", "New Codex Session", "⌘⌥T", true],
       ["new_terminal", "New Terminal", "⌘⇧T", true],
       ["rename", "Rename Session…", "⌘R", cur != null],
       // Confirmed even from here, unlike ⌘W/⌘⇧W: it kills a process that may be
       // mid-turn, so the dialog is part of the command rather than of the menu.
       ["restart", "Restart Session…", "⌘⇧R", isClaude],
       ["save_session", "Save Session…", "⌘S", isClaude],
+      [
+        "continue_other_agent",
+        `Continue in ${cur?.kind === "codex" ? "Claude" : "Codex"}…`,
+        "⌘⌥S",
+        isClaude,
+      ],
       ["request_compact", "Request Compact", "⌘⇧K", isClaude],
       ["ask_all", "Ask All Claudes…", "⌘⇧B", true],
       ["load_session", "Load Session…", "⌘L", true],

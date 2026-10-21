@@ -1,5 +1,6 @@
 <script lang="ts">
   import { sessions, activeId, notice, unread } from "../stores";
+  import { rowLabel } from "../agents";
 
   const active = $derived(
     $activeId == null ? null : ($sessions.find((x) => x.id === $activeId) ?? null),
@@ -8,7 +9,7 @@
   const activeLabel = $derived(
     active == null
       ? "no active session"
-      : `${active.kind === "shell" ? "term" : "claude"} #${active.id}`,
+      : rowLabel(active.kind, active.id),
   );
 
   /**

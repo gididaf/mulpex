@@ -3,6 +3,7 @@
   import { renameSession } from "../ipc";
   import { terminals } from "../terminals";
   import { get } from "svelte/store";
+  import { rowLabel } from "../agents";
 
   let value = $state(get(rename)?.value ?? "");
   let inputEl: HTMLInputElement | undefined = $state();
@@ -11,7 +12,7 @@
     const r = $rename;
     if (!r) return "";
     const s = $projects.get(r.handle)?.sessions.find((x) => x.id === r.id);
-    return `${s?.kind === "shell" ? "term" : "claude"} #${r.id}`;
+    return rowLabel(s?.kind, r.id);
   });
 
   $effect(() => {

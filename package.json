@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "node --test src/lib/*.test.mjs",
     "tauri": "tauri",
     "tauri:dev": "bash scripts/tauri-dev.sh",
     "tauri:build": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.mulpex/updater.key})\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" tauri build",

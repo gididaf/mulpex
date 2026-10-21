@@ -306,6 +306,146 @@ pub fn peer_rules(token: &str) -> String {
     )
 }
 
+/// [`peer_rules`] for a remote of either agent. Claude's text is unchanged; a
+/// codex is told it is a Codex instance and that its driver may be either.
+pub fn peer_rules_for(agent: crate::agent::Agent, token: &str) -> String {
+    let text = peer_rules(token);
+    match agent {
+        crate::agent::Agent::Claude => text,
+        crate::agent::Agent::Codex => text
+            .replacen("You are a REMOTE CLAUDE CODE INSTANCE.", "You are a REMOTE CODEX INSTANCE.", 1)
+            .replacen(
+                "by ANOTHER Claude Code instance (running in Mulpex on the user's Mac)",
+                "by ANOTHER coding agent (a Claude Code or Codex instance running in Mulpex on the \
+                 user's Mac)",
+                1,
+            ),
+    }
+}
+
+/// The `rules_b64` a [`remote_launch_command_for`] of this agent expects.
+/// Claude reads the rules raw (`--append-system-prompt`); Codex reads them as a
+/// `-c developer_instructions=` TOML value, so the decoded text must already be
+/// a quoted TOML string — otherwise Codex would try to parse the rules
+/// themselves as TOML.
+pub fn rules_b64_for(agent: crate::agent::Agent, token: &str) -> String {
+    let rules = peer_rules_for(agent, token);
+    match agent {
+        crate::agent::Agent::Claude => b64(rules.as_bytes()),
+        crate::agent::Agent::Codex => b64(crate::codex::toml_str(&rules).as_bytes()),
+    }
+}
+
+/// [`remote_launch_command`] for either agent. Claude's string is exactly the
+/// old one. A codex runs with its yolo flag, no alt screen, the update picker
+/// off, and the far directory (and its git root) trusted for this launch only —
+/// computed by the remote shell after the `cd`, since only it knows where it is.
+pub fn remote_launch_command_for(
+    agent: crate::agent::Agent,
+    cwd: Option<&str>,
+    rules_b64: &str,
+    replace_shell: bool,
+    task_b64: Option<&str>,
+) -> String {
+    if agent == crate::agent::Agent::Claude {
+        return remote_launch_command(cwd, rules_b64, replace_shell, task_b64);
+    }
+    let cd = match cwd {
+        Some(dir) => format!("cd {} && ", quote_path(dir)),
+        None => String::new(),
+    };
+    let exec = if replace_shell { "exec " } else { "" };
+    let task = match task_b64 {
+        Some(b64) => format!(" \"$(printf %s '{b64}' | base64 -d)\""),
+        None => String::new(),
+    };
+    // One inline table, no duplicate key (TOML rejects one, and Codex would then
+    // read the whole value as a raw string and trust nothing).
+    let trust = "T=\"\\\"$PWD\\\"={trust_level=\\\"trusted\\\"}\"; \
+                 G=$(git rev-parse --show-toplevel 2>/dev/null); \
+                 if [ -n \"$G\" ] && [ \"$G\" != \"$PWD\" ]; then \
+                 T=\"$T,\\\"$G\\\"={trust_level=\\\"trusted\\\"}\"; fi; ";
+    format!(
+        "{cd}{trust}{exec}codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen \
+         -c check_for_update_on_startup=false -c \"projects={{$T}}\" \
+         -c \"developer_instructions=$(printf %s {rules_b64} | base64 -d)\"{task}"
+    )
+}
+
+/// [`ssh_command`] for either agent.
+pub fn ssh_command_for(
+    agent: crate::agent::Agent,
+    ssh_target: &str,
+    cwd: Option<&str>,
+    rules_b64: &str,
+    task_b64: Option<&str>,
+) -> String {
+    format!(
+        "ssh -tt {} {}",
+        shell_quote(ssh_target),
+        shell_quote(&remote_launch_command_for(agent, cwd, rules_b64, true, task_b64))
+    )
+}
+
+/// Which agent a remote terminal runs: the `agent` key `write_agent` adds to its
+/// meta file. Absent (every terminal opened before Codex) → Claude.
+pub fn agent_of(state_dir: &Path, id: usize) -> crate::agent::Agent {
+    std::fs::read_to_string(meta_path(state_dir, id))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("agent")?.as_str().and_then(crate::agent::Agent::parse))
+        .unwrap_or_default()
+}
+
+/// Record a remote terminal's agent in its meta file, after `RemoteMeta::write`.
+pub fn write_agent(state_dir: &Path, id: usize, agent: crate::agent::Agent) -> std::io::Result<()> {
+    let path = meta_path(state_dir, id);
+    let raw = std::fs::read_to_string(&path)?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw).map_err(std::io::Error::other)?;
+    v["agent"] = serde_json::Value::String(agent.word().into());
+    std::fs::write(path, v.to_string())
+}
+
+/// [`looks_like_claude_tui`] for either agent.
+pub fn looks_like_tui(agent: crate::agent::Agent, screen: &str) -> bool {
+    match agent {
+        crate::agent::Agent::Claude => looks_like_claude_tui(screen),
+        crate::agent::Agent::Codex => looks_like_codex_tui(screen),
+    }
+}
+
+/// [`has_spinner`] for either agent.
+pub fn has_spinner_for(agent: crate::agent::Agent, screen: &str) -> bool {
+    match agent {
+        crate::agent::Agent::Claude => has_spinner(screen),
+        crate::agent::Agent::Codex => codex_working(screen),
+    }
+}
+
+/// Whether a screen looks like a live Codex TUI at its composer: a line that
+/// starts with the `›` caret (S15), and the footer under it that names the
+/// model and the directory (`gpt-5.5 high · ~/src/app`). Measured on real codex
+/// screens (`crates/mulpex-core/tests/fixtures/codex-*.txt`).
+pub fn looks_like_codex_tui(screen: &str) -> bool {
+    // Blank rows below the footer (a tall window) are not part of the look.
+    let tail: Vec<&str> = screen.lines().rev().filter(|l| !l.trim().is_empty()).take(12).collect();
+    let caret = tail.iter().any(|l| l.trim_start().starts_with('›'));
+    let footer = tail.iter().any(|l| l.contains(" · ") && !l.trim_start().starts_with('›'));
+    caret && footer
+}
+
+/// Whether a codex is visibly mid-turn: its status line reads
+/// `• Working (12s • esc to interrupt)` — matched on the interrupt hint, which
+/// is the stable part, not the verb.
+pub fn codex_working(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(12)
+        .any(|l| l.contains("esc to interrupt"))
+}
+
 /// The remote half of the launch command line: what runs on the far machine.
 ///
 /// Two non-obvious pieces.
@@ -787,6 +927,93 @@ mod tests {
         // With no cwd there is no `cd`, so the launch inherits wherever the
         // user had already navigated to.
         assert!(!remote_launch_command(None, "B64", false, None).contains("cd "));
+    }
+
+    /// The codex launch, run for real by `sh` (with a fake `codex` that prints
+    /// its argv): the trust table is one valid inline table with the cwd and,
+    /// when different, its git root; the rules decode to a TOML string; the
+    /// task is the last argument; and Claude's string is untouched.
+    #[test]
+    fn a_codex_remote_launch_runs_in_a_real_shell() {
+        use crate::agent::Agent;
+        let base = std::env::temp_dir().join(format!("mpx-rcodex-{}", crate::persist::new_uuid()));
+        let bin = base.join("bin");
+        let repo = base.join("re po");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let fake = bin.join("codex");
+        std::fs::write(&fake, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n").unwrap();
+        std::process::Command::new("chmod").arg("+x").arg(&fake).status().unwrap();
+        let git = std::process::Command::new("git").arg("init").arg("-q").arg(&repo).status();
+        if !git.is_ok_and(|s| s.success()) {
+            return; // no git on this box
+        }
+        let rules = rules_b64_for(Agent::Codex, TOK);
+        let task = b64("do the \"thing\" now".as_bytes());
+        let cmd = remote_launch_command_for(Agent::Codex, Some(&sub.display().to_string()), &rules, false, Some(&task));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let args: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|a| !a.is_empty())
+            .map(String::from)
+            .collect();
+        assert_eq!(args[0], "--dangerously-bypass-approvals-and-sandbox", "{args:?} {}", String::from_utf8_lossy(&out.stderr));
+        let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap().display().to_string();
+        let trust = args.iter().find(|a| a.starts_with("projects=")).expect("trust arg");
+        let pwd_sub = trust.contains(&format!("\"{}\"", sub.display())) || trust.contains(&format!("\"{}\"", real(&sub)));
+        assert!(pwd_sub, "{trust}");
+        assert!(trust.contains(&format!("\"{}\"={{trust_level=\"trusted\"}}", real(&repo))), "{trust}");
+        assert!(trust.starts_with("projects={\"") && trust.ends_with("}}"), "{trust}");
+        let dev = args.iter().find(|a| a.starts_with("developer_instructions=")).unwrap();
+        let decoded: String = serde_json::from_str(dev.strip_prefix("developer_instructions=").unwrap()).unwrap();
+        assert_eq!(decoded, peer_rules_for(Agent::Codex, TOK));
+        assert!(decoded.contains("REMOTE CODEX INSTANCE"));
+        assert_eq!(args.last().unwrap(), "do the \"thing\" now");
+        // Claude's launch is the old string, byte for byte.
+        assert_eq!(
+            remote_launch_command_for(Agent::Claude, Some("/srv"), "R", true, None),
+            remote_launch_command(Some("/srv"), "R", true, None)
+        );
+        assert_eq!(peer_rules_for(Agent::Claude, TOK), peer_rules(TOK));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Screens captured from a real codex 0.149.1 TUI in tmux (paths scrubbed):
+    /// at its composer, mid-turn, and after the turn.
+    #[test]
+    fn codex_screens_are_recognised_from_real_captures() {
+        use crate::agent::Agent;
+        let idle = include_str!("../tests/fixtures/codex-idle.txt");
+        let working = include_str!("../tests/fixtures/codex-working.txt");
+        let done = include_str!("../tests/fixtures/codex-done.txt");
+        for s in [idle, working, done] {
+            assert!(looks_like_tui(Agent::Codex, s));
+            assert!(!looks_like_claude_tui(s), "a codex screen read as a claude");
+        }
+        assert!(has_spinner_for(Agent::Codex, working));
+        assert!(!has_spinner_for(Agent::Codex, idle));
+        assert!(!has_spinner_for(Agent::Codex, done));
+        assert!(!looks_like_codex_tui("gidi@mac ~ % codex\nzsh: command not found: codex\n"));
+    }
+
+    #[test]
+    fn the_agent_of_a_remote_terminal_rides_its_meta_file() {
+        use crate::agent::Agent;
+        let dir = std::env::temp_dir().join(format!("mpx-ragent-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = RemoteMeta { token: TOK.into(), ssh_target: "h".into(), opener: 1 };
+        meta.write(&dir, 3).unwrap();
+        assert_eq!(agent_of(&dir, 3), Agent::Claude);
+        write_agent(&dir, 3, Agent::Codex).unwrap();
+        assert_eq!(agent_of(&dir, 3), Agent::Codex);
+        assert_eq!(RemoteMeta::read(&dir, 3), Some(meta));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
