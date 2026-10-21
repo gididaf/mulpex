@@ -544,7 +544,7 @@ impl Core {
                     .map(|r| r.session_id.clone())
                     .filter(|u| !u.is_empty())
                     .unwrap_or_else(|| info["meta"]["session_id"].as_str().unwrap_or("").to_string());
-                let kind = if shell { pty::SessionKind::Shell } else { pty::SessionKind::Claude };
+                let kind = pty::SessionKind::from_word(info["meta"]["kind"].as_str().unwrap_or("claude"));
                 match Session::adopt(id, kind, &session_id, info, crate::ptyd::take_snapshot(&state_dir, id)) {
                     Ok(session) => {
                         used.insert(id);
@@ -613,7 +613,8 @@ impl Core {
                 &project_dir,
                 geometry.1,
                 geometry.0,
-                SpawnSpec::Claude {
+                SpawnSpec::Agent {
+                    agent: mulpex_core::agent::Agent::Claude,
                     settings_path: &settings_path,
                     state_dir: &state_dir,
                     helper_path,
@@ -934,7 +935,8 @@ impl Core {
             &self.project_dir,
             self.geometry.1,
             self.geometry.0,
-            SpawnSpec::Claude {
+            SpawnSpec::Agent {
+                agent: mulpex_core::agent::Agent::Claude,
                 settings_path: &self.settings_path,
                 state_dir: &self.state_dir,
                 helper_path: &self.helper_path,
@@ -1982,7 +1984,8 @@ impl Core {
             &self.project_dir,
             self.geometry.1,
             self.geometry.0,
-            SpawnSpec::Claude {
+            SpawnSpec::Agent {
+                agent: mulpex_core::agent::Agent::Claude,
                 settings_path: &settings_path,
                 state_dir: &state_dir,
                 helper_path: &helper_path,
@@ -3193,10 +3196,10 @@ fn auto_compact_message(pct: Option<u8>) -> String {
 }
 
 fn kind_of(s: &Session) -> SessionKind {
-    if s.is_shell() {
-        SessionKind::Shell
-    } else {
-        SessionKind::Claude
+    match s.kind {
+        pty::SessionKind::Claude => SessionKind::Claude,
+        pty::SessionKind::Codex => SessionKind::Codex,
+        pty::SessionKind::Shell => SessionKind::Shell,
     }
 }
 

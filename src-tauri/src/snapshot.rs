@@ -51,7 +51,34 @@ impl Status {
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
     Claude,
+    Codex,
     Shell,
+}
+
+impl SessionKind {
+    /// The coding agent this row runs, or `None` for a terminal.
+    pub fn agent(self) -> Option<mulpex_core::agent::Agent> {
+        use mulpex_core::agent::Agent;
+        match self {
+            SessionKind::Claude => Some(Agent::Claude),
+            SessionKind::Codex => Some(Agent::Codex),
+            SessionKind::Shell => None,
+        }
+    }
+
+    /// A claude or a codex — a hub peer, not a terminal.
+    pub fn is_agent(self) -> bool {
+        self != SessionKind::Shell
+    }
+}
+
+impl From<mulpex_core::agent::Agent> for SessionKind {
+    fn from(a: mulpex_core::agent::Agent) -> Self {
+        match a {
+            mulpex_core::agent::Agent::Claude => SessionKind::Claude,
+            mulpex_core::agent::Agent::Codex => SessionKind::Codex,
+        }
+    }
 }
 
 /// One session as the sidebar shows it.

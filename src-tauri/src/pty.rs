@@ -30,6 +30,7 @@ use crate::ptyd;
 /// grammar), so it has exactly one copy. Re-exported here because `state.rs`
 /// builds a `SpawnTask`.
 pub use mulpex_core::rules::SpawnTask;
+use mulpex_core::agent::Agent;
 use mulpex_core::rules::{append_system_prompt, spawn_prompt};
 
 /// What is running on a session's PTY. The two kinds share every mechanism that
@@ -39,13 +40,55 @@ use mulpex_core::rules::{append_system_prompt, spawn_prompt};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
     Claude,
+    Codex,
     Shell,
+}
+
+impl SessionKind {
+    /// The coding agent this session runs, or `None` for a terminal.
+    pub fn agent(self) -> Option<Agent> {
+        match self {
+            SessionKind::Claude => Some(Agent::Claude),
+            SessionKind::Codex => Some(Agent::Codex),
+            SessionKind::Shell => None,
+        }
+    }
+
+    pub fn is_agent(self) -> bool {
+        self != SessionKind::Shell
+    }
+
+    /// The daemon-meta / wire word: `claude`, `codex` or `shell`.
+    pub fn word(self) -> &'static str {
+        self.agent().map_or("shell", Agent::word)
+    }
+
+    /// Inverse of [`word`](Self::word). Anything unknown is a claude — the
+    /// pre-Codex meaning of "not a shell".
+    pub fn from_word(w: &str) -> Self {
+        match w {
+            "shell" => SessionKind::Shell,
+            "codex" => SessionKind::Codex,
+            _ => SessionKind::Claude,
+        }
+    }
+}
+
+impl From<Agent> for SessionKind {
+    fn from(a: Agent) -> Self {
+        match a {
+            Agent::Claude => SessionKind::Claude,
+            Agent::Codex => SessionKind::Codex,
+        }
+    }
 }
 
 /// Everything kind-specific about a spawn, so `Session::spawn` takes one
 /// argument instead of a growing tail of claude-only ones.
 pub enum SpawnSpec<'a> {
-    Claude {
+    /// A coding agent — a claude or a codex.
+    Agent {
+        agent: Agent,
         settings_path: &'a Path,
         state_dir: &'a Path,
         /// Absolute path of `mulpex-helper`. The hooks and MCP server reach it
@@ -71,7 +114,7 @@ pub enum SpawnSpec<'a> {
 impl SpawnSpec<'_> {
     fn kind(&self) -> SessionKind {
         match self {
-            SpawnSpec::Claude { .. } => SessionKind::Claude,
+            SpawnSpec::Agent { agent, .. } => SessionKind::from(*agent),
             SpawnSpec::Shell { .. } => SessionKind::Shell,
         }
     }
@@ -637,7 +680,8 @@ impl Session {
         // scratch dir, and the optional first thing to type in. Everything after
         // this point is kind-agnostic.
         let (cmd, state_dir, session_id, initial_task, seed) = match spec {
-            SpawnSpec::Claude {
+            SpawnSpec::Agent {
+                agent: _,
                 settings_path,
                 state_dir,
                 helper_path,
@@ -787,7 +831,7 @@ impl Session {
         // listener therefore has to notice on its own, and a pid it can probe is
         // the smallest thing that lets it. Claude sessions only: a shell terminal
         // is never a hub peer and has no listener.
-        if let (SessionKind::Claude, Some(pid)) = (kind, child_pid) {
+        if let (true, Some(pid)) = (kind.is_agent(), child_pid) {
             let dir = state_dir.join(mulpex_core::PIDS_DIR);
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(dir.join(id.to_string()), pid.to_string());
@@ -953,7 +997,7 @@ impl Session {
     /// Started on a build whose spawn-frozen code differs from this one: it
     /// runs old hub rules/tools until ⌘⇧R. Never true for a terminal.
     pub fn outdated(&self) -> bool {
-        self.kind == SessionKind::Claude && self.spawn_print != SPAWN_PRINT
+        self.kind.is_agent() && self.spawn_print != SPAWN_PRINT
     }
 
     /// The daemon's handle for this PTY.
@@ -1076,7 +1120,7 @@ impl Session {
 /// own, never this build's on a republish, or a rename would clear the badge.
 fn meta_of(kind: SessionKind, id: usize, session_id: &str, print: &str) -> serde_json::Value {
     serde_json::json!({
-        "kind": if kind == SessionKind::Shell { "shell" } else { "claude" },
+        "kind": kind.word(),
         "id": id,
         "session_id": session_id,
         "print": print,

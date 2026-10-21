@@ -14,6 +14,7 @@
 // `mcp.rs`'s tool list is one `json!` literal, deeper than the default 128.
 #![recursion_limit = "256"]
 
+pub mod agent;
 pub mod config;
 pub mod hook;
 pub mod listen;

@@ -548,7 +548,7 @@ pub fn project_view(
         .iter()
         .map(|s| {
             let st = snap.statuses.iter().find(|e| e.id == s.id);
-            let claude = s.kind == SessionKind::Claude;
+            let claude = s.kind.is_agent();
             // The open question or plan, while the claude is waiting on it.
             let needs = claude && st.is_some_and(|e| e.status == crate::snapshot::Status::Needs);
             let dialog = if needs { dialog::read(state_dir, s.id) } else { None };
@@ -950,7 +950,7 @@ fn transcript_of(handle: ProjectHandle, id: usize) -> Option<PathBuf> {
     let state = app.state::<crate::state::AppState>();
     let ws = state.ws.lock().unwrap();
     let core = ws.project(handle)?;
-    let s = core.sessions.iter().find(|s| s.id == id && s.kind == crate::pty::SessionKind::Claude)?;
+    let s = core.sessions.iter().find(|s| s.id == id && s.kind.is_agent())?;
     Some(crate::saves::transcript_path(&core.project_dir, &s.session_id))
 }
 
