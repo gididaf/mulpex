@@ -167,6 +167,7 @@ pub fn run() {
             commands::reparent_session,
             commands::rename_session,
             commands::set_compact_phase,
+            commands::compact_give_up,
             commands::set_session_muted,
             commands::get_pins,
             commands::set_pin,

@@ -819,23 +819,43 @@ A claude can't run `/compact` on itself, and compacting mid-step loses the step.
   older than the status). Measured on claude 2.1.302 in tmux: `/compact` at the idle prompt with a
   `sleep 150` shell running compacted, the shell survived it, and its completion still woke the
   claude afterwards. The hub listener never caused this — it is a watcher, not `bg` work.
-- **`resume`** — `hook::sessionstart` (source `compact`) flips `compacting` → `resume`, only from
-  `compacting`, so an automatic compaction during `requested` does not skip the checkpoint. The app
-  types the resume prompt (bracketed paste + `\r`, like Remote Control) at the next empty box and
-  deletes the file.
+- **`resume`** — the end of a compaction (`hook::end_compaction`: claude's `SessionStart[compact]`,
+  codex's `PostCompact`) flips `compacting` → `resume`. It also flips **`requested`** → `resume` when
+  the compaction was **manual**: someone typed `/compact` by hand before the app did, and that is the
+  compact the request was for. An *automatic* compaction during `requested` stays `requested`, so it
+  does not skip the checkpoint. The app types the resume prompt (bracketed paste + `\r`, like Remote
+  Control) at the next empty box and deletes the file.
 
 The **frontend drives every step** because only it can read the input box; the file is what the
-hook and the phone see. It polls every 300 ms while a request exists — the box emptying is not a hub
-change. Pressing ⌘⇧K again cancels (after `/compact` is typed, that only skips the resume prompt).
-In-memory by design: a restart, ⌘⇧R or the row exiting drops it (`forget_session_files`, the
-⌘⇧R cleanup, `dropCompact`).
+hook and the phone see. It steps every 300 ms while a request exists (the box emptying is not a hub
+change) **and on every hub update** of that project, each request isolated so one throwing row
+cannot stall the rest. Pressing ⌘⇧K again cancels (after `/compact` is typed, that only skips the
+resume prompt). In-memory by design: a restart, ⌘⇧R or the row exiting drops it
+(`forget_session_files`, the ⌘⇧R cleanup, `dropCompact`, which also clears the file).
+
+**A request never waits forever, and never leaves its claude stopped.** The claude was told to stop
+and wait, so every way a request can end without the compact sends it a hub message
+(`compact_give_up` → `Core::give_up_compact`) telling it to carry on — never typed, since typing is
+what failed. The sidebar line reads "compact didn't run: <why>" for 6 s.
+- **The turn is over but the box can't be typed into** (a draft, or a screen `promptbox.ts` does not
+  recognize) for 60 s (`IDLE_GIVE_UP_MS`), in `requested` *or* `resume`. From `resume` the message is
+  the resume prompt itself.
+- **A phase file with no request behind it** (a reload, a crashed window, a row Mulpex lost track
+  of): `sweepOrphans` ends it on the next hub update and sends the same message. A file we cleared
+  ourselves within 5 s is skipped — that is a snapshot lagging our own write.
+- **The `compacting` failures below.**
+
+Seen 2026-10-25 in viva-la-rts: seven codex rows sat stopped 25–55 min in `requested` with status
+`waiting`, every wake re-injecting the stop note, while Mulpex compacted their claude orchestrator
+fine in the same window. Headless, a draft in a codex box reproduced exactly that, and a clean box
+compacted and resumed; which one the live rows had was not established (the live pane could not be
+read without detaching the app from the daemon). Since then the "why" in the notice says.
 
 **A refused compaction never ends.** On an empty or tiny conversation Claude Code prints
 `Not enough messages to compact.` after `PreCompact` has fired, and no `SessionStart` follows
-(measured on claude 2.1.296). So `compacting` fails — sidebar line "compact didn't run" for 6 s, no
-resume typed — when that text appears on the screen (only if it wasn't there before typing), when no
-`PreCompact` arrives within 15 s, when the `compacting/` flag clears without a `resume`, or after
-15 minutes.
+(measured on claude 2.1.296). So `compacting` gives up when that text appears on the screen (only if
+it wasn't there before typing), when no `PreCompact` arrives within 15 s, when the `compacting/` flag
+clears without a `resume`, or after 15 minutes.
 
 Measured end to end on a real claude 2.1.296 in tmux (2026-10-11): the note arrived mid-turn on a
 12-step task and claude stopped after step 6 with "Next is b7.txt…"; `/compact\r` in one write ran

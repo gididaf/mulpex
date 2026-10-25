@@ -476,6 +476,12 @@ export const setCompactPhase = async (
   if (slotOf(projectHandle) === 0) await invoke<void>("set_compact_phase", { projectHandle, id, phase });
 };
 
+/** ⌘⇧K couldn't type into claude#id's box: clear the phase and tell it, by hub
+ *  message, to carry on. `compacted`: only the resume prompt was left. */
+export const compactGiveUp = async (projectHandle: ProjectHandle, id: number, compacted: boolean, reason: string) => {
+  if (slotOf(projectHandle) === 0) await invoke<void>("compact_give_up", { projectHandle, id, compacted, reason });
+};
+
 /** Keystrokes for a session; a remote one's go straight to its host's PTY. */
 export const sendBytes = (
   projectHandle: ProjectHandle,

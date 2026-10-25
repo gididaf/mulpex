@@ -1303,8 +1303,9 @@ fn sessionstart(ctx: &Ctx) -> anyhow::Result<()> {
 /// Codex with `PostCompact` (S9).
 fn end_compaction(ctx: &Ctx) {
     let _ = std::fs::write(ctx.state_dir.join(ctx.id_str()), compaction_end_status(ctx));
+    let manual = compaction_trigger(ctx).as_deref() != Some("auto");
     clear_compacting(ctx);
-    mark_compact_resume(ctx);
+    mark_compact_resume(ctx, manual);
 }
 
 /// Codex's `PostCompact`: the end of a compaction (`end_compaction`).
@@ -1316,12 +1317,22 @@ fn postcompact(ctx: &Ctx) -> anyhow::Result<()> {
 }
 
 /// The `/compact` the app typed for a ⌘⇧K request has finished: hand it back to
-/// the app, which types the resume prompt. Only from `compacting` — an automatic
-/// compaction while the request is still `requested` is not the one we asked for.
-fn mark_compact_resume(ctx: &Ctx) {
-    if compact_phase(ctx).as_deref() == Some("compacting") {
-        let _ = std::fs::write(compactreq_file(ctx), "resume");
+/// the app, which types the resume prompt. Also from `requested` when the
+/// compaction was manual — someone typed `/compact` by hand before the app
+/// did, and that is the compact the request was for. An automatic compaction
+/// while the request is still `requested` is not the one we asked for.
+fn mark_compact_resume(ctx: &Ctx, manual: bool) {
+    match compact_phase(ctx).as_deref() {
+        Some("compacting") => {}
+        Some("requested") if manual => {}
+        _ => return,
     }
+    let _ = std::fs::write(compactreq_file(ctx), "resume");
+}
+
+/// The running compaction's `trigger` (`precompact` keeps it in the flag).
+fn compaction_trigger(ctx: &Ctx) -> Option<String> {
+    std::fs::read_to_string(compacting_flag(ctx)).ok().map(|t| t.trim().to_owned())
 }
 
 /// `SessionStart` also fires for `startup`, `resume` and `clear`; only the
@@ -2430,6 +2441,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("4")).unwrap(), "waiting");
         assert!(!compacting_flag(&ctx).exists());
         assert_eq!(std::fs::read_to_string(compactreq_file(&ctx)).unwrap(), "resume");
+
+        // A /compact typed by hand before the app typed one (still `requested`).
+        std::fs::write(compacting_flag(&ctx), "manual").unwrap();
+        std::fs::write(compactreq_file(&ctx), "requested").unwrap();
+        end_compaction(&ctx);
+        assert_eq!(std::fs::read_to_string(compactreq_file(&ctx)).unwrap(), "resume");
+        // An automatic one leaves the request waiting for its checkpoint.
+        std::fs::write(compacting_flag(&ctx), "auto").unwrap();
+        std::fs::write(compactreq_file(&ctx), "requested").unwrap();
+        end_compaction(&ctx);
+        assert_eq!(std::fs::read_to_string(compactreq_file(&ctx)).unwrap(), "requested");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3317,8 +3339,9 @@ mod tests {
     /// `PreCompact` 09:18:10 → `Notification{idle_prompt}` 09:19:10, to the
     /// second. Between `PreCompact` and the `SessionStart` that ends it nothing
     /// else fires at all (09:24:19 → 09:24:53 on a real compaction).
-    /// ⌘⇧K: the note rides tool calls only while `requested`, and only the
-    /// compaction the app typed (`compacting`) hands back as `resume`.
+    /// ⌘⇧K: the note rides tool calls only while `requested`; the compaction
+    /// the app typed (`compacting`) hands back as `resume`, and so does a manual
+    /// one typed by hand while still `requested` — but never an automatic one.
     #[test]
     fn compact_request_phases() {
         let dir = std::env::temp_dir().join(format!("mulpex-compactreq-{}", crate::persist::new_uuid()));
@@ -3329,13 +3352,20 @@ mod tests {
         std::fs::write(compactreq_file(&ctx), "requested\n").unwrap();
         assert!(compact_requested(&ctx));
         // An auto-compaction mid-turn must not skip the checkpoint.
-        mark_compact_resume(&ctx);
+        mark_compact_resume(&ctx, false);
         assert_eq!(compact_phase(&ctx).as_deref(), Some("requested"));
+        // A /compact typed by hand is the compact the request was for.
+        mark_compact_resume(&ctx, true);
+        assert_eq!(compact_phase(&ctx).as_deref(), Some("resume"));
 
         std::fs::write(compactreq_file(&ctx), "compacting").unwrap();
         assert!(!compact_requested(&ctx), "the note stops once /compact is typed");
-        mark_compact_resume(&ctx);
+        mark_compact_resume(&ctx, false);
         assert_eq!(compact_phase(&ctx).as_deref(), Some("resume"));
+
+        let _ = std::fs::remove_file(compactreq_file(&ctx));
+        mark_compact_resume(&ctx, true);
+        assert_eq!(compact_phase(&ctx), None, "no request, nothing to hand back");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

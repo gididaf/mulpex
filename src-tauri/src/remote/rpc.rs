@@ -103,9 +103,9 @@ pub const ALLOWED: &[&str] = &[
 ///   this Mulpex's own window is never moved around from afar.
 /// - `attach_session`, `send_bytes`, `resize_terminals`: have their own paths
 ///   (`sub`, `in`, the geometry lease in `desktop.rs`).
-/// - `set_compact_phase`: ⌘⇧K's state machine runs in THIS frontend
-///   (`compact.ts`), reached through `fa`; writing the phase from afar would
-///   race it.
+/// - `set_compact_phase`, `compact_give_up`: ⌘⇧K's state machine runs in
+///   THIS frontend (`compact.ts`), reached through `fa`; writing the phase from
+///   afar would race it.
 /// - `set_mute_menu_checked`: this Mulpex's own menu.
 /// - `wake_typed`: answers a `codex-wake` event, which only THIS Mulpex's own
 ///   window hears (it is not in `desktop.rs::EVENT_NAMES`) — two windows typing
@@ -126,6 +126,7 @@ pub const DENIED: &[&str] = &[
     "send_bytes",
     "resize_terminals",
     "set_compact_phase",
+    "compact_give_up",
     "set_mute_menu_checked",
     "wake_typed",
     "quit_app",

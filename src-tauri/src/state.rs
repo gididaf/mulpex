@@ -1471,6 +1471,15 @@ impl Core {
         }
     }
 
+    /// A ⌘⇧K request could not type into the instance's box: drop the phase
+    /// and tell the instance, which stopped at a checkpoint and is waiting, to
+    /// carry on. A hub message, not typing: typing is what failed.
+    /// `compacted`: only the resume prompt was left to type.
+    pub fn give_up_compact(&self, id: usize, compacted: bool, reason: &str) {
+        self.set_compact_phase(id, None);
+        self.send_app_message(id, &compact_give_up_message(compacted, reason));
+    }
+
     /// Rename an instance **as the user** (⌘R): a non-empty (trimmed) name sets
     /// it, empty clears it. Persists so it survives restart. Ports
     /// `App::commit_rename`.
@@ -3455,6 +3464,21 @@ fn auto_compact_message(pct: Option<u8>) -> String {
              don't treat it as stuck. You don't need to do anything."
         ),
         None => "The user disabled auto-compact for you and your claudes.".to_string(),
+    }
+}
+
+/// What an instance is told when its compact request gives up (`give_up_compact`).
+/// The compacted wording matches `compact.ts`'s typed RESUME prompt.
+fn compact_give_up_message(compacted: bool, reason: &str) -> String {
+    if compacted {
+        "[Mulpex] The conversation was just compacted at your checkpoint. Continue the task \
+         from where you stopped."
+            .to_string()
+    } else {
+        format!(
+            "[Mulpex] The /compact you stopped for did not run ({reason}), so it is called \
+             off. Continue your task from where you stopped."
+        )
     }
 }
 

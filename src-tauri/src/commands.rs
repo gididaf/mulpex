@@ -280,6 +280,22 @@ pub fn set_compact_phase(
     }
 }
 
+/// ⌘⇧K could not type into the instance's box: clear the phase and tell the
+/// instance, which stopped at a checkpoint, to carry on (`lib/compact.ts`).
+/// `compacted`: the compaction did happen, and only the resume prompt is left.
+#[tauri::command]
+pub fn compact_give_up(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    compacted: bool,
+    reason: String,
+) {
+    if let Some(core) = state.ws.lock().unwrap().project(project_handle) {
+        core.give_up_compact(id, compacted, &reason);
+    }
+}
+
 /// The project's saved ⌘⇧P pins, by instance id (`pins.rs`).
 #[tauri::command]
 pub fn get_pins(

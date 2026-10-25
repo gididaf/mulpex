@@ -5,6 +5,22 @@ history: it records the evidence behind claims made elsewhere in the docs, so a 
 "verified live" from "compiles clean". Nothing here is a rule; the rules live in
 [CLAUDE.md](../CLAUDE.md) and the subsystem docs.
 
+- **⌘⇧K / auto-compact never leaves a row stopped, measured 2026-10-25** (`docs/sessions.md`),
+  headless (hidden-window build on Xvfb, `MULPEX_DEBUG_DUMP`, real codex 0.164.0 and claude 2.1.310):
+  - codex, ⌘⇧K mid-turn and an auto-compact rule on a *hidden* row: checkpoint → `/compact` →
+    `resume` → task finished.
+  - codex with a draft in the box at turn end: `requested` held ~60 s, then the request gave up, the
+    hub message woke the codex, it finished the task, and the draft was still in the box.
+  - a hand-written `compactreq/<id>` with no request behind it: removed within 4 s and the row told
+    to carry on.
+  - `/compact` typed by hand while `requested`: one compaction, then the resume prompt.
+  - claude, ⌘⇧K mid-turn: unchanged (checkpoint → `/compact` → resume prompt); with a draft, the
+    same 60 s give-up.
+  - **NOT established:** why the seven live viva-la-rts codex rows could not be typed into. A draft
+    matches the symptom exactly; the live pane was never read.
+  - `cargo test -p mulpex --lib`: `wake::tests` (2) and `state::remote_watcher` (1–2, timing) fail on
+    an unmodified master too.
+
 - **Remote Hosts, measured 2026-10-12** (`docs/remote-hosts.md`):
   - **Unit tests:** `cargo test -p mulpex --lib` passes 166 tests, including the stand-in-relay
     desktop test.

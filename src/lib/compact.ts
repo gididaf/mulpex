@@ -8,7 +8,15 @@
 //               background work left; input box empty): Mulpex typed
 //               `/compact`
 //   resume      the compaction's `SessionStart` arrived (the hook flips the file);
-//               Mulpex types RESUME and the request is done
+//               Mulpex types RESUME and the request is done. A `/compact`
+//               someone typed by hand while still `requested` counts too.
+//
+// The turn can end with the box still untypeable (a draft in it, or a screen
+// `promptbox.ts` does not recognize). Waiting for that would leave the claude
+// stopped forever — it was told to stop and wait — so after IDLE_GIVE_UP_MS
+// the request gives up and tells it by hub message to carry on (`giveUp`).
+// Same for a phase file with no request behind it here (a reload, a crashed
+// window): `sweepOrphans` ends it the same way.
 //
 // A codex runs the same three steps (docs/codex.md S9: `/compact` typed into an
 // empty box compacts, PreCompact/PostCompact fire, and the hook ends the phase
@@ -32,6 +40,7 @@ import { compactsHeld } from "./checkpoint";
 import { isRemote } from "./hosts";
 import { addrIn, agentOf } from "./agents";
 import {
+  compactGiveUp,
   sendBytes,
   setCompactPhase,
   type Agent,
@@ -56,8 +65,13 @@ function compactBytes(agent: Agent): Uint8Array {
 const START_TIMEOUT_MS = 15_000;
 /** A compaction that has not ended after this long is given up on. */
 const RUN_TIMEOUT_MS = 15 * 60_000;
+/** The turn is over but the box can't be typed into: give up after this long. */
+const IDLE_GIVE_UP_MS = 60_000;
 /** How long "compact didn't run" stays under the row. */
 const NOTICE_MS = 6_000;
+/** A phase file this soon after we cleared it is a hub snapshot lagging our
+ *  own write, not an orphan. */
+const CLEAR_LAG_MS = 5_000;
 /** Claude Code's answer when there is too little to compact (fires `PreCompact`
  *  and then nothing — no `SessionStart` ever ends it). */
 const REFUSED = /Not enough messages to compact/i;
@@ -74,6 +88,10 @@ interface Req {
   refusedBefore: boolean;
   /** The row whose auto-compact rule started this (maybe the claude itself), if one did. */
   by: number | null;
+  /** Since when the turn has been over with the box untypeable (0: it isn't). */
+  idleSince: number;
+  /** Why it gave up, for the notice. */
+  why?: string;
 }
 
 const reqs = writable<Map<string, Req>>(new Map());
@@ -93,13 +111,29 @@ function put(h: ProjectHandle, id: number, r: Req | null) {
   ensureTimer();
 }
 
-function setPhase(h: ProjectHandle, id: number, r: Req, phase: Phase) {
-  put(h, id, { ...r, phase });
-  void setCompactPhase(h, id, phase === "failed" ? null : phase);
+/** When each row's phase file was last cleared by us (see CLEAR_LAG_MS). */
+const cleared = new Map<string, number>();
+
+function writePhase(h: ProjectHandle, id: number, phase: CompactPhase | null) {
+  if (phase == null) cleared.set(keyOf(h, id), Date.now());
+  void setCompactPhase(h, id, phase);
 }
 
-function fail(h: ProjectHandle, id: number, r: Req) {
-  setPhase(h, id, r, "failed");
+function setPhase(h: ProjectHandle, id: number, r: Req, phase: CompactPhase) {
+  put(h, id, { ...r, phase });
+  writePhase(h, id, phase);
+}
+
+/** The request is over without the compact it was for (or, from `resume`,
+ *  without the resume prompt): claude#id stopped at a checkpoint and waits, so
+ *  tell it by hub message to carry on — typing is what can't be relied on. A
+ *  "didn't run" notice stays under the row for a while. */
+function giveUp(h: ProjectHandle, id: number, r: Req, why: string) {
+  const compacted = r.phase === "resume";
+  cleared.set(keyOf(h, id), Date.now());
+  void compactGiveUp(h, id, compacted, why);
+  if (compacted) return put(h, id, null);
+  put(h, id, { ...r, phase: "failed", why });
   setTimeout(() => {
     if (get(reqs).get(keyOf(h, id))?.phase === "failed") put(h, id, null);
   }, NOTICE_MS);
@@ -113,7 +147,7 @@ export function toggleCompact(h: ProjectHandle, id: number): string | null {
   if (!s || s.kind === "shell" || s.exited || s.failed) return "Nothing to compact — no running claude or codex";
   if (active(h, id)) {
     put(h, id, null);
-    void setCompactPhase(h, id, null);
+    writePhase(h, id, null);
     return null;
   }
   if (get(compactsHeld)) return "Mulpex is quitting — compact after it's back";
@@ -129,7 +163,7 @@ function active(h: ProjectHandle, id: number): boolean {
 
 /** Start a request — never a toggle. `by` is the orchestrator whose rule fired. */
 function startCompact(h: ProjectHandle, id: number, by: number | null) {
-  const r: Req = { phase: "requested", typedAt: 0, sawStart: false, refusedBefore: false, by };
+  const r: Req = { phase: "requested", typedAt: 0, sawStart: false, refusedBefore: false, by, idleSince: 0 };
   setPhase(h, id, r, "requested");
   step(h, id);
 }
@@ -151,6 +185,12 @@ export function autoCompactTick(h: ProjectHandle) {
   if (isRemote(h)) return;
   const p = get(projects).get(h);
   if (!p) return;
+  // Not only the timer: a status change is what most steps wait for.
+  for (const k of get(reqs).keys()) {
+    const [kh, id] = parse(k);
+    if (kh === h) safeStep(kh, id);
+  }
+  sweepOrphans(h);
   for (const s of p.sessions) suppressedRelease(h, s.id, p.ctx.get(s.id), ruleFor(p.sessions, s.id));
   if (get(compactsHeld)) return;
   for (const orch of p.sessions) {
@@ -194,20 +234,62 @@ compactsHeld.subscribe((held) => {
   wasHeld = held;
 });
 
-/** Drop claude#id's request (the row exited). */
+/** Drop claude#id's request (the row exited or restarted). */
 export function dropCompact(h: ProjectHandle, id: number) {
   suppressed.delete(keyOf(h, id));
-  if (get(reqs).has(keyOf(h, id))) put(h, id, null);
+  if (get(reqs).has(keyOf(h, id))) {
+    put(h, id, null);
+    writePhase(h, id, null);
+  }
 }
 
-// A turn that ended with background shells still running reads `working`, but
-// the claude has stopped — waiting for `waiting` would wait for the test run.
-function ready(h: ProjectHandle, id: number): boolean {
+/** A phase file on disk that no request here is behind: the hook keeps telling
+ *  that claude to stop, and nothing will ever move it on. End it, and tell the
+ *  claude — it may already be stopped and waiting. */
+function sweepOrphans(h: ProjectHandle) {
+  const p = get(projects).get(h);
+  for (const e of p?.hub?.statuses ?? []) {
+    const k = keyOf(h, e.id);
+    if (!e.compact_phase || get(reqs).has(k)) continue;
+    if (Date.now() - (cleared.get(k) ?? 0) < CLEAR_LAG_MS) continue;
+    if (!p?.sessions.some((s) => s.id === e.id && !s.exited)) continue;
+    cleared.set(k, Date.now());
+    void compactGiveUp(h, e.id, e.compact_phase !== "requested", "Mulpex lost track of the request");
+  }
+}
+
+/** Why `/compact` (or RESUME) can't be typed into claude#id now, or null if it can.
+ *  `idle` = its turn is over, so only the box stands in the way. */
+function blocker(h: ProjectHandle, id: number): { idle: boolean; why: string } | null {
   const p = get(projects).get(h);
   const status = p?.statuses.get(id);
+  // A turn that ended with background shells still running reads `working`, but
+  // the claude has stopped — waiting for `waiting` would wait for the test run.
   const bgOnly =
     status === "working" && !!p?.hub?.statuses.find((e) => e.id === id)?.background_only;
-  return (status === "waiting" || bgOnly) && terminals.promptBox(h, id) === "empty";
+  if (status !== "waiting" && !bgOnly) return { idle: false, why: `status ${status ?? "unknown"}` };
+  const box = terminals.promptBox(h, id);
+  if (box === "empty") return null;
+  return { idle: true, why: box === "draft" ? "its input box has a draft" : "Mulpex can't find its input box" };
+}
+
+/** Wait for the box, but not forever: an idle row with an untypeable box gives up. */
+function waitForBox(h: ProjectHandle, id: number, r: Req, b: { idle: boolean; why: string }) {
+  if (!b.idle) {
+    if (r.idleSince) put(h, id, { ...r, idleSince: 0 });
+    return;
+  }
+  if (!r.idleSince) return put(h, id, { ...r, idleSince: Date.now() });
+  if (Date.now() - r.idleSince > IDLE_GIVE_UP_MS) giveUp(h, id, r, b.why);
+}
+
+/** One request's step, isolated: a throw here must not stall every other row. */
+function safeStep(h: ProjectHandle, id: number) {
+  try {
+    step(h, id);
+  } catch (e) {
+    console.error(`compact step ${h}:${id}`, e);
+  }
 }
 
 /** Advance one request as far as the claude's state allows. */
@@ -216,22 +298,31 @@ function step(h: ProjectHandle, id: number) {
   if (!r || r.phase === "failed") return;
   const p = get(projects).get(h);
   const s = p?.sessions.find((x) => x.id === id);
-  if (!p || !s || s.exited) return put(h, id, null);
+  if (!p || !s || s.exited) {
+    put(h, id, null);
+    return writePhase(h, id, null);
+  }
   const entry = p.hub?.statuses.find((e) => e.id === id);
 
   if (get(compactsHeld) && (r.phase === "requested" || r.phase === "resume")) {
     // A request called off before `/compact` may try again after the hold.
     if (r.phase === "requested") suppressed.delete(keyOf(h, id));
     put(h, id, null);
-    void setCompactPhase(h, id, null);
+    writePhase(h, id, null);
     return;
   }
 
   if (r.phase === "requested") {
-    if (!ready(h, id)) return;
+    // Compacted already: a `/compact` typed by hand (the hook counted it).
+    if (entry?.compact_phase === "resume") {
+      put(h, id, { ...r, phase: "resume", idleSince: 0 });
+      return step(h, id);
+    }
+    const b = blocker(h, id);
+    if (b) return waitForBox(h, id, r, b);
     sendBytes(h, id, compactBytes(agentOf(s.kind) ?? "claude"));
     const refusedBefore = REFUSED.test(terminals.screenText(h, id));
-    put(h, id, { ...r, phase: "compacting", typedAt: Date.now(), sawStart: false, refusedBefore });
+    put(h, id, { ...r, phase: "compacting", typedAt: Date.now(), sawStart: false, refusedBefore, idleSince: 0 });
     void setCompactPhase(h, id, "compacting");
     return;
   }
@@ -248,20 +339,21 @@ function step(h: ProjectHandle, id: number) {
       r = { ...r, sawStart: true };
       put(h, id, r);
     }
-    if (!r.refusedBefore && REFUSED.test(terminals.screenText(h, id))) return fail(h, id, r);
-    if (!r.sawStart && since > START_TIMEOUT_MS) return fail(h, id, r);
+    if (!r.refusedBefore && REFUSED.test(terminals.screenText(h, id))) return giveUp(h, id, r, "too little to compact");
+    if (!r.sawStart && since > START_TIMEOUT_MS) return giveUp(h, id, r, "it never started");
     // Started, then the flag cleared with no `SessionStart` (the next prompt or
     // turn end clears a refused one).
-    if (r.sawStart && entry && !entry.compacting) return fail(h, id, r);
-    if (since > RUN_TIMEOUT_MS) return fail(h, id, r);
+    if (r.sawStart && entry && !entry.compacting) return giveUp(h, id, r, "it ended without finishing");
+    if (since > RUN_TIMEOUT_MS) return giveUp(h, id, r, "it ran too long");
     return;
   }
 
   if (r.phase === "resume") {
-    if (!ready(h, id)) return;
+    const b = blocker(h, id);
+    if (b) return waitForBox(h, id, r, b);
     sendBytes(h, id, new TextEncoder().encode(`\x1b[200~${RESUME}\x1b[201~\r`));
     put(h, id, null);
-    void setCompactPhase(h, id, null);
+    writePhase(h, id, null);
   }
 }
 
@@ -272,7 +364,7 @@ function ensureTimer() {
   const any = get(reqs).size > 0;
   if (any && !timer) {
     timer = setInterval(() => {
-      for (const k of get(reqs).keys()) step(...parse(k));
+      for (const k of get(reqs).keys()) safeStep(...parse(k));
     }, 300);
   } else if (!any && timer) {
     clearInterval(timer);
@@ -310,12 +402,13 @@ export const compactLines = derived([reqs, activeProjectHandle, projects], ([$m,
     const [h, id] = parse(k);
     if (h !== $h) continue;
     // An auto-compact names the orchestrator whose rule fired it (unless it's its own).
+    const label = (l: Record<Phase, string>) => (r.why ? `${l[r.phase]}: ${r.why}` : l[r.phase]);
     const text =
       r.by == null
-        ? LABEL[r.phase]
+        ? label(LABEL)
         : r.by === id
-          ? `auto-compact: ${AUTO_LABEL[r.phase]}`
-          : `auto-compact (${addrIn($p.get(h)?.sessions ?? [], r.by)}): ${AUTO_LABEL[r.phase]}`;
+          ? `auto-compact: ${label(AUTO_LABEL)}`
+          : `auto-compact (${addrIn($p.get(h)?.sessions ?? [], r.by)}): ${label(AUTO_LABEL)}`;
     out.set(id, { text, failed: r.phase === "failed" });
   }
   return out;
