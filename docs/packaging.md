@@ -38,9 +38,13 @@ beside the main binary.
 to Mulpex, so a claude reading another app's container pops *"Mulpex.app would like to access data
 from other apps"* — a Mac-only modal that stalls that claude, unanswerable from Remote Control.
 Full Disk Access covers it (and the folder prompts below). No app can grant itself TCC access, so
-Mulpex only detects and points: at launch it **opens** `~/Library/Application
-Support/com.apple.TCC/TCC.db` (`stat` succeeds without the grant — measured, it must be an open)
-and shows `FdaBanner` if that fails; Mulpex ▸ *Grant Full Disk Access…* opens the Settings pane.
+Mulpex only detects and points: at launch it **opens** a protected file — the system
+`/Library/Application Support/com.apple.TCC/TCC.db`, then the per-user one, then lists
+`~/Library/Safari` (`stat` succeeds without the grant — measured, it must be an open) — and shows
+`FdaBanner` only if one exists and none opens; Mulpex ▸ *Grant Full Disk Access…* opens the Settings pane.
+**macOS 27 removed the per-user `TCC.db`**, which was once the only probe: every user with the
+grant got the banner (measured 2026-10-26 on 27.0.1 — ENOENT; the system db opens with the grant,
+fails without it under `launchctl submit`). None existing reports granted: a lying banner is worse.
 The grant applies only after a relaunch, hence the banner's "restart" state and no re-checking.
 
 **Symptom, as the user experiences it: "Claude refuses to open."** A session appears in the sidebar

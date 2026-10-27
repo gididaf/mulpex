@@ -10,17 +10,37 @@
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
-/// The TCC database is readable only with Full Disk Access, which makes opening
-/// it the standard probe. `stat` succeeds without the grant, so it has to be an
-/// actual open. Only changes after a relaunch: macOS applies the grant at launch.
+/// Files only Full Disk Access can read, so opening one is the probe. `stat`
+/// succeeds without the grant, so it has to be an actual open (a directory has to
+/// be listed). Only changes after a relaunch: macOS applies the grant at launch.
+///
+/// A list, not one file: macOS 27 removed the per-user TCC.db that used to be
+/// the only probe, and Mulpex then nagged everyone who had the grant. Granted if
+/// any of them opens; if none of them exists, we can't tell, and say granted — a
+/// banner that lies is worse than none.
 #[cfg(target_os = "macos")]
 #[tauri::command]
 pub fn has_full_disk_access() -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
-        return false;
-    };
-    let db = PathBuf::from(home).join("Library/Application Support/com.apple.TCC/TCC.db");
-    std::fs::File::open(db).is_ok()
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let probes = [
+        PathBuf::from("/Library/Application Support/com.apple.TCC/TCC.db"),
+        home.join("Library/Application Support/com.apple.TCC/TCC.db"),
+        home.join("Library/Safari"),
+    ];
+    let mut any_exists = false;
+    for p in &probes {
+        let opened = if p.is_dir() {
+            std::fs::read_dir(p).and_then(|mut d| d.next().transpose()).map(|_| ())
+        } else {
+            std::fs::File::open(p).map(|_| ())
+        };
+        match opened {
+            Ok(()) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => any_exists = true,
+        }
+    }
+    !any_exists
 }
 
 #[cfg(target_os = "macos")]
