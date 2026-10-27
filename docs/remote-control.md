@@ -74,6 +74,13 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   (measured exact on claude 2.1.292, multi-line Hebrew included). **Over 900 bytes the message is
   written to `<mulpex home>/remote/inbox/<uuid>.md` and only a one-line pointer is typed** — the root
   rule about >1 KB through a TUI. Control characters are stripped so a message can't end the paste.
+- **Attaching files** — the chat's 📎 picks any files (25 MB together). On Send each goes up in
+  2 MB chunks as `file-put {rid, name, data, upload, done}` (standard base64, like the Board's
+  images) and lands in `<mulpex home>/remote/phone-files/<uuid>/<name>` (0700 dir, 0600 file,
+  pruned after a week — `remote/files.rs`); the phone then appends `Attached from my phone:` and
+  the paths to the message, so the claude reads them itself. A failed send keeps the uploaded
+  paths and doesn't upload again. The view's `files: true` says the host takes `file-put`; an
+  older host gets "Update Mulpex on the Mac" instead of a request nobody answers.
 - **Dialogs** — the `askq`/`plan` hooks save the tool input to `dialog/<id>.json`
   (`mulpex_core::DIALOG_DIR`); the view carries it while the status is `needs`. The answer is turned
   into keys **on the Mac against the file as it is now** (`dialog.rs`, every sequence measured on a

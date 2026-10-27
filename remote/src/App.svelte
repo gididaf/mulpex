@@ -3,7 +3,7 @@
   import Chat, { type Item } from "./Chat.svelte";
   import type { DialogView } from "./Dialog.svelte";
   import Term from "./Term.svelte";
-  import BoardView, { type Board } from "./Board.svelte";
+  import BoardView, { type Board, toB64 } from "./Board.svelte";
   import { unb64 } from "./crypto";
   import { dragSort, moveTo } from "./order";
   import { swipePages } from "./swipe";
@@ -40,7 +40,8 @@
   };
   /** `board_rev` changes whenever the project's Board does. */
   type Project = { handle: number; name: string; sessions: Row[]; board_rev?: number };
-  type View = { t: "state"; active: number | null; projects: Project[] };
+  /** `files`: the Mac takes `file-put` (older ones don't, and would never answer). */
+  type View = { t: "state"; active: number | null; projects: Project[]; files?: boolean };
 
   /** The claude whose conversation is open, if any. */
   let chat = $state<{ handle: number; id: number; items: Item[]; gone: boolean; loading: boolean } | null>(
@@ -160,6 +161,24 @@
   function sendText(text: string): Promise<Reply> {
     if (!chat) return Promise.resolve({ ok: false, why: "No claude open" });
     return request({ t: "type", handle: chat.handle, id: chat.id, text });
+  }
+
+  /** One attached file → its path on the Mac. In chunks: a whole one would not fit a relay frame. */
+  async function uploadFile(file: File): Promise<string> {
+    const CHUNK = 2 * 1024 * 1024;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let upload: string | null = null;
+    for (let off = 0; ; off += CHUNK) {
+      const end = Math.min(off + CHUNK, bytes.length);
+      const done = end >= bytes.length;
+      const r = await request(
+        { t: "file-put", name: file.name || "file", data: toB64(bytes.subarray(off, end)), upload, done },
+        60_000,
+      );
+      if (!r.ok) throw new Error(`${file.name}: ${r.why ?? "upload failed"}`);
+      if (done) return r.value?.path;
+      upload = r.value?.upload ?? null;
+    }
   }
 
   function sendAnswer(answer: unknown): Promise<Reply> {
@@ -548,6 +567,7 @@
       loading={chat.loading}
       onback={() => history.back()}
       onsend={sendText}
+      onupload={view?.files ? uploadFile : null}
       onclose={() => chat && closeInstance(chat.handle, chat.id, chatRow?.agent === "codex" ? "codex" : "claude")}
       compact={chatRow?.compact ?? null}
       oncompact={() => chat && toggleCompact(chat.handle, chat.id)}

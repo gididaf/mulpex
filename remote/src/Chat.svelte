@@ -25,6 +25,7 @@
     loading,
     onback,
     onsend,
+    onupload = null,
     onkey,
     dialog,
     onanswer,
@@ -46,6 +47,8 @@
     onback: () => void;
     /** Resolves with the Mac's answer: typed, or why not. */
     onsend: (text: string) => Promise<{ ok: boolean; why: string | null }>;
+    /** Upload one attached file, resolving with its path on the Mac. Null: this Mac can't take files. */
+    onupload?: ((file: File) => Promise<string>) | null;
     onkey: (key: string) => void;
     /** The question or plan this claude is waiting on, if any. */
     dialog: DialogView | null;
@@ -67,15 +70,67 @@
   let error = $state<string | null>(null);
   let box: HTMLTextAreaElement | undefined = $state();
 
+  /** Files picked for the next message, all together at most `MAX_FILES_BYTES`. */
+  const MAX_FILES_BYTES = 25 * 1024 * 1024;
+  let files = $state<File[]>([]);
+  /** Files already on the Mac, so a send that fails after uploading doesn't upload again. */
+  const uploaded = new Map<File, string>();
+  let progress = $state<string | null>(null);
+  let fileEl: HTMLInputElement | undefined = $state();
+
+  function pick(list: FileList | null) {
+    if (!list?.length) return;
+    const next = [...files, ...list];
+    if (next.reduce((n, f) => n + f.size, 0) > MAX_FILES_BYTES) error = "Files are over 25 MB together";
+    else {
+      files = next;
+      error = null;
+    }
+    if (fileEl) fileEl.value = "";
+  }
+
+  function unpick(i: number) {
+    uploaded.delete(files[i]);
+    files = files.filter((_, j) => j !== i);
+  }
+
+  function size(n: number): string {
+    return n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
   async function send() {
-    const text = draft.trim();
-    if (!text || sending) return;
+    let text = draft.trim();
+    if ((!text && !files.length) || sending) return;
     sending = true;
     error = null;
+    if (files.length && onupload) {
+      const paths: string[] = [];
+      try {
+        for (const [i, f] of files.entries()) {
+          progress = `Uploading ${files.length > 1 ? `${i + 1}/${files.length} ` : ""}${f.name}…`;
+          let p = uploaded.get(f);
+          if (!p) {
+            p = await onupload(f);
+            uploaded.set(f, p);
+          }
+          paths.push(p);
+        }
+      } catch (e) {
+        sending = false;
+        progress = null;
+        error = e instanceof Error ? e.message : String(e);
+        return;
+      }
+      progress = null;
+      const list = paths.map((p) => `- ${p}`).join("\n");
+      text = text ? `${text}\n\nAttached from my phone:\n${list}` : `I attached these files from my phone:\n${list}`;
+    }
     const r = await onsend(text);
     sending = false;
     if (r.ok) {
       draft = "";
+      files = [];
+      uploaded.clear();
       pinned = true;
       grow();
     } else error = r.why ?? "Not sent";
@@ -197,12 +252,31 @@
   {#if !gone}
     <div class="composer">
       {#if error}<div class="error" dir="auto">{error}</div>{/if}
+      {#if progress}<div class="progress" dir="auto">{progress}</div>{/if}
+      {#if files.length}
+        <div class="files">
+          {#each files as f, i (i)}
+            <span class="file">
+              <span class="fname" dir="auto">{f.name}</span>
+              <span class="fsize">{size(f.size)}</span>
+              <button onclick={() => unpick(i)} disabled={sending} aria-label="Remove {f.name}">✕</button>
+            </span>
+          {/each}
+        </div>
+      {/if}
       <div class="keys">
         {#each keys as [k, label] (k)}
           <button onclick={() => onkey(k)}>{label}</button>
         {/each}
       </div>
       <div class="input">
+        <input bind:this={fileEl} type="file" multiple hidden onchange={(e) => pick((e.currentTarget as HTMLInputElement).files)} />
+        <button
+          class="attach"
+          disabled={sending}
+          aria-label="Attach files"
+          onclick={() => (onupload ? fileEl?.click() : (error = "Update Mulpex on the Mac to attach files"))}
+        >📎</button>
         <textarea
           bind:this={box}
           bind:value={draft}
@@ -211,7 +285,7 @@
           dir="auto"
           placeholder="Message {agent}…"
         ></textarea>
-        <button class="send" disabled={!draft.trim() || sending} onclick={send}>
+        <button class="send" disabled={(!draft.trim() && !files.length) || sending} onclick={send}>
           {sending ? "…" : "Send"}
         </button>
       </div>
@@ -472,6 +546,61 @@
   }
   .send:disabled {
     opacity: 0.4;
+  }
+  .attach {
+    flex: 0 0 auto;
+    width: 2.4rem;
+    height: 2.4rem;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-elev);
+    color: var(--text);
+    font-size: 1.1rem;
+  }
+  .attach:disabled {
+    opacity: 0.4;
+  }
+  .progress {
+    color: var(--text-dim, var(--text));
+    opacity: 0.8;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.2rem 0.35rem;
+    unicode-bidi: plaintext;
+  }
+  .files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    padding-bottom: 0.4rem;
+  }
+  .file {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+    padding: 0.2rem 0.3rem 0.2rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--bg-elev);
+    font-size: 0.8rem;
+  }
+  .fname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 12rem;
+  }
+  .fsize {
+    opacity: 0.6;
+    white-space: nowrap;
+  }
+  .file button {
+    border: 0;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    padding: 0 0.25rem;
   }
   .detail.result.err {
     border-inline-start-color: var(--red);

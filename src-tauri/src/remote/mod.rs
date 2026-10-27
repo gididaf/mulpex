@@ -29,6 +29,7 @@ pub mod client;
 mod crypto;
 mod desktop;
 mod dialog;
+mod files;
 mod push;
 mod rpc;
 
@@ -588,7 +589,8 @@ pub fn project_view(
 }
 
 pub fn workspace_view(active: Option<ProjectHandle>, projects: Vec<Value>) -> Value {
-    json!({ "t": "state", "active": active, "projects": projects })
+    // `files`: this host takes `file-put`, so the phone offers attaching.
+    json!({ "t": "state", "active": active, "projects": projects, "files": true })
 }
 
 fn start_thread(g: &mut Inner) {
@@ -1396,6 +1398,20 @@ impl Server {
                     Err(e) => (false, Some(e), Value::Null),
                 };
                 let msg = json!({"t": "typed", "rid": rid, "ok": ok, "why": why, "value": value});
+                self.send_sealed(ws, cid, &msg.to_string())?;
+            }
+            // A file attached to a chat message, in chunks (`files.rs`). The
+            // phone types the finished paths into the message itself.
+            Some("file-put") => {
+                let rid = req.get("rid").and_then(Value::as_str).unwrap_or("").chars().take(64).collect::<String>();
+                let name = req.get("name").and_then(Value::as_str);
+                let upload = req.get("upload").and_then(Value::as_str);
+                let data = req.get("data").and_then(Value::as_str).unwrap_or("");
+                let done = req.get("done").and_then(Value::as_bool).unwrap_or(true);
+                let msg = match files::put(name, upload, data, done) {
+                    Ok(value) => json!({"t": "typed", "rid": rid, "ok": true, "value": value}),
+                    Err(why) => json!({"t": "typed", "rid": rid, "ok": false, "why": why}),
+                };
                 self.send_sealed(ws, cid, &msg.to_string())?;
             }
             Some("visible") => {
