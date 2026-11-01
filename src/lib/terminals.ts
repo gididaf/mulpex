@@ -186,7 +186,7 @@ class TerminalManager {
   }
 
   /** Create the xterm for (handle, id) inside `container` and bind its PTY stream.
-   *  `kind` gates only the Shift+Enter carve-out below — everything else is one
+   *  `kind` gates only the Shift+Enter carve-out and the scrollback length below — everything else is one
    *  code path for both kinds, deliberately (the DOM-renderer / no-WebGL rule
    *  that makes RTL work is not a Claude-specific concern). */
   create(
@@ -225,7 +225,10 @@ class TerminalManager {
     const term = new Terminal({
       cols: geo.cols,
       rows: geo.rows,
-      scrollback: 10000,
+      // A full pane costs ~26 MB at 120 columns (measured), and WebKitGTK
+      // used to kill the page outright at 4 GB (`webcrash.rs`). Shells keep
+      // less: a VM had 25 of them open beside 23 agents.
+      scrollback: isAgent(kind) ? 10000 : 3000,
       macOptionIsMeta: true,
       allowProposedApi: true,
       fontFamily: FONT_FAMILY,

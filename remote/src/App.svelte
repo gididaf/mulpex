@@ -87,6 +87,12 @@
   let view = $state<View | null>(null);
   let link = $state<LinkState>("connecting");
   let refusal = $state<string | null>(null);
+  /** What to call the paired computer: its name, once it said it. A Linux VM
+   *  is not a Mac, and "Mac is offline" sent people looking at the wrong box. */
+  let hostName = $state<string | null>(null);
+  const host = $derived(hostName ?? "the computer");
+  /** At the start of a sentence. A real name is left as it is. */
+  const Host = $derived(hostName ?? "The computer");
   // The callback gets the link itself: it first fires from inside the
   // constructor, before `conn` is assigned.
   const conn = new Link(
@@ -108,6 +114,10 @@
     (msg) => {
       if (msg.t === "state") {
         view = msg as View;
+        if (typeof msg.host === "string" && msg.host) {
+          conn.setHostName(msg.host);
+          hostName = msg.host;
+        }
         openPending();
       } else if (msg.t === "push-key" || msg.t === "push-state") {
         pushWaiters.get(msg.t)?.(msg);
@@ -130,6 +140,7 @@
     },
   );
   link = conn.state;
+  hostName = conn.hostName;
 
   function openChat(handle: number, row: Row) {
     if (row.kind !== "claude") return openTerm(handle, row);
@@ -147,13 +158,13 @@
 
   /** A request the Mac answers (`typed`, matched by request id). */
   function request(msg: Record<string, unknown>, timeoutMs = 15_000): Promise<Reply> {
-    if (link !== "online") return Promise.resolve({ ok: false, why: "Not connected to the Mac" });
+    if (link !== "online") return Promise.resolve({ ok: false, why: `Not connected to ${host}` });
     const rid = Math.random().toString(36).slice(2);
     return new Promise((resolve) => {
       typing.set(rid, resolve);
       conn.send({ ...msg, rid });
       setTimeout(() => {
-        if (typing.delete(rid)) resolve({ ok: false, why: "No answer from the Mac" });
+        if (typing.delete(rid)) resolve({ ok: false, why: `No answer from ${host}` });
       }, timeoutMs);
     });
   }
@@ -227,7 +238,7 @@
       return;
     }
     if (link !== "online") {
-      pushNote = "Connect to the Mac first.";
+      pushNote = `Connect to ${host} first.`;
       return;
     }
     push = "busy";
@@ -244,12 +255,12 @@
         return;
       }
       const k = await askMac("push-key", {});
-      if (!k?.key) throw new Error("No answer from the Mac");
+      if (!k?.key) throw new Error(`No answer from ${host}`);
       // A key from a different Mac (or an old one) can't be reused: start over.
       await (await reg.pushManager.getSubscription())?.unsubscribe();
       const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: k.key });
       const st = await askMac("push-sub", { sub: sub.toJSON() });
-      if (!st?.on) throw new Error("The Mac didn't accept it");
+      if (!st?.on) throw new Error(`${Host} didn't accept it`);
       push = "on";
     } catch (e) {
       pushNote = String(e instanceof Error ? e.message : e);
@@ -383,10 +394,10 @@
     chat ? view?.projects.find((p) => p.handle === chat!.handle)?.sessions.find((s) => s.id === chat!.id) : null,
   );
 
-  const refusals: Record<string, string> = {
-    "not paired": "This phone isn't paired with the Mac.",
-    revoked: "This phone was removed on the Mac.",
-  };
+  const refusals = $derived<Record<string, string>>({
+    "not paired": `This phone isn't paired with ${host}.`,
+    revoked: `This phone was removed on ${host}.`,
+  });
   /** The tab the phone is looking at; follows the Mac until the user picks one. */
   let picked = $state<number | null>(null);
 
@@ -531,7 +542,7 @@
   {#if link === "unpaired"}
     <div class="empty">
       {#if refusal}<p class="refusal">{refusals[refusal] ?? refusal}</p>{/if}
-      Open Remote Control on your Mac (⌘⇧O) and scan its QR code.
+      Open Remote Control in Mulpex (⌘⇧O, or Super+Shift+O on Linux) and scan its QR code.
     </div>
   {:else if boardScreen}
     {@const fp = view?.projects.find((p) => p.handle === boardScreen!.handle)}
@@ -589,7 +600,7 @@
         {link === "online"
           ? "connected · encrypted"
           : link === "mac-offline"
-            ? "Mac is offline"
+            ? `${Host} is offline`
             : link === "pairing"
               ? "pairing…"
               : link === "offline"
@@ -674,12 +685,12 @@
         </ul>
         </div>
       {:else}
-        <div class="empty">No projects are open on the Mac.</div>
+        <div class="empty">No projects are open on {host}.</div>
       {/if}
     {:else if link === "mac-offline"}
-      <div class="empty">Remote Control is off on the Mac, or the Mac can't reach the relay.</div>
+      <div class="empty">Remote Control is off on {host}, or {host} can't reach the relay.</div>
     {:else}
-      <div class="empty">Waiting for the Mac…</div>
+      <div class="empty">Waiting for {host}…</div>
     {/if}
   {/if}
 </main>

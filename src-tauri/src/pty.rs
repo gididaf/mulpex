@@ -535,6 +535,16 @@ impl OutputSink {
             if !buf.is_empty() {
                 let _ = ch.send(b64encode(buf));
             }
+        } else {
+            // Attached before: the page was reloaded (its web process crashed,
+            // `lib.rs::on_page_crash`) and this is a brand-new, blank xterm. Rebuild
+            // it from the ring exactly as an adopted pane is, or it stays blank
+            // until claude happens to redraw — which for most rows is never.
+            let (msgs, partial) = compose(&t, &Replay::default());
+            for m in msgs {
+                let _ = ch.send(m);
+            }
+            redraw = partial;
         }
         *st = SinkState::Attached(ch);
         redraw
@@ -1500,6 +1510,49 @@ mod tests {
         assert_eq!(t2.start, 6, "the six bytes before rolled off");
         assert_eq!(t2.resizes, vec![(6, 90, 20)], "the resize inside them went too");
         assert_eq!(t2.total, 6 + CLAUDE_TAIL_BYTES as u64);
+    }
+
+    /// Every message a pane's channel received, as JSON strings.
+    fn recording_channel() -> (Channel<String>, Arc<Mutex<Vec<String>>>) {
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let ch = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(j) = body {
+                g.lock().unwrap().push(serde_json::from_str::<String>(&j).unwrap());
+            }
+            Ok(())
+        });
+        (ch, got)
+    }
+
+    /// A reloaded page (its web process crashed) attaches a blank xterm to a
+    /// sink that is already streaming: it must be rebuilt from the ring, not
+    /// left blank. From spawn when the ring still holds it (exact); otherwise
+    /// what there is, asking for a redraw.
+    #[test]
+    fn a_second_attach_replays_the_ring() {
+        let sink = OutputSink::new(false, (100, 30));
+        sink.push(b"one ");
+        let (first, got1) = recording_channel();
+        assert!(!sink.attach(first));
+        sink.resized(120, 40);
+        sink.push(b"two");
+        assert_eq!(got1.lock().unwrap().len(), 3, "buffered flush, resize, live");
+
+        let (second, got2) = recording_channel();
+        assert!(!sink.attach(second), "the ring starts at spawn: exact, no redraw");
+        let msgs = got2.lock().unwrap().clone();
+        assert_eq!(msgs[0], snap_msg(100, 30, 0, ""));
+        assert_eq!(msgs[1], b64encode(b"one "));
+        assert_eq!(msgs[2], resize_msg(120, 40));
+        assert_eq!(msgs[3], b64encode(b"two"));
+        sink.push(b"!");
+        assert_eq!(got2.lock().unwrap().last().unwrap(), &b64encode(b"!"), "then live");
+        assert_eq!(got1.lock().unwrap().len(), 3, "the dead page's channel gets nothing more");
+
+        sink.push(&vec![b'z'; CLAUDE_TAIL_BYTES]);
+        let (third, _got3) = recording_channel();
+        assert!(sink.attach(third), "a rolled-over ring can't be exact: redraw");
     }
 
 

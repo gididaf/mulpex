@@ -67,3 +67,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # menu), and WebKitGTK cannot be relied on to let script read the clipboard.
 [target.'cfg(target_os = "linux")'.dependencies]
 tauri-plugin-clipboard-manager = "~2.3"
+# The page's web process dying (`webcrash.rs`): Tauri doesn't forward
+# WebKitGTK's `web-process-terminated`. Same version wry links.
+webkit2gtk = { version = "=2.0.2", features = ["v2_34"] }

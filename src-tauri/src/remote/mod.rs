@@ -590,7 +590,9 @@ pub fn project_view(
 
 pub fn workspace_view(active: Option<ProjectHandle>, projects: Vec<Value>) -> Value {
     // `files`: this host takes `file-put`, so the phone offers attaching.
-    json!({ "t": "state", "active": active, "projects": projects, "files": true })
+    // `host`: what the phone calls this computer ("gidi-dev-mulpex is
+    // offline"), which is not always a Mac.
+    json!({ "t": "state", "active": active, "projects": projects, "files": true, "host": desktop::hostname() })
 }
 
 fn start_thread(g: &mut Inner) {

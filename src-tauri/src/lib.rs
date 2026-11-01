@@ -25,6 +25,7 @@ mod secrets;
 mod snapshot;
 mod state;
 mod wake;
+mod webcrash;
 mod headless;
 mod handoff;
 pub(crate) use mulpex_ptyd::vtgrid;
@@ -120,6 +121,8 @@ fn teardown(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    webcrash::disable_memory_killer();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -146,6 +149,10 @@ pub fn run() {
     // WebKitGTK's own clipboard API is not reliably readable from script.
     #[cfg(target_os = "linux")]
     let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
+    // The page's process died (`webcrash.rs`). Tauri's own default here only
+    // reloads, forever; ours stops a crash loop.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| webcrash::on_page_crash(webview, "terminated"));
     let app = builder
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
@@ -328,6 +335,8 @@ pub fn run() {
                 // claudes; wake them as their listeners come up, unasked.
                 ws.checkpoint_auto_wake();
             }
+            #[cfg(target_os = "linux")]
+            webcrash::watch_linux(app.handle());
             remote::init(app.handle().clone());
             remote::client::init(app.handle().clone());
             hub::start(app.handle().clone());

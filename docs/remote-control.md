@@ -48,6 +48,9 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
 - **View** — every project's sidebar rows with status, task, ctx %, and the open dialog. Built in
   `hub.rs`'s loop (only while on), sent when it changes. Each claude row also carries
   `board_open`/`board_unread`/`board_urgent` (its Board badge) and each project a `board_rev`.
+  The view's `host` is the computer's name (`desktop::hostname`). The phone keeps it with its
+  pairing and says it instead of "Mac" ("gidi-dev-mulpex is offline"); an older host sends
+  none, and the phone says "the computer".
 - **Board** — `board-get {handle}` → `{t:"board", handle, board}`; `board-edit {rid, handle, edit}`,
   `board-on {rid, handle, on}`, `board-image-get {rid, handle, id, offset}` and `board-image-put
   {rid, handle, data, upload, done}` answer as `typed` with a `value`. Images go in chunks (a whole

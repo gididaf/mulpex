@@ -109,6 +109,36 @@ unit-tested on every platform; only the file reads are Linux-gated.
   letters (י, ו) sit in full-width cells and words look letter-spaced. Order and
   direction are correct (measured on a real claude reply, WebKitGTK 2.52).
 
+## The page crashing (`webcrash.rs`)
+
+On 2026-11-01 the VM's page died after four days: `Unable to shrink memory footprint of
+process (4347 MB) below the kill thresold (4096 MB). Killed` (`~/.xsession-errors`).
+WebKitGTK kills a web process past a fixed memory limit. The Rust side and the daemon
+kept running, so the claudes did too and the phone still listed them, but nothing that
+needs the page worked. A phone message is typed by the page (`remote-type`), so the
+phone said "No answer", and nothing ever brought the page back.
+
+- **The killer is off**: `WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR=1`, set in `run()`
+  before any webview exists (a user's own value wins). The limit can only be raised
+  through `memory-pressure-settings`, a construct-only property of the web context,
+  which wry builds with no hook. Off also means WebKit no longer trims its caches
+  under memory pressure.
+- **A dead page reloads**: `web-process-terminated` on the GTK webview (Tauri doesn't
+  forward it). `TerminatedByApi` is ignored. On macOS Tauri already reloaded on its own;
+  `on_web_content_process_terminate` routes it through the same `on_page_crash`.
+- **The third crash in five minutes** shows `public/crashed.html` (Try again → `/`)
+  instead of reloading forever.
+- **Panes come back whole**: a second `attach` of a sink is a reload, so it is rebuilt
+  from the ring like an adopted pane (docs/ptyd.md, "Repainting an adopted pane").
+- **Memory**: a full pane is ~26–28 MB at 120–131 columns with 10,000 lines (measured,
+  Xvfb, 30 busy shells: the page levels off at ~1.17 GB and frees it on close). The VM
+  had 25 shells beside 23 agents, so shells keep 3,000 lines (`terminals.ts`).
+
+Measured (Xvfb, the hidden-window build made visible): three shells, `kill -9` of the
+web process → the page reloads, all three dumps identical to before, live output
+continues; a third kill inside five minutes → `crashed.html`; Try again → the app,
+pane rebuilt.
+
 ## Building
 
 Ubuntu 24.04 packages:

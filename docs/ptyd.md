@@ -124,6 +124,10 @@ replayed at their exact stream offsets, the same rule as a remote mirror
 snapshot is cut at the right byte. Text the app writes into a pane
 (`Session::notice`) is pane-only and never counted at an offset.
 
+**A second attach is a reloaded page** (its web process died, docs/linux.md):
+a new, blank xterm on a sink that is already streaming. It gets the same
+rebuild with no snapshot, so case 2 or 3. The old page's channel just stops.
+
 ## Versions
 
 - `proto::PROTO` — what the wire speaks. `PROTO_MIN..=PROTO` is what this app can

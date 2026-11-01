@@ -16,6 +16,8 @@ type Pairing = {
   devSecret: string;
   /** Set once the Mac accepted this phone. */
   paired: boolean;
+  /** The computer's name, as its last view gave it (older hosts send none). */
+  name?: string;
 };
 
 const STORE = "mulpex.pairing";
@@ -91,8 +93,21 @@ export class Link {
       dev: prev?.dev ?? b64(newKey().slice(0, 12)),
       devSecret: prev?.devSecret ?? b64(newKey()),
       paired: false,
+      name: prev?.name,
     };
     this.oneTime = unb64(secret);
+    save(this.pairing);
+  }
+
+  /** The paired computer's name, if it ever said it. */
+  get hostName(): string | null {
+    return this.pairing?.name ?? null;
+  }
+
+  /** Remember the computer's name, so "<name> is offline" works before it answers. */
+  setHostName(name: string) {
+    if (!this.pairing || !name || this.pairing.name === name) return;
+    this.pairing.name = name;
     save(this.pairing);
   }
 

@@ -275,7 +275,7 @@
           class="attach"
           disabled={sending}
           aria-label="Attach files"
-          onclick={() => (onupload ? fileEl?.click() : (error = "Update Mulpex on the Mac to attach files"))}
+          onclick={() => (onupload ? fileEl?.click() : (error = "Update Mulpex on that computer to attach files"))}
         >📎</button>
         <textarea
           bind:this={box}
