@@ -47,6 +47,27 @@ const HOOKS: &[(&str, &str, Option<u32>)] = &[
 /// hook turns it into the `needs` status word.
 pub const WAITING_MARKER: &str = "[waiting for you]";
 
+/// Codex's percent-of-window compact threshold. Undocumented; found in the
+/// 0.164.0 binary (S23). `codex doctor` accepts 1–100 and rejects 170 with
+/// "invalid input parameter". The name says it compacts after a turn, not mid-turn;
+/// a compact actually firing at 70% has NOT been measured.
+pub const COMPACT_PERCENT_KEY: &str = "model_post_turn_compact_threshold_percent";
+/// Mulpex's default for [`COMPACT_PERCENT_KEY`].
+pub const COMPACT_PERCENT: u8 = 70;
+
+/// Whether a `config.toml`'s text sets `key` anywhere (top level or in a
+/// profile table). A line scan, not a TOML parse: a false "yes" only means we
+/// leave Codex's own default alone, which is the safe side.
+pub fn config_sets(config: Option<&str>, key: &str) -> bool {
+    config.is_some_and(|c| {
+        c.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    })
+}
+
 /// A string as a TOML basic string (quoted, escaped).
 pub fn toml_str(s: &str) -> String {
     // serde_json escapes `"`, `\` and every control character (as `\n`, `\t`,
@@ -71,7 +92,15 @@ fn hook_command(helper: &Path, sub: &str) -> String {
 /// - `--no-alt-screen`: the pane keeps its scrollback and xterm selection.
 /// - `check_for_update_on_startup=false`: otherwise a blocking update picker
 ///   sits in front of the first prompt.
-pub fn launch_args(helper: &Path, state_dir: &Path, project_dir: &Path, id: usize) -> Vec<String> {
+/// - [`COMPACT_PERCENT_KEY`]`=70`, unless the user's own `config.toml`
+///   (`user_config`, its text) already sets that key — theirs wins.
+pub fn launch_args(
+    helper: &Path,
+    state_dir: &Path,
+    project_dir: &Path,
+    id: usize,
+    user_config: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--dangerously-bypass-approvals-and-sandbox".into(),
         "--dangerously-bypass-hook-trust".into(),
@@ -81,6 +110,10 @@ pub fn launch_args(helper: &Path, state_dir: &Path, project_dir: &Path, id: usiz
         "-c".into(),
         trust_override(project_dir),
     ];
+    if !config_sets(user_config, COMPACT_PERCENT_KEY) {
+        args.push("-c".into());
+        args.push(format!("{COMPACT_PERCENT_KEY}={COMPACT_PERCENT}"));
+    }
     for (event, sub, timeout) in HOOKS {
         let mut hook = format!(
             "{{type=\"command\",command={}",
@@ -238,8 +271,9 @@ mod tests {
     #[test]
     fn launch_args_carry_every_hook_the_mcp_env_and_the_rules() {
         let helper = Path::new("/Applications/Mulpex Dev.app/Contents/MacOS/mulpex-helper");
-        let args = launch_args(helper, Path::new("/tmp/st ate"), Path::new("/p"), 7);
+        let args = launch_args(helper, Path::new("/tmp/st ate"), Path::new("/p"), 7, None);
         assert_eq!(args[0], "--dangerously-bypass-approvals-and-sandbox");
+        assert!(args.contains(&"model_post_turn_compact_threshold_percent=70".to_string()));
         assert!(args.contains(&"--dangerously-bypass-hook-trust".to_string()));
         assert!(args.contains(&"--no-alt-screen".to_string()));
         assert!(args.contains(&"check_for_update_on_startup=false".to_string()));
@@ -277,6 +311,20 @@ mod tests {
     }
 
     #[test]
+    fn the_users_own_compact_percent_wins() {
+        let h = Path::new("/h");
+        let ours = |cfg: Option<&str>| {
+            launch_args(h, h, h, 1, cfg).iter().any(|a| a.starts_with(COMPACT_PERCENT_KEY))
+        };
+        assert!(ours(None));
+        assert!(ours(Some("model = \"gpt-6.1-sol\"\n")));
+        assert!(ours(Some("# model_post_turn_compact_threshold_percent = 50\n")), "a comment is not a setting");
+        assert!(ours(Some("model_post_turn_compact_threshold_percent_x = 5\n")), "a longer key is not ours");
+        assert!(!ours(Some("model_post_turn_compact_threshold_percent = 85\n")));
+        assert!(!ours(Some("[profiles.fast]\n  model_post_turn_compact_threshold_percent=50\n")));
+    }
+
+    #[test]
     fn trust_lists_the_dir_and_its_git_root() {
         let dir = std::env::temp_dir().join(format!("mpx-trust-{}", crate::persist::new_uuid()));
         let sub = dir.join("a b");
@@ -306,6 +354,7 @@ mod tests {
             Path::new(&var("MPX_STATE")),
             Path::new(&var("MPX_PROJECT")),
             var("MPX_ID").parse().unwrap(),
+            None,
         );
         std::fs::write(var("MPX_ARGS_OUT"), args.join("\0")).unwrap();
     }

@@ -1312,7 +1312,9 @@ fn codex_command(
         cmd.env_remove(&k);
     }
     let project = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    for a in mulpex_core::codex::launch_args(helper_path, state_dir, &project, id) {
+    let user_config =
+        std::fs::read_to_string(crate::agent_transcript::codex_home().join("config.toml")).ok();
+    for a in mulpex_core::codex::launch_args(helper_path, state_dir, &project, id, user_config.as_deref()) {
         cmd.arg(a);
     }
     if resume && !session_id.is_empty() {

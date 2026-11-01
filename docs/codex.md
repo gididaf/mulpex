@@ -40,6 +40,7 @@ Driven on a real `codex` in tmux and with `codex exec`; nothing below is from do
 | — | A turn that ends in an API error (OpenAI 429 after retries) or an interrupt fires **no Stop hook** — the app reads the rollout tail to bring such a row back to `waiting`. |
 | — | `codex queue` → ack measured 8.2–8.5 s on a just-resumed codex (fast on a warm one), so the ack window is 15 s and a late ack still upgrades "unanswered" to "delivered". |
 | S21 | Not installed on the Linux VM yet; a host without `codex` disables ⌘⌥T there with a toast. |
+| S23 | Codex 0.164.0 has an undocumented `model_post_turn_compact_threshold_percent` (found in the binary; `codex doctor` accepts 1–100 and rejects 170). Every Mulpex codex is launched with `-c …=70` (`codex::COMPACT_PERCENT`) unless `$CODEX_HOME/config.toml` already sets the key, at any table level. The name says it compacts after a turn, not mid-turn. **A compact actually firing at 70% has not been measured.** `model_auto_compact_token_limit` (mid-turn) takes a token count, not a percent, so it was not used. |
 
 ## Contracts between the parts
 
