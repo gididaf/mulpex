@@ -23,9 +23,12 @@ fn main() -> anyhow::Result<()> {
         // The `statusLine` command from `settings.json`: saves the context-window
         // % for the sidebar, then runs the person's own statusline.
         Some("statusline") => mulpex_core::statusline::run(&args[2..]),
+        // For a plain script (a Slack bridge, a cron job): drop a hub message
+        // into one instance's inbox — see `send.rs`.
+        Some("send") => mulpex_core::send::run(&args[2..]),
         other => {
             eprintln!(
-                "mulpex-helper: expected `hook <event>`, `mcp`, `listen` or `statusline`, got {:?}",
+                "mulpex-helper: expected `hook <event>`, `mcp`, `listen`, `statusline` or `send`, got {:?}",
                 other
             );
             std::process::exit(2);

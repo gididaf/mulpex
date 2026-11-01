@@ -493,6 +493,14 @@ fn resolve_name(ctx: &Ctx, reg: &Registry, word: &str) -> Result<Option<usize>, 
 /// `parse_address`, falling back to a sidebar name in my project. The address
 /// grammar wins, so a name can never shadow "all", "3" or "claude#3".
 fn parse_target(ctx: &Ctx, reg: &Registry, word: &str) -> Result<Address, String> {
+    if word.trim().ends_with(crate::send::SCRIPT_SUFFIX.trim()) {
+        return Err(format!(
+            "\"{}\" is a script (`mulpex-helper send`), not an instance — it cannot receive hub \
+             messages, so nothing was sent. Act on its message, or answer it wherever it came \
+             from (e.g. Slack).",
+            word.trim()
+        ));
+    }
     match registry::parse_address(word) {
         Ok(a) => Ok(a),
         Err(e) => match resolve_name(ctx, reg, word)? {
@@ -2940,6 +2948,10 @@ fn sender_label_in(state_dir: Option<&Path>, v: &Value) -> String {
     if let Some(t) = v.get("from_terminal").and_then(|x| x.as_u64()) {
         return format!("term#{t} (remote claude)");
     }
+    // A plain script (`mulpex-helper send`). `from` is 0 there too.
+    if let Some(s) = v.get("from_script").and_then(|x| x.as_str()) {
+        return format!("{s}{}", crate::send::SCRIPT_SUFFIX);
+    }
     let id = v.get("from").and_then(|x| x.as_u64()).unwrap_or(0);
     match v.get("from_project").and_then(|x| x.as_str()) {
         Some(p) if !p.is_empty() => format!("{p}#{id}"),
@@ -3622,6 +3634,10 @@ mod tests {
         );
         // The app itself is "Mulpex", never a "claude#0" to reply to.
         assert_eq!(sender_label(&json!({ "from": 0, "from_app": true })), "Mulpex");
+        assert_eq!(
+            sender_label(&json!({ "from": 0, "from_script": "slack-bridge" })),
+            "slack-bridge (script)"
+        );
         // And the two local forms both parse back as addresses.
         assert_eq!(registry::parse_address("claude#2").unwrap(), Address::Local(2));
         assert!(matches!(

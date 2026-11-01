@@ -704,6 +704,29 @@ senders: ⌘⇧Q Checkpoint & Quit and its wake ([sessions.md](sessions.md)), an
 messages (below). Each body also says "do not reply" itself, because a claude spawned before it shipped has
 the old `HUB_RULES`.
 
+## Messages from a script (`mulpex-helper send`)
+
+For a plain process on the same machine — a Slack/Trello bridge under systemd, a cron job — that
+must wake an instance. A Monitor a claude arms itself dies at 30 minutes; the hub listener does
+not, so pushing into the inbox is the durable way to watch something.
+
+```
+~/.mulpex/bin/mulpex-helper send --project cloudraw --to 9 --from slack-bridge -m "text"
+                                  (or --file msg.txt, or the body on stdin; --to cloudraw#9 alone works too)
+```
+
+- **Finding the hub without `MULPEX_STATE_DIR`:** `<mulpex home>/ptyd/ptyd.pid` → the state root
+  `<temp>/mulpex-<pid>` → `registry.json` (the same file cross-project sends read). A service whose
+  `TMPDIR` differs from the app's sets `MULPEX_STATE_ROOT`.
+- **Refuses, never queues** (exit 1, reason on stderr): Mulpex not running, unknown project, an
+  instance not in the registry. Mulpex reaps a dead instance's inbox, so held mail would rot; the
+  caller retries. Exit 2 is bad usage, an empty body, or a body over 8 KB.
+- **The file** is `{"from":0,"from_script":"<label>","ts","body"}`, written beside the inbox and
+  renamed in. `sender_label` shows it as `<label> (script)`; `bounce_dead_inbox` skips `from: 0`
+  like an app message; `parse_target` refuses a `hub_send` to a `… (script)` name with a reason.
+  An MCP server spawned before this shipped shows the sender as `claude#0`.
+- Code: `crates/mulpex-core/src/send.rs`.
+
 ## Ask All Claudes (⌘⇧B) — the one app message that IS answered
 
 `broadcast.rs` sends one question to the picked claudes of every open project, through
