@@ -50,6 +50,13 @@ pub struct Input {
     /// The thread to `codex queue` to, when Codex has minted one and the TUI
     /// is up; `None` means only the typed fallback can reach it.
     pub thread: Option<String>,
+    /// A ⌘⇧K / auto-compact request is in progress on it (`compactreq/<id>`
+    /// has a phase). A ring now would start a turn in the very window the
+    /// compact flow needs the codex idle with an empty box for, so `/compact`
+    /// never runs (seen 2026-11-01: a ring 0 s after the checkpoint turn
+    /// ended, three auto-compacts in a row "never started"). The mail is held,
+    /// not dropped: once the phase clears it rings as usual.
+    pub hold: bool,
 }
 
 /// Starts one `codex queue` and reports how it ended. Injected so the state
@@ -201,7 +208,7 @@ impl Wakes {
                 }
                 continue;
             }
-            if !matches!(row.phase, Phase::Idle) || !i.waiting {
+            if !matches!(row.phase, Phase::Idle) || !i.waiting || i.hold {
                 continue;
             }
             let failed = row.mark.as_ref().is_some_and(|m| m.state == "unanswered" || m.state == "refused");
@@ -356,7 +363,7 @@ mod tests {
     }
 
     fn input(unread: usize, waiting: bool, thread: Option<&str>) -> Vec<Input> {
-        vec![Input { id: 4, unread, waiting, thread: thread.map(str::to_string) }]
+        vec![Input { id: 4, unread, waiting, thread: thread.map(str::to_string), hold: false }]
     }
 
     /// A queuer that records its calls and answers `ok` at once.
@@ -400,6 +407,24 @@ mod tests {
         assert_eq!(calls.borrow()[1].1, mulpex_core::codex::wake_line(3));
         let log = std::fs::read_to_string(mulpex_core::wake_log_path(&sd, 4)).unwrap();
         assert_eq!(log.lines().count(), 3, "{log}");
+        let _ = std::fs::remove_dir_all(sd);
+    }
+
+    /// A compact in progress holds the ring; when it ends, the held mail rings.
+    #[test]
+    fn a_compact_in_progress_holds_the_ring_until_it_ends() {
+        let sd = dir();
+        let calls = RefCell::new(Vec::new());
+        let q = queuer(&calls, true);
+        let mut w = Wakes::default();
+        let held = |unread| vec![Input { id: 4, unread, waiting: true, thread: Some("T".into()), hold: true }];
+        assert!(w.tick(&sd, &held(1), &q).is_empty());
+        w.tick(&sd, &held(2), &q);
+        assert!(calls.borrow().is_empty(), "rang during a compact");
+        assert_eq!(state(&w), None);
+        // The compact ended: the held mail rings, for the full count.
+        w.tick(&sd, &input(2, true, Some("T")), &q);
+        assert_eq!(calls.borrow().as_slice(), &[("T".to_string(), mulpex_core::codex::wake_line(2))]);
         let _ = std::fs::remove_dir_all(sd);
     }
 

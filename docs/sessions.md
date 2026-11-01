@@ -932,7 +932,9 @@ after the relaunch, waking each one by hand. ⌘⇧Q (Mulpex menu, ⌘P, the upd
 
 ### Auto-compact an orchestrator's claudes
 
-Right-click a claude row → **Auto-compact (self + claudes): Off / 50 / 60 / 70 / 80 %**. Mulpex
+Right-click a claude row → **Auto-compact (self + claudes, not codex): Off / 50 / 60 / 70 / 80 %**
+(on a codex row: **Auto-compact (claudes only — codex compacts itself)**; codex rows are never
+auto-compacted, see [codex.md](codex.md#compact-and-codex)). Mulpex
 then runs the ⌘⇧K flow above on **the row itself** and every claude in its **sidebar subtree** (its
 `hub_spawn` children, theirs, and rows dragged under it) whose context % reaches the threshold. A
 claude already over it goes at once. (Until 2026-10-20 the row itself was excluded — "its claudes"

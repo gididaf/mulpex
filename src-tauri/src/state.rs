@@ -1688,7 +1688,8 @@ impl Core {
             None => self.auto_compact.remove(&id),
         };
         self.persist_sessions();
-        self.send_app_message(id, &auto_compact_message(pct));
+        let agent = self.agent_of(id).unwrap_or_default();
+        self.send_app_message(id, &auto_compact_message(agent, pct));
         true
     }
 
@@ -2710,7 +2711,7 @@ impl Core {
         mulpex_core::mcp::log_message(
             &self.state_dir.join("messages.log"),
             mulpex_core::mcp::APP_SENDER,
-            &format!("claude#{to}"),
+            &mulpex_core::addr(&self.state_dir, to),
             body,
         );
         Some(file)
@@ -2832,7 +2833,9 @@ impl Core {
                     .unwrap_or(true);
                 let up = mulpex_core::agentready_path(&self.state_dir, id).exists()
                     || self.started.get(&id).is_none_or(|t| t.elapsed() >= CODEX_UP);
-                crate::wake::Input { id, unread, waiting, thread: (!sid.is_empty() && up).then_some(sid) }
+                let hold = std::fs::read_to_string(mulpex_core::compactreq_path(&self.state_dir, id))
+                    .is_ok_and(|p| !p.trim().is_empty());
+                crate::wake::Input { id, unread, waiting, thread: (!sid.is_empty() && up).then_some(sid), hold }
             })
             .collect();
         let bin = crate::claude_bin::resolve(Agent::Codex).cloned();
@@ -3455,15 +3458,22 @@ fn read_adopt_manifest(state_dir: &Path) -> Vec<AdoptRow> {
 pub const AUTO_COMPACT_CHOICES: [u8; 4] = [50, 60, 70, 80];
 
 /// What the orchestrator is told when the user turns auto-compact on or off.
-fn auto_compact_message(pct: Option<u8>) -> String {
+/// Codex rows are skipped (`compact.ts::autoCompactTick`): codex compacts
+/// itself mid-turn near a full window, so a Mulpex compact only adds a stop —
+/// which is why a codex orchestrator's rule covers only its claudes.
+fn auto_compact_message(agent: Agent, pct: Option<u8>) -> String {
+    let (who, reacher) = match agent {
+        Agent::Claude => ("you and your claudes", "you or one of them"),
+        Agent::Codex => ("your claudes", "one of them"),
+    };
     match pct {
         Some(p) => format!(
-            "The user enabled auto-compact for you and your claudes at {p}% context. When you \
-             or one of them reaches it, Mulpex asks that claude to stop at a checkpoint, runs \
-             /compact, and tells it to continue. A child may pause briefly while that happens; \
-             don't treat it as stuck. You don't need to do anything."
+            "The user enabled auto-compact for {who} at {p}% context. When {reacher} reaches \
+             it, Mulpex asks that claude to stop at a checkpoint, runs /compact, and tells it to \
+             continue. A child may pause briefly while that happens; don't treat it as stuck. \
+             Codex rows are skipped: codex compacts itself. You don't need to do anything."
         ),
-        None => "The user disabled auto-compact for you and your claudes.".to_string(),
+        None => format!("The user disabled auto-compact for {who}."),
     }
 }
 

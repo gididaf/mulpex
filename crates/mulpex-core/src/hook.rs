@@ -1553,7 +1553,7 @@ fn posttooluse(ctx: &Ctx) -> anyhow::Result<()> {
     }
     // (d) The user pressed ⌘⇧K: on every tool call until the turn ends, so a long
     // turn cannot forget it.
-    if compact_requested(ctx) {
+    if compact_requested(ctx) && compact_note_due(ctx) {
         context.push(COMPACT_NOTE.to_string());
     }
 
@@ -1590,6 +1590,43 @@ fn compact_phase(ctx: &Ctx) -> Option<String> {
 /// A ⌘⇧K request is waiting for this claude to reach a checkpoint.
 fn compact_requested(ctx: &Ctx) -> bool {
     compact_phase(ctx).as_deref() == Some("requested")
+}
+
+/// How often COMPACT_NOTE may repeat while a request stands, per agent. A claude
+/// gets it on every tool call. A codex's code-mode `exec` runs several inner
+/// tools in one go and `PostToolUse` fires for each, so it got the note 4–5
+/// times a call (seen 2026-11-01); at most once per window is enough to keep a
+/// long turn from forgetting it.
+fn compact_note_every(agent: Agent) -> Option<std::time::Duration> {
+    match agent {
+        Agent::Claude => None,
+        Agent::Codex => Some(std::time::Duration::from_secs(30)),
+    }
+}
+
+/// `compactnote/<id>`: when the note was last injected.
+fn compact_note_file(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir.join("compactnote").join(ctx.id_str())
+}
+
+/// Whether COMPACT_NOTE goes on this tool call (and, if so, record it). Always
+/// for an agent with no window; otherwise when it has not gone out since the
+/// request was written, or not for a full window.
+fn compact_note_due(ctx: &Ctx) -> bool {
+    let Some(every) = compact_note_every(ctx.agent) else { return true };
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let marker = compact_note_file(ctx);
+    let due = match (mtime(&marker), mtime(&compactreq_file(ctx))) {
+        (Some(last), Some(req)) if last >= req => last.elapsed().map_or(true, |a| a >= every),
+        _ => true,
+    };
+    if due {
+        if let Some(d) = marker.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&marker, "");
+    }
+    due
 }
 
 /// A one-line nudge naming the instances that have just closed, told to the
@@ -3366,6 +3403,36 @@ mod tests {
         let _ = std::fs::remove_file(compactreq_file(&ctx));
         mark_compact_resume(&ctx, true);
         assert_eq!(compact_phase(&ctx), None, "no request, nothing to hand back");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A claude gets the compact note on every tool call; a codex at most once
+    /// per window, and again at once for a fresh request.
+    #[test]
+    fn the_compact_note_repeats_per_tool_for_claude_and_is_throttled_for_codex() {
+        let dir = std::env::temp_dir().join(format!("mulpex-compactnote-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join(crate::COMPACTREQ_DIR)).unwrap();
+        let claude = test_ctx(&dir, 3);
+        std::fs::write(compactreq_file(&claude), "requested").unwrap();
+        assert!(compact_note_due(&claude) && compact_note_due(&claude) && compact_note_due(&claude));
+
+        let codex = codex_ctx(&dir, 4);
+        std::fs::write(compactreq_file(&codex), "requested").unwrap();
+        assert!(compact_note_due(&codex), "the first tool call");
+        assert!(!compact_note_due(&codex), "the next inner tool of the same exec");
+        assert!(!compact_note_due(&codex));
+        // The window ran out: once more.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+        std::fs::File::options().write(true).open(compact_note_file(&codex)).unwrap().set_modified(old).unwrap();
+        // (the request file must not look newer than the marker for this check)
+        std::fs::File::options().write(true).open(compactreq_file(&codex)).unwrap().set_modified(old - std::time::Duration::from_secs(1)).unwrap();
+        assert!(compact_note_due(&codex), "after the window");
+        assert!(!compact_note_due(&codex));
+        // A fresh request (newer file) gets it at once.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(compactreq_file(&codex), "requested").unwrap();
+        assert!(compact_note_due(&codex), "a new request");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

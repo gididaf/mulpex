@@ -51,6 +51,16 @@ import {
 
 const RESUME =
   "The conversation was just compacted at your checkpoint. Continue the task from where you stopped.";
+/** RESUME for a codex with hub mail waiting. The wake ring holds a codex's
+ *  mail while a compact is in progress (`wake.rs` `Input::hold`), and the
+ *  resume turn starts before it would ring, so the prompt says so. */
+const RESUME_WITH_MAIL = `${RESUME} You also have unread hub mail: call mcp__mulpex__hub_inbox first.`;
+
+/** What to type after the compact. Only a codex is told about mail — a claude's
+ *  own listener announces it. */
+function resumeText(agent: Agent, unread: number): string {
+  return agent === "codex" && unread > 0 ? RESUME_WITH_MAIL : RESUME;
+}
 
 /** What types `/compact` into `agent`'s empty box and submits it, in ONE write.
  *  claude: the plain keys. codex: a bracketed paste, then CR — typed fast, a
@@ -172,7 +182,13 @@ function startCompact(h: ProjectHandle, id: number, by: number | null) {
 //
 // The user sets "auto-compact at X%" on a row; that row and every claude in its
 // sidebar subtree whose context reaches X gets the ⌘⇧K flow above, run by Mulpex
-// itself — no model ever decides to compact. One attempt per crossing: a claude
+// itself — no model ever decides to compact.
+//
+// Codex rows are skipped, as the rule itself or as a child. Codex compacts
+// ITSELF mid-turn near a full window without ending the turn (every long
+// rollout shows one every ~1.5–2 h), so a Mulpex compact only adds a stop to a
+// turn that didn't need one. A codex orchestrator's rule still covers its
+// claudes. ⌘⇧K on a codex still works — that is the user asking. One attempt per crossing: a claude
 // is `suppressed` after its attempt (success or not) until its context reads
 // below X again, which covers both a failed compact and the ctx file still
 // showing the old number right after a good one.
@@ -197,7 +213,7 @@ export function autoCompactTick(h: ProjectHandle) {
     const pct = orch.auto_compact;
     if (pct == null || orch.kind === "shell") continue;
     for (const c of [orch, ...descendantsOf(p.sessions, orch.id)]) {
-      if (c.kind === "shell" || c.exited || c.failed) continue;
+      if (!autoCompacts(c.kind) || c.exited || c.failed) continue;
       const k = keyOf(h, c.id);
       const ctx = p.ctx.get(c.id);
       if (ctx == null || ctx < pct || suppressed.has(k) || active(h, c.id)) continue;
@@ -207,6 +223,9 @@ export function autoCompactTick(h: ProjectHandle) {
     }
   }
 }
+
+/** Whether a row of this kind is ever auto-compacted: claudes only (see above). */
+const autoCompacts = (kind: SessionInfo["kind"]): boolean => kind === "claude";
 
 /** The lowest threshold claude#id's own rule or any ancestor's puts on it, if any. */
 function ruleFor(list: SessionInfo[], id: number): number | null {
@@ -351,7 +370,9 @@ function step(h: ProjectHandle, id: number) {
   if (r.phase === "resume") {
     const b = blocker(h, id);
     if (b) return waitForBox(h, id, r, b);
-    sendBytes(h, id, new TextEncoder().encode(`\x1b[200~${RESUME}\x1b[201~\r`));
+    const unread = p.hub?.pending.find((e) => e.id === id)?.count ?? 0;
+    const text = resumeText(agentOf(s.kind) ?? "claude", unread);
+    sendBytes(h, id, new TextEncoder().encode(`\x1b[200~${text}\x1b[201~\r`));
     put(h, id, null);
     writePhase(h, id, null);
   }

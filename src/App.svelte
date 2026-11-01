@@ -639,7 +639,10 @@
             // by the user — no model can turn it on. A submenu; the current
             // choice carries a ✓.
             {
-              label: "Auto-compact (self + claudes)",
+              label:
+                agent === "codex"
+                  ? "Auto-compact (claudes only — codex compacts itself)"
+                  : "Auto-compact (self + claudes, not codex)",
               hint: s.auto_compact != null ? `${s.auto_compact}%` : undefined,
               sub: ([null, ...AUTO_COMPACT_CHOICES] as (number | null)[]).map((pct) => ({
                 label: pct == null ? "Off" : `${pct}%`,

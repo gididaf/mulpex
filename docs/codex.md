@@ -85,6 +85,25 @@ the line (bracketed paste + CR) into an **empty** box, and refuses visibly over 
 is denied over Remote Hosts: two windows would type twice). A resumed codex has a thread id but no
 `agentready` until its next prompt, so queue is used once the codex has been up ≥ 4 s.
 
+**No ring while a compact is in progress** (`compactreq/<id>` has a phase → `wake::Input::hold`).
+Seen 2026-11-01 (codex 0.164.0): three auto-compacts on codex children all ended "it never started"
+— the codex obeyed the note and ended its turn, and in the same second the ring saw `waiting` +
+unread mail and `codex queue` started a new turn, so `compact.ts` never found the idle, empty box it
+types `/compact` into. The mail is held, not dropped: it rings once the phase clears, and the resume
+prompt typed after a compact adds "you also have unread hub mail: call hub_inbox first" when the
+inbox is non-empty (codex only — a claude's listener announces its own).
+
+## Compact and codex
+- **Auto-compact skips codex rows** (`compact.ts::autoCompacts`), as a rule's own row or as a child.
+  Codex compacts itself mid-turn near a full window without ending the turn (rollouts on 0.164.0: a
+  `compacted` + ContextCompaction item every ~1.5–2 h, same `turn_id`, ~4 min each), so a Mulpex
+  compact only adds a stop to a turn that runs for a day. A codex orchestrator's rule still covers
+  its claudes; the menu says so ("claudes only — codex compacts itself"). ⌘⇧K on a codex still runs.
+- **The checkpoint note is throttled for a codex**: its code-mode `exec` runs several inner tools and
+  `PostToolUse` fires for each, so the note came 4–5 times per call. `hook::compact_note_due` lets
+  it out at most once per 30 s per request (`compactnote/<id>` mtime vs the `compactreq/<id>` mtime);
+  a claude still gets it on every tool call.
+
 ## Documented gaps
 No Read lock for codex (it reads through `Bash`, which the bash guard covers by path); no
 AskUserQuestion/plan dialogs — `needs` comes from the rules' `[waiting for you]` last line;
