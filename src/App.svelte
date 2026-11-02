@@ -1019,12 +1019,24 @@
     }
   }
 
+  /** "No prompt to type into", with the reader's reason, and what this window's
+   *  xterm held saved to `<mulpex home>/diag/promptbox/` — a refusal the user
+   *  can't explain from what they see (`promptbox.ts::promptBoxReport`). */
+  function noPromptWhy(handle: ProjectHandle, id: number, via: string): string {
+    const r = terminals.promptBoxReport(handle, id);
+    const p = get(projects).get(handle);
+    const kind = p?.sessions.find((x) => x.id === id)?.kind;
+    const head = `${new Date().toISOString()} ${via}: ${p?.name ?? "?"} ${addr(kind, id)} (handle ${handle})`;
+    void invoke("promptbox_diag", { text: `${head}\n${r.reason}\n${r.dump}` }).catch(() => {});
+    return `No prompt to type into right now (${r.reason})`;
+  }
+
   /** The prompt state that rules out typing into claude#id, as a toast; null when
    *  typing is fine. A draft is fine here: the line is appended to it. */
   function secretsBlocked(handle: ProjectHandle, id: number): string | null {
     const p = get(projects).get(handle);
     if (p?.statuses.get(id) === "needs") return "Answer or close the open question first";
-    if (terminals.promptBox(handle, id) === "none") return "No prompt to type into right now";
+    if (terminals.promptBox(handle, id) === "none") return noPromptWhy(handle, id, "secrets");
     return null;
   }
 
@@ -1073,7 +1085,7 @@
     else {
       const box = terminals.promptBox(handle, id);
       if (box === "draft") why = "There's unsent text in this claude's prompt on the Mac";
-      else if (box === "none") why = "No prompt to type into right now";
+      else if (box === "none") why = noPromptWhy(handle, id, "phone");
     }
     // Control characters out: an ESC inside could end the paste early (`ESC[201~`)
     // and turn the rest of the message into keystrokes.

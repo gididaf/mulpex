@@ -77,6 +77,12 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   (measured exact on claude 2.1.292, multi-line Hebrew included). **Over 900 bytes the message is
   written to `<mulpex home>/remote/inbox/<uuid>.md` and only a one-line pointer is typed** — the root
   rule about >1 KB through a TUI. Control characters are stripped so a message can't end the paste.
+  **A "No prompt to type into" refusal carries the reader's reason** (`no › row on screen`, `❯ row 5
+  has no rule above it` …) and writes what THIS window's xterm held — every row with its first cells'
+  attributes, viewport, cursor — to `<mulpex home>/diag/promptbox/<ms>.txt` (newest 20; ⌘K's refusal
+  too). Added 2026-11-02 because a codex refusal could not be reproduced: real codex 0.164 bytes read
+  correctly in every state tried, and the phone checks the HOST's xterm, which a remote desktop's
+  mirror (the screenshot you'd send) is not. Read the file before changing `promptbox.ts`.
 - **Attaching files** — the chat's 📎 picks any files (25 MB together). On Send each goes up in
   2 MB chunks as `file-put {rid, name, data, upload, done}` (standard base64, like the Board's
   images) and lands in `<mulpex home>/remote/phone-files/<uuid>/<name>` (0700 dir, 0600 file,

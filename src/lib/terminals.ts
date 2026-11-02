@@ -26,11 +26,11 @@ import { Channel, attachSession, sendBytes, resizeTerminals } from "./ipc";
 import { slotOf, hostClipboardImage } from "./hosts";
 import { pastePaths } from "./paths";
 import type { SessionKind } from "./ipc";
-import { readPromptBox } from "./promptbox";
+import { promptBoxReport, readPromptBox } from "./promptbox";
 import { agentOf, isAgent } from "./agents";
 import { projects } from "./stores";
 import { get } from "svelte/store";
-import type { PromptBox } from "./promptbox";
+import type { PromptBox, PromptBoxReport } from "./promptbox";
 import { captureSelection, plainText } from "./pins";
 import { IS_LINUX, isSuper } from "./platform";
 import type { PinRun } from "./pins";
@@ -514,6 +514,17 @@ class TerminalManager {
     const agent = agentOf(get(projects).get(handle)?.sessions.find((s) => s.id === id)?.kind);
     if (!e || !agent) return "none";
     return readPromptBox(e.term.buffer.active, e.term.rows, e.term.cols, agent);
+  }
+
+  /** `promptBox`, with why and the screen it read — for a refusal the user
+   *  can't explain from what they see (`promptbox.ts::promptBoxReport`). */
+  promptBoxReport(handle: number, id: number): PromptBoxReport {
+    const e = this.entries.get(keyOf(handle, id));
+    const kind = get(projects).get(handle)?.sessions.find((s) => s.id === id)?.kind;
+    const agent = agentOf(kind);
+    if (!e) return { box: "none", reason: "no terminal for this row in this window", dump: "" };
+    if (!agent) return { box: "none", reason: `not an agent row (kind=${kind ?? "unknown"})`, dump: "" };
+    return promptBoxReport(e.term.buffer.active, e.term.rows, e.term.cols, agent);
   }
 
   /** (handle, id)'s visible screen as plain text, one line per row. */

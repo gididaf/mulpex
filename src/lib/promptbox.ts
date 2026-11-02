@@ -21,7 +21,7 @@
 // A box that can't be found at all — a question or plan dialog replaces it,
 // claude is still starting — is "none", and ⌘⇧E does nothing.
 
-import type { IBuffer } from "@xterm/xterm";
+import type { IBuffer, IBufferCell } from "@xterm/xterm";
 import type { Agent } from "./ipc";
 
 export type PromptBox = "empty" | "draft" | "none";
@@ -115,4 +115,88 @@ function readCodexBox(buf: IBuffer, rows: number, cols: number): PromptBox {
     return placeholder ? "empty" : "none";
   }
   return "none";
+}
+
+// ---- Diagnostics -----------------------------------------------------------
+//
+// A "none" is a refusal the user sees ("No prompt to type into right now")
+// while the pane, to their eye, holds an ordinary empty box. The readers above
+// only answer the question; this says why, so a refusal on a live screen can
+// be compared against what the reader expects instead of being guessed at
+// from a screenshot (which shows neither attributes nor the local xterm — a
+// remote desktop sees its own mirror). It never changes the answer.
+
+export type PromptBoxReport = {
+  box: PromptBox;
+  /** One short line, fit for a phone's error text. */
+  reason: string;
+  /** The visible screen, every row's first cells with their attributes. */
+  dump: string;
+};
+
+/** How a cell is drawn, compactly: `"›" b d fg=default`. */
+function cellAttrs(c: IBufferCell): string {
+  const fg = c.isFgDefault() ? "default" : c.isFgRGB() ? `#${c.getFgColor().toString(16).padStart(6, "0")}` : `p${c.getFgColor()}`;
+  const bg = c.isBgDefault() ? "" : c.isBgRGB() ? ` bg=#${c.getBgColor().toString(16).padStart(6, "0")}` : ` bg=p${c.getBgColor()}`;
+  return `${JSON.stringify(c.getChars())}${c.isBold() ? " b" : ""}${c.isDim() ? " d" : ""}${c.isInverse() ? " inv" : ""} fg=${fg}${bg}`;
+}
+
+/** `readPromptBox`'s answer, why, and the screen it was read from. */
+export function promptBoxReport(buf: IBuffer, rows: number, cols: number, agent: Agent = "claude"): PromptBoxReport {
+  const box = readPromptBox(buf, rows, cols, agent);
+  const top = buf.viewportY;
+  const cell = buf.getNullCell();
+  const text = (y: number) => buf.getLine(y)?.translateToString(true) ?? "";
+
+  const lines = [
+    `agent=${agent} box=${box} cols=${cols} rows=${rows} viewportY=${top} baseY=${buf.baseY} length=${buf.length} cursor=${buf.cursorX},${buf.cursorY} buffer=${buf.type}`,
+  ];
+  for (let y = top; y < top + rows; y++) {
+    const line = buf.getLine(y);
+    const first: string[] = [];
+    for (let x = 0; x < 3 && line?.getCell(x, cell); x++) first.push(cellAttrs(cell));
+    lines.push(`${String(y - top).padStart(3)} | ${first.join(" ; ").padEnd(70)} | ${text(y)}`);
+  }
+
+  let reason = box === "none" ? "" : box;
+  if (box === "none" && agent === "codex") {
+    // The bottom-most row that starts with "›" at all, and what disqualified it.
+    let found = -1;
+    for (let y = top + rows - 1; y >= top; y--) {
+      if (buf.getLine(y)?.getCell(0, cell) && cell.getChars() === CODEX_PROMPT) {
+        found = y;
+        break;
+      }
+    }
+    if (found < 0) reason = "no › row on screen";
+    else {
+      const line = buf.getLine(found)!;
+      line.getCell(0, cell);
+      const head = cellAttrs(cell);
+      const ok = cell.isBold() && !cell.isDim() && cell.isFgDefault();
+      line.getCell(1, cell);
+      reason = !ok
+        ? `› row ${found - top} is not the composer's (${head})`
+        : cell.getChars().trim() !== ""
+          ? `› row ${found - top} has no space after › (${JSON.stringify(cell.getChars())})`
+          : `› row ${found - top} has neither placeholder nor text`;
+    }
+  } else if (box === "none") {
+    // The reader takes the bottom-most "❯" row under a rule; failing that,
+    // the bottom-most "❯" row at all.
+    let ruled = -1;
+    let any = -1;
+    for (let y = top + rows - 1; y > top; y--) {
+      if (!isPromptRow(text(y))) continue;
+      if (any < 0) any = y;
+      if (isRule(text(y - 1))) {
+        ruled = y;
+        break;
+      }
+    }
+    if (ruled >= 0) reason = `❯ row ${ruled - top} has no closing rule below it`;
+    else if (any >= 0) reason = `❯ row ${any - top} has no rule above it`;
+    else reason = "no ❯ row on screen";
+  }
+  return { box, reason, dump: `${reason}\n${lines.join("\n")}\n` };
 }

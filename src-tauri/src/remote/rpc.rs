@@ -118,6 +118,8 @@ pub const ALLOWED: &[&str] = &[
 /// - `remote_reply`, `remote_snapshot_reply`, `host_*`, `fda_*`,
 ///   `geometry_take_back`: this machine's own permissions, and the
 ///   remote-control plumbing itself.
+/// - `promptbox_diag`: a refusal THIS window's prompt check made, about its own
+///   xterm, written to this machine's disk.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const DENIED: &[&str] = &[
     "switch_project",
@@ -142,6 +144,7 @@ pub const DENIED: &[&str] = &[
     "remote_set_enabled",
     "remote_set_relay_url",
     "remote_reply",
+    "promptbox_diag",
     "host_list",
     "host_update",
     "host_update_cancel",

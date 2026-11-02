@@ -1205,3 +1205,30 @@ pub fn debug_dump(name: String, text: String) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{name}.txt")), text);
 }
+
+/// A prompt check refused to type (`promptbox.ts::promptBoxReport`): what that
+/// window's xterm held, to `<mulpex home>/diag/promptbox/`, newest 20 kept.
+/// Not gated: it fires only on a refusal, and the refusal is the bug report.
+/// Returns the file's path.
+#[tauri::command]
+pub fn promptbox_diag(text: String) -> Result<String, String> {
+    let dir = mulpex_core::mulpex_home().join("diag").join("promptbox");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{ms}.txt"));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    let mut old: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("txt"))
+        .collect();
+    old.sort();
+    for p in old.iter().rev().skip(20) {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(path.display().to_string())
+}

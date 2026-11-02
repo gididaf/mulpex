@@ -195,6 +195,7 @@ pub fn run() {
             commands::remote_snapshot_reply,
             commands::debug_dump_enabled,
             commands::debug_dump,
+            commands::promptbox_diag,
             commands::debug_drive_take,
             commands::focus_session,
             commands::get_hub_snapshot,

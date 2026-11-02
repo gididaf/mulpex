@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import xterm from "@xterm/xterm";
-import { readPromptBox } from "./promptbox.ts";
+import { promptBoxReport, readPromptBox } from "./promptbox.ts";
 
 const { Terminal } = xterm;
 const dir = new URL("./fixtures/codex/", import.meta.url);
@@ -63,4 +63,41 @@ test("each reader refuses the other agent's screen", async () => {
   const claude = "─".repeat(40) + "\r\n❯ \x1b[2mTry \"fix it\"\x1b[0m\r\n" + "─".repeat(40) + "\r\n";
   assert.equal(await read(claude, "claude"), "empty");
   assert.equal(await read(claude, "codex"), "none");
+});
+
+// promptBoxReport: the answer never changes, and a "none" says why.
+async function report(bytes, agent) {
+  const term = await screen(bytes);
+  return promptBoxReport(term.buffer.active, term.rows, term.cols, agent);
+}
+
+test("report: same answer as the reader on every recorded state", async () => {
+  for (const off of Object.values(at)) {
+    const bytes = session.subarray(0, off);
+    assert.equal((await report(bytes, "codex")).box, await read(bytes, "codex"));
+    assert.equal((await report(bytes, "claude")).box, await read(bytes, "claude"));
+  }
+});
+
+test("report: codex reasons", async () => {
+  assert.equal((await report("hello\r\n", "codex")).reason, "no › row on screen");
+  assert.match((await report("\x1b[1;2m› \x1b[0mold prompt\r\n", "codex")).reason, /^› row 0 is not the composer's \("›" b d fg=default\)$/);
+  assert.equal((await report("\x1b[1m›\x1b[0m \r\n  gpt-5 · /x\r\n", "codex")).reason, "› row 0 has neither placeholder nor text");
+  assert.equal((await report("\x1b[1m›\x1b[0mx\r\n", "codex")).reason, '› row 0 has no space after › ("x")');
+});
+
+test("report: claude reasons", async () => {
+  const rule = "─".repeat(40);
+  assert.equal((await report("hello\r\n", "claude")).reason, "no ❯ row on screen");
+  assert.equal((await report("text\r\n❯ hi\r\n" + rule + "\r\n", "claude")).reason, "❯ row 1 has no rule above it");
+  assert.equal((await report(rule + "\r\n❯ \r\n", "claude")).reason, "❯ row 1 has no closing rule below it");
+});
+
+test("report: the dump carries the screen and its attributes", async () => {
+  const r = await report(session.subarray(0, at.empty), "codex");
+  assert.equal(r.box, "empty");
+  const lines = r.dump.split("\n");
+  assert.match(lines[1], /^agent=codex box=empty cols=100 rows=30 viewportY=\d+ baseY=\d+/);
+  assert.equal(lines.length, 1 + 1 + ROWS + 1);
+  assert.ok(lines.some((l) => /"›" b fg=default/.test(l) && l.endsWith("› Ask Codex to do anything")), r.dump);
 });
