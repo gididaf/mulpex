@@ -439,6 +439,35 @@ the capability and `sendNotification` is simply denied at runtime; the badge (a 
 keeps working, so the failure looks like "notifications are flaky", not "notifications are off".
 Same allowlist shape as `lib.rs::is_forwarded` for menu ids.
 
+## One Mulpex per home (`instance.rs`)
+
+A second app on the same `MULPEX_HOME` shares the daemon, the session stores and the Remote
+Control identity with the first, and nothing in either was written for that. On 2026-11-03 a
+claude on the Linux VM ran `~/Applications/Mulpex.AppImage --version` (there was no such flag: it
+opened the whole app) from its own shell, so the second app inherited that claude's environment:
+- it took the claude's `ANTHROPIC_BASE_URL` (the Live Token proxy) for the real API and configured
+  the daemon with it, so the proxy called itself until it ran out of file descriptors and every
+  claude got 502 (docs/live-token.md);
+- it and the real app took turns on the relay link, so the Mac's remote badge flipped every second;
+- the session lists came out with every name gone and 13 rows missing (most likely its writes;
+  not reproduced).
+
+Now:
+- `run()` takes an exclusive `flock` on `<home>/app.lock` first thing. A second launch writes
+  `<home>/focus-request` (the first app's window comes to the front) and exits with a line on
+  stderr, before it touches anything.
+- A restart (`RunEvent::ExitRequested` with `tauri::RESTART_EXIT_CODE`: updates, host updates,
+  detached restarts) writes `<home>/restarting` with its pid; the new app waits up to 60 s for
+  the lock while that names the lock's holder. A file, not an env var: on macOS Tauri relaunches
+  through LaunchServices (`open -n`), which passes no environment.
+- `scrub_inherited_env` drops `MULPEX_INSTANCE_ID`/`MULPEX_STATE_DIR`, the child-session markers,
+  and an `ANTHROPIC_BASE_URL` that is a Live Token proxy URL, so even a first app started from
+  inside a claude starts clean.
+- `--version` / `--help` print and exit (`main.rs`).
+
+The flock dies with the process, so a crash never leaves it stale. Rust opens files `O_CLOEXEC`, so
+the daemon and the claudes never inherit it.
+
 ## The scratch dir outlives the app (since the PTY daemon)
 
 The scratch root is the daemon's, `temp/mulpex-<daemon pid>`, and a project's dir under it is

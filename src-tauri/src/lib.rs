@@ -8,6 +8,7 @@ mod remote_update;
 mod claude_bin;
 mod commands;
 mod hub;
+mod instance;
 mod live_token;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menu;
@@ -121,6 +122,9 @@ fn teardown(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything reads the environment or the home: see `instance.rs`.
+    instance::scrub_inherited_env();
+    instance::claim_or_exit();
     #[cfg(target_os = "linux")]
     webcrash::disable_memory_killer();
     let builder = tauri::Builder::default()
@@ -341,6 +345,7 @@ pub fn run() {
             remote::init(app.handle().clone());
             remote::client::init(app.handle().clone());
             hub::start(app.handle().clone());
+            instance::watch_focus(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -367,7 +372,16 @@ pub fn run() {
         // `killpg`, so anything they'd backgrounded outside the foreground process
         // group was orphaned. `teardown` is idempotent; the window-close path fires
         // both events and runs it twice.
-        RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+        RunEvent::ExitRequested { code, .. } => {
+            // Every restart (`request_restart`: commands, an update, a host
+            // update) passes here with this code; the app it starts inherits
+            // the mark and waits for our lock instead of exiting.
+            if code == Some(tauri::RESTART_EXIT_CODE) {
+                instance::mark_restart();
+            }
+            teardown(app);
+        }
+        RunEvent::Exit => {
             teardown(app);
         }
         _ => {}

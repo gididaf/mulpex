@@ -101,6 +101,21 @@ pane that was at the bottom at the bottom.
 On the Mac, `client.rs` re-subscribes every open mirror on each `welcome`, so a reconnect
 restarts each pane from a fresh snapshot. The frontend does nothing for that.
 
+**Blank panes, unexplained (2026-11-03).** After the VM's host had been fought over by two apps on
+one home for ~50 minutes, then rebooted, every pane of that host stayed empty on the Mac — through
+disconnect/connect and remove/re-pair — while the host's `MULPEX_DEBUG_REMOTE` log showed it was
+never asked for one. Only restarting the Mac app cleared it. Two headless repros (a second host
+app for 20 s and 150 s, then a host reboot) did not reproduce it. One run of
+`test-remote-hosts.sh` did show a relative: after "relay dropped and back", one pane whose ring
+had rolled (so it needs the host window's `host-serialize`) never got its `snap`, and 4 further
+runs passed. So both sides now log it:
+- the Mac, always, to `<home>/remote/mirror.log` (1 MB, then `.log.1`): every `host_attach` /
+  `host_detach`, each `welcome` with how many panes it re-subscribes, every `snap`/`gone`, and the
+  first frame for a pane that has no channel;
+- the host, with `MULPEX_DEBUG_REMOTE`: every `sub` received, and a `gone` answer.
+The harness appends the host's log across its restarts (`>>`), so the next failure keeps both
+halves.
+
 When ⌘⇧R replaces a session's process, the old tap's receiver disconnects and the host
 re-subscribes the new one (a replay from spawn). Separately, `session-restarted` (now emitted by
 `restart_session`) is what makes **every** window rebind its own pane.

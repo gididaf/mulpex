@@ -504,6 +504,10 @@ impl Server {
             }
             "sub" => {
                 if let (Some(h), Some(id)) = (h, id) {
+                    if std::env::var_os("MULPEX_DEBUG_REMOTE").is_some() {
+                        let was = desk.subs.get(&(h, id)).map(|s| matches!(s, Sub::Live { .. }));
+                        eprintln!("mulpex: sub h={h} id={id} replacing_live={was:?}");
+                    }
                     desk.subs.remove(&(h, id));
                     if let Some(msg) = subscribe(desk, h, id) {
                         return self.send_sealed(ws, cid, &msg).map(|_| true);
@@ -637,6 +641,9 @@ impl Server {
 /// — `gone` when there is no such session.
 fn subscribe(desk: &mut Desk, h: ProjectHandle, id: usize) -> Option<String> {
     let Some(tap) = tap_session(h, id) else {
+        if std::env::var_os("MULPEX_DEBUG_REMOTE").is_some() {
+            eprintln!("mulpex: sub h={h} id={id}: no such session, answering gone");
+        }
         return Some(json!({"t": "gone", "h": h, "id": id}).to_string());
     };
     let rid = b64(&super::crypto::random32()[..12]);

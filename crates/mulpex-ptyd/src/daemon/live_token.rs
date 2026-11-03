@@ -382,11 +382,28 @@ pub fn stats() -> Value {
 fn upstream_base() -> String {
     let u = config().upstream;
     let u = u.trim_end_matches('/');
-    if u.is_empty() {
+    let own = PROXY.get().map(|p| p.port);
+    if u.is_empty() || own.is_some_and(|port| is_self(u, port)) {
         "https://api.anthropic.com".to_string()
     } else {
         u.to_string()
     }
+}
+
+/// An upstream that is this proxy. An app started from inside a claude once
+/// took that claude's base URL for "the API the claudes would have used" and
+/// configured it: every request then called the proxy again, and the chain
+/// held two sockets per hop until the daemon ran out of file descriptors and
+/// every claude got 502 (2026-11-03). Loopback on our own port is never a
+/// real upstream.
+fn is_self(upstream: &str, port: u16) -> bool {
+    let rest = upstream
+        .strip_prefix("http://")
+        .or_else(|| upstream.strip_prefix("https://"))
+        .unwrap_or(upstream);
+    let authority = rest.split('/').next().unwrap_or("");
+    let Some((host, p)) = authority.rsplit_once(':') else { return false };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]") && p.parse::<u16>() == Ok(port)
 }
 
 async fn handle(req: Request<Incoming>) -> Result<Response<Body>, std::convert::Infallible> {
@@ -548,6 +565,15 @@ async fn run_refresh_command() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn our_own_port_is_never_the_upstream() {
+        assert!(is_self("http://127.0.0.1:34693/43e170caaa5efe2cff20f09709501ade/c/x-2", 34693));
+        assert!(is_self("http://localhost:34693", 34693));
+        assert!(!is_self("http://127.0.0.1:4000", 34693), "a user's own loopback gateway");
+        assert!(!is_self("https://api.anthropic.com", 34693));
+        assert!(!is_self("https://gw.example.com:34693", 34693));
+    }
 
     #[test]
     fn secret_prefix_is_required_and_stripped() {

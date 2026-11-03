@@ -77,7 +77,9 @@ export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 export CI=true
 build() { # $1 version [$2 = "rewire": change the wire | a git commit to build instead] → $WORK/build-$1/
-  local v=$1 src="$WORK/src-$1"
+  # Named for the output too: LEGACY is built under BASE's version number, and
+  # sharing BASE's source dir mixed the two trees (and `ln` then failed).
+  local v=$1 src="$WORK/src-${3:-$1}"
   echo "› building v$v${2:+ ($2)}"
   mkdir -p "$src"
   if [ -n "${2:-}" ] && [ "$2" != rewire ]; then

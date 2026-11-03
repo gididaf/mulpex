@@ -379,7 +379,9 @@ fn upstream_base() -> String {
         .into_iter()
         .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
         .map(|(_, v)| v.trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
+        // A Live Token proxy URL leaking in (an app started from inside a
+        // claude) is the proxy, not the API behind it.
+        .filter(|v| !v.is_empty() && !crate::instance::is_live_token_url(v))
         .unwrap_or_else(|| "https://api.anthropic.com".to_string())
 }
 

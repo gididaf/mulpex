@@ -543,6 +543,7 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
             // for, and rebuilds them when the host restarted.
             set_state(slot, epoch, "connected", None);
             // Re-mirror every pane still open here: each restarts from a snapshot.
+            mirror_log(&format!("welcome host={slot} epoch={epoch} resubscribing={}", subs.len()));
             for (h, id) in subs {
                 let _ = tx.send(json!({"t": "sub", "h": h, "id": id}).to_string());
             }
@@ -629,6 +630,20 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
                 _ => {}
             }
             let ch = inner().lock().unwrap().channels.get(&(slot, h, id)).cloned();
+            // The first frame of each stream, and frames with no pane to go
+            // to, are what a blank pane's log has to show.
+            static ORPHANS: Mutex<Vec<(u32, u64, usize)>> = Mutex::new(Vec::new());
+            let first_orphan = ch.is_none() && {
+                let mut o = ORPHANS.lock().unwrap();
+                let new = !o.contains(&(slot, h, id));
+                if new {
+                    o.push((slot, h, id));
+                }
+                new
+            };
+            if t == "snap" || t == "gone" || first_orphan {
+                mirror_log(&format!("{t} host={slot} h={h} id={id} pane={}", ch.is_some()));
+            }
             if let Some(ch) = ch {
                 let _ = ch.send(out);
             }
@@ -1096,15 +1111,35 @@ pub async fn host_invoke(host: u32, cmd: String, args: Value) -> Result<Value, S
 #[tauri::command]
 pub fn host_attach(host: u32, project_handle: u64, id: usize, channel: Channel<Value>) {
     let h = project_handle.saturating_sub(base_of(host));
-    inner().lock().unwrap().channels.insert((host, h, id), channel);
-    let _ = send_to(host, json!({"t": "sub", "h": h, "id": id}));
+    let replaced = inner().lock().unwrap().channels.insert((host, h, id), channel).is_some();
+    let sent = send_to(host, json!({"t": "sub", "h": h, "id": id}));
+    mirror_log(&format!("attach host={host} h={h} id={id} replaced={replaced} sub={sent:?}"));
 }
 
 #[tauri::command]
 pub fn host_detach(host: u32, project_handle: u64, id: usize) {
     let h = project_handle.saturating_sub(base_of(host));
-    inner().lock().unwrap().channels.remove(&(host, h, id));
-    let _ = send_to(host, json!({"t": "unsub", "h": h, "id": id}));
+    let had = inner().lock().unwrap().channels.remove(&(host, h, id)).is_some();
+    let sent = send_to(host, json!({"t": "unsub", "h": h, "id": id}));
+    mirror_log(&format!("detach host={host} h={h} id={id} had={had} unsub={sent:?}"));
+}
+
+/// Where a remote pane's stream starts and stops, for the next time a pane
+/// stays blank. On 2026-11-03 every pane of a host stayed empty here through
+/// a disconnect/connect and a remove/re-pair, while the host's log showed it
+/// was never asked for one, and only restarting this app cleared it; two
+/// headless repros did not reproduce it. Always on (an app started from
+/// Finder gets no env switch), no screen content, capped at 1 MB.
+fn mirror_log(line: &str) {
+    use std::io::Write as _;
+    let path = super::remote_dir().join("mirror.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{ts} {line}");
+    }
 }
 
 /// Keystrokes for a host's session. Dropped while it's unreachable.

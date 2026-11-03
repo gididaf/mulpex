@@ -70,7 +70,7 @@ relay() { target/debug/mulpex-relay --listen "127.0.0.1:$PORT" --static remote/d
 # The project's scratch dir: under A's daemon's root, named for the project.
 KEY="$(printf %s "$(cd "$WORK/proj" && pwd -P)" | shasum -a 256 | cut -c1-16)"
 SD() { ls -d "${TMPDIR%/}"/mulpex-*/"$KEY" 2>/dev/null | head -1; }
-start_a() { MULPEX_DEBUG_DUMP=1 MULPEX_DEBUG_REMOTE=1 MULPEX_HOME="$WORK/A" MULPEX_DEBUG_TAIL_BYTES=8192 "$BIN" >"$WORK/A.log" 2>&1 & A=$!; PIDS+=($A); sleep 5; mkdir -p "$(SD)/termreq"; }
+start_a() { MULPEX_DEBUG_DUMP=1 MULPEX_DEBUG_REMOTE=1 MULPEX_HOME="$WORK/A" MULPEX_DEBUG_TAIL_BYTES=8192 "$BIN" >>"$WORK/A.log" 2>&1 & A=$!; PIDS+=($A); sleep 5; mkdir -p "$(SD)/termreq"; }
 start_b() { MULPEX_DEBUG_DUMP=1 MULPEX_HOME="$WORK/B" "$BIN" >"$WORK/B.log" 2>&1 & B=$!; PIDS+=($B); }
 N=0
 req() { N=$((N + 1)); printf '%s' "$1" >"$(SD)/termreq/$(printf %016d $N)-t.json"; }
@@ -128,6 +128,23 @@ check "relay dropped and back" 1 2
 
 kill "$B"; sleep 2; start_b; sleep 10
 check "this Mac restarted" 1 2
+
+# A second launch on the host's home (2026-11-03: a claude ran the app binary
+# with `--version`, which opened a whole second Mulpex on the same daemon and
+# relay identity). It must hand over and exit at once, touching nothing.
+"$BIN" --version | grep -q "^Mulpex " && echo "  ✓ --version prints and exits" || { echo "  ✗ --version"; FAIL=1; }
+t0=$(date +%s)
+MULPEX_HOME="$WORK/A" "$BIN" >"$WORK/A2.log" 2>&1 & A2=$!
+for _ in $(seq 1 50); do kill -0 "$A2" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$A2" 2>/dev/null; then
+  echo "  ✗ a second launch on the host's home kept running"; kill -9 "$A2"; FAIL=1
+else
+  echo "  ✓ a second launch exited in $(( $(date +%s) - t0 )) s: $(head -c 60 "$WORK/A2.log")…"
+fi
+kill -0 "$A" 2>/dev/null && echo "  ✓ the first app is untouched" || { echo "  ✗ the first app died"; FAIL=1; }
+req '{"op":"send","id":1,"data":"echo after-the-second-launch\r"}'
+sleep 4
+check "after a second launch" 1 2
 
 kill "$A"; sleep 3; rm -rf "$WORK/A/dump" "$WORK/B/dump"; start_a
 req '{"op":"open","label":"after","seed":"echo new run"}'

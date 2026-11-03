@@ -107,6 +107,24 @@ must not depend on Claude Code internals, because Claude Code updates constantly
   first-party Anthropic host. Set ENABLE_TOOL_SEARCH=true". Hence the env var.
 - **`/usage` was the same** with the proxy as without it.
 
+## The proxy is never its own upstream (2026-11-03)
+
+The app tells the daemon which API the claudes "would have used": the login environment's
+`ANTHROPIC_BASE_URL`, else `api.anthropic.com`. A second app started from inside a claude's shell
+inherited that claude's base URL — the proxy itself — and pushed it. Every request then called the
+proxy again; each hop held two loopback sockets that never closed, the daemon hit its 1024
+descriptor limit (`live token refresh: spawn: Too many open files` in `ptyd.log`, 426 self-loops
+in `ss`), and every claude got `502 live token proxy: error sending request`. Raising the limit
+only let it grow (38 k descriptors in two minutes).
+
+Guards, either one enough on its own:
+- the daemon ignores an upstream on loopback at its own port (`is_self`);
+- the app ignores an `ANTHROPIC_BASE_URL` shaped like a proxy URL
+  (`instance::is_live_token_url`) and strips it from its own environment at start.
+
+A user's own loopback gateway (`http://127.0.0.1:4000`) is still honoured. And a second app can no
+longer start at all (docs/sessions.md, "One Mulpex per home").
+
 ## Limits
 
 - A claude started while the feature was off has no proxy env. Restart it once with ⌘⇧R. The dialog
