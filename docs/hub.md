@@ -284,6 +284,22 @@ Also settled while diagnosing this, against two plausible-sounding suggestions:
   after a restart. A surviving flag means the instance believes it is armed when it isn't, and it
   is never woken by hub mail again — with nothing anywhere to say so.
 
+## The per-turn context fits in 9,500 characters (2026-10-20)
+
+Everything `userpromptsubmit` returns as `additionalContext` shares one budget,
+`hook::CONTEXT_LIMIT = 9_500`. Past 10,000 characters Claude Code saves the context to a file and
+shows the model a **2 KB preview** instead (measured: the largest shown whole was exactly 10,000;
+10,019 was cut). An orchestrator with a dozen workers wrote 14 KB, so the model saw the start of
+the peer list and never the Board rule after it. The margin is because Claude Code counts UTF-16
+units and the hook counts chars.
+
+So the parts go in a fixed order, the fixed-size ones first: the Board rule and columns, the
+secrets note (docs/secrets.md), the arm nudge, the name nudge — and **the peer list last, in
+whatever room is left** (`mcp::peers_context_within(ctx, budget)`). Each peer's task is collapsed
+to one line of at most `PEER_TASK_CHARS = 150` characters plus "…", and a list that still doesn't
+fit stops with "…and N more — call mcp__mulpex__hub_instances". Anything new added to this hook
+spends from the same budget; put it before the peer list, never after.
+
 ## Naming a row (`hub_set_name`), and the two backstops behind it
 
 An instance labels its own sidebar row with `hub_set_name`, which is a **fire-and-forget file

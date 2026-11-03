@@ -270,8 +270,10 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
 
 ## Teardown fires on TWO RunEvents (the fixed scratch-root leak)
 
-`lib.rs` matches **`RunEvent::ExitRequested | RunEvent::Exit`**, and dropping either arm
-re-opens a measured bug. `ExitRequested` is only reachable through `app.exit()` — i.e. the
+`lib.rs` runs teardown on **both `RunEvent::ExitRequested` and `RunEvent::Exit`** (two arms
+since v0.58.2: the `ExitRequested` arm also calls `instance::mark_restart()` when its code is
+`tauri::RESTART_EXIT_CODE`, so the relaunched app waits for `app.lock` — docs/sessions.md, "One
+Mulpex per home"), and dropping either arm re-opens a measured bug. `ExitRequested` is only reachable through `app.exit()` — i.e. the
 window-close arm and `AppHandle::restart()`. **⌘Q and an Apple-Event `quit` never touch it:**
 they go to Cocoa's `NSApplication terminate:`, which tao turns into `applicationWillTerminate:` →
 `AppState::exit()` → `Event::LoopDestroyed`, and tauri-runtime-wry maps *that* to

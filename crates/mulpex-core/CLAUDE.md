@@ -21,6 +21,7 @@ the reason that outlived it.)
 | `remote.rs` | [../../docs/remote-peers.md](../../docs/remote-peers.md) |
 | `persist.rs` | [../../docs/sessions.md](../../docs/sessions.md) — the store's positional columns |
 | `rules.rs` (`HUB_RULES`, `PLANNING_RULES`, `spawn_prompt`), `state_dir.rs` | [../../docs/hub.md](../../docs/hub.md), [../../docs/sessions.md](../../docs/sessions.md) — one copy, because the app writes them and the helper reads them back |
+| `send.rs` (`mulpex-helper send`) | [../../docs/hub.md](../../docs/hub.md) "Messages from a script" — a script outside any claude drops mail and wakes an instance; `mcp.rs` `parse_target`/`sender_label` special-case `from_script` |
 | `listen.rs` (`mulpex-helper listen`) | [../../docs/hub.md](../../docs/hub.md) — why the listener is a binary, and why it has to notice its own `claude` dying |
 
 Traps that live in this crate specifically:
@@ -37,7 +38,12 @@ Traps that live in this crate specifically:
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `watching/`, `compacting/`,
   `armed/`, `relisten/`, `pids/`, `listeners/`,
   `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, `ctx/`,
-  `dialog/`, `secrets/`, `agents/`, `transcript/`, `agentready/`, `wake/`, like `peers/` already does.
+  `dialog/`, `secrets/`, `agents/`, `transcript/`, `agentready/`, `wake/`, `compactreq/`,
+  `compactnote/`, like `peers/` already does.
+- **`userpromptsubmit`'s `additionalContext` has a 9,500-char budget** (`hook::CONTEXT_LIMIT`):
+  over 10,000 Claude Code shows the model only a 2 KB preview. Fixed-size parts go first and the
+  peer list last, in the room left (`peers_context_within`); anything new goes before the peer
+  list. → [../../docs/hub.md](../../docs/hub.md)
 - **A re-arm-only wake must leave no trace, and proving it *is* re-arm-only is the whole job.**
   `quietturn/<id>` is written when a `<task-notification>` turn starts and cleared by the first
   tool call that is not `is_listener_rearm` — so surviving to `Stop` is evidence, not a guess.

@@ -13,7 +13,8 @@ Mac (src-tauri/src/remote/)  ──wss out──►  relay (crates/mulpex-relay)
 
 - **`src-tauri/src/remote/`** — the Mac side. `mod.rs`: state, the connection thread, the
   protocol. `crypto.rs`: pairing + per-connection handshake + sealed frames. `chat.rs`: transcript
-  → chat items. `dialog.rs`: AskUserQuestion / plan → buttons → keystrokes. `push.rs`: Web Push.
+  → chat items (`chat_codex.rs`: the same from a codex rollout). `dialog.rs`: AskUserQuestion /
+  plan → buttons → keystrokes. `push.rs`: Web Push. `files.rs`: files attached from the phone chat.
 - **`crates/mulpex-relay`** — a dumb router (axum). One room per Mac (`host_id`); it also serves
   the phone app. It never looks inside `data`, and must not start to.
 - **`remote/`** — the phone app (Svelte, built with `vite build --config remote/vite.config.ts`

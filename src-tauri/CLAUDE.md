@@ -17,7 +17,9 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `live_token.rs` (Mulpex ▸ Live Token…: settings + named tokens + pins for the daemon's token-swapping proxy), its env in `pty.rs`/`saves.rs`/`explain.rs`/`broadcast.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real, per-claude routes/pins |
 | `broadcast.rs`, `broadcast_prompt.md` (⌘⇧B Ask All Claudes) | [../docs/hub.md](../docs/hub.md) |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
-| `board.rs` (the Board: `hub_board`, live outbox, images, migration from To Do) | [../docs/hub.md](../docs/hub.md) — single writer, what a claude sees, delivery, store; [../docs/frontend.md](../docs/frontend.md) — the UI, drag, images |
+| `instance.rs` (one Mulpex per home: `app.lock`, `focus-request`, `restarting`, inherited-env scrub), `main.rs` (`--version`/`--help`/`--wire-hash`/`--ptyd-proto`) | [../docs/sessions.md](../docs/sessions.md) "One Mulpex per home"; [../docs/live-token.md](../docs/live-token.md) — why a proxy URL in the env is dropped |
+| `webcrash.rs` (a crashed page reloads; Linux: WebKit's memory killer off, `crashed.html` after 3 in 5 min) | [../docs/linux.md](../docs/linux.md); [../docs/ptyd.md](../docs/ptyd.md) — a second `attach` (a reloaded page) replays the ring |
+| `board.rs` (the Board: `hub_board`, UPDATE outbox, images, migration from To Do) | [../docs/hub.md](../docs/hub.md) — single writer, what a claude sees, delivery, store; [../docs/frontend.md](../docs/frontend.md) — the UI, drag, images |
 | `menu.rs`, `lib.rs` menu dispatch | **Keyboard** in [../CLAUDE.md](../CLAUDE.md); a new shortcut also goes in `src/lib/linuxKeys.ts`, a new item in `src/lib/components/MenuBar.svelte` → [../docs/linux.md](../docs/linux.md) |
 | `crates/mulpex-ptyd/src/procs.rs` process sweeps (`/proc` on Linux), `tauri.linux.conf.json`, `capabilities/linux.json`, `scripts/release-linux.sh` | [../docs/linux.md](../docs/linux.md) |
 | `lib.rs` `RunEvent`, `tauri.conf.json`, `Info.plist` | [../docs/packaging.md](../docs/packaging.md) |
@@ -40,8 +42,9 @@ Traps that live in this directory specifically:
 - **`lib.rs::is_forwarded` is an allowlist.** A menu item not listed there builds, appears, shows its
   accelerator and even ticks itself, while the frontend never hears a thing. Same for
   `capabilities/default.json` and the notification plugin.
-- **Teardown matches BOTH `RunEvent::ExitRequested` and `RunEvent::Exit`.** ⌘Q and an Apple-Event
-  quit only reach the second; dropping that arm re-opens a measured scratch-root leak.
+- **Teardown runs on BOTH `RunEvent::ExitRequested` and `RunEvent::Exit`** (separate arms: the
+  first also marks a restart for `instance.rs`). ⌘Q and an Apple-Event quit only reach the second;
+  dropping that arm re-opens a measured scratch-root leak.
   → [../docs/packaging.md](../docs/packaging.md)
 - **`reap_dead`'s early return tests *removability*, not liveness**, and the failure mark must latch
   — otherwise the body's two disk writes run on every 200 ms tick forever.

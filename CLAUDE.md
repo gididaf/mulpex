@@ -24,7 +24,7 @@ reasoning in `docs/`.
 | [docs/ptyd.md](docs/ptyd.md) | `mulpex-ptyd`, the daemon that owns every PTY so claudes and terminals outlive an app restart: who owns what, the stable scratch root, quit vs detach vs crash, adoption (`ptyd-rows.json`), repainting an adopted pane (snapshot / ring from spawn / redraw), `PROTO` and why an update never replaces a running daemon, `latest.json`'s `ptyd`/`ptyd_min`, the TCC measurement | `crates/mulpex-ptyd/*`, `pty.rs` `Session`/`OutputSink`, `ptyd.rs`, `Core::open`, `lib.rs` `teardown`, `updater.ts`, `remote_update.rs`, anything about restarting |
 | [docs/rendering.md](docs/rendering.md) | One geometry; RTL/BiDi; terminals alive while hidden | `terminals.ts`, `TerminalView/Pane.svelte`, `styles.css`, any spawn/resize path |
 | [docs/frontend.md](docs/frontend.md) | Sidebar order (claudes above terminals), context menu, dropped paths, mute, drag-reorder, tab badges, attention/dock, hub panel, the ⌘⇧L side panel — Board (`hub_board`: one per project, the user's columns + descriptions claudes follow, edits queued until UPDATE (real changes only, unsent comments editable), images; opt-in per project via the tab's right-click) · Pins · Explain tabs (one global column — every PTY shares one geometry) | `src/lib/components/*`, `stores.ts`, `attention.ts`, `App.svelte` |
-| [docs/sessions.md](docs/sessions.md) | Finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator and its claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
+| [docs/sessions.md](docs/sessions.md) | One Mulpex per home (`app.lock`; a second launch focuses the first and exits; a restart waits); finding the `claude` binary + login env; status words (`needs`/`working`); watchers vs work in flight (`watchers.txt`, agentalk); failed starts; stable instance numbers; failed restores; ⌘⇧R restart-in-place; ⌘⇧K Request Compact (checkpoint note → `/compact` → resume prompt) and the right-click auto-compact rule for an orchestrator and its claudes; ⌘⇧Q Checkpoint & Quit (every claude stops at a checkpoint via an app-sent hub message, `checkpoint.json`, wake after relaunch once each listener is up) | `instance.rs`, `main.rs`, `claude_bin.rs`, `pty.rs` spawn, `hook.rs` status writes, `persist.rs`, `reap_dead` |
 | [docs/hub.md](docs/hub.md) | Idle-wake listener, ⌘⇧B Ask All Claudes (`hub_reply_broadcast`), `hub_set_name`, cross-project `<project>#<n>`, `hub_spawn` + argv task delivery and its hook-side verification, `hub_close`, `hub_send` to a list (`cc`, skipped recipients) or to a sidebar name (`hub_instances` shows names), the Board (`hub_board`: what a claude sees, the outbox, the store, migration from To Do) | `mcp.rs`, `hook.rs`, `registry.rs`, `state.rs` poll-loop handshakes |
 | [docs/shell-terminals.md](docs/shell-terminals.md) | ⌘⇧T shells, `vtgrid` transcript + screen frames, `hub_terminal_*`, is-a-command-running, killing jobs | `vtgrid.rs`, `termlog.rs`, `SessionKind`, the daemon's `DSession::kill` + `procs.rs` (tty sweep, kill sequence), terminal MCP tools |
 | [docs/remote-peers.md](docs/remote-peers.md) | `hub_remote_open`, base64-argv task delivery + its 32 k cap, the `<<<MPX …>>>` marker, screen-only reads | `remote.rs`, the remote watcher in `state.rs` |
@@ -64,7 +64,11 @@ crates/mulpex-core/   headless lib: hook, mcp, persist, config (copied verbatim 
                         sidebar, then runs the person's own statusline)
                       + secrets (the ⌘K `secrets/<id>/` layout the app writes and the
                         hook announces — docs/secrets.md)
-crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` / `statusline` dispatch → mulpex-core
+                      + agent + codex (the `Agent` type and every Codex launch fact —
+                        docs/codex.md)
+                      + send (`mulpex-helper send`: a script outside any claude
+                        drops mail and wakes an instance — docs/hub.md)
+crates/mulpex-helper/ bin: `hook <event>` / `mcp` / `listen` / `statusline` / `send` dispatch → mulpex-core
                       (there was a `crates/mulpex-cli/` here — `mpx`, a second host over
                        tmux — deleted 2026-09-17; see the note under this block)
 crates/mulpex-ptyd/   lib + bin: the PTY daemon — owns every PTY, child, output ring, shell
@@ -74,7 +78,9 @@ crates/mulpex-ptyd/   lib + bin: the PTY daemon — owns every PTY, child, outpu
 crates/mulpex-relay/  bin: the Remote Control relay (runs on the VM; routes sealed frames,
                       serves the phone app) — docs/remote-control.md
 src-tauri/            the Tauri app (Rust backend)
-  src/pty.rs          Session = one claude OR one shell (SessionKind) on a PTY the
+  src/main.rs, instance.rs  `--version`/`--help`; one Mulpex per home (`app.lock`, a second
+                      launch focuses the first and exits) — docs/sessions.md
+  src/pty.rs          Session = one claude, codex OR shell (SessionKind) on a PTY the
                       DAEMON owns; builds argv/env, mirrors the output ring, streams
                       to a frontend Channel, rebuilds an adopted pane (`compose`)
   src/ptyd.rs         the daemon connection, starting it, exit modes (quit / detach),
@@ -105,6 +111,12 @@ src-tauri/            the Tauri app (Rust backend)
                       push — docs/remote-control.md; and Remote Hosts (client.rs drives
                       another Mulpex, desktop.rs + rpc.rs serve one) — docs/remote-hosts.md
   src/checkpoint.rs   ⌘⇧Q Checkpoint & Quit + the wake after relaunch — docs/sessions.md
+  src/wake.rs, handoff.rs, headless.rs, agent_transcript.rs  Codex: ringing a codex,
+                      ⌘⌥S hand-off, headless runs per agent, reading either transcript
+                      — docs/codex.md
+  src/spawnprint.rs   what marks a running claude ↻ outdated (rules/tools changed since
+                      its spawn) — docs/frontend.md
+  src/webcrash.rs     a crashed page reloads itself; Linux memory killer off — docs/linux.md
   src/broadcast.rs    ⌘⇧B Ask All Claudes: one question to every claude, answers via
                       `hub_reply_broadcast`, a Sonnet summary — docs/hub.md
   src/menu.rs         native ⌘ menu; ids forwarded to the frontend as a `menu` event
@@ -536,4 +548,4 @@ new work more than any individual fix is.
 
 ## Last Synced Commit
 
-`e7f7db69837f7d03fbe6c8aef7a11b24223056a5` — 2026-10-20
+`9b6fb23f8f62be9174386716bbd7f5ded455de1c` — 2026-11-03

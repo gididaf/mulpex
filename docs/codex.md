@@ -58,7 +58,7 @@ Driven on a real `codex` in tmux and with `codex exec`; nothing below is from do
 
 ### Core API (`mulpex-core`)
 - `agent::Agent { Claude, Codex }` — `word()`, `title()`, `parse()`, `other()`, `from_env()` (`MULPEX_AGENT`).
-- `codex::launch_args(helper, state_dir, project_dir, id) -> Vec<String>` — every codex option (yolo, hook-trust bypass, `--no-alt-screen`, update check off, the `-c hooks.*`, `-c mcp_servers.mulpex.*` with env, `-c developer_instructions=`). The app appends `resume <uuid>` and/or the positional prompt.
+- `codex::launch_args(helper, state_dir, project_dir, id, user_config) -> Vec<String>` — every codex option (yolo, hook-trust bypass, `--no-alt-screen`, update check off, the `-c hooks.*`, `-c mcp_servers.mulpex.*` with env, `-c developer_instructions=`, and `-c model_post_turn_compact_threshold_percent=70` unless `user_config` — `$CODEX_HOME/config.toml`, read by `pty.rs` — already sets that key). The app appends `resume <uuid>` and/or the positional prompt.
 - `codex::wake_line(n)` / `codex::is_wake_line(prompt)` — `mulpex: N new hub message(s)`, the text `listen.rs` prints for Claude.
 - `codex::ctx_pct(rollout) -> Option<u8>`; `codex::CHILD_ENV_DENY`.
 - `rules::system_prompt_for(helper, Agent)` — Claude ⇒ exactly `append_system_prompt(helper)` (golden hash). `rules::spawn_prompt_for(task, parent_agent)`, `rules::board_rule(agent)`.

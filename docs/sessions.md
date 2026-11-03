@@ -825,7 +825,8 @@ one shift away from ⌘R (Rename) and kills a process that may be mid-turn. Reac
 menu, ⌘P and a row's right-click menu; the context-menu route aims at the row you clicked, not the
 focused one. Terminals are excluded everywhere — a shell has no conversation to resume.
 
-Guarded by `restarting_an_instance_with_nothing_to_resume_refuses_without_killing_it` and
+Guarded by `restarting_an_unprompted_instance_starts_it_fresh_on_the_same_row` (there is no
+"nothing to resume" refusal any more: an instance never prompted restarts fresh, same row) and
 `restarting_an_instance_keeps_its_row_and_clears_the_dead_childs_state`. **Not yet driven in the
 real app** — the reattach half is unverified in the GUI; see [verification-log.md](verification-log.md).
 
