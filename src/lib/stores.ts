@@ -39,6 +39,9 @@ export interface ProjectState {
   ctx: Map<number, number>;
   /** id → the codex's last wake attempt (`StatusEntry.wake`); codexes only. */
   wake: Map<number, WakeMark>;
+  /** Claudes whose hub listener is down (`StatusEntry.deaf`): peer mail will
+   *  not wake them. A red tag on the row, and counted in the tab's red badge. */
+  deaf: Set<number>;
   tasks: Map<number, string>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
@@ -366,7 +369,9 @@ export function wakeStuck(m: WakeMark | null | undefined): boolean {
  *  tab's red badge, and through it the dock badge). */
 export function needsCount(p: ProjectState): number {
   return p.sessions.filter(
-    (s) => !s.muted && (p.statuses.get(s.id) === "needs" || wakeStuck(p.wake?.get(s.id))),
+    (s) =>
+      !s.muted &&
+      (p.statuses.get(s.id) === "needs" || wakeStuck(p.wake?.get(s.id)) || !!p.deaf?.has(s.id)),
   ).length;
 }
 
@@ -637,6 +642,7 @@ export function applyHubFor(handle: ProjectHandle, snap: HubSnapshot): void {
       snap.statuses.filter((e) => e.ctx_pct != null).map((e) => [e.id, e.ctx_pct!]),
     ),
     wake: new Map(snap.statuses.filter((e) => e.wake).map((e) => [e.id, e.wake!])),
+    deaf: new Set(snap.statuses.filter((e) => e.deaf).map((e) => e.id)),
     tasks: new Map(snap.tasks.map((e) => [e.id, e.task])),
   });
 }

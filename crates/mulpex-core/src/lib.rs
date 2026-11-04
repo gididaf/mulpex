@@ -267,6 +267,34 @@ pub fn ctx_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
     state_dir.join(CTX_DIR).join(id.to_string())
 }
 
+/// `deaf/<id>` exists while that claude's hub listener has been down for at
+/// least `DEAF_AFTER` — a peer's mail will sit in its inbox until its next turn.
+/// Written (and removed) by the app's poll loop (`Core::refresh_deaf`), the one
+/// place that knows how long a listener has been down; read by `mcp.rs` so a
+/// sender learns it from `hub_send` and `hub_instances`. The file holds the unix
+/// second the listener was first seen down.
+///
+/// Why this exists: a plugin monitor that exits is never restarted by Claude
+/// Code, and the fallback (a model-armed Monitor) dies after 30 minutes. On
+/// 2026-11-04 monorepo#1/#3/#4 sat deaf for hours with mail waiting and nothing
+/// anywhere said so. → docs/hub.md
+pub const DEAF_DIR: &str = "deaf";
+
+/// How long a claude's listener must be down before it counts as deaf. Wide
+/// enough that a fresh spawn (listener up in ~1 s) or a Monitor's 30-minute
+/// expiry followed by the re-arm turn never flashes the mark.
+pub const DEAF_AFTER_SECS: u64 = 60;
+
+/// `deaf/<id>` for one instance.
+pub fn deaf_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(DEAF_DIR).join(id.to_string())
+}
+
+/// Whether the app has marked `claude#id` deaf (`DEAF_DIR`).
+pub fn is_deaf(state_dir: &std::path::Path, id: usize) -> bool {
+    deaf_path(state_dir, id).exists()
+}
+
 /// `watching/<id>` for one instance.
 pub fn watching_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
     state_dir.join(WATCHING_DIR).join(id.to_string())

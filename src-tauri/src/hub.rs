@@ -108,6 +108,9 @@ pub fn start(app: AppHandle) {
                 for (id, line) in core.tick_wakes() {
                     wakes.push(CodexWake { handle: core.handle, id, line });
                 }
+                // Which claudes cannot hear peer mail. Before the snapshot,
+                // which carries each row's `deaf`.
+                core.refresh_deaf();
                 let snap = core.hub_snapshot();
                 // An instance that ended a turn still unnamed gets a provisional
                 // label from its own task, so the row stops showing the user's

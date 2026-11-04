@@ -1732,6 +1732,10 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     // never re-arms, which is the whole thing it exists to prevent.
     let mut sanctioned_resume = false;
     let mut codex_wake_turn = false;
+    // A Monitor just expired. If it was the hub listener and nothing else is
+    // listening, this system turn is the one chance to re-arm — see
+    // `monitor_expiry_turn`.
+    let mut expiry_turn = false;
     if std::io::stdin().read_to_string(&mut input).is_ok() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
             // Claude Code's UserPromptSubmit payload carries the text under
@@ -1761,6 +1765,7 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                 }
                 codex_wake_turn = codex_wake;
                 system_turn = codex_wake || p.starts_with("<task-notification");
+                expiry_turn = ctx.agent == Agent::Claude && monitor_expiry_turn(p);
                 if system_turn && !codex_wake {
                     // Provisionally silent, and the status write above is undone
                     // with it: the overwhelming majority of these wakes are a
@@ -1869,6 +1874,12 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
     }
     // A codex has no listener: Mulpex rings it (`codex::wake_line`).
     if welcome && ctx.agent == Agent::Claude && !listener_armed(ctx) {
+        parts.push(arm_listener_nudge(ctx));
+    } else if !welcome && expiry_turn && !listener_survives_expiry(ctx) {
+        // The one system turn allowed to re-arm. Without it a claude whose
+        // plugin monitor had died was deaf from its fallback Monitor's 30-minute
+        // expiry until the user next typed to it — measured: monorepo#3/#4,
+        // 2026-11-04, five hours with mail waiting.
         parts.push(arm_listener_nudge(ctx));
     }
     if welcome && !instance_named(ctx) {
@@ -2016,6 +2027,49 @@ fn orphaned_task_wake(prompt: &str) -> bool {
     prompt.starts_with("<task-notification")
         && prompt.contains("<status>stopped</status>")
         && prompt.contains("No completion record was found")
+}
+
+/// A `<task-notification>` reporting that a Monitor ENDED — hit its time limit,
+/// or its process exited. Claude Code's wordings, collected from every
+/// transcript on the VM (2.1.316–2.1.318, 2026-11-04):
+/// - `<event>[Monitor expired after 30m with 4 events delivered. …]</event>`
+/// - `<summary>Monitor "…" ended without producing output (exit 0)</summary>` —
+///   what every plugin listener said on 2026-11-03 18:11Z as it died
+/// - `… script failed (exit 143)`, `… stream ended`, `… stopped`
+///
+/// A live event is `<summary>Monitor event: "…"</summary>` and is excluded. The
+/// restart wake (`stopped` + no completion record) never reaches here — it is
+/// swallowed first (`orphaned_task_wake`). Which Monitor it was is not trusted
+/// from the description (the model picks it); `listener_survives_expiry` asks
+/// the hub's own lock instead, so a CI watcher ending beside a live listener
+/// nudges nothing.
+fn monitor_expiry_turn(prompt: &str) -> bool {
+    prompt.starts_with("<task-notification")
+        && (prompt.contains("[Monitor expired after")
+            || (prompt.contains("<summary>Monitor \"") && !prompt.contains("<summary>Monitor event:")))
+}
+
+/// How long the expiry turn waits for a listener to show up in the lock.
+/// A plugin listener queued behind the expired one takes over within a second
+/// (its claim loop ticks at 1 Hz), so two seconds tells "handed over" from "no
+/// one left".
+const EXPIRY_HANDOVER_WAIT: Duration = Duration::from_secs(2);
+
+/// On a Monitor-expiry turn: is a hub listener process still serving this
+/// instance? The `armed/<id>` heartbeat cannot answer — the expired listener
+/// touched it a second ago — so this asks `listeners/<id>`, whose pid dies with
+/// the listener, and gives a queued listener time to take over first.
+fn listener_survives_expiry(ctx: &Ctx) -> bool {
+    let deadline = std::time::Instant::now() + EXPIRY_HANDOVER_WAIT;
+    loop {
+        if crate::listen::listener_process_alive(&ctx.state_dir, ctx.instance) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Consume the ⌘⇧R flag, reporting whether it was there. Deleted on read: it
@@ -3558,6 +3612,60 @@ assuming it completed.</summary>\n</task-notification>";
         // The flag is per instance: claude#3's restart must not speak for claude#4.
         std::fs::write(crate::resumed_in_place_path(&dir, 3), "").unwrap();
         assert!(!take_resumed_in_place(&test_ctx(&dir, 4)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The expiry notice is recognised by Claude Code's own wording (copied from a
+    /// live 2.1.317 transcript), and nothing else a task-notification carries is.
+    #[test]
+    fn a_monitor_expiry_is_recognised_and_nothing_else_is() {
+        const EXPIRED: &str = "<task-notification>\n<task-id>bixufb8z3</task-id>\n\
+<summary>Monitor event: \"Mulpex hub inbox listener\"</summary>\n<event>[Monitor expired after \
+30m with 4 events delivered. Re-arm it if you still need the watch.]</event>\n</task-notification>";
+        assert!(monitor_expiry_turn(EXPIRED));
+        // The process ending, in each wording Claude Code uses (from real
+        // transcripts) — the 11-03 plugin deaths were the first one.
+        for summary in [
+            "Monitor \"Mulpex hub inbox listener\" ended without producing output (exit 0)",
+            "Monitor \"Mulpex hub inbox listener\" script failed (exit 143)",
+            "Monitor \"mulpex hub listener\" stream ended",
+            "Monitor \"mulpex hub listener\" stopped",
+        ] {
+            let p = format!(
+                "<task-notification>\n<task-id>b7h8v8xpy</task-id>\n<status>failed</status>\n\
+                 <summary>{summary}</summary>\n</task-notification>"
+            );
+            assert!(monitor_expiry_turn(&p), "{summary}");
+        }
+        assert!(!monitor_expiry_turn(HUB_WAKE), "a hub wake is not an expiry");
+        assert!(!monitor_expiry_turn(ORPHAN_WAKE));
+        assert!(
+            !monitor_expiry_turn("the user typing [Monitor expired after 30m]"),
+            "only a task-notification counts"
+        );
+    }
+
+    /// The expiry turn trusts the listener lock, not the heartbeat: a live pid in
+    /// `listeners/<id>` (a plugin listener that took over) means no nudge; a dead
+    /// one or none means re-arm.
+    #[test]
+    fn an_expiry_nudges_only_when_no_listener_is_left() {
+        let dir = std::env::temp_dir().join(format!("mulpex-expiry-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(dir.join(crate::LISTENERS_DIR)).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let lock = dir.join(crate::LISTENERS_DIR).join("3");
+
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(listener_survives_expiry(&ctx), "a live listener holds the lock");
+
+        std::fs::write(&lock, i32::MAX.to_string()).unwrap();
+        let t = std::time::Instant::now();
+        assert!(!listener_survives_expiry(&ctx), "the lock names a dead pid");
+        assert!(t.elapsed() >= EXPIRY_HANDOVER_WAIT, "it waited for a handover first");
+
+        std::fs::remove_file(&lock).unwrap();
+        assert!(!listener_survives_expiry(&ctx), "no lock at all");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

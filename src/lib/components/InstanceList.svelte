@@ -134,7 +134,12 @@
     return {
       count: kids.length,
       needs: kids.some(
-        (k) => !k.muted && !k.failed && ($statuses.get(k.id) === "needs" || wakeStuck($activeProject?.wake?.get(k.id))),
+        (k) =>
+          !k.muted &&
+          !k.failed &&
+          ($statuses.get(k.id) === "needs" ||
+            wakeStuck($activeProject?.wake?.get(k.id)) ||
+            !!$activeProject?.deaf?.has(k.id)),
       ),
     };
   }
@@ -422,6 +427,13 @@
               >
             {/if}
           {/if}
+          {#if s.kind === "claude" && !s.failed && !s.muted && $activeProject?.deaf?.has(s.id)}
+            <span
+              class="deaf"
+              title="Hub listener is down — peer mail won't wake it. Type anything here to revive it."
+              >deaf</span
+            >
+          {/if}
           {#if shell}
             <span class="st">{s.exited ? "exited" : "running"}</span>
           {:else if s.failed}
@@ -686,6 +698,19 @@
     font-size: 0.72rem;
     line-height: 1;
     transition: opacity 1s linear;
+  }
+  /* A claude that cannot hear peer mail (`StatusEntry.deaf`). Red like
+     `needs`: it waits on the user — only a typed turn revives it. */
+  .deaf {
+    color: var(--dot-needs);
+    border: 1px solid var(--dot-needs);
+    border-radius: 3px;
+    padding: 0 3px;
+    font-size: 0.62rem;
+    font-weight: 600;
+    line-height: 1.3;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
   }
   .wake.stuck {
     color: var(--label);

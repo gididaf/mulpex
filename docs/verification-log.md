@@ -2725,3 +2725,28 @@ Measured, in the `board` worktree:
   comment sent.
 - **Not measured**: a real ⌘V of a macOS screenshot in WKWebView (only a synthetic paste), a real
   Finder drop onto the panel, the phone on a device, how the drag feels.
+
+## 2026-11-04 — deaf instances: plugin listener deaths (docs/hub.md)
+
+Diagnosed from the live VM: `/tmp/mulpex-11681` and every project dir under it were born
+2026-11-03 18:11:47.5–.96Z while the claudes kept running; monorepo#3's transcript logs
+`Monitor "Mulpex hub inbox listener" ended without producing output (exit 0)` at 18:11:47.806,
+before its project dir's birth (.870). After that, only fallback Monitors: armed 07:49/07:50,
+expired 08:19:45/08:20:02 (`[Monitor expired after 30m …]`), never re-armed; `inbox/3` held mail
+from 08:36, 08:51, 09:22. Across the VM, 7 of 10 claudes resumed at that restart had no plugin
+listener left.
+
+Measured on the fix (worktree build, `claude` 2.1.318, dev app under Xvfb, own home):
+
+- real `mulpex-helper listen`, scratch dir removed 1.5 s then rebuilt: shipped binary dead, new
+  alive, lock re-taken, `mulpex: 1 new hub message(s)` still printed; removed 12 s → exits.
+- real `hook userpromptsubmit` fed monorepo#3's exact expiry payload: shipped binary no nudge; new
+  nudges with a dead lock, stays silent with a live one, silent on a hub wake.
+- dev app: plugin listener of claude#2 killed → `DEAF` tag + red tab badge at +90 s (30 s
+  heartbeat grace + 60 s); `hub_send` via the real MCP server → `not_woken: ["claude#2"]`;
+  `hub_instances` → `listener: "down"`.
+- 60 s tool Monitor in claude#2 expired → `ARM-NUDGE` in that turn's hook context → model re-armed
+  with `timeout_ms 1800000` unprompted. claude#1's plugin listener killed → notification
+  `script failed (exit 143)` → nudge → re-armed 5 s later unprompted.
+
+NOT verified: the `title` tooltip (Xvfb WebKit draws no native tooltips); macOS.

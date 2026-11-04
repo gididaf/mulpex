@@ -40,6 +40,47 @@ use std::time::Duration;
 /// hub message feels immediate, slow enough to be free.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long the scratch dir must stay gone before the listener believes Mulpex
+/// is gone and exits.
+///
+/// One missed check used to be enough, and that killed listeners for good: on
+/// 2026-11-03 18:11Z the scratch root was removed and rebuilt within half a
+/// second while every `claude` kept running (a second Mulpex app on the same
+/// home tore down the shared root). Each plugin listener that ticked inside that
+/// gap exited 0 — the transcript says `Monitor "Mulpex hub inbox listener" ended
+/// without producing output` — and Claude Code never restarts a plugin monitor.
+/// monorepo#1/#3/#4 were left on the 30-minute fallback and went deaf for hours.
+/// A real quit or a closed project leaves the dir gone for good, so waiting ten
+/// seconds costs nothing there (and the owner check usually fires first).
+const STATE_DIR_GONE_GRACE: Duration = Duration::from_secs(10);
+
+/// Tracks how long the scratch dir has been missing, so a blip is survived and a
+/// real removal is not.
+struct DirWatch {
+    missing_since: Option<std::time::Instant>,
+}
+
+impl DirWatch {
+    fn new() -> Self {
+        Self { missing_since: None }
+    }
+
+    /// One check. `Some(true)` = present, `Some(false)` = missing but still in
+    /// grace (skip this pass), `None` = gone for good, exit.
+    fn check(&mut self, state_dir: &Path, grace: Duration) -> Option<bool> {
+        if state_dir.is_dir() {
+            self.missing_since = None;
+            return Some(true);
+        }
+        let since = *self.missing_since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= grace {
+            None
+        } else {
+            Some(false)
+        }
+    }
+}
+
 /// Paths this listener watches, resolved once from the environment `claude`
 /// inherited from the app.
 struct Watch {
@@ -121,6 +162,14 @@ fn owner_is_gone(w: &Watch, owner: Option<libc::pid_t>) -> bool {
     }
 }
 
+/// Whether some listener process is serving `id` right now: `listeners/<id>`
+/// names a pid that is alive. Unlike the `armed/<id>` heartbeat, this goes false
+/// the moment the listener dies — the hook needs that on the very turn that
+/// reports a Monitor expiring, when the heartbeat is still seconds old.
+pub fn listener_process_alive(state_dir: &Path, id: usize) -> bool {
+    read_pid(&state_dir.join(crate::LISTENERS_DIR).join(id.to_string())).is_some_and(alive)
+}
+
 /// Take the lock unless another live listener already serves this instance.
 ///
 /// Returns false while an incumbent holds it. First one wins: the incumbent is
@@ -153,9 +202,21 @@ pub fn run(_args: &[String]) -> anyhow::Result<()> {
     // went (a 30-minute model-armed Monitor expiring, an orphan being reaped) the
     // instance stopped hearing its mail with nothing anywhere to say so. Silent,
     // because every line printed here wakes the instance.
+    let mut dir = DirWatch::new();
     let mut prev = unread(&w.inbox);
-    while !claim(&w) {
-        if !w.state_dir.is_dir() || owner_is_gone(&w, owner) {
+    loop {
+        match dir.check(&w.state_dir, STATE_DIR_GONE_GRACE) {
+            None => return Ok(()),
+            Some(false) => {
+                std::thread::sleep(TICK);
+                continue;
+            }
+            Some(true) => {}
+        }
+        if claim(&w) {
+            break;
+        }
+        if owner_is_gone(&w, owner) {
             return Ok(());
         }
         // Tracked while waiting so a message landing in the second between the
@@ -166,9 +227,20 @@ pub fn run(_args: &[String]) -> anyhow::Result<()> {
 
     loop {
         // Mulpex is gone (teardown removes the whole scratch root) or this
-        // project was closed. Either way nobody is left to wake.
-        if !w.state_dir.is_dir() {
-            return Ok(());
+        // project was closed — for longer than a blip. Nobody is left to wake.
+        match dir.check(&w.state_dir, STATE_DIR_GONE_GRACE) {
+            None => return Ok(()),
+            Some(false) => {
+                std::thread::sleep(TICK);
+                continue;
+            }
+            Some(true) => {}
+        }
+        // The dir came back rebuilt (its `listeners/` emptied): take the lock
+        // again, or a second listener would claim it and double every wake.
+        if read_pid(&w.lock).is_none() {
+            let _ = std::fs::create_dir_all(w.lock.parent().unwrap_or(&w.state_dir));
+            let _ = std::fs::write(&w.lock, std::process::id().to_string());
         }
         if owner_is_gone(&w, owner) {
             // Only our own lock: after a restart the slot may already belong to
@@ -192,7 +264,11 @@ pub fn run(_args: &[String]) -> anyhow::Result<()> {
         // The heartbeat `hook::listener_armed` reads. Written on every pass, not
         // once at startup: a monitor that expired must go stale within seconds,
         // or the arm nudge — the only thing that ever re-arms one — never returns.
-        let _ = std::fs::write(&w.armed, "");
+        // A rebuilt scratch dir may not have `armed/` yet.
+        if std::fs::write(&w.armed, "").is_err() {
+            let _ = std::fs::create_dir_all(w.armed.parent().unwrap_or(&w.state_dir));
+            let _ = std::fs::write(&w.armed, "");
+        }
         std::thread::sleep(TICK);
     }
 }
@@ -288,6 +364,26 @@ mod tests {
         assert!(!owner_is_gone(&w, Some(me)));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 2026-11-03 case: the scratch dir vanishes for a moment and comes back.
+    /// A listener must ride that out; only a dir that stays gone ends it.
+    #[test]
+    fn a_scratch_dir_blip_is_survived_but_a_removal_is_not() {
+        let dir = scratch("blip");
+        let mut d = DirWatch::new();
+        let grace = Duration::from_millis(300);
+        assert_eq!(d.check(&dir, grace), Some(true));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(d.check(&dir, grace), Some(false), "missing, but inside the grace");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(d.check(&dir, grace), Some(true), "back: the clock resets");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(d.check(&dir, grace), Some(false));
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(d.check(&dir, grace), None, "gone past the grace: exit");
     }
 
     /// Two listeners on one inbox is exactly the reported symptom — one hub

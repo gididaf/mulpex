@@ -90,6 +90,10 @@ export interface StatusEntry {
    *  (`wake.rs`). Null for a claude — its listener wakes it — and absent from
    *  an older remote host's snapshot. */
   wake?: WakeMark | null;
+  /** A claude whose hub listener has been down a minute or more: peer mail
+   *  will not wake it until its next turn (`Core::refresh_deaf`). Absent from
+   *  an older remote host's snapshot. */
+  deaf?: boolean;
 }
 /** One wake attempt: `rang` (sent, no ack yet), `delivered` (the codex's own
  *  hook acked it), `unanswered` (no ack in time) or `refused` (the typed

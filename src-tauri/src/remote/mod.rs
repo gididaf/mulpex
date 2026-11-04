@@ -2132,6 +2132,7 @@ mod tests {
                 compact_phase: Some("requested".into()),
                 compacting: false,
                 wake: None,
+                deaf: false,
             }],
             tasks: vec![],
             locks: vec![],

@@ -430,6 +430,15 @@ fn hub_instances(ctx: &Ctx) -> String {
                 e["task_delivery"] = json!(state);
                 e["task_delivery_note"] = json!(note);
             }
+            // Only when known down: a missing mark is "not known deaf", and the
+            // field is absent rather than claiming `up`.
+            if crate::is_deaf(&ctx.state_dir, id) {
+                e["listener"] = json!("down");
+                e["listener_note"] = json!(
+                    "its hub listener is down: a message to it is delivered but will not wake \
+                     it until its next turn"
+                );
+            }
             e
         })
         .collect();
@@ -522,7 +531,7 @@ fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
                 .instances
                 .iter()
                 .map(|i| {
-                    json!({
+                    let mut e = json!({
                         "id": i.id,
                         "address": p.address(i.id),
                         "agent": crate::agent_of(Path::new(&p.state_dir), i.id).word(),
@@ -530,7 +539,11 @@ fn other_projects(ctx: &Ctx, reg: &Registry) -> Vec<Value> {
                         "task": i.task,
                         "name": i.name,
                         "name_set_by": i.name_by,
-                    })
+                    });
+                    if crate::is_deaf(Path::new(&p.state_dir), i.id) {
+                        e["listener"] = json!("down");
+                    }
+                    e
                 })
                 .collect();
             json!({ "project": p.name, "dir": p.dir, "instances": instances })
@@ -776,7 +789,32 @@ fn send_local(
             message,
         );
     }
-    Ok(json!({ "ok": !delivered.is_empty(), "delivered_to": delivered }).to_string())
+    let deaf: Vec<String> = delivered
+        .iter()
+        .filter(|&&id| crate::is_deaf(&ctx.state_dir, id))
+        .map(|&id| crate::addr(&ctx.state_dir, id))
+        .collect();
+    let mut out = json!({ "ok": !delivered.is_empty(), "delivered_to": delivered });
+    add_deaf_note(&mut out, deaf);
+    Ok(out.to_string())
+}
+
+/// Tell a sender which recipients will NOT be woken by this message: their hub
+/// listener has been down for a while (`crate::DEAF_DIR`, set by the app), so the
+/// mail sits in the inbox until that instance's next turn — which, for an idle
+/// one, means until the user next types to it. The message itself was delivered;
+/// this is so an orchestrator does not wait on a reply that is not coming.
+fn add_deaf_note(out: &mut Value, deaf: Vec<String>) {
+    if deaf.is_empty() {
+        return;
+    }
+    out["not_woken"] = json!(deaf);
+    out["not_woken_note"] = json!(format!(
+        "Delivered, but {} will NOT be woken by it: its hub listener is down, so it sees this \
+         only on its next turn (if it is idle, that is when the user next types to it). Don't \
+         wait on a reply from it; the user can see it marked 'deaf' in the sidebar.",
+        deaf.join(", ")
+    ));
 }
 
 /// One recipient of a list send, already resolved and known to be live.
@@ -965,6 +1003,15 @@ fn send_many(ctx: &Ctx, entries: &[Value], message: &str) -> Result<String, Stri
     if !skipped.is_empty() {
         out["skipped"] = json!(skipped);
     }
+    let deaf: Vec<String> = delivered
+        .iter()
+        .filter(|t| {
+            // `<state_dir>/inbox/<id>` → that project's state dir.
+            t.inbox.parent().and_then(Path::parent).is_some_and(|sd| crate::is_deaf(sd, t.id))
+        })
+        .map(|t| t.label_from(&my_dir))
+        .collect();
+    add_deaf_note(&mut out, deaf);
     if delivered.iter().any(|t| !t.local) {
         out["note"] = json!(format!(
             "Some recipients are in another PROJECT — a different repository and working tree — \
@@ -1045,7 +1092,7 @@ fn send_foreign(ctx: &Ctx, qualifier: &str, id: usize, message: &str) -> Result<
     log_message(&ctx.state_dir.join("messages.log"), &me, &to_addr, message);
     log_message(&target.messages_log(), &me, &to_addr, message);
 
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "delivered_to": [to_addr],
         "project": target.name,
@@ -1054,8 +1101,11 @@ fn send_foreign(ctx: &Ctx, qualifier: &str, id: usize, message: &str) -> Result<
              ({}), so they cannot see your files. Reply address for them: {me}.",
             target.dir,
         ),
-    })
-    .to_string())
+    });
+    // `<state_dir>/inbox/<id>` → that project's state dir.
+    let deaf = dir.parent().and_then(Path::parent).is_some_and(|sd| crate::is_deaf(sd, id));
+    add_deaf_note(&mut out, if deaf { vec![to_addr] } else { vec![] });
+    Ok(out.to_string())
 }
 
 /// This project's name, as another project must qualify it. Falls back to the
@@ -3560,6 +3610,37 @@ mod tests {
         assert!(e.contains("not a valid address") && e.contains("sidebar name"), "{e}");
         // A name in ANOTHER project is not resolved — names are project-local.
         assert!(hub_send(&ctx, &json!({ "to": "Reviewer", "message": "x" })).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A recipient the app has marked deaf still gets the message, and the
+    /// sender is told it will not be woken — single, list and hub_instances.
+    #[test]
+    fn a_deaf_recipient_is_reported_to_the_sender() {
+        let (root, ctx, b_state) = two_projects("deaf");
+        name_project_a(&root, &ctx, &b_state, &[(1, None, ""), (2, None, ""), (3, None, "")]);
+        let mark = crate::deaf_path(&ctx.state_dir, 3);
+        std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
+        std::fs::write(&mark, "0").unwrap();
+
+        let reply: Value =
+            serde_json::from_str(&hub_send(&ctx, &json!({ "to": "3", "message": "hi" })).unwrap()).unwrap();
+        assert_eq!(reply["delivered_to"], json!([3]), "still delivered");
+        assert_eq!(reply["not_woken"], json!(["claude#3"]), "{reply}");
+        assert!(reply["not_woken_note"].as_str().unwrap().contains("NOT be woken"));
+
+        let reply: Value =
+            serde_json::from_str(&hub_send(&ctx, &json!({ "to": "1", "message": "hi" })).unwrap()).unwrap();
+        assert!(reply.get("not_woken").is_none(), "a listening one is not flagged: {reply}");
+
+        let reply: Value =
+            serde_json::from_str(&hub_send(&ctx, &json!({ "to": ["1", "3"], "message": "hi" })).unwrap()).unwrap();
+        assert_eq!(reply["not_woken"], json!(["claude#3"]), "{reply}");
+
+        let list: Value = serde_json::from_str(&hub_instances(&ctx)).unwrap();
+        let of = |id: u64| list["instances"].as_array().unwrap().iter().find(|e| e["id"] == id).unwrap().clone();
+        assert_eq!(of(3)["listener"], "down");
+        assert!(of(1).get("listener").is_none(), "unknown is not reported as up");
         let _ = std::fs::remove_dir_all(&root);
     }
 

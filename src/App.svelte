@@ -170,6 +170,7 @@
       watching: new Set(),
       ctx: new Map(),
       wake: new Map(),
+      deaf: new Set(),
       tasks: new Map(),
       hub: null,
       activeSessionId: info.sessions[info.active]?.id ?? null,

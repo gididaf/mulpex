@@ -222,6 +222,10 @@ pub struct StatusEntry {
     /// The last time the app rang this codex about unread mail (`wake.rs`), and
     /// how that went. Always `None` for a claude, whose listener wakes it.
     pub wake: Option<WakeMark>,
+    /// A claude whose hub listener has been down for `DEAF_AFTER_SECS`: peer
+    /// mail will not wake it until its next turn (`Core::refresh_deaf`). The
+    /// sidebar's red `deaf` tag. Always false for a codex.
+    pub deaf: bool,
 }
 
 /// One wake attempt as the row shows it. `state` is `rang` (sent, ack not seen

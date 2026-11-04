@@ -78,6 +78,7 @@ function blankProject(handle: number, dir: string, name: string, sessions: Boots
     watching: new Set(),
     ctx: new Map(),
     wake: new Map(),
+    deaf: new Set(),
     tasks: new Map(),
     hub: null,
     activeSessionId: sessions[0]?.id ?? null,
@@ -95,7 +96,7 @@ function buildCached(st: HostStatus) {
 /** The host went away: keep its tabs, forget every status they showed. */
 function markOffline(slot: number) {
   for (const p of ofHost(slot)) {
-    patchProject(p.handle, { statuses: new Map(), watching: new Set(), ctx: new Map(), wake: new Map(), hub: null });
+    patchProject(p.handle, { statuses: new Map(), watching: new Set(), ctx: new Map(), wake: new Map(), deaf: new Set(), hub: null });
   }
 }
 

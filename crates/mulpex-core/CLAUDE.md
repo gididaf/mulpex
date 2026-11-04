@@ -38,7 +38,7 @@ Traps that live in this crate specifically:
   (`mcp::live_ids`). Any new per-instance flag goes in a subdir — `bg/`, `watching/`, `compacting/`,
   `armed/`, `relisten/`, `pids/`, `listeners/`,
   `named/`, `namenudge/`, `spawning/`, `resumed/`, `sessionid/`, `quietturn/`, `ctx/`,
-  `dialog/`, `secrets/`, `agents/`, `transcript/`, `agentready/`, `wake/`, `compactreq/`,
+  `dialog/`, `secrets/`, `agents/`, `transcript/`, `agentready/`, `wake/`, `compactreq/`, `deaf/`,
   `compactnote/`, like `peers/` already does.
 - **`userpromptsubmit`'s `additionalContext` has a 9,500-char budget** (`hook::CONTEXT_LIMIT`):
   over 10,000 Claude Code shows the model only a 2 KB preview. Fixed-size parts go first and the

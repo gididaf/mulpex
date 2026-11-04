@@ -427,6 +427,13 @@ pub struct Core {
     wakes: crate::wake::Wakes,
     /// When `settle_codex_turns` last looked.
     codex_settled_at: Option<Instant>,
+    /// Claude rows whose hub listener is down, and since when this app first
+    /// saw it down (`refresh_deaf`). In memory: an app restart restarts the
+    /// clock, which only delays the mark by a minute.
+    listener_down_since: HashMap<usize, Instant>,
+    /// Claude rows down for `DEAF_AFTER_SECS` or more — the sidebar's red tag,
+    /// mirrored to `deaf/<id>` for the helper.
+    deaf: HashSet<usize>,
 }
 
 /// Minimum gap between launching two `hub_spawn` children. Each `claude` cold
@@ -746,6 +753,8 @@ impl Core {
             last_spawn_at: None,
             wakes: Default::default(),
             codex_settled_at: None,
+            listener_down_since: HashMap::new(),
+            deaf: HashSet::new(),
         };
         // The row that had focus before the restart has it again.
         if let Some(id) = adopted_active {
@@ -2912,6 +2921,27 @@ impl Core {
             .is_some_and(|a| a < Duration::from_secs(30))
     }
 
+    /// Which claude rows are deaf: their hub listener has been down for
+    /// `DEAF_AFTER_SECS`, so peer mail lands in an inbox nothing is watching and
+    /// waits for the next turn. Runs every tick; one stat per claude plus one
+    /// read of `deaf/`, and writes only when the set changes.
+    ///
+    /// Why the app and not the hook: an idle claude runs no hook at all, and
+    /// idle is exactly when it is deaf. On 2026-11-04 monorepo#1/#3/#4 sat that
+    /// way for five hours — their plugin monitors had exited on a scratch-dir
+    /// blip, the 30-minute fallback expired, and nothing said so. Codex rows are
+    /// skipped: the app rings those itself (`wake.rs`).
+    pub fn refresh_deaf(&mut self) {
+        let listening: Vec<(usize, bool)> = self
+            .live_instances()
+            .filter(|s| s.kind.agent() == Some(Agent::Claude) && s.is_alive())
+            .map(|s| (s.id, self.listener_alive(s.id)))
+            .collect();
+        let now = Instant::now();
+        self.deaf = track_deaf(&mut self.listener_down_since, &listening, now);
+        sync_deaf_files(&self.state_dir, &self.deaf, &self.listener_down_since, now);
+    }
+
     /// Mark instances "worked on" once their hook state file appears (a prompt
     /// was submitted). Persists if the set grew. Ports the worked half of
     /// `App::refresh_statuses`.
@@ -3071,6 +3101,7 @@ impl Core {
                     compact_phase,
                     compacting,
                     wake: self.wakes.mark(s.id),
+                    deaf: self.deaf.contains(&s.id),
                 }
             })
             .collect();
@@ -3416,6 +3447,59 @@ impl Core {
         }
         self.sessions.clear();
         let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
+}
+
+/// One `refresh_deaf` pass over the live claudes (`(id, listener alive)`):
+/// start the clock for a listener newly seen down, stop it for one back up,
+/// forget rows that are gone, and return who has been down `DEAF_AFTER_SECS`.
+fn track_deaf(
+    down_since: &mut HashMap<usize, Instant>,
+    listening: &[(usize, bool)],
+    now: Instant,
+) -> HashSet<usize> {
+    down_since.retain(|id, _| listening.iter().any(|(l, _)| l == id));
+    for &(id, alive) in listening {
+        if alive {
+            down_since.remove(&id);
+        } else {
+            down_since.entry(id).or_insert(now);
+        }
+    }
+    let after = Duration::from_secs(mulpex_core::DEAF_AFTER_SECS);
+    down_since
+        .iter()
+        .filter(|(_, since)| now.saturating_duration_since(**since) >= after)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Mirror the deaf set to `deaf/<id>` for the helper (`hub_send`,
+/// `hub_instances`), writing only what changed. A file holds the unix second
+/// the listener was first seen down. Also clears marks a previous app run left
+/// in a scratch dir that outlived it.
+fn sync_deaf_files(
+    state_dir: &Path,
+    deaf: &HashSet<usize>,
+    down_since: &HashMap<usize, Instant>,
+    now: Instant,
+) {
+    let dir = state_dir.join(mulpex_core::DEAF_DIR);
+    let on_disk: HashSet<usize> = std::fs::read_dir(&dir)
+        .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default();
+    for id in on_disk.difference(deaf) {
+        let _ = std::fs::remove_file(mulpex_core::deaf_path(state_dir, *id));
+    }
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for id in deaf.difference(&on_disk) {
+        let down_for = down_since.get(id).map_or(0, |s| now.saturating_duration_since(*s).as_secs());
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(mulpex_core::deaf_path(state_dir, *id), unix.saturating_sub(down_for).to_string());
+        eprintln!("[deaf] claude#{id}: hub listener down for {down_for}s — peer mail will not wake it");
     }
 }
 
@@ -4935,6 +5019,51 @@ mod tests {
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The monorepo#3 shape: a claude whose listener is down is marked deaf only
+    /// after DEAF_AFTER_SECS, cleared the moment it is back, and forgotten when
+    /// the row goes; the helper's `deaf/<id>` mirror follows.
+    #[test]
+    fn a_claude_is_deaf_only_after_its_listener_has_been_down_a_while() {
+        let dir = std::env::temp_dir().join(format!("mulpex-deaf-{}", persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let after = Duration::from_secs(mulpex_core::DEAF_AFTER_SECS);
+        let t0 = Instant::now();
+        let mut down = HashMap::new();
+
+        // 3 down, 5 listening: nobody is deaf yet — a fresh spawn never flashes.
+        let deaf = track_deaf(&mut down, &[(3, false), (5, true)], t0);
+        assert!(deaf.is_empty());
+        sync_deaf_files(&dir, &deaf, &down, t0);
+        assert!(!mulpex_core::is_deaf(&dir, 3));
+
+        // Still down a minute later: deaf, and the helper can see it.
+        let t1 = t0 + after;
+        let deaf = track_deaf(&mut down, &[(3, false), (5, true)], t1);
+        assert_eq!(deaf, HashSet::from([3]));
+        sync_deaf_files(&dir, &deaf, &down, t1);
+        assert!(mulpex_core::is_deaf(&dir, 3) && !mulpex_core::is_deaf(&dir, 5));
+
+        // The user typed, it re-armed: cleared at once, on disk too.
+        let deaf = track_deaf(&mut down, &[(3, true), (5, true)], t1);
+        assert!(deaf.is_empty() && down.is_empty());
+        sync_deaf_files(&dir, &deaf, &down, t1);
+        assert!(!mulpex_core::is_deaf(&dir, 3));
+
+        // Down again: the clock starts over rather than resuming.
+        let t2 = t1 + Duration::from_secs(1);
+        assert!(track_deaf(&mut down, &[(3, false)], t2).is_empty());
+        // The row closed: forgotten.
+        assert!(track_deaf(&mut down, &[], t2 + after).is_empty());
+        assert!(down.is_empty());
+
+        // A mark a previous app run left behind is cleared.
+        std::fs::create_dir_all(dir.join(mulpex_core::DEAF_DIR)).unwrap();
+        std::fs::write(mulpex_core::deaf_path(&dir, 9), "1").unwrap();
+        sync_deaf_files(&dir, &HashSet::new(), &HashMap::new(), t2);
+        assert!(!mulpex_core::is_deaf(&dir, 9));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Closing restored rows one by one, right after launch, must not bring

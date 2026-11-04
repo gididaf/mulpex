@@ -92,6 +92,47 @@ move; and a dead monitor is **never restarted** by Claude Code. Neither is a rea
 fallback. What the 30-minute cap did to the sidebar's yellow dot is in
 [sessions.md](sessions.md#the-listener-expires-so-armedid-is-a-heartbeat).
 
+### When the plugin monitor dies anyway: deaf instances (2026-11-04)
+
+"Crash-only fallback" turned out to mean "deaf for hours". On 2026-11-03 18:11Z the scratch root
+was removed and rebuilt within half a second while every `claude` kept running (a second Mulpex on
+the same home — the incident behind `app.lock`). Each listener that ticked inside the gap saw
+`!state_dir.is_dir()` and exited 0 — the transcript says `Monitor "Mulpex hub inbox listener" ended
+without producing output (exit 0)` — and Claude Code never restarts a plugin monitor. The fallback
+then had three holes in a row:
+
+1. the arm nudge fires only on a **user** turn, so an idle claude stayed deaf until someone typed;
+2. the nudge makes the model arm a tool `Monitor`, which dies at 30:00;
+3. that expiry arrives as a `<task-notification>`, where every nudge is gated off — so nothing
+   re-armed it. monorepo#3/#4 went deaf at 08:20 the next morning with mail arriving at 08:36,
+   08:51 and 09:22, and nothing anywhere said so. (cloudraw#9 survived only because its model
+   chose to re-arm on every expiry notice, ~3 Monitors per half hour.)
+
+Three fixes, each closing one hole:
+
+- **The listener survives a blip.** `listen.rs` exits only once the scratch dir has been gone for
+  `STATE_DIR_GONE_GRACE` (10 s) straight, and on its return re-takes `listeners/<id>` and
+  re-creates `armed/`. Measured with the real binaries: a 1.5 s removal killed the shipped helper
+  and not the new one.
+- **A Monitor ending is a turn that may re-arm.** `hook::monitor_expiry_turn` recognises Claude
+  Code's ending notices (`[Monitor expired after …]`, `… ended without producing output`,
+  `… script failed (exit N)`, `… stream ended`, `… stopped`), and on such a turn the arm nudge is
+  allowed iff **no listener process holds `listeners/<id>`** (`listener_survives_expiry`, which
+  waits 2 s for a queued listener to take over). The heartbeat cannot answer here — the dead
+  listener touched `armed/<id>` a second ago. The lock is the judge, not the Monitor's description,
+  so a CI watcher ending beside a live listener nudges nothing. This does not reopen the
+  restart-wake loop below: that wake (`stopped` + no completion record) is swallowed before this
+  check. Driven end to end in a dev app: a plugin listener killed → nudged on its death notice →
+  re-armed 5 s later; a 60 s tool Monitor expired → nudged → re-armed at the 30-minute maximum. The
+  cost is one quiet turn per half hour for a claude on the fallback.
+- **Deaf is visible.** The poll loop (`Core::refresh_deaf`) marks a claude whose heartbeat has been
+  stale for `DEAF_AFTER_SECS` (60 s; so ~90 s after death, with the heartbeat's 30 s grace): a red
+  `DEAF` tag on its row, counted in the tab's red badge, and `deaf/<id>` for the helper. `hub_send`
+  then answers `not_woken: [...]` with a note, and `hub_instances` shows `listener: "down"` (only
+  when known — absent is not "up"), so an orchestrator stops waiting on a reply that is not coming.
+  The app does this rather than a hook because an idle claude runs no hook, and idle is exactly
+  when it is deaf. Codex rows are excluded: the app rings those itself.
+
 ### A re-arm is not news: `quietturn/<id>`
 
 **Mostly history since the plugin monitor landed** — a routine re-arm no longer happens at all, so
