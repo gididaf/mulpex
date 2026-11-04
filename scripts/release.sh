@@ -72,11 +72,12 @@ if [ "$DRY_RUN" -eq 0 ]; then
     echo "ERROR: working tree is dirty — commit before releasing." >&2
     exit 1
   fi
-  # `gh release create` below passes no --target, so GitHub creates the tag at
-  # the REMOTE default branch's HEAD. With local commits unpushed that tags the
-  # wrong code — silently, because the uploaded artifacts are the correct local
-  # build, so the release works while its source tag points somewhere else.
-  # This already happened: v0.6.0's tag sits on the v0.5.0 release commit.
+  # The tag must name pushed code. Without --target GitHub tags the REMOTE
+  # default branch's HEAD — silently wrong, since the uploaded artifacts are the
+  # correct local build (v0.6.0's tag sits on the v0.5.0 release commit). So
+  # `gh release create` below passes --target HEAD, which also keeps the tag
+  # right when someone pushes to master mid-build (the unattended release,
+  # scripts/release-auto.sh); this check keeps HEAD a commit GitHub has.
   git fetch --quiet origin || true
   UNPUSHED="$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo unknown)"
   if [ "$UNPUSHED" = "unknown" ]; then
@@ -208,6 +209,7 @@ fi
 # stays a draft — fix it and run release-linux.sh, then publish it by hand:
 #   gh release edit <tag> -R gididaf/mulpex --draft=false --latest
 gh release create "$TAG" -R "$REPO" --draft \
+  --target "$(git rev-parse HEAD)" \
   --title "Mulpex $TAG" \
   --notes "$NOTES" \
   "$DMG" "$TARBALL" "$SIGFILE" "$LATEST"

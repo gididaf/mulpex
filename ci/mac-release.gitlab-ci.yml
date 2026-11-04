@@ -1,0 +1,50 @@
+# The unattended Mulpex release: the CI file of GitLab project root/mulpex-release
+# (gitlab.dreamvps.com, id 67), which holds nothing else. scripts/release-auto.sh
+# uploads THIS file there whenever it differs, so edit it here, never in GitLab.
+#
+# It runs on the Mac's GitLab runner (gidi-mac, tag macos, shell executor, as
+# gididaf in the GUI session, so the login keychain's signing identity and
+# ~/.mulpex/updater.key are reachable) and does exactly what `npm run release`
+# does by hand, in its own clone, ~/mulpex-release — never in the live checkout
+# the Mac's claudes work in. docs/packaging.md, "Unattended release".
+#
+# Variables (set by release-auto.sh when it triggers the pipeline):
+#   MULPEX_SHA      the bump commit to release; must already be on origin/master
+#   MULPEX_VERSION  its version, checked against tauri.conf.json
+
+workflow:
+  rules:
+    - if: $MULPEX_SHA && $MULPEX_VERSION
+
+release:
+  tags: [macos]
+  timeout: 75m
+  variables:
+    GIT_STRATEGY: none # this project has no code; the job clones GitHub itself
+  script:
+    - |
+      set -euo pipefail
+      # launchd gives the runner a bare environment and there is no ~/.bash_profile,
+      # so a login bash finds neither node nor cargo (measured 2026-11-04).
+      export PATH="/opt/homebrew/bin:$PATH"
+      export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
+      . "$HOME/.cargo/env"
+      D="$HOME/mulpex-release"
+      [ -d "$D/.git" ] || git clone https://github.com/gididaf/mulpex.git "$D"
+      cd "$D"
+      git fetch --tags --force --prune origin
+      git merge-base --is-ancestor "$MULPEX_SHA" origin/master || {
+        echo "ERROR: $MULPEX_SHA is not on origin/master — push it first." >&2; exit 1; }
+      # A real branch with an upstream, not a detached HEAD: release.sh's
+      # preflight counts @{upstream}..HEAD. HEAD being an ancestor of
+      # origin/master gives 0 even if master moved on since the trigger, and
+      # --target in release.sh tags exactly this commit.
+      git checkout -f -B master "$MULPEX_SHA"
+      git branch -u origin/master
+      # Keep the caches (node_modules, the Rust target dir), drop everything else.
+      git clean -ffdx -e node_modules -e target
+      V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+      [ "$V" = "$MULPEX_VERSION" ] || {
+        echo "ERROR: $MULPEX_SHA is version $V, not $MULPEX_VERSION." >&2; exit 1; }
+      npm ci --no-audit --no-fund
+      npm run release

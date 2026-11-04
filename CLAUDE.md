@@ -136,6 +136,8 @@ src/                  Svelte/Vite frontend
                       TerminalPane/View, MessageReader, Rename, RightPanel (BoardTab + CardOverlay, PinsTab, ExplainTab),
                       SaveOverlay, SecretsDialog, ContextMenu, UpdateBanner…
 scripts/release.sh    signed build → draft release → Linux build adds itself → publish (docs/packaging.md)
+scripts/release-auto.sh  the same, unattended from the VM: bump + push + the Mac's GitLab runner
+                      runs release.sh (ci/mac-release.gitlab-ci.yml; docs/packaging.md)
 scripts/tauri-dev.sh  `npm run tauri:dev`: free Vite port + a home per worktree (`~/.mulpex-dev-<folder>`)
 scripts/deploy-relay.sh  Remote Control relay + phone app → the VM (docs/remote-control.md)
 remote/               the phone web app (PWA) for Remote Control

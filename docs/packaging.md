@@ -234,12 +234,14 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   --latest`). The draft is there because the Mac orders its remote hosts to update to its own new
   version first — only hosts on a different wire fingerprint (`latest.json`'s `wire`, `wire.rs`;
   docs/remote-hosts.md): a public `latest.json` without Linux in it would fail every
-  such update. If the Linux step fails, the release stays a draft and nothing has shipped. The unpushed check exists because `gh release create` is called with **no
-  `--target`**, so GitHub creates the tag at the *remote* default branch's HEAD: with local
-  commits unpushed, the tag names code the release does not contain — **silently**, since the
-  uploaded artifacts are the correct local build, so the release works while its source tag
-  points elsewhere. Not hypothetical: **the v0.6.0 tag sits on the v0.5.0 release commit** for
-  exactly this reason. `--dry-run` builds and writes the JSON
+  such update. If the Linux step fails, the release stays a draft and nothing has shipped. Without
+  `--target`, GitHub creates the tag at the *remote* default branch's HEAD: with local commits
+  unpushed, the tag names code the release does not contain — **silently**, since the uploaded
+  artifacts are the correct local build, so the release works while its source tag points
+  elsewhere. Not hypothetical: **the v0.6.0 tag sits on the v0.5.0 release commit** for exactly
+  this reason. So `gh release create` passes `--target <HEAD>` (since 2026-11-04 — which also keeps
+  the tag right when someone pushes to master mid-build, as happens under the unattended release
+  below), and the unpushed check keeps HEAD a commit GitHub has. `--dry-run` builds and writes the JSON
   without publishing — and because it skips the clean-tree and unused-tag checks, it is also how
   you inspect a release build *before* committing. Use it: `release.sh` checks only that the
   artifacts **exist**, never that the `.app` inside them is signed, which is exactly how the
@@ -267,6 +269,47 @@ version raises a fixed card (`UpdateBanner.svelte`) with **Update & Restart**.
   Same late-failure shape as the bullet above: the `.app` and `.dmg` are already written by then,
   so it looks like a finished build with a **stale** `Mulpex.app.tar.gz` beside it from a previous
   run. `release.sh` exports it (`:73`); `tauri:build` didn't until this was hit, and now does.
+
+## Unattended release (`scripts/release-auto.sh`, from the VM)
+
+Since 2026-11-04 nobody has to be at the Mac. Most work happens on the Linux dev VM, and a release
+used to wait until the user sat down and ran `npm run release` there. Now, when the user says
+"release", a VM claude runs **`scripts/release-auto.sh`** (in the background — a run takes 10–30
+min). It:
+
+1. checks the checkout is on `master` and not behind `origin/master` (it never pulls: that is a
+   tree-wide op in a shared checkout), bumps the version — **patch** by default, or `minor`,
+   `major`, `X.Y.Z` — in `tauri.conf.json`, `src-tauri/Cargo.toml` and `Cargo.lock`, and commits
+   **only those three files** (peers' dirty files stay out) as `chore: vX.Y.Z`, then pushes;
+2. uploads `ci/mac-release.gitlab-ci.yml` to GitLab project **`root/mulpex-release`** (id 67,
+   gitlab.dreamvps.com, VM 2253 on nl4) if it differs — the repo copy is the source of truth, the
+   project holds nothing else;
+3. triggers its pipeline with `MULPEX_SHA` + `MULPEX_VERSION`, follows it, and exits 0 only once
+   the release is published; on failure it prints the job log's last 80 lines.
+   `--retry` re-releases HEAD's version without a bump; `--no-wait` / `--wait <id>` split the two.
+
+The job runs on the Mac's GitLab runner (`gidi-mac`, id 51, tag `macos`, shell executor, the
+LaunchAgent in `gui/501` that also builds CloudRaw's Mac client — enabled for both projects,
+`concurrent = 1`, so the two never overlap). Running as the user inside the GUI session is what
+makes it work: the login keychain holds the signing identity and codesign ran with **no prompt**
+(measured by the Mac claude, 2026-11-04), and `~/.mulpex/updater.key` never leaves the Mac. The
+job clones GitHub into **`~/mulpex-release`** — never the live checkout the Mac's claudes edit —
+and runs plain `npm run release`, so every preflight above still applies. Traps it handles:
+
+- **launchd's environment is bare** and there is no `~/.bash_profile`, so the job sources nvm and
+  `~/.cargo/env` and puts `/opt/homebrew/bin` (gh) on `PATH` itself.
+- **Not a detached HEAD:** `release.sh` counts `@{upstream}..HEAD`, which fails without a branch.
+  The job does `checkout -B master $MULPEX_SHA` + `branch -u origin/master`; HEAD being an
+  ancestor of `origin/master` passes the check even if master moved on since the trigger.
+- **Tags are fetched**, or the release notes (`git log <last tag>..HEAD`) become everything.
+
+Limits: the runner needs the user **logged in** on the Mac (after a reboot with no login the
+keychain is locked and the job never starts — it sits `pending`). The token
+(`~/.mulpex/secrets/gitlab-mulpex-release.env`, `GITLAB_MULPEX_RELEASE_TOKEN`, project access
+token, Maintainer, `api` + `write_repository`, expires 2027-11-04) is read from the file and handed
+to curl on stdin. Measured end to end on 2026-11-04 with a bogus `MULPEX_SHA` (pipeline 3756):
+the runner picked it up, nvm/cargo loaded, the clone ran, the job refused and the script printed
+the log. The Mac claude's `--dry-run --mac-only` under the same bare env: PASS, 251 s cold.
 
 ## Teardown fires on TWO RunEvents (the fixed scratch-root leak)
 
