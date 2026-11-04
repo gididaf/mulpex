@@ -302,6 +302,17 @@ and runs plain `npm run release`, so every preflight above still applies. Traps 
   The job does `checkout -B master $MULPEX_SHA` + `branch -u origin/master`; HEAD being an
   ancestor of `origin/master` passes the check even if master moved on since the trigger.
 - **Tags are fetched**, or the release notes (`git log <last tag>..HEAD`) become everything.
+- **A failed run resumes.** A failure after `gh release create --draft` (usually the Linux leg)
+  leaves a draft, which `release.sh` would then refuse ("already exists"). So when `vX.Y.Z` is a
+  draft holding `Mulpex.app.tar.gz`, the job runs only `release-linux.sh` + publish — `--retry`
+  after a Linux failure just works. A draft without the Mac build must be deleted by hand.
+- **Never over a newer release:** the job refuses if a higher `v*` tag exists, since `--latest`
+  would point clients back at an older version.
+- **No `set -x` in the job, ever:** `release.sh` exports the updater key's contents, and the
+  shell executor would print them into the GitLab log.
+
+First real run: **v0.58.4, 2026-11-04, pipeline 3757 — 9 min trigger to published**, tag on the
+bump commit, all three platforms in `latest.json`.
 
 Limits: the runner needs the user **logged in** on the Mac (after a reboot with no login the
 keychain is locked and the job never starts — it sits `pending`). The token

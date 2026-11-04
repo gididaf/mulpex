@@ -11,6 +11,10 @@
 # Variables (set by release-auto.sh when it triggers the pipeline):
 #   MULPEX_SHA      the bump commit to release; must already be on origin/master
 #   MULPEX_VERSION  its version, checked against tauri.conf.json
+#
+# NEVER add `set -x` (or any trace) here: release.sh exports the updater key's
+# contents (TAURI_SIGNING_PRIVATE_KEY), and the shell executor would print it
+# into the GitLab job log.
 
 workflow:
   rules:
@@ -46,5 +50,24 @@ release:
       V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
       [ "$V" = "$MULPEX_VERSION" ] || {
         echo "ERROR: $MULPEX_SHA is version $V, not $MULPEX_VERSION." >&2; exit 1; }
+      # Never publish over a newer release: --latest would point every client
+      # back at this one (and the updater ignores a downgrade anyway).
+      NEWEST="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)"
+      if [ -n "$NEWEST" ] && [ "$NEWEST" != "v$V" ] \
+         && [ "$(printf '%s\n' "$NEWEST" "v$V" | sort -V | tail -1)" = "$NEWEST" ]; then
+        echo "ERROR: $NEWEST is newer than v$V — release a newer version instead." >&2; exit 1
+      fi
       npm ci --no-audit --no-fund
+      # Resume: a run that failed after `gh release create --draft` (usually the
+      # Linux leg) left a draft with the Mac assets. release.sh would refuse it
+      # ("already exists"), so finish it the way release.sh's error says to.
+      if [ "$(gh release view "v$V" -R gididaf/mulpex --json isDraft -q .isDraft 2>/dev/null)" = "true" ]; then
+        gh release view "v$V" -R gididaf/mulpex --json assets -q '.assets[].name' | grep -qx 'Mulpex.app.tar.gz' || {
+          echo "ERROR: draft v$V has no Mac build — delete the draft, then retry." >&2; exit 1; }
+        echo "==> resuming draft v$V: Linux build + publish"
+        scripts/release-linux.sh --host "${MULPEX_LINUX_HOST:-gidi@89.42.24.40}"
+        gh release edit "v$V" -R gididaf/mulpex --draft=false --latest
+        echo "==> published v$V"
+        exit 0
+      fi
       npm run release
