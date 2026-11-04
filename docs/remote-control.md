@@ -83,6 +83,10 @@ Claudes run with `--dangerously-skip-permissions`, so this is full control of th
   too). Added 2026-11-02 because a codex refusal could not be reproduced: real codex 0.164 bytes read
   correctly in every state tried, and the phone checks the HOST's xterm, which a remote desktop's
   mirror (the screenshot you'd send) is not. Read the file before changing `promptbox.ts`.
+  **The box is read from the live screen (`baseY`), never from what is scrolled into view
+  (`viewportY`)** — until v0.58.3 a pane left scrolled up in the host's window hid its box, and the
+  phone was refused by an idle claude (viva-la-rts#4114, 2026-11-04; inferred from the code, the
+  live app predated the dump).
 - **Attaching files** — the chat's 📎 picks any files (25 MB together). On Send each goes up in
   2 MB chunks as `file-put {rid, name, data, upload, done}` (standard base64, like the Board's
   images) and lands in `<mulpex home>/remote/phone-files/<uuid>/<name>` (0700 dir, 0600 file,

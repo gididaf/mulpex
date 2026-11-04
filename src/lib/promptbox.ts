@@ -45,14 +45,18 @@ function isPromptRow(text: string): boolean {
   return text.startsWith(PROMPT + " ") || text.startsWith(PROMPT + " ");
 }
 
-/** The state of `agent`'s input box on the visible screen of `buf`. */
+/** The state of `agent`'s input box on the bottom screen of `buf`.
+ *
+ *  Read from `baseY` (the live screen), never `viewportY` (what is scrolled
+ *  into view): a pane left scrolled up in this window hid its box, and the
+ *  phone was refused "No prompt to type into" by a claude sitting idle. */
 export function readPromptBox(buf: IBuffer, rows: number, cols: number, agent: Agent = "claude"): PromptBox {
   return agent === "codex" ? readCodexBox(buf, rows, cols) : readClaudeBox(buf, rows, cols);
 }
 
 /** claude's box (the rules at the top of this file). */
 function readClaudeBox(buf: IBuffer, rows: number, cols: number): PromptBox {
-  const top = buf.viewportY;
+  const top = buf.baseY;
   const lineText = (y: number) => buf.getLine(y)?.translateToString(true) ?? "";
 
   for (let y = top + rows - 1; y > top; y--) {
@@ -97,7 +101,7 @@ function readClaudeBox(buf: IBuffer, rows: number, cols: number): PromptBox {
 const CODEX_PROMPT = "›";
 
 function readCodexBox(buf: IBuffer, rows: number, cols: number): PromptBox {
-  const top = buf.viewportY;
+  const top = buf.baseY;
   const cell = buf.getNullCell();
   for (let y = top + rows - 1; y >= top; y--) {
     const line = buf.getLine(y);
@@ -144,12 +148,12 @@ function cellAttrs(c: IBufferCell): string {
 /** `readPromptBox`'s answer, why, and the screen it was read from. */
 export function promptBoxReport(buf: IBuffer, rows: number, cols: number, agent: Agent = "claude"): PromptBoxReport {
   const box = readPromptBox(buf, rows, cols, agent);
-  const top = buf.viewportY;
+  const top = buf.baseY;
   const cell = buf.getNullCell();
   const text = (y: number) => buf.getLine(y)?.translateToString(true) ?? "";
 
   const lines = [
-    `agent=${agent} box=${box} cols=${cols} rows=${rows} viewportY=${top} baseY=${buf.baseY} length=${buf.length} cursor=${buf.cursorX},${buf.cursorY} buffer=${buf.type}`,
+    `agent=${agent} box=${box} cols=${cols} rows=${rows} viewportY=${buf.viewportY} baseY=${buf.baseY} length=${buf.length} cursor=${buf.cursorX},${buf.cursorY} buffer=${buf.type}`,
   ];
   for (let y = top; y < top + rows; y++) {
     const line = buf.getLine(y);

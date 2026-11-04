@@ -101,3 +101,25 @@ test("report: the dump carries the screen and its attributes", async () => {
   assert.equal(lines.length, 1 + 1 + ROWS + 1);
   assert.ok(lines.some((l) => /"›" b fg=default/.test(l) && l.endsWith("› Ask Codex to do anything")), r.dump);
 });
+
+// A pane scrolled up in the window still has its box on the live screen.
+// xterm without a page ignores scrollLines, so the buffer reports a viewport
+// 50 rows up, which is what the window's scrolled-up xterm hands the reader.
+function scrolledUp(term) {
+  const b = term.buffer.active;
+  assert.ok(b.baseY >= 50);
+  return new Proxy(b, {
+    get: (t, k) => (k === "viewportY" ? t.baseY - 50 : typeof t[k] === "function" ? t[k].bind(t) : t[k]),
+  });
+}
+
+test("a scrolled-up pane still reads its box (claude and codex)", async () => {
+  const rule = "─".repeat(40);
+  const history = Array.from({ length: 80 }, (_, i) => `line ${i}\r\n`).join("");
+  const claude = await screen(history + rule + "\r\n❯\u00a0\x1b[2mTry it\x1b[0m\r\n" + rule + "\r\n");
+  assert.equal(readPromptBox(scrolledUp(claude), claude.rows, claude.cols, "claude"), "empty");
+  assert.equal(promptBoxReport(scrolledUp(claude), claude.rows, claude.cols, "claude").box, "empty");
+
+  const codex = await screen(Buffer.concat([Buffer.from(history), session.subarray(0, at.empty)]));
+  assert.equal(readPromptBox(scrolledUp(codex), codex.rows, codex.cols, "codex"), "empty");
+});
