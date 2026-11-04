@@ -2588,7 +2588,7 @@ dependencies = [
 
 [[package]]
 name = "mulpex"
-version = "0.58.2"
+version = "0.58.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
