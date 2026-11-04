@@ -39,6 +39,7 @@ import { terminals } from "./terminals";
 import { compactsHeld } from "./checkpoint";
 import { isRemote } from "./hosts";
 import { addrIn, agentOf } from "./agents";
+import { Attempts } from "./compactRetry";
 import {
   compactGiveUp,
   sendBytes,
@@ -143,6 +144,13 @@ function giveUp(h: ProjectHandle, id: number, r: Req, why: string) {
   cleared.set(keyOf(h, id), Date.now());
   void compactGiveUp(h, id, compacted, why);
   if (compacted) return put(h, id, null);
+  // An auto attempt that didn't compact may retry later; hub updates come only
+  // on a change, so wake the rule check when that time comes.
+  if (r.by != null) {
+    const now = Date.now();
+    const at = suppressed.failed(keyOf(h, id), now);
+    if (at != null) setTimeout(() => autoCompactTick(h), at - now + 1_000);
+  }
   put(h, id, { ...r, phase: "failed", why });
   setTimeout(() => {
     if (get(reqs).get(keyOf(h, id))?.phase === "failed") put(h, id, null);
@@ -189,11 +197,12 @@ function startCompact(h: ProjectHandle, id: number, by: number | null) {
 // rollout shows one every ~1.5–2 h), so a Mulpex compact only adds a stop to a
 // turn that didn't need one. A codex orchestrator's rule still covers its
 // claudes. ⌘⇧K on a codex still works — that is the user asking. One attempt per crossing: a claude
-// is `suppressed` after its attempt (success or not) until its context reads
-// below X again, which covers both a failed compact and the ctx file still
-// showing the old number right after a good one.
+// is `suppressed` after its attempt until its context reads below X again,
+// which covers the ctx file still showing the old number right after a good
+// one. A FAILED attempt also releases after RETRY_AFTER_MS (`compactRetry.ts`):
+// nothing compacted it, so its context would never drop on its own.
 
-const suppressed = new Set<string>();
+const suppressed = new Attempts();
 
 /** Apply every auto-compact rule in project `h`. Called on each hub update. */
 export function autoCompactTick(h: ProjectHandle) {
@@ -216,9 +225,9 @@ export function autoCompactTick(h: ProjectHandle) {
       if (!autoCompacts(c.kind) || c.exited || c.failed) continue;
       const k = keyOf(h, c.id);
       const ctx = p.ctx.get(c.id);
-      if (ctx == null || ctx < pct || suppressed.has(k) || active(h, c.id)) continue;
+      if (ctx == null || ctx < pct || suppressed.blocks(k, Date.now()) || active(h, c.id)) continue;
       if (saveStatusOf(h, c.id)) continue;
-      suppressed.add(k);
+      suppressed.started(k);
       startCompact(h, c.id, orch.id);
     }
   }
@@ -242,7 +251,7 @@ function ruleFor(list: SessionInfo[], id: number): number | null {
 function suppressedRelease(h: ProjectHandle, id: number, ctx: number | undefined, pct: number | null) {
   const k = keyOf(h, id);
   if (!suppressed.has(k) || active(h, id)) return;
-  if (pct == null || ctx == null || ctx < pct) suppressed.delete(k);
+  if (pct == null || ctx == null || ctx < pct) suppressed.release(k);
 }
 
 // Hub updates only come on a change, so a child already over the line when the
@@ -255,7 +264,7 @@ compactsHeld.subscribe((held) => {
 
 /** Drop claude#id's request (the row exited or restarted). */
 export function dropCompact(h: ProjectHandle, id: number) {
-  suppressed.delete(keyOf(h, id));
+  suppressed.release(keyOf(h, id));
   if (get(reqs).has(keyOf(h, id))) {
     put(h, id, null);
     writePhase(h, id, null);
@@ -325,7 +334,7 @@ function step(h: ProjectHandle, id: number) {
 
   if (get(compactsHeld) && (r.phase === "requested" || r.phase === "resume")) {
     // A request called off before `/compact` may try again after the hold.
-    if (r.phase === "requested") suppressed.delete(keyOf(h, id));
+    if (r.phase === "requested") suppressed.release(keyOf(h, id));
     put(h, id, null);
     writePhase(h, id, null);
     return;

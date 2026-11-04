@@ -978,10 +978,13 @@ with no migration. Its own line reads `auto-compact: …`, without the `(claude#
   child pausing to compact isn't mistaken for stuck. It is told it needs to do nothing.
 - **Enforced in the frontend** (`compact.ts::autoCompactTick`, on every `hub-update`), because the
   ⌘⇧K driver lives there. Context % comes from `ctx/<id>` (the statusline) — no LLM call watches it.
-- **One attempt per crossing.** After an attempt, success or "didn't run", the child is
-  `suppressed` until its context reads below the threshold again (or reads nothing). That covers a
-  failed compact looping, and the ctx file still showing the old number right after a good one —
-  the statusline only rewrites it on its next draw. With nested rules the lowest threshold on a claude
+- **One attempt per crossing.** After an attempt the child is `suppressed` until its context
+  reads below the threshold again (or reads nothing). That covers the ctx file still showing the
+  old number right after a good one — the statusline only rewrites it on its next draw.
+  **A "didn't run" also releases after 10 minutes** (`compactRetry.ts`, no cap, a timer re-runs
+  the tick): nothing compacted it, so its context never drops. Until 2026-11-04 one failure
+  disabled the rule for that claude for good — viva-la-rts#1538 sat at 59% under a 50% rule for
+  hours after a single "can't find its input box" (a pane scrolled up, before v0.58.3). With nested rules the lowest threshold on a claude
   (its own rule or an ancestor's) decides when it is released.
 - The child's sidebar line says who asked: `auto-compact (claude#3): waiting for checkpoint…`.
 
