@@ -1032,11 +1032,20 @@
     return `No prompt to type into right now (${r.reason})`;
   }
 
+  /** Is a question or plan dialog covering instance#id's prompt? `needs` means
+   *  that only for a claude. A codex has no such dialog: its `needs` is "it asked
+   *  you in text" (`hook.rs::codex_asked_the_user`), and its prompt is open — the
+   *  reply is exactly what has to be typed. */
+  function dialogOpen(handle: ProjectHandle, id: number): boolean {
+    const p = get(projects).get(handle);
+    const s = p?.sessions.find((x) => x.id === id);
+    return s?.kind !== "codex" && p?.statuses.get(id) === "needs";
+  }
+
   /** The prompt state that rules out typing into claude#id, as a toast; null when
    *  typing is fine. A draft is fine here: the line is appended to it. */
   function secretsBlocked(handle: ProjectHandle, id: number): string | null {
-    const p = get(projects).get(handle);
-    if (p?.statuses.get(id) === "needs") return "Answer or close the open question first";
+    if (dialogOpen(handle, id)) return "Answer or close the open question first";
     if (terminals.promptBox(handle, id) === "none") return noPromptWhy(handle, id, "secrets");
     return null;
   }
@@ -1082,7 +1091,7 @@
     let why: string | null = null;
     if (!p || !s || s.kind === "shell" || s.exited || s.failed) why = "That claude isn't running";
     else if (saveStatusOf(handle, id)) why = "That claude was saved and stopped";
-    else if (p.statuses.get(id) === "needs") why = "Answer the open question first";
+    else if (dialogOpen(handle, id)) why = "Answer the open question first";
     else {
       const box = terminals.promptBox(handle, id);
       if (box === "draft") why = "There's unsent text in this claude's prompt on the Mac";

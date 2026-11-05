@@ -2987,17 +2987,30 @@ impl Core {
     /// open question first". The transcript does record it — an `is_error`
     /// result for the dialog's tool call — so that is what's read here, only
     /// for claudes showing `needs` with a dialog on file.
+    ///
+    /// Only a dismissal *after the dialog on file was opened* counts. The hook
+    /// writes `needs` ~110 ms before Claude Code appends the new dialog's
+    /// `tool_use` to the transcript (measured, claude 2.1.318), so a poll in that
+    /// gap sees the PREVIOUS dialog as the last one — and if that one was
+    /// escaped, an open question read as dismissed. cloud#1, 2026-11-04: a 19:32
+    /// escape turned the 19:37 question `waiting`, and the phone lost its buttons.
     pub fn clear_escaped_dialogs(&self) {
         for s in self.instances() {
             let status = self.state_dir.join(s.id.to_string());
-            if !std::fs::read_to_string(&status).is_ok_and(|t| t.trim() == "needs")
-                || !mulpex_core::dialog_path(&self.state_dir, s.id).is_file()
-            {
+            if !std::fs::read_to_string(&status).is_ok_and(|t| t.trim() == "needs") {
                 continue;
             }
+            let Some(opened) = std::fs::metadata(mulpex_core::dialog_path(&self.state_dir, s.id))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+            else {
+                continue;
+            };
             let path = crate::saves::transcript_path(&self.project_dir, &s.session_id);
             let Some(tail) = read_tail(&path, DIALOG_TAIL_BYTES) else { continue };
-            if let Some(word) = escaped_dialog(&tail) {
+            if let Some(word) = escaped_dialog(&tail, opened) {
                 eprintln!("[dialog] claude#{}: its dialog was dismissed (no hook fires for that) — {word}", s.id);
                 let _ = std::fs::write(&status, word);
             }
@@ -3923,7 +3936,11 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
 /// - an assistant entry → the plan was rejected with feedback and claude went
 ///   on working (its tool calls can't clear a `needs`): `working`;
 /// - nothing yet → wait for the next line rather than guess.
-fn escaped_dialog(tail: &str) -> Option<&'static str> {
+///
+/// `opened_ms` is when the dialog on file was opened (unix ms). A rejection
+/// stamped before it belongs to an older dialog — the transcript hasn't caught
+/// up yet — and one with no readable stamp is not trusted either.
+fn escaped_dialog(tail: &str, opened_ms: i64) -> Option<&'static str> {
     let blocks = |e: &serde_json::Value| -> Vec<serde_json::Value> {
         e.pointer("/message/content").and_then(|c| c.as_array()).cloned().unwrap_or_default()
     };
@@ -3956,6 +3973,10 @@ fn escaped_dialog(tail: &str) -> Option<&'static str> {
                     if b.get("is_error").and_then(|v| v.as_bool()) != Some(true) {
                         return None; // answered
                     }
+                    let at = e.get("timestamp").and_then(|t| t.as_str()).and_then(rfc3339_ms);
+                    if !at.is_some_and(|at| at >= opened_ms) {
+                        return None; // an older dialog's dismissal
+                    }
                     rejected = true;
                 }
                 if rejected && b.get("text").and_then(|t| t.as_str()).is_some_and(|t| t.starts_with("[Request interrupted"))
@@ -3968,6 +3989,30 @@ fn escaped_dialog(tail: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// A transcript `timestamp` (`2026-11-04T19:37:29.982Z`, always UTC) as unix
+/// milliseconds. Anything else is `None`.
+fn rfc3339_ms(ts: &str) -> Option<i64> {
+    let ts = ts.strip_suffix('Z')?;
+    let (date, time) = ts.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut t = hms.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (h, min, s) = (t.next()??, t.next()??, t.next()??);
+    let ms: i64 = format!("{frac:0<3}").get(..3)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + h) * 60 + min) * 60_000 + s * 1000 + ms)
 }
 
 #[cfg(test)]
@@ -3988,24 +4033,44 @@ mod tests {
     #[test]
     fn an_escaped_dialog_is_read_from_the_transcript() {
         use serde_json::json;
-        let rejected = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        // The dialog on file opened just before the escape.
+        let opened = rfc3339_ms("2026-11-04T19:32:32.480Z").unwrap();
+        let rejected = json!({"type":"user","timestamp":"2026-11-04T19:32:39.568Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
             "content":"The user doesn't want to proceed with this tool use. The tool use was rejected"}]}});
-        let interrupted = json!({"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}});
+        let interrupted = json!({"type":"user","timestamp":"2026-11-04T19:32:39.569Z","message":{"content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}});
         let answered = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"User has answered"}]}});
         let went_on = json!({"type":"assistant","message":{"content":[{"type":"text","text":"Changing the plan."}]}});
         for tool in ["AskUserQuestion", "ExitPlanMode"] {
-            assert_eq!(escaped_dialog(&dialog_tail(tool, &[])), None, "{tool}: still open");
-            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone()])), None, "{tool}: wait for what follows");
-            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), interrupted.clone()])), Some("waiting"), "{tool}: Esc");
-            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), went_on.clone()])), Some("working"), "{tool}: feedback");
-            assert_eq!(escaped_dialog(&dialog_tail(tool, &[answered.clone(), went_on.clone()])), None, "{tool}: answered");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[]), opened), None, "{tool}: still open");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone()]), opened), None, "{tool}: wait for what follows");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), interrupted.clone()]), opened), Some("waiting"), "{tool}: Esc");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[rejected.clone(), went_on.clone()]), opened), Some("working"), "{tool}: feedback");
+            assert_eq!(escaped_dialog(&dialog_tail(tool, &[answered.clone(), went_on.clone()]), opened), None, "{tool}: answered");
         }
         // A newer dialog after an escaped one is the one that counts.
-        let mut two = dialog_tail("AskUserQuestion", &[rejected.clone(), interrupted.clone()]);
+        let escaped = dialog_tail("AskUserQuestion", &[rejected.clone(), interrupted.clone()]);
+        let mut two = escaped.clone();
         two.push_str(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{}}]}}).to_string());
         two.push('\n');
-        assert_eq!(escaped_dialog(&two), None, "the new question is open");
-        assert_eq!(escaped_dialog("not json\n"), None);
+        assert_eq!(escaped_dialog(&two, opened), None, "the new question is open");
+        // cloud#1, 2026-11-04: a new question opened at 19:37 while its
+        // `tool_use` was not in the transcript yet (it lands ~110 ms after the
+        // hook), so the escaped 19:32 one was still the last. Still open.
+        let reopened = rfc3339_ms("2026-11-04T19:37:29.992Z").unwrap();
+        assert_eq!(escaped_dialog(&escaped, reopened), None, "an older dialog's escape is not this one's");
+        // A rejection with no timestamp is not trusted.
+        let unstamped = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"rejected"}]}});
+        assert_eq!(escaped_dialog(&dialog_tail("AskUserQuestion", &[unstamped, interrupted.clone()]), opened), None);
+        assert_eq!(escaped_dialog("not json\n", opened), None);
+    }
+
+    #[test]
+    fn transcript_timestamps_parse_to_unix_ms() {
+        assert_eq!(rfc3339_ms("2026-11-04T19:37:29.982Z"), Some(1_793_821_049_982));
+        assert_eq!(rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert_eq!(rfc3339_ms("2024-02-29T00:00:00.5Z"), Some(1_709_164_800_500));
+        assert_eq!(rfc3339_ms("2026-11-04 19:37:29"), None);
+        assert_eq!(rfc3339_ms("garbage"), None);
     }
 
     /// Every real transcript on this machine whose LAST dialog was dismissed:
@@ -4020,7 +4085,7 @@ mod tests {
         for d in std::fs::read_dir(&root).into_iter().flatten().flatten() {
             for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
                 let Some(tail) = read_tail(&f.path(), DIALOG_TAIL_BYTES) else { continue };
-                let got = escaped_dialog(&tail).unwrap_or("none");
+                let got = escaped_dialog(&tail, 0).unwrap_or("none");
                 *seen.entry(got).or_default() += 1;
                 if got != "none" && f.path().to_string_lossy().contains("probe") {
                     eprintln!("{got}: {}", f.path().display());

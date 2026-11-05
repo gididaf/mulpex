@@ -553,8 +553,10 @@ pub fn project_view(
         .map(|s| {
             let st = snap.statuses.iter().find(|e| e.id == s.id);
             let claude = s.kind.is_agent();
-            // The open question or plan, while the claude is waiting on it.
-            let needs = claude && st.is_some_and(|e| e.status == crate::snapshot::Status::Needs);
+            // The open question or plan, while the claude is waiting on it. A
+            // codex has no dialog: its `needs` is a question asked in text.
+            let needs = s.kind == crate::snapshot::SessionKind::Claude
+                && st.is_some_and(|e| e.status == crate::snapshot::Status::Needs);
             let dialog = if needs { dialog::read(state_dir, s.id) } else { None };
             json!({
                 "dialog": dialog,
