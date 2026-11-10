@@ -592,6 +592,11 @@ fn on_message(slot: u32, epoch: u64, tx: &Sender<String>, m: Value) -> Option<En
             } else if name == "checkpoint-changed" {
                 // Unlike the rest it names no project, so say which host.
                 emit("host-checkpoint-changed", json!({"slot": slot, "ev": payload}));
+            } else if name == "daemon-lost" {
+                // Names no project either: the toast says which host lost it.
+                let mut p = payload;
+                p["slot"] = json!(slot);
+                emit(name, p);
             } else if super::desktop::EVENT_NAMES.contains(&name) {
                 emit(name, payload);
             }

@@ -170,10 +170,35 @@ changes something a running claude froze at spawn belongs in `FILES`.
 
 ## If the daemon dies under a running app
 
-The client's reader sees EOF and every session gets `Event::Lost`: they die in
-the UI, and `reap_dead` keeps a worked claude's record in the store
-(`lost_with_daemon`) so the next launch resumes it. The next spawn starts a new
-daemon.
+The client's reader sees EOF and every session gets `Event::Lost`. Within one
+poll tick (`hub.rs`, before `reap_dead`) `ptyd::replaced(ws.state_root)` sees it
+— a dead connection, or one already talking to a daemon with another root — and
+`Workspace::recover_lost_daemon` moves the whole workspace onto a new daemon:
+
+1. every project's store is written (it is what the reopen resumes from);
+2. `ptyd::state_root()` starts the new daemon; `live_token::reconnect()` drops
+   the dead proxy's port and pushes the config to the new one;
+3. each project's scratch dir is renamed under the new root (inboxes, tasks and
+   ⌘K secrets come along; the dead processes' own files — status, `sessionid`,
+   `agentready`, ctx — are deleted first so they are not read as the new ones);
+4. each project is reopened in place (`Core::open`, same handle): every worked
+   claude/codex `--resume`s under its old number, name and nesting. Fresh claudes
+   and terminals have nothing to resume and are gone (`session-exited`); the rest
+   get `session-restarted`, which rebinds their panes;
+5. a line goes to `ptyd.log` (`log_from_app`, UTC) and `daemon-lost` raises a
+   sticky toast — forwarded to a remote desktop with the host's `slot`.
+
+**Why this exists.** Before it, the app kept the dead daemon's scratch root and
+Live Token port. The next ⌘T started a new daemon, but its claude got
+`MULPEX_STATE_DIR` under the old root and an `ANTHROPIC_BASE_URL` nothing
+listened on: every request was `ECONNREFUSED`. Seen on gidi-dev-mulpex on
+2026-11-10, where a hand-made systemd scope (`mulpex-work.scope`, default
+`OOMPolicy=stop`) was stopped after an OOM kill inside it and took the daemon and
+every claude with it. Nothing was logged, because a daemon that dies of a signal
+writes nothing; since then it logs `got SIGTERM/SIGINT/SIGQUIT` before dying
+(SIGKILL cannot be caught — then only the app's line is there). If you cap a
+Linux host's agents in a cgroup, give the scope `OOMPolicy=continue`, or one
+runaway test ends every session.
 
 ## Protocol
 

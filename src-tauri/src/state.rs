@@ -289,6 +289,106 @@ impl Workspace {
         }
     }
 
+    /// The PTY daemon died under the running app (`ptyd::replaced`) and took
+    /// every claude, codex and terminal with it. Before this, the app went on
+    /// with the dead daemon's scratch root and Live Token port: the next ⌘T
+    /// started a new daemon, but its claude was handed `MULPEX_STATE_DIR` under
+    /// the old root and an `ANTHROPIC_BASE_URL` nothing listened on, so every
+    /// request failed with ECONNREFUSED (gidi-dev-mulpex, 2026-11-10: a systemd
+    /// scope stopped on OOM took the daemon down).
+    ///
+    /// Now: write each project's store (the reopen resumes from it), start the
+    /// new daemon, push it the Live Token config, move each project's scratch
+    /// dir under the new root (inboxes and the Board's state come along), and
+    /// reopen every project in place — same handle, so the tab stays — which
+    /// `--resume`s every worked claude/codex with its number, name and nesting,
+    /// exactly as a relaunch would. Fresh claudes and terminals have nothing to
+    /// resume and are gone. `None` when no new daemon could be started; the
+    /// caller retries later.
+    pub fn recover_lost_daemon(&mut self, helper: &Path) -> Option<DaemonRecovery> {
+        let old_root = self.state_root.clone();
+        let mut lost = 0usize;
+        let mut old_ids: Vec<(ProjectHandle, Vec<usize>)> = Vec::new();
+        for core in &self.projects {
+            // Every row the daemon held, which is every row there is — minus a
+            // terminal that had already exited and one that never started.
+            lost += core
+                .sessions
+                .iter()
+                .filter(|s| s.is_alive() || s.lost_with_daemon())
+                .count();
+            old_ids.push((core.handle, core.sessions.iter().map(|s| s.id).collect()));
+            core.persist_sessions();
+        }
+        // Starts the new daemon (the dead connection is not reused).
+        let Some(new_root) = crate::ptyd::state_root() else {
+            crate::ptyd::log_from_app("the PTY daemon is gone and a new one would not start; retrying");
+            return None;
+        };
+        crate::live_token::reconnect();
+        self.state_root = new_root.clone();
+        let mut out = DaemonRecovery {
+            old_pid: crate::ptyd::root_pid(&old_root),
+            lost,
+            resumed: 0,
+            exited: Vec::new(),
+            restarted: Vec::new(),
+        };
+        for core in std::mem::take(&mut self.projects) {
+            let (handle, dir, old_dir) = (core.handle, core.project_dir.clone(), core.state_dir.clone());
+            // What the dead processes said about themselves must not be read as
+            // the new ones speaking: a leftover `sessionid/<id>` makes a resume
+            // that fails look like one that came up (`reap_dead`'s lost-restore
+            // test), and a status file would show a dead claude `working`.
+            for s in &core.sessions {
+                core.forget_process_files(s.id);
+            }
+            // Its sessions are dead; dropping them asks a dead connection to
+            // kill them, which returns at once.
+            drop(core);
+            let new_dir = new_root.join(crate::ptyd::project_key(&dir));
+            if old_dir != new_dir && old_dir.is_dir() && !new_dir.exists() {
+                if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                    eprintln!("[ptyd] could not move {} to {}: {e}", old_dir.display(), new_dir.display());
+                }
+            }
+            match Core::open(handle, dir.clone(), helper, new_dir, self.geometry) {
+                Ok(core) => {
+                    out.resumed += core.sessions.len();
+                    let before = old_ids.iter().find(|(h, _)| *h == handle).map(|(_, v)| v.clone()).unwrap_or_default();
+                    for id in before {
+                        // A row that is back under its old number keeps its pane
+                        // and is rebound to the new PTY; one that is not is gone.
+                        if core.sessions.iter().any(|s| s.id == id) {
+                            out.restarted.push((handle, id));
+                        } else {
+                            core.forget_session_files(id);
+                            out.exited.push((handle, id));
+                        }
+                    }
+                    self.projects.push(core);
+                }
+                Err(e) => eprintln!("[ptyd] could not reopen {} on the new daemon: {e}", dir.display()),
+            }
+        }
+        if self.active.is_some_and(|h| self.project(h).is_none()) {
+            self.active = self.projects.first().map(|c| c.handle);
+        }
+        if old_root != new_root {
+            let _ = std::fs::remove_dir_all(&old_root);
+        }
+        crate::ptyd::log_from_app(&format!(
+            "the PTY daemon{} is gone, killed from outside (a `got SIG…` line just above names the \
+             signal; none means SIGKILL, e.g. an OOM killer); {} instance(s) went with it. New daemon \
+             at {}; resumed {}",
+            out.old_pid.map(|p| format!(" (pid {p})")).unwrap_or_default(),
+            out.lost,
+            new_root.display(),
+            out.resumed,
+        ));
+        Some(out)
+    }
+
     /// Kill every project's process groups and remove the whole scratch root. The
     /// "no orphaned claude" guarantee, now across all projects.
     pub fn teardown_all(&mut self) {
@@ -308,6 +408,16 @@ impl Workspace {
         crate::pty::reap_orphaned_listeners();
         let _ = std::fs::remove_dir_all(&self.state_root);
     }
+}
+
+/// What `Workspace::recover_lost_daemon` did, for the poll loop to tell the
+/// frontend (`daemon-lost`, and a `session-restarted`/`session-exited` per row).
+pub struct DaemonRecovery {
+    pub old_pid: Option<u32>,
+    pub lost: usize,
+    pub resumed: usize,
+    pub exited: Vec<(ProjectHandle, usize)>,
+    pub restarted: Vec<(ProjectHandle, usize)>,
 }
 
 /// One open project and everything backing its live Claude sessions.
@@ -2435,6 +2545,20 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// The files a running instance's own process keeps current — its status,
+    /// which transcript it writes, readiness, context %, a pending compact, a
+    /// codex wake ack — and nothing the *row* owns (its inbox, task, ⌘K secrets).
+    /// For a row whose process died and is about to be resumed under the same
+    /// number (`Workspace::recover_lost_daemon`).
+    fn forget_process_files(&self, id: usize) {
+        let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
+        let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::wake_ack_path(&self.state_dir, id));
     }
 
     /// Watch every remote-claude terminal and turn "it's your turn" into a hub

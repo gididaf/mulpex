@@ -34,10 +34,52 @@ pub fn start(app: AppHandle) {
         // sidebar. It also closes a standing gap: a rename or a mute changed the
         // backend and emitted nothing.
         let mut last_sessions: HashMap<ProjectHandle, Vec<SessionInfo>> = HashMap::new();
+        // When a lost daemon could not be replaced, so the retry waits a little
+        // instead of trying (and logging) five times a second.
+        let mut recover_after: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(POLL);
             let state = app.state::<AppState>();
             let mut ws = state.ws.lock().unwrap();
+
+            // The PTY daemon died under us (or a spawn already reconnected to a
+            // new one): move the workspace onto the new daemon and resume, before
+            // `reap_dead` below sees the dead rows. Never while quitting or
+            // restarting — those close the connection on purpose.
+            if !crate::state::TORN_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+                && !crate::ptyd::detaching()
+                && recover_after.map_or(true, |t| std::time::Instant::now() >= t)
+                && crate::ptyd::replaced(&ws.state_root)
+            {
+                let helper = state.helper_path.clone();
+                match ws.recover_lost_daemon(&helper) {
+                    Some(r) => {
+                        recover_after = None;
+                        let info = ws.workspace_info();
+                        drop(ws);
+                        for (handle, id) in &r.exited {
+                            let _ = app.emit("session-exited", SessionExited { handle: *handle, id: *id });
+                        }
+                        for (handle, id) in &r.restarted {
+                            let _ = app.emit("session-restarted", SessionExited { handle: *handle, id: *id });
+                        }
+                        let _ = app.emit("projects-changed", info);
+                        if r.lost > 0 {
+                            let at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let _ = app.emit(
+                                "daemon-lost",
+                                serde_json::json!({ "pid": r.old_pid, "lost": r.lost, "resumed": r.resumed, "at": at }),
+                            );
+                        }
+                        // The session diff below runs next tick, against the new rows.
+                        continue;
+                    }
+                    None => recover_after = Some(std::time::Instant::now() + Duration::from_secs(5)),
+                }
+            }
 
             // Collect everything under the lock, then drop it before emitting.
             let mut batch: Vec<(ProjectHandle, Vec<usize>, HubSnapshot, Vec<SessionInfo>)> =

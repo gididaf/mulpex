@@ -227,6 +227,58 @@ pub fn state_root() -> Option<PathBuf> {
     c.hello["state_root"].as_str().map(PathBuf::from)
 }
 
+/// Has the daemon behind `root` (the workspace's scratch root) gone away?
+/// True when the connection to it hit EOF — the daemon died: killed, crashed,
+/// or its whole cgroup stopped (docs/ptyd.md) — and also when the app is
+/// already talking to a *different* daemon than the one `root` belongs to (a
+/// spawn reconnected before the poll loop noticed). `false` before the first
+/// connection: a workspace that never had a daemon has nothing to recover.
+pub fn replaced(root: &Path) -> bool {
+    let g = CLIENT.lock().unwrap();
+    let Some(c) = g.as_ref() else { return false };
+    if !c.is_alive() {
+        return true;
+    }
+    c.hello["state_root"].as_str().is_some_and(|now| Path::new(now) != root)
+}
+
+/// The pid a scratch root is named for (`mulpex-<daemon pid>`), for messages.
+pub fn root_pid(root: &Path) -> Option<u32> {
+    root.file_name()?.to_str()?.strip_prefix("mulpex-")?.parse().ok()
+}
+
+/// One line in `ptyd.log`, from the app, stamped (UTC). The daemon cannot write
+/// its own death down when it is SIGKILLed or its cgroup is stopped, so the app
+/// says it, in the file anyone debugging the daemon reads first.
+pub fn log_from_app(line: &str) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamped = format!("[app {}] {line}\n", utc_stamp(secs));
+    eprint!("{stamped}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path(&home())) {
+        let _ = f.write_all(stamped.as_bytes());
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` for a unix time (civil-from-days, no date crate).
+fn utc_stamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 /// Every session the daemon holds.
 pub fn list() -> Vec<Value> {
     existing()
@@ -422,5 +474,19 @@ mod tests {
     fn an_update_without_ptyd_fields_never_survives() {
         assert!(!update_survives(None, None));
         assert!(!update_survives(Some(1), None));
+    }
+
+    #[test]
+    fn utc_stamps_are_civil_dates() {
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00:00 UTC");
+        // 2026-11-10 17:24:12 UTC — the VM's scope stop that motivated this.
+        assert_eq!(utc_stamp(1_794_331_452), "2026-11-10 17:24:12 UTC");
+        assert_eq!(utc_stamp(951_782_400), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn a_root_names_its_daemon() {
+        assert_eq!(root_pid(Path::new("/tmp/mulpex-11681")), Some(11681));
+        assert_eq!(root_pid(Path::new("/tmp/mulpex-open-test-x")), None);
     }
 }
