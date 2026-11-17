@@ -136,6 +136,7 @@
   import LoadDialog from "./lib/components/LoadDialog.svelte";
   import SecretsDialog from "./lib/components/SecretsDialog.svelte";
   import LiveTokenDialog from "./lib/components/LiveTokenDialog.svelte";
+  import SystemReplaceDialog from "./lib/components/SystemReplaceDialog.svelte";
   import ImportDialog from "./lib/components/ImportDialog.svelte";
   import RemoteDialog from "./lib/components/RemoteDialog.svelte";
   import BroadcastDialog from "./lib/components/BroadcastDialog.svelte";
@@ -432,6 +433,7 @@
   let secretsFor = $state<{ handle: ProjectHandle; id: number } | null>(null);
   /** Mulpex ▸ Live Token…: the host (0 = this machine) whose settings are open. */
   let liveTokenHost = $state<number | null>(null);
+  let systemReplaceHost = $state<number | null>(null);
   /** ⌘⇧O: the Remote Control dialog is open. */
   /** ⌘⇧O is open on this host's Remote Control (0 = this Mulpex), or closed. */
   let remoteFor = $state<number | null>(null);
@@ -1593,6 +1595,10 @@
         // The settings of the machine being looked at: a remote host's tab edits that host.
         liveTokenHost = get(activeHost);
         break;
+      case "system_replace":
+        // Same as Live Token: a remote host's tab edits that host's rules.
+        systemReplaceHost = get(activeHost);
+        break;
       case "checkpoint_quit":
         // A remote tab in front: checkpoint THAT host's claudes and restart it.
         await startCheckpoint("quit", get(activeHost)).catch((e) => flashToast(String(e)));
@@ -2203,6 +2209,16 @@
       hostLabel={liveTokenHost > 0 ? hostName(liveTokenHost) : null}
       onclose={() => {
         liveTokenHost = null;
+        terminals.refocus();
+      }}
+    />
+  {/if}
+  {#if systemReplaceHost != null}
+    <SystemReplaceDialog
+      host={systemReplaceHost}
+      hostLabel={systemReplaceHost > 0 ? hostName(systemReplaceHost) : null}
+      onclose={() => {
+        systemReplaceHost = null;
         terminals.refocus();
       }}
     />

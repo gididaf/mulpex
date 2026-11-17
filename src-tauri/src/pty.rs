@@ -726,6 +726,13 @@ impl Session {
                 plain_prompt,
             } => {
                 let mut cmd = claude_command()?;
+                // Mulpex ▸ System Text Replacements…: `--replace OLD NEW` pairs
+                // for the user's own launcher in front of `claude`. Empty unless
+                // switched on (`system_replace.rs`), and only here — interactive
+                // claudes — never in the headless `-p` runs.
+                for a in crate::system_replace::args() {
+                    cmd.arg(a);
+                }
                 cmd.arg("--dangerously-skip-permissions");
                 if resume {
                     cmd.arg("--resume");

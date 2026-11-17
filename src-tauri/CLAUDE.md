@@ -15,6 +15,7 @@ Root rules: [../CLAUDE.md](../CLAUDE.md).
 | `explain.rs`, `explain_prompt.md` (⌘⇧E: a Sonnet `--fork-session` explains a selection; follow-ups `--resume` that fork; Mulpex deletes it) | [../docs/explain.md](../docs/explain.md) — why follow-ups resume instead of re-fork (measured cache cost), why it is gated on the transcript file |
 | `secrets.rs` (⌘K) | [../docs/secrets.md](../docs/secrets.md) |
 | `live_token.rs` (Mulpex ▸ Live Token…: settings + named tokens + pins for the daemon's token-swapping proxy), its env in `pty.rs`/`saves.rs`/`explain.rs`/`broadcast.rs` | [../docs/live-token.md](../docs/live-token.md) — why `ANTHROPIC_BASE_URL` and not the unix socket, why the env token stays real, per-claude routes/pins |
+| `system_replace.rs` (Mulpex ▸ System Text Replacements…: `--replace` pairs in the Claude arm of `pty.rs::Session::spawn`) | [../docs/system-replace.md](../docs/system-replace.md) — off = zero args (other users run a plain `claude`), interactive only, the measured 400 |
 | `broadcast.rs`, `broadcast_prompt.md` (⌘⇧B Ask All Claudes) | [../docs/hub.md](../docs/hub.md) |
 | `pins.rs` (⌘⇧P) | [../docs/frontend.md](../docs/frontend.md) |
 | `instance.rs` (one Mulpex per home: `app.lock`, `focus-request`, `restarting`, inherited-env scrub), `main.rs` (`--version`/`--help`/`--wire-hash`/`--ptyd-proto`) | [../docs/sessions.md](../docs/sessions.md) "One Mulpex per home"; [../docs/live-token.md](../docs/live-token.md) — why a proxy URL in the env is dropped |

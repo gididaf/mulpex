@@ -66,6 +66,9 @@ pub const ALLOWED: &[&str] = &[
     "secrets_get",
     "secrets_update",
     "secrets_delete",
+    "system_replace_get",
+    "system_replace_set",
+    "system_replace_test",
     "live_token_get",
     "live_token_set",
     "live_token_add_token",
@@ -273,6 +276,9 @@ pub fn dispatch(app: &AppHandle, cmd: &str, args: &Value, device: &str) -> Resul
             arg(args, "rows")?,
         )?),
         "secrets_delete" => out(c::secrets_delete(arg(args, "name")?)?),
+        "system_replace_get" => out(c::system_replace_get()),
+        "system_replace_set" => out(c::system_replace_set(arg(args, "settings")?)?),
+        "system_replace_test" => out(c::system_replace_test(arg(args, "settings")?)?),
         "live_token_get" => out(c::live_token_get()),
         "live_token_set" => {
             out(c::live_token_set(arg(args, "tokenFile")?, arg(args, "refreshCommand")?)?)

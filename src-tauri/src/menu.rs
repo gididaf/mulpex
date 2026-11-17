@@ -56,11 +56,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Settings for `live_token.rs` (off unless a token file is set). No
     // accelerator, for the same reason as Check for Updates.
     let live_token = MenuItemBuilder::with_id("live_token", "Live Token…").build(app)?;
+    // Settings for `system_replace.rs` (off by default), same reasoning.
+    let system_replace =
+        MenuItemBuilder::with_id("system_replace", "System Text Replacements…").build(app)?;
     let app_menu = SubmenuBuilder::new(app, "Mulpex")
         .about(None)
         .item(&check_updates)
         .item(&full_disk_access)
         .item(&live_token)
+        .item(&system_replace)
         .separator()
         .services()
         .separator()

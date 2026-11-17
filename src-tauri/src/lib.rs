@@ -10,6 +10,7 @@ mod commands;
 mod hub;
 mod instance;
 mod live_token;
+mod system_replace;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menu;
 mod project;
@@ -80,6 +81,7 @@ fn is_forwarded(id: &str) -> bool {
             | "explain"
             | "secrets"
             | "live_token"
+            | "system_replace"
             | "pin_selection"
             | "toggle_panel"
             | "request_compact"
@@ -218,6 +220,9 @@ pub fn run() {
             commands::secrets_get,
             commands::secrets_update,
             commands::secrets_delete,
+            commands::system_replace_get,
+            commands::system_replace_set,
+            commands::system_replace_test,
             commands::live_token_get,
             commands::live_token_set,
             commands::live_token_add_token,

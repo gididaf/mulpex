@@ -887,6 +887,29 @@ pub fn secrets_get(name: String) -> Result<crate::secrets::SavedDetail, String> 
     crate::secrets::get_saved(&mulpex_core::mulpex_home(), &name)
 }
 
+/// Mulpex ▸ System Text Replacements…: the saved settings.
+#[tauri::command]
+pub fn system_replace_get() -> crate::system_replace::Settings {
+    crate::system_replace::settings()
+}
+
+/// System Text Replacements… Save. Used from the next claude launch on.
+#[tauri::command]
+pub fn system_replace_set(
+    settings: crate::system_replace::Settings,
+) -> Result<crate::system_replace::Settings, String> {
+    crate::system_replace::set_settings(settings)
+}
+
+/// System Text Replacements… Test: `claude --replace … --version` with the
+/// dialog's (unsaved) rules. `async` so the run stays off the main thread.
+#[tauri::command(async)]
+pub fn system_replace_test(
+    settings: crate::system_replace::Settings,
+) -> Result<crate::system_replace::TestResult, String> {
+    crate::system_replace::test(&settings)
+}
+
 /// Mulpex ▸ Live Token…: the settings and whether the token file reads.
 #[tauri::command]
 pub fn live_token_get() -> crate::live_token::Status {

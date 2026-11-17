@@ -533,6 +533,26 @@ export const secretsSave = (
 /** A saved set's rows, values included — only for the edit form. */
 /** Mulpex ▸ Live Token… (`live_token.rs`). `host` is the machine whose
  *  settings these are: 0 for this one, a slot for a remote host. */
+export interface SystemReplaceRule {
+  old: string;
+  new: string;
+  enabled: boolean;
+}
+export interface SystemReplaceSettings {
+  enabled: boolean;
+  rules: SystemReplaceRule[];
+}
+export interface SystemReplaceTestResult {
+  ok: boolean;
+  command: string;
+  output: string;
+}
+export const systemReplaceGet = (host: number) => call<SystemReplaceSettings>("system_replace_get", {}, host);
+export const systemReplaceSet = (host: number, settings: SystemReplaceSettings) =>
+  call<SystemReplaceSettings>("system_replace_set", { settings }, host);
+export const systemReplaceTest = (host: number, settings: SystemReplaceSettings) =>
+  call<SystemReplaceTestResult>("system_replace_test", { settings }, host);
+
 export interface LiveTokenStatus {
   token_file: string;
   refresh_command: string;

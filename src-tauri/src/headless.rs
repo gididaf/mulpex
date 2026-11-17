@@ -233,7 +233,7 @@ pub fn is_unavailable(reason: &str) -> bool {
 /// Spawn, feed `prompt` on stdin and close it, drain both pipes, wait with a
 /// timeout. Both pipes are drained on their own threads: a child that fills one
 /// while we block reading the other deadlocks until the timeout.
-fn run_child(mut cmd: Command, prompt: &str, timeout: Duration) -> Result<(ExitStatus, String, String), String> {
+pub(crate) fn run_child(mut cmd: Command, prompt: &str, timeout: Duration) -> Result<(ExitStatus, String, String), String> {
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

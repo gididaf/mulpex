@@ -35,6 +35,7 @@
       items: [
         cmd("Check for Updates…", "check_updates"),
         cmd("Live Token…", "live_token"),
+        cmd("System Text Replacements…", "system_replace"),
         SEP,
         cmd("Checkpoint & Quit…", "checkpoint_quit", "⌘⇧Q"),
         cmd("Quit Mulpex", "quit", "⌘Q"),
@@ -207,6 +208,10 @@
     top: 100%;
     left: 0;
     min-width: 15rem;
+    /* Size to the widest item: a label's `overflow: hidden` gives it no
+       min-content width, so without this a label longer than 15rem is cut
+       (labels still stop at their own 22rem cap). */
+    width: max-content;
     max-height: calc(100vh - var(--menubar-h) - 8px);
     overflow-y: auto;
     padding: 0.25rem 0;
