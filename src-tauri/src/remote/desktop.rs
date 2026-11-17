@@ -58,6 +58,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "board-changed",
     "checkpoint-changed",
     "broadcast-summary",
+    "daemon-lost",
 ];
 
 /// The most terminal output in one frame.

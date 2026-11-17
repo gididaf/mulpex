@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { projects, activeProject, activeId, saves, toast } from "../stores";
+  import { projects, activeProject, activeId, saves, toast, daemonLost } from "../stores";
   import { terminals } from "../terminals";
   import TerminalView from "./TerminalView.svelte";
   import RightPanel from "./RightPanel.svelte";
@@ -98,7 +98,12 @@
         <button onclick={() => geometryTakeBack()}>Take back</button>
       </div>
     {/if}
-    {#if $toast}
+    {#if $daemonLost}
+      <div class="toast sticky" role="alert">
+        <span>{$daemonLost}</span>
+        <button aria-label="Close" onclick={() => daemonLost.set(null)}>✕</button>
+      </div>
+    {:else if $toast}
       <div class="toast" role="status">{$toast}</div>
     {/if}
   </div>
@@ -179,5 +184,22 @@
     font-size: 0.85rem;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
     pointer-events: none;
+  }
+  .toast.sticky {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    width: max-content;
+    border-color: var(--border-focus);
+    pointer-events: auto;
+  }
+  .toast.sticky button {
+    flex: none;
+    border: none;
+    background: none;
+    color: var(--text-dim, var(--text));
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
   }
 </style>

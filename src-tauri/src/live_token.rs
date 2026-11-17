@@ -466,6 +466,16 @@ pub fn init() {
     }
 }
 
+/// The daemon was replaced (`Workspace::recover_lost_daemon`): its proxy went
+/// with it. Forget the dead one's port first, so a push that fails leaves claudes
+/// spawned without the proxy (the plain env token) rather than pointed at a port
+/// nothing listens on — which is what every request got before: ECONNREFUSED.
+pub fn reconnect() {
+    *PROXY.lock().unwrap() = None;
+    ROUTES.store(false, Ordering::Relaxed);
+    init();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

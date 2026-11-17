@@ -86,6 +86,14 @@ pub fn run(home: PathBuf) -> anyhow::Result<()> {
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        // A daemon stopped from outside used to vanish without a line in its
+        // log (2026-11-10: systemd stopped its OOM-killed scope with SIGTERM),
+        // so the cause had to be dug out of root-only logs. Say which signal,
+        // then die of it as before. SIGKILL cannot be caught; the app logs that
+        // case (`ptyd::log_from_app`).
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT] {
+            libc::signal(sig, on_fatal_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        }
     }
     std::fs::create_dir_all(proto::dir(&home))?;
     let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
@@ -148,6 +156,21 @@ pub fn run(home: PathBuf) -> anyhow::Result<()> {
         thread::spawn(move || serve(server, stream));
     }
     Ok(())
+}
+
+/// Log the signal (async-signal-safe: one `write`, no allocation), then die of
+/// it with the default action, exactly as before the handler existed.
+extern "C" fn on_fatal_signal(sig: libc::c_int) {
+    let msg: &[u8] = match sig {
+        libc::SIGTERM => b"[ptyd] got SIGTERM from outside; exiting (every session ends with it)\n",
+        libc::SIGINT => b"[ptyd] got SIGINT from outside; exiting (every session ends with it)\n",
+        _ => b"[ptyd] got SIGQUIT from outside; exiting (every session ends with it)\n",
+    };
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
 }
 
 fn exit_clean(server: &Server) -> ! {

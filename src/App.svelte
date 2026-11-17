@@ -86,6 +86,7 @@
     claudeInAnotherProject,
     flashNotice,
     flashToast,
+    showDaemonLost,
     reorderProjects as reorderProjectsLocal,
     reorderSessions as reorderSessionsLocal,
   } from "./lib/stores";
@@ -1811,6 +1812,12 @@
         dropCompact(e.payload.handle, e.payload.id);
         if (!isRemote(e.payload.handle)) terminals.reattach(e.payload.handle, e.payload.id);
       }),
+      // The PTY daemon died and every instance with it; the backend already
+      // resumed what it could (`recover_lost_daemon`). `slot` is set when it
+      // happened on a remote host this window is driving.
+      listen<{ pid: number | null; lost: number; resumed: number; at: number; slot?: number }>("daemon-lost", (e) =>
+        showDaemonLost(e.payload, e.payload.slot ? hostName(e.payload.slot) : null),
+      ),
       listen<SessionExitedEvent>("pins-changed", (e) => void reloadPins(e.payload.handle, e.payload.id)),
       // The Board changed — by a claude, a remote desktop, the phone, or a message delivered.
       listen<{ handle: ProjectHandle }>("board-changed", (e) => void loadBoard(e.payload.handle)),

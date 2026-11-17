@@ -2750,3 +2750,30 @@ Measured on the fix (worktree build, `claude` 2.1.318, dev app under Xvfb, own h
   `script failed (exit 143)` → nudge → re-armed 5 s later unprompted.
 
 NOT verified: the `title` tooltip (Xvfb WebKit draws no native tooltips); macOS.
+
+## 2026-11-10 — recovering from a PTY daemon that died under the app (docs/ptyd.md)
+
+Field case, gidi-dev-mulpex (read over ssh, nothing touched): the daemon (pid 11681) and every
+claude/codex vanished at 17:24 UTC. `systemctl status mulpex-work.scope` → `failed (Result:
+oom-kill)` at 17:24:12; the scope was a hand-made cgroup cap (`/usr/local/sbin/mulpex-work-cap`,
+`mulpex-work.slice` MemoryMax=100G) whose first version used the default `OOMPolicy=stop`, so one
+OOM kill inside it stopped the whole scope. Its old root `/tmp/mulpex-11681` was still on disk,
+i.e. the daemon never ran `exit_clean`. A ⌘T at 18:29 started daemon 3459250, but that claude's
+env had `MULPEX_STATE_DIR=/tmp/mulpex-11681/…` and `ANTHROPIC_BASE_URL=127.0.0.1:41687` (the dead
+daemon's proxy) → ECONNREFUSED on every request.
+
+Measured on the fix, hidden-window app (`target/headless`), home `~/.mulpex-dev-dl`, Live Token on
+(token file), one project with a store record of a real `claude -p` conversation:
+
+- **kill -9 the daemon**: within one tick a new daemon came up; the claude came back with
+  `--resume <same uuid>`, `MULPEX_STATE_DIR` under the new root, `ANTHROPIC_BASE_URL` on the new
+  daemon's port (lsof: that daemon listening); the old root was gone; `ptyd.log` got the `[app …]`
+  line. Pane dump: the resumed conversation, repainted from a fresh stream (`session-restarted`).
+  UI dump: the sticky toast. A typed prompt got its answer (PONG), i.e. through the new proxy.
+- **kill -TERM** (the new daemon build): `[ptyd] got SIGTERM from outside…` in `ptyd.log`, then the
+  same recovery — a second one in a row.
+- **Mixed rows** (the worked claude + a fresh ⌘T claude + a terminal), kill -9: toast "3 instances
+  closed; 1 resumed", sidebar left with claude#1 only, one `mulpex-helper listen` for that home
+  (the old ones exited on their own).
+- **Not measured**: the remote-desktop path (a Mac driving a host whose daemon dies) — the event is
+  forwarded with its `slot` (code only); a project whose `Core::open` fails during recovery.

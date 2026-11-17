@@ -725,6 +725,22 @@ export function flashNotice(text: string, ms = 2000) {
   noticeTimer = setTimeout(() => notice.set(null), ms) as unknown as number;
 }
 
+/** The PTY daemon died and the backend moved onto a new one
+ *  (`state.rs::recover_lost_daemon`): stays up until the user closes it, since
+ *  instances vanishing at once is otherwise unexplained. */
+export const daemonLost = writable<string | null>(null);
+
+export function showDaemonLost(p: { pid: number | null; lost: number; resumed: number; at: number }, host: string | null) {
+  const t = new Date(p.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const who = host ? `${host}: ` : "";
+  const pid = p.pid ? ` (pid ${p.pid})` : "";
+  const n = (k: number) => (k === 1 ? "1 instance" : `${k} instances`);
+  daemonLost.set(
+    `${who}the PTY daemon${pid} was killed from outside at ${t}. ${n(p.lost)} closed with it; ` +
+      `${p.resumed} resumed. The rest (fresh claudes, terminals) had nothing to resume. Details: ptyd.log`,
+  );
+}
+
 /** A short toast over the terminal — for "that key did nothing, here's why",
  *  where the bottom strip is too far from where the user is looking. */
 export const toast = writable<string | null>(null);
