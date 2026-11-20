@@ -9,11 +9,11 @@
   // the name, ⋯ for the description (what claudes read), move and delete; `+`
   // at the end adds one. Cards and column headers are dragged with POINTER
   // events — Tauri's native drag-drop swallows HTML5 DnD (`InstanceList.svelte`).
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { activeProjectHandle, activeId, sessions } from "../stores";
   import { addrIn, isAgent } from "../agents";
   import { boards, boardAll, editBoard, setBoardOn, sendBoard, imageCount, unreadCount, pendingCards } from "../board";
-  import type { Board, BoardCard, BoardColumn, BoardColChange, BoardColRef } from "../ipc";
+  import { boardArchived, type Board, type BoardCard, type BoardColumn, type BoardColChange, type BoardColRef } from "../ipc";
   import { terminals } from "../terminals";
   import CardOverlay from "./CardOverlay.svelte";
 
@@ -26,10 +26,56 @@
 
   let showArchived = $state(false);
   let openN: number | null = $state(null);
-  const openCard = $derived(openN != null ? board?.cards.find((c) => c.n === openN) : undefined);
+
+  // ── the archive, a page at a time ─────────────────────────────────────────
+  // The board the backend sends leaves archived cards out (a long-lived board
+  // had megabytes of them riding every edit), so the list is fetched here:
+  // ARCH_PAGE at a time, newest archived first, re-read whenever the board
+  // changes while it is open.
+  const ARCH_PAGE = 25;
+  let archived: BoardCard[] = $state([]);
+  let archTotal = $state(0);
+  let archLoading = $state(false);
+  let archFor: number | null = null;
+  async function loadArchive(more: boolean) {
+    const hh = h;
+    if (hh == null) return;
+    const offset = more ? archived.length : 0;
+    const limit = more ? ARCH_PAGE : Math.max(ARCH_PAGE, archived.length);
+    archLoading = true;
+    try {
+      const r = await boardArchived(hh, offset, limit);
+      if (hh !== h) return;
+      archived = r ? (more ? [...archived, ...r.cards.filter((c) => !archived.some((a) => a.n === c.n))] : r.cards) : [];
+      archTotal = r?.total ?? 0;
+    } catch {
+      /* a closed project, or a host that went away */
+    } finally {
+      archLoading = false;
+    }
+  }
+  $effect(() => {
+    // Re-read on every board change while the archive (or an archived card) is open.
+    void board;
+    const want = showArchived || openN != null;
+    const hh = h;
+    untrack(() => {
+      if (hh !== archFor) {
+        archived = [];
+        archFor = hh;
+      }
+      if (want) void loadArchive(false);
+      else if (archived.length) archived = [];
+    });
+  });
+  let clearing = $state(false);
+
+  const openCard = $derived(
+    openN != null ? (board?.cards.find((c) => c.n === openN) ?? archived.find((c) => c.n === openN)) : undefined,
+  );
   $effect(() => {
     // The card was deleted (here, on the phone, by another desktop).
-    if (openN != null && board && !openCard) openN = null;
+    if (openN != null && board && !openCard && !archLoading) openN = null;
   });
 
   /** Cards the view shows in column `col`, in board order. */
@@ -38,7 +84,6 @@
       (c) => c.col === col && !c.archived && ($boardAll || c.assignee == null || c.assignee === focusedClaude),
     );
   }
-  const archived = $derived(board?.cards.filter((c) => c.archived) ?? []);
 
   const edit = (e: Parameters<typeof editBoard>[1]) => (h != null ? editBoard(h, e) : Promise.resolve(false));
 
@@ -300,7 +345,7 @@
         <button class:on={$boardAll} onclick={() => boardAll.set(true)}>All</button>
       </div>
       <button class="link" class:on={showArchived} onclick={() => (showArchived = !showArchived)}>
-        {showArchived ? "← Board" : `Archived${archived.length ? ` (${archived.length})` : ""}`}
+        {showArchived ? "← Board" : `Archived${board.archived_count ? ` (${board.archived_count})` : ""}`}
       </button>
     </div>
 
@@ -344,8 +389,13 @@
 
     {#if showArchived}
       <div class="archived">
-        {#if !archived.length}
+        {#if !board.archived_count}
           <div class="empty">Nothing archived.</div>
+        {:else}
+          <div class="ahead">
+            <span>{board.archived_count} archived</span>
+            <button class="link danger" onclick={() => (clearing = true)}>Clear archive</button>
+          </div>
         {/if}
         {#each archived as c (c.n)}
           <div class="arow">
@@ -354,6 +404,11 @@
             <button class="link" onclick={() => edit({ op: "archive", n: c.n, on: false })}>Restore</button>
           </div>
         {/each}
+        {#if archived.length < archTotal}
+          <button class="link more" disabled={archLoading} onclick={() => loadArchive(true)}>
+            {archLoading ? "Loading…" : `Load ${Math.min(ARCH_PAGE, archTotal - archived.length)} more · ${archTotal - archived.length} left`}
+          </button>
+        {/if}
       </div>
     {:else}
       <div
@@ -488,6 +543,19 @@
 
     {#if openCard}
       <CardOverlay handle={h} {board} card={openCard} {claudes} onclose={() => { openN = null; terminals.refocus(); }} />
+    {/if}
+
+    {#if clearing}
+      <div class="modal-back">
+        <div class="modal" role="dialog" aria-label="Clear archive">
+          <div class="mtitle">Delete {board.archived_count} archived card{board.archived_count === 1 ? "" : "s"}?</div>
+          <div class="mtext">They are deleted for good, with their comments and images. This can't be undone.</div>
+          <div class="row-end">
+            <button class="link" onclick={() => (clearing = false)}>Cancel</button>
+            <button class="btn danger" onclick={() => { clearing = false; openN = null; edit({ op: "clear_archive" }); }}>Delete all</button>
+          </div>
+        </div>
+      </div>
     {/if}
 
     {#if deleting}
@@ -990,6 +1058,21 @@
     min-height: 0;
     overflow-y: auto;
     padding: 0.3rem 0;
+  }
+  .ahead {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 0.2rem 0.8rem 0.4rem;
+    font-size: 0.7rem;
+    color: var(--text-faint);
+  }
+  .link.danger {
+    color: var(--dot-needs, #e5534b);
+  }
+  .more {
+    display: block;
+    margin: 0.5rem auto;
   }
   .arow {
     display: flex;

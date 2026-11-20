@@ -382,6 +382,8 @@ export interface BoardCard {
   chosen: string | null;
   comments: BoardComment[];
   archived: boolean;
+  /** When it was archived (unix seconds); absent on older archived cards. */
+  archived_at?: number;
   author: "claude" | "user";
   by: number | null;
   /** A claude changed it since the user last opened it. */
@@ -394,8 +396,11 @@ export interface Board {
   on: boolean;
   next: number;
   columns: BoardColumn[];
-  /** In display order (per column, urgent first). */
+  /** In display order (per column, urgent first). Never the archived ones —
+   *  those come a page at a time from `boardArchived`. */
   cards: BoardCard[];
+  /** How many cards are archived. */
+  archived_count: number;
   /** The user's changes waiting for UPDATE: claude id → card numbers. */
   pending: Record<string, number[]>;
   /** The user's comments UPDATE has not sent yet — still editable. */
@@ -436,6 +441,7 @@ export type BoardEdit =
   | { op: "archive"; n: number; on: boolean }
   | { op: "archive_column"; col: number }
   | { op: "delete"; n: number }
+  | { op: "clear_archive" }
   | { op: "seen"; n: number }
   | { op: "col_add"; name: string; desc?: string }
   | { op: "col_edit"; col: number; name?: string; desc?: string }
@@ -445,6 +451,9 @@ export type BoardEdit =
   | { op: "reject"; proposal: number; reason: string };
 
 export const boardGet = (projectHandle: ProjectHandle) => call<Board | null>("board_get", { projectHandle });
+/** One page of the archive, newest archived first. */
+export const boardArchived = (projectHandle: ProjectHandle, offset: number, limit: number) =>
+  call<{ cards: BoardCard[]; total: number } | null>("board_archived", { projectHandle, offset, limit });
 
 export const boardEdit = (projectHandle: ProjectHandle, edit: BoardEdit) =>
   call<Board>("board_edit", { projectHandle, edit });

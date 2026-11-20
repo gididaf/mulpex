@@ -436,6 +436,14 @@ defines, cards with an assignee, detail, choices, comments and images. Backend
   📎, choices, comments, composer. Opening it sends `seen`. Archive / Restore / Delete (confirm).
 - **Archive, not auto-removal.** Archived cards leave the board view (Archived lists them, Restore)
   and never reach a claude's context; only the user deletes for good.
+- **The archive is paged, not shipped.** `board_get` / `board_view` leave archived cards out and
+  send `archived_count`. A long-lived board had 725 of them, 2.3 MB of JSON, riding every edit and
+  every `board-changed`. The Archived view fetches `board_archived(offset, limit)` 25 at a time,
+  newest archived first: by `archived_at`, then by card number for cards archived before that
+  field existed. It re-reads the loaded range on every board change while it, or an archived card,
+  is open. **Clear archive** (`clear_archive`, confirm first) deletes every archived card for good,
+  with its comments' and its own images. The phone gets the same trimmed board and has no archive
+  list.
 - **Images are attachments, never Markdown `<img>`** — the sanitizer stays strict
   (`renderMarkdownAuto` still forbids `img`/`a`). PNG/JPG/GIF/WebP checked by magic bytes, ≤10 MB,
   ≤10 per comment or card. Paste (⌘V in the composer, `ClipboardEvent.files`), drop (the window's
@@ -516,20 +524,19 @@ project the lock list was always that session's own files — which is why it wa
 at `sessions.length <= 1`, and why it was never worth the panel row. Don't "restore" either
 section without asking.
 
-**Unread messages are marked**: a message still sitting in a live recipient's inbox gets a red dot
-and is always listed, even past the newest 8 the feed otherwise shows (`HubPanel.svelte`). The
-header's `(N unread)` count leaves out muted recipients, while the list does not.
+**It is one line** (2026-11-20, at the user's request): `MESSAGES` and a red unread-count pill,
+hidden at 0. Tapping it opens the message reader (⌘⇧M). The 8-message feed that used to fill the
+panel is gone. The count leaves out muted recipients; the reader does not.
 
 Contention is still visible, in the place you're already looking: the ⏳ on the blocked session's
 row in `InstanceList`, which reads `$hub.waiting` directly. So the **backend snapshot still carries
 `locks` and `waiting`** (`ipc.ts::HubSnapshot`, `snapshot.rs`) — this was a UI-only removal, and
 stripping the fields would break that ⏳.
 
-The sidebar splits **72% session list / 28% hub panel** (was 45/55 — messages are reference
-material, the session list is what you steer with). Both rows scroll independently, which needs
-`min-height: 0` on the grid items (`.sidebar > :global(*)` in `App.svelte`): without it a grid
-item's *auto* minimum lets it grow past its track and the children's `overflow-y: auto` never
-engages.
+The sidebar is **`1fr auto`**: the session list gets everything above the one-line hub panel
+(was 72/28, and 45/55 before that). The list scrolls only because of `min-height: 0` on the grid
+items (`.sidebar > :global(*)` in `App.svelte`): without it a grid item's *auto* minimum lets it
+grow past its track and its `overflow-y: auto` never engages.
 
 
 ## ↻ Outdated claudes

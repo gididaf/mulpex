@@ -2717,13 +2717,23 @@ impl Core {
 
     /// The board as the panel draws it, plus the claudes a message is waiting for.
     pub fn board_view(&self) -> serde_json::Value {
-        let mut v = serde_json::to_value(self.board.get()).unwrap_or_default();
+        let mut v = self.board.with(|b| {
+            let mut v = serde_json::to_value(b.without_archive()).unwrap_or_default();
+            v["archived_count"] = serde_json::json!(b.archived_count());
+            v
+        });
         let pending = self.board.pending();
         let (sending, unsent) = self.board.with_outbox(|o| (o.sending_ids(), o.unsent_comments()));
         v["unsent"] = serde_json::json!(unsent);
         v["pending"] = serde_json::json!(pending);
         v["sending"] = serde_json::json!(sending);
         v
+    }
+
+    /// One page of the board's archive, newest archived first: `{cards, total}`.
+    pub fn board_archived(&self, offset: usize, limit: usize) -> serde_json::Value {
+        let (cards, total) = self.board.with(|b| b.archived_page(offset, limit.min(200)));
+        serde_json::json!({ "cards": cards, "total": total })
     }
 
     /// The user's edit to the board (desktop panel, remote desktop, phone).

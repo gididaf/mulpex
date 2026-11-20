@@ -94,6 +94,10 @@ pub struct Card {
     pub comments: Vec<Comment>,
     #[serde(default)]
     pub archived: bool,
+    /// When it was archived (unix seconds) — the archive list's order. `None`
+    /// for a card archived before this field existed, or not archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     pub author: Author,
     /// The claude that created it, when `author` is claude.
     #[serde(default)]
@@ -213,6 +217,8 @@ pub enum BoardEdit {
     ArchiveColumn { col: u32 },
     /// Permanent. The user only.
     Delete { n: u32 },
+    /// Every archived card, deleted for good with its images. The user only.
+    ClearArchive,
     Seen { n: u32 },
     ColAdd { name: String, #[serde(default)] desc: String },
     ColEdit { col: u32, #[serde(default)] name: Option<String>, #[serde(default)] desc: Option<String> },
@@ -463,6 +469,35 @@ impl Board {
         self.cards.iter().filter(|c| !c.archived).count()
     }
 
+    pub fn archived_count(&self) -> usize {
+        self.cards.iter().filter(|c| c.archived).count()
+    }
+
+    /// One page of the archive, newest archived first (a card archived before
+    /// `archived_at` existed sorts after those, by number, highest first).
+    /// Returns the page and the archive's whole size.
+    pub fn archived_page(&self, offset: usize, limit: usize) -> (Vec<Card>, usize) {
+        let mut all: Vec<&Card> = self.cards.iter().filter(|c| c.archived).collect();
+        all.sort_by(|a, b| b.archived_at.cmp(&a.archived_at).then(b.n.cmp(&a.n)));
+        let total = all.len();
+        (all.into_iter().skip(offset).take(limit).cloned().collect(), total)
+    }
+
+    /// The board without its archived cards — what the panels are sent on
+    /// every change. The archive comes a page at a time (`archived_page`): a
+    /// long-lived board carried megabytes of it on every edit.
+    pub fn without_archive(&self) -> Board {
+        Board {
+            on: self.on,
+            next: self.next,
+            next_col: self.next_col,
+            columns: self.columns.clone(),
+            cards: self.cards.iter().filter(|c| !c.archived).cloned().collect(),
+            proposals: self.proposals.clone(),
+            next_prop: self.next_prop,
+        }
+    }
+
     /// Display order is storage order: within each column urgent cards first,
     /// otherwise stable. Every mutation ends here, so a position the panel
     /// draws is a position it can send back.
@@ -599,6 +634,7 @@ impl Board {
                         chosen: None,
                         comments: Vec::new(),
                         archived: false,
+                        archived_at: None,
                         author: Author::Claude,
                         by,
                         unread: true,
@@ -683,6 +719,7 @@ impl Board {
                     let mut card = self.take(*n).expect("checked above");
                     let moved = card.col != col || card.archived;
                     card.archived = false;
+                    card.archived_at = None;
                     card.updated = now;
                     card.unread = true;
                     if moved {
@@ -722,6 +759,7 @@ impl Board {
                     let card = self.card_mut(*n).expect("checked above");
                     if !card.archived {
                         card.archived = true;
+                        card.archived_at = Some(now);
                         card.updated = now;
                         let card = card.clone();
                         Self::tell(&card, by, Change::Archived(true), &mut ev);
@@ -799,6 +837,7 @@ impl Board {
                     chosen: None,
                     comments: Vec::new(),
                     archived: false,
+                    archived_at: None,
                     author: Author::User,
                     by: None,
                     unread: false,
@@ -924,6 +963,7 @@ impl Board {
                 let card = self.card_mut(n)?;
                 if card.archived != on {
                     card.archived = on;
+                    card.archived_at = on.then_some(now);
                     card.updated = now;
                     if on {
                         card.unread = false;
@@ -935,6 +975,7 @@ impl Board {
             BoardEdit::ArchiveColumn { col } => {
                 for card in self.cards.iter_mut().filter(|c| c.col == col && !c.archived) {
                     card.archived = true;
+                    card.archived_at = Some(now);
                     card.unread = false;
                     card.updated = now;
                     Self::tell(card, None, Change::Archived(true), &mut ev);
@@ -949,6 +990,17 @@ impl Board {
                 // An archived card was already reported gone.
                 if !card.archived {
                     Self::tell(&card, None, Change::Deleted, &mut ev);
+                }
+            }
+            BoardEdit::ClearArchive => {
+                // Archived cards were already reported gone, so nobody is told.
+                let (gone, keep): (Vec<Card>, Vec<Card>) = std::mem::take(&mut self.cards).into_iter().partition(|c| c.archived);
+                self.cards = keep;
+                for card in gone {
+                    gone_images.extend(card.images);
+                    for m in card.comments {
+                        gone_images.extend(m.images);
+                    }
                 }
             }
             BoardEdit::Seen { n } => {
@@ -1011,6 +1063,7 @@ impl Board {
                             let first = self.columns.iter().find(|c| c.id != col).map(|c| c.id).unwrap();
                             if !card.archived {
                                 card.archived = true;
+                                card.archived_at = Some(now);
                                 card.updated = now;
                                 Self::tell(&card, None, Change::Archived(true), &mut ev);
                             }
@@ -2048,6 +2101,7 @@ mod legacy {
                     chosen: it.chosen,
                     comments,
                     archived: false,
+                    archived_at: None,
                     author: if it.author == "user" { Author::User } else { Author::Claude },
                     by: (it.author != "user").then_some(id),
                     unread,
@@ -2116,6 +2170,38 @@ mod tests {
         // Bad column names say which exist.
         let e = claude(&mut b, 3, json!({"action":"move","id":3,"column":"QA"})).unwrap_err();
         assert!(e.contains("\"To Do\""), "{e}");
+    }
+
+    #[test]
+    fn the_archive_pages_newest_first_and_clears_with_its_images() {
+        let mut b = Board::default();
+        for t in ["a", "b", "c", "d"] {
+            b.apply_user(BoardEdit::Add { title: t.into(), detail: None, col: 1, assignee: Some(3), images: vec![format!("{t}.png")] }, 1).unwrap();
+        }
+        // #1 was archived before `archived_at` existed.
+        b.card_mut(1).unwrap().archived = true;
+        b.apply_user(BoardEdit::Archive { n: 3, on: true }, 10).unwrap();
+        b.apply_user(BoardEdit::Archive { n: 2, on: true }, 20).unwrap();
+        assert_eq!(b.card(2).unwrap().archived_at, Some(20));
+        let (page, total) = b.archived_page(0, 2);
+        assert_eq!(total, 3);
+        assert_eq!(page.iter().map(|c| c.n).collect::<Vec<_>>(), vec![2, 3], "newest archived first");
+        let (page, _) = b.archived_page(2, 2);
+        assert_eq!(page.iter().map(|c| c.n).collect::<Vec<_>>(), vec![1], "undated ones last");
+        let view = b.without_archive();
+        assert_eq!(view.cards.iter().map(|c| c.n).collect::<Vec<_>>(), vec![4]);
+        // Restoring drops the stamp.
+        b.apply_user(BoardEdit::Archive { n: 3, on: false }, 30).unwrap();
+        assert_eq!(b.card(3).unwrap().archived_at, None);
+        assert_eq!(b.archived_count(), 2);
+        let (ev, mut gone) = b.apply_user(BoardEdit::ClearArchive, 40).unwrap();
+        assert!(ev.is_empty(), "archived cards were already reported gone");
+        gone.sort();
+        assert_eq!(gone, vec!["a.png", "b.png"]);
+        assert_eq!(b.cards.iter().map(|c| c.n).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(b.archived_count(), 0);
+        let e: BoardEdit = serde_json::from_value(json!({"op": "clear_archive"})).unwrap();
+        assert!(matches!(e, BoardEdit::ClearArchive));
     }
 
     #[test]

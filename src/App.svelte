@@ -2313,9 +2313,9 @@
   .sidebar {
     grid-area: side;
     display: grid;
-    /* The hub panel is half its old share (55% → 28%): messages are reference
-       material, the session list is what you steer with. */
-    grid-template-rows: 72% 28%;
+    /* The hub panel is one line (Messages + an unread badge); the session list
+       takes everything else. */
+    grid-template-rows: 1fr auto;
     min-height: 0;
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border);

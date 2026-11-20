@@ -185,6 +185,7 @@ pub fn run() {
             commands::get_pins,
             commands::set_pin,
             commands::board_get,
+            commands::board_archived,
             commands::board_edit,
             commands::board_set_on,
             commands::board_update,

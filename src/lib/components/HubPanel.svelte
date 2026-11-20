@@ -1,114 +1,54 @@
 <script lang="ts">
-  import { hub, showMessages, unread } from "../stores";
-
-  // Unread messages are always listed, however old — they are what the user
-  // needs to see to nag a claude whose listener died. Read ones fill the rest of
-  // the 8 slots. Order stays newest first.
-  const FEED = 8;
-  const feed = $derived.by(() => {
-    const all = $hub?.messages ?? [];
-    let room = Math.max(0, FEED - all.filter((m) => m.unread).length);
-    return all.filter((m) => m.unread || room-- > 0);
-  });
+  import { showMessages, unread } from "../stores";
 </script>
 
-<!-- Messages is the whole panel. Locks and Waiting used to render above it,
-     anomaly-only; both were dropped because neither is something the user
-     steers with. Contention is still surfaced where the eye already is — a ⏳
-     on the blocked session's row in InstanceList, which reads `$hub.waiting`
-     directly, so the snapshot still carries locks/waiting for that. -->
+<!-- Messages is one line now: the label and an unread badge. The feed of the
+     last 8 messages that used to fill this panel was dropped on the user's
+     ask (2026-11-20) — tapping opens the full reader (⌘⇧M), which is where
+     messages are actually read. Locks and Waiting were dropped earlier; a
+     blocked session still shows ⏳ on its row in InstanceList, from
+     `$hub.waiting`. The badge excludes muted recipients: mute silences the
+     nag, not the record. -->
 <div class="hub">
-  <section class="grow">
-    <button class="label as-button" onclick={() => showMessages.set(true)}>
-      <!-- The unread *count* excludes muted recipients, but the message list
-           below does not: mute silences the nag, not the record. -->
-      Messages{#if $unread > 0}
-        <span class="unread">({$unread} unread)</span>
-      {/if}
-    </button>
-    <!-- Both ends are already addresses (`claude#2`, `all`, `central-one#3`), so
-         they render verbatim — a route must stay unambiguous now that a sender
-         can live in another project. The index is in the key because
-         (ts, from, to) is not unique: two messages on the same route inside one
-         second are possible, and Svelte 5 throws on a duplicate key. -->
-    {#if $hub && $hub.messages.length}
-      {#each feed as m, i (m.ts + "-" + m.from + "-" + m.to + "-" + i)}
-        <div class="msg" class:is-unread={m.unread} title={m.unread ? "not read yet" : undefined}>
-          {#if m.unread}<span class="dot"></span>{/if}
-          <span class="route">{m.from}→{m.to}</span>
-          <span class="snippet">{m.body.replace(/\s+/g, " ").slice(0, 60)}</span>
-        </div>
-      {/each}
-    {:else}
-      <div class="empty">none</div>
-    {/if}
-  </section>
+  <button class="label as-button" onclick={() => showMessages.set(true)} title="Open messages (⌘⇧M)">
+    Messages{#if $unread > 0}<span class="badge">{$unread}</span>{/if}
+  </button>
 </div>
 
 <style>
   .hub {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
+    flex: none;
     padding: 0.4rem 0.5rem;
-    overflow-y: auto;
-    gap: 0.6rem;
-  }
-  .grow {
-    flex: 1;
-    min-height: 0;
+    border-top: 1px solid var(--border);
   }
   .label {
     color: var(--label);
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    margin-bottom: 0.3rem;
   }
   .as-button {
     background: none;
     border: none;
     padding: 0;
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
   }
   .as-button:hover {
     filter: brightness(1.2);
   }
-  .unread {
-    color: var(--dot-needs);
-    margin-left: 0.3rem;
-  }
-  .msg {
-    display: flex;
-    gap: 0.4rem;
-    align-items: baseline;
-    font-size: 0.76rem;
-    margin-bottom: 2px;
-  }
-  .snippet {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-dim);
-  }
-  .route {
-    color: var(--accent);
-    flex: none;
-  }
-  .dot {
-    flex: none;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
+  .badge {
     background: var(--dot-needs);
-    align-self: center;
-  }
-  .is-unread .snippet {
-    color: var(--text);
-  }
-  .empty {
-    color: var(--text-faint);
-    font-size: 0.76rem;
-    font-style: italic;
+    color: #fff;
+    border-radius: 999px;
+    min-width: 1.1rem;
+    padding: 0 0.35rem;
+    font-size: 0.66rem;
+    line-height: 1.1rem;
+    text-align: center;
+    letter-spacing: 0;
+    font-weight: 600;
   }
 </style>

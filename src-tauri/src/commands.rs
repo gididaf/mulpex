@@ -336,6 +336,15 @@ pub fn board_get(state: State<AppState>, project_handle: ProjectHandle) -> serde
     }
 }
 
+/// One page of the Board's archive (`board_get` leaves archived cards out).
+#[tauri::command]
+pub fn board_archived(state: State<AppState>, project_handle: ProjectHandle, offset: usize, limit: usize) -> serde_json::Value {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.board_archived(offset, limit),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// The user's edit to the board. Returns the board as it now stands;
 /// `board-changed` follows from the poll loop, which is what reaches a remote
 /// desktop and the phone.
