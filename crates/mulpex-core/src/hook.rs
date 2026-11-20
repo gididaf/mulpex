@@ -585,7 +585,10 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     release_my_locks(ctx);
 
     let unread = crate::mcp::unread_for(ctx, ctx.instance);
-    if unread > 0 && !already_continued {
+    // An instance that asked to close itself is not held back to read mail: the
+    // close bounces unread mail to its senders, which is the user's chosen rule.
+    let closing_self = self_close_pending(ctx);
+    if unread > 0 && !already_continued && !closing_self {
         let reason = format!(
             "You have {unread} unread hub message(s) from other Mulpex instances. Call \
              mcp__mulpex__hub_inbox to read them before finishing — a peer may be \
@@ -620,7 +623,21 @@ fn stop(ctx: &Ctx) -> anyhow::Result<()> {
     // is how the app tells "turn over, only background work left" from a turn in
     // progress, which rewrites the status (`crate::only_background_work`).
     set_background_flag(ctx, busy);
+    // The turn that called `hub_close` on itself is over: hand the row to the
+    // app to close. Not while it waits on a question to the user (`needs`) —
+    // that turn ends later, after the answer. Background work does not hold it
+    // open: the instance asked to go, and the close takes those tasks with it.
+    if closing_self && status != "needs" {
+        let _ = std::fs::write(crate::closeself_path(&ctx.state_dir, ctx.instance), "ready");
+    }
     Ok(())
+}
+
+/// `closeself/<id>` says `pending`: this instance called `hub_close` on itself
+/// during the turn now ending. → `crate::CLOSESELF_DIR`
+fn self_close_pending(ctx: &Ctx) -> bool {
+    std::fs::read_to_string(crate::closeself_path(&ctx.state_dir, ctx.instance))
+        .is_ok_and(|w| w.trim() == "pending")
 }
 
 /// `PreToolUse[AskUserQuestion]`: the instance stopped to ask the user
@@ -1806,6 +1823,11 @@ fn userpromptsubmit(ctx: &Ctx) -> anyhow::Result<()> {
                     // reader is the only side that knows whether the row is
                     // muted, and the mark is consumed either way.
                     let _ = std::fs::write(crate::user_prompt_path(&ctx.state_dir, ctx.instance), "");
+                    // The user talking to an instance that asked to close itself
+                    // (and has not been closed yet — e.g. they interrupted that
+                    // turn, so no `Stop` fired) wants it alive. Peer mail does
+                    // not cancel it; only this branch knows the turn is theirs.
+                    let _ = std::fs::remove_file(crate::closeself_path(&ctx.state_dir, ctx.instance));
                 }
                 // The restart wake. Swallow it unless ⌘⇧R asked for it — see
                 // `orphaned_task_wake` for why this is the whole bug. A Claude

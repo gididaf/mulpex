@@ -1669,6 +1669,43 @@ impl Core {
         changed
     }
 
+    /// Close the instances that asked to close THEMSELVES and whose calling turn
+    /// has ended (`closeself/<id>` = `ready`, written by `hook::stop`). Same
+    /// `Core::close` as ⌘W and `hub_close`, so locks release and unread mail
+    /// bounces; the next `reap_dead` removes the row. A `pending` mark is left
+    /// alone (that turn is still running), and a row ⌘S holds is never closed
+    /// from here. Returns whether anything was closed.
+    pub fn process_self_closes(&mut self) -> bool {
+        let dir = self.state_dir.join(mulpex_core::CLOSESELF_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        let mut closed = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = path.file_name().and_then(|s| s.to_str()).and_then(|s| s.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let open = self.sessions.iter().any(|s| s.id == id && !s.is_shell());
+            if !open || self.closing.contains(&id) {
+                // Gone already (or never an agent row): the mark means nothing.
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if !std::fs::read_to_string(&path).is_ok_and(|w| w.trim() == "ready") {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+            if self.saving.contains(&id) {
+                continue;
+            }
+            self.close(id);
+            closed = true;
+        }
+        closed
+    }
+
     /// The label the sidebar shows for a row: the real name if there is one,
     /// otherwise the provisional one. See `fallback_names` for why the two are
     /// separate maps rather than one.
@@ -2193,6 +2230,8 @@ impl Core {
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         // A compact request was for the old process's conversation turn.
         let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        // So was a pending self-close: a restarted row stays open.
+        let _ = std::fs::remove_file(mulpex_core::closeself_path(&self.state_dir, id));
         // A codex's "has a thread, hooks work" mark and its wake ledger describe
         // the old process too; the new one earns its own (`wake.rs`).
         let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
@@ -2522,6 +2561,7 @@ impl Core {
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::closeself_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::transcript_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::wake_ack_path(&self.state_dir, id));
@@ -2557,6 +2597,7 @@ impl Core {
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::ctx_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::compactreq_path(&self.state_dir, id));
+        let _ = std::fs::remove_file(mulpex_core::closeself_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::agentready_path(&self.state_dir, id));
         let _ = std::fs::remove_file(mulpex_core::wake_ack_path(&self.state_dir, id));
     }
@@ -7016,6 +7057,42 @@ mod tests {
             core.reap_dead();
             !core.sessions.iter().any(|s| s.id == idle || s.id == busy)
         }));
+
+        core.teardown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `hub_close` on yourself, the app's half: a `pending` mark (the calling
+    /// turn still running) is left alone, a `ready` one (the `Stop` hook saw that
+    /// turn end) closes the row like ⌘W, and a mark for a row that is not open
+    /// is just cleaned up.
+    #[test]
+    fn self_close_waits_for_ready_then_closes_the_row() {
+        let (_env, root, mut core) = scratch_core("self-close-test");
+        let me = core.spawn_instance().unwrap().id;
+        let other = core.spawn_instance().unwrap().id;
+        let state_dir = core.state_dir.clone();
+        let mark = |id: usize, word: &str| {
+            let p = mulpex_core::closeself_path(&state_dir, id);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, word).unwrap();
+        };
+
+        mark(me, "pending");
+        mark(999, "ready");
+        assert!(!core.process_self_closes(), "pending must not close anything");
+        assert!(core.sessions.iter().any(|s| s.id == me && s.is_alive()));
+        assert!(mulpex_core::closeself_path(&core.state_dir, me).exists(), "pending is kept");
+        assert!(!mulpex_core::closeself_path(&core.state_dir, 999).exists(), "a stale mark is cleaned");
+
+        mark(me, "ready");
+        assert!(core.process_self_closes());
+        assert!(!mulpex_core::closeself_path(&core.state_dir, me).exists(), "the mark is consumed");
+        assert!(wait_until(|| {
+            core.reap_dead();
+            !core.sessions.iter().any(|s| s.id == me)
+        }));
+        assert!(core.sessions.iter().any(|s| s.id == other && s.is_alive()), "only the caller goes");
 
         core.teardown();
         let _ = std::fs::remove_dir_all(&root);

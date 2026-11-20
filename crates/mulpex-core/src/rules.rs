@@ -66,8 +66,9 @@ spawning only as many as the work genuinely needs.\n\
 inverse of hub_spawn. Clean up after fanning work out: once a worker has reported and gone idle, \
 close it rather than leaving a dead row for the user to tidy by hand. Pass to: \"40\", \
 \"claude#40\", or an array to close several. An instance that is mid-turn is REFUSED rather than \
-killed under its task — wait for it, or pass force: true if you mean to interrupt it. You cannot \
-close YOURSELF (the call would never return), and you cannot close a row in another project. \
+killed under its task — wait for it, or pass force: true if you mean to interrupt it. You may \
+close YOURSELF (to: \"self\") when the user asked you to wrap up: your row closes when this turn \
+ends, so hub_send any report and finish your reply first. You cannot close a row in another project. \
 Terminals are not instances: hub_terminal_close closes those.\n\
 - mcp__mulpex__hub_board — the project's Board in Mulpex (the user may call it \"the board\", \
 \"todo\", \"TODO\", \"my list\" or \"the list\"): columns the user defines, with cards assigned to \
@@ -585,7 +586,7 @@ mod tests {
         );
     }
 
-    const CLAUDE_RULES_FNV: &str = "cddb72572c560459";
+    const CLAUDE_RULES_FNV: &str = "929e6e55bea8899c";
 
     #[test]
     fn codex_rules_drop_claude_only_tools_and_explain_the_ring() {

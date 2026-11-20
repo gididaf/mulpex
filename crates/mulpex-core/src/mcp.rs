@@ -203,12 +203,12 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "hub_close",
-            "description": "Close Claude instances in this project and remove their sidebar rows — the inverse of hub_spawn. Use it to clean up after fanning work out: once a worker has reported its result and gone idle, close it rather than leaving a dead row behind for the user to tidy. Only instances in YOUR OWN project can be closed, never one in another project, and never yourself. An instance that is mid-turn is REFUSED rather than killed under its own task — wait for it to go idle, or pass force: true if you genuinely mean to interrupt it. Closing releases the instance's file locks, and any mail it never read is bounced back to whoever sent it. Terminals are not instances: close those with hub_terminal_close. The reply lists what was closed and, for anything refused, why.",
+            "description": "Close Claude instances in this project and remove their sidebar rows — the inverse of hub_spawn. Use it to clean up after fanning work out: once a worker has reported its result and gone idle, close it rather than leaving a dead row behind for the user to tidy. Only instances in YOUR OWN project can be closed, never one in another project. You may close YOURSELF (to: \"self\" or your own number) when the user asked you to wrap up: nothing happens mid-turn — your row closes once this turn ends, so send any report (hub_send) and finish your reply first; it is not undone by later mail. An instance that is mid-turn is REFUSED rather than killed under its own task — wait for it to go idle, or pass force: true if you genuinely mean to interrupt it. Closing releases the instance's file locks, and any mail it never read is bounced back to whoever sent it. Terminals are not instances: close those with hub_terminal_close. The reply lists what was closed and, for anything refused, why.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "to": {
-                        "description": "Which instance(s) to close, in THIS project: the number (\"40\"), the address (\"claude#40\"), or an array of either to close several at once. \"all\" is not accepted — name the instances you mean.",
+                        "description": "Which instance(s) to close, in THIS project: the number (\"40\"), the address (\"claude#40\"), \"self\" for yourself, or an array of any of these to close several at once. \"all\" is not accepted — name the instances you mean.",
                     },
                     "force": {
                         "type": "boolean",
@@ -1381,16 +1381,41 @@ struct Delivery {
 /// whole call rather than being reported per id: nothing was closed, and the fix
 /// is to write a different argument.
 ///
-/// **Self-close is refused rather than deferred.** Killing the caller means this
-/// MCP call never returns — the instance is gone before it can say what it did,
-/// and whatever it was mid-way through reporting is lost with it. An orchestrator
-/// closes its workers; a worker that has reported is closed by whoever spawned it.
+/// **Self-close is deferred, never immediate.** Killing the caller inside the
+/// call means it never returns — the instance is gone before it can say what it
+/// did. So naming yourself only writes `closeself/<id>` = `pending`; `hook::stop`
+/// turns it `ready` when this turn really ends idle, and the app's poll loop then
+/// closes the row (`Core::process_self_closes`). Written here, not by the app,
+/// because no live state can refuse it: the caller is by definition alive and
+/// mid-turn, which is exactly what the busy check would reject.
 fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
-    let ids = close_targets(ctx, args)?;
+    let CloseTargets { ids, close_self } = close_targets(ctx, args)?;
     let force = args
         .get("force")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
+    // Scheduled only once the rest of the call has succeeded (below), so a call
+    // that returns an error never leaves a close pending behind it.
+    let schedule_self = || -> Result<(), String> {
+        let path = crate::closeself_path(&ctx.state_dir, ctx.instance);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&path, "pending").map_err(|e| format!("could not schedule closing yourself: {e}"))
+    };
+    const SELF_NOTE: &str = "You will be closed when this turn ends — your row goes away, \
+        your locks release and unread mail bounces back to its senders. Nothing else happens \
+        mid-turn, so finish what you are doing: hub_send any report first, then end your reply.";
+    if ids.is_empty() {
+        schedule_self()?;
+        return Ok(json!({
+            "ok": true,
+            "closed": [],
+            "closing_self": true,
+            "note": SELF_NOTE,
+        })
+        .to_string());
+    }
     let reply = app_request(
         ctx,
         json!({ "op": "close_instance", "from": ctx.instance, "ids": ids, "force": force }),
@@ -1408,8 +1433,9 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
         .unwrap_or_default();
 
     // Nothing closed is a failed call, not a partial success — the caller asked
-    // for rows to go away and none did.
-    if closed.is_empty() {
+    // for rows to go away and none did. (Unless one of them was itself, which
+    // is now scheduled.)
+    if closed.is_empty() && !close_self {
         let why = refused
             .iter()
             .filter_map(|r| r.get("reason").and_then(|x| x.as_str()))
@@ -1435,13 +1461,20 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
             closed.len() + refused.len()
         )
     };
-    Ok(json!({
+    if close_self {
+        schedule_self()?;
+    }
+    let note = if close_self { format!("{note} {SELF_NOTE}") } else { note };
+    let mut out = json!({
         "ok": refused.is_empty(),
         "closed": closed,
         "refused": refused,
         "note": note,
-    })
-    .to_string())
+    });
+    if close_self {
+        out["closing_self"] = json!(true);
+    }
+    Ok(out.to_string())
 }
 
 /// `hub_board` — forwarded whole to the app, which owns the board (`board.rs`
@@ -1471,7 +1504,7 @@ fn hub_board(ctx: &Ctx, args: &Value) -> Result<String, String> {
 /// which matters, because every one of them exists to make sure nothing is queued
 /// at all. A request file written on the way to a refusal would be applied later
 /// by a poll loop that never sees any of this reasoning.
-fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
+fn close_targets(ctx: &Ctx, args: &Value) -> Result<CloseTargets, String> {
     const HELP: &str = "Give an instance in THIS project: \"40\", \"claude#40\", or an array of \
                         either.";
     let raw: Vec<String> = match args.get("to") {
@@ -1494,7 +1527,12 @@ fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
     }
 
     let mut ids: Vec<usize> = Vec::new();
+    let mut close_self = false;
     for one in &raw {
+        if matches!(one.to_ascii_lowercase().as_str(), "self" | "me" | "myself") {
+            close_self = true;
+            continue;
+        }
         match registry::parse_address(one)? {
             Address::LocalAll => {
                 return Err(
@@ -1511,14 +1549,9 @@ fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
                      instance over there to close it, with hub_send."
                 ))
             }
-            Address::Local(id) if id == ctx.instance => {
-                return Err(format!(
-                    "{} is YOU, and an instance cannot close itself: this call would \
-                     never return and whatever you were about to report would be lost. Finish \
-                     your turn and let whoever spawned you close you.",
-                    crate::addr(&ctx.state_dir, id)
-                ))
-            }
+            // Yourself: not asked of the app now — `hub_close` defers it to the
+            // end of this turn (`CLOSESELF_DIR`).
+            Address::Local(id) if id == ctx.instance => close_self = true,
             // Dedup: "40" and "claude#40" are one row, and asking Mulpex to close
             // it twice would report the second attempt as "no claude#40 is open".
             Address::Local(id) => {
@@ -1528,7 +1561,15 @@ fn close_targets(ctx: &Ctx, args: &Value) -> Result<Vec<usize>, String> {
             }
         }
     }
-    Ok(ids)
+    Ok(CloseTargets { ids, close_self })
+}
+
+/// What `hub_close`'s `to` resolved to: other rows to ask Mulpex about now, and
+/// whether the caller named itself (closed when its turn ends).
+#[derive(Debug, PartialEq)]
+struct CloseTargets {
+    ids: Vec<usize>,
+    close_self: bool,
 }
 
 /// One `to` entry as text. A model writes an instance number as a JSON number as
@@ -3358,24 +3399,57 @@ mod tests {
     /// get back some rows gone and some not, with no way to tell which attempt
     /// the error belonged to.
     #[test]
-    fn hub_close_refuses_self_all_and_other_projects() {
+    fn hub_close_refuses_all_and_other_projects() {
         let dir = std::env::temp_dir().join(format!("mulpex-close-{}", new_uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = test_ctx(&dir, 3);
         let err = |to: Value| close_targets(&ctx, &json!({ "to": to })).unwrap_err();
 
-        assert!(err(json!("claude#3")).contains("cannot close itself"));
-        // A model writes an id as a bare number as often as a string, and both
-        // name the same row — so both must hit the same refusal.
-        assert!(err(json!(3)).contains("cannot close itself"));
         assert!(err(json!("all")).contains("not accepted"));
         assert!(err(json!("central-one#3")).contains("ANOTHER project"));
         assert!(err(json!("term#4")).contains("terminal"));
         assert!(err(json!({})).contains("not an address"));
         assert!(close_targets(&ctx, &json!({})).unwrap_err().contains("missing 'to'"));
-        // One bad entry fails the batch rather than closing the good ones.
-        assert!(err(json!(["4", "claude#3"])).contains("cannot close itself"));
+        // One bad entry fails the batch rather than closing the good ones —
+        // including scheduling yourself.
+        assert!(err(json!(["self", "central-one#4"])).contains("ANOTHER project"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Naming yourself — by "self", the address, or a bare number — is a
+    /// deferred self-close, kept apart from the rows Mulpex is asked about now.
+    #[test]
+    fn hub_close_names_yourself_every_way() {
+        let dir = std::env::temp_dir().join(format!("mulpex-close-self-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let t = |to: Value| close_targets(&ctx, &json!({ "to": to })).unwrap();
+        let me = CloseTargets { ids: vec![], close_self: true };
+        assert_eq!(t(json!("self")), me);
+        assert_eq!(t(json!("Self")), me);
+        assert_eq!(t(json!("claude#3")), me);
+        assert_eq!(t(json!(3)), me);
+        assert_eq!(t(json!(["5", "self", 6, "3"])), CloseTargets { ids: vec![5, 6], close_self: true });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole helper side of a self-close: it never asks the app (so no
+    /// request file waits for a poll loop), it writes `closeself/<id>` =
+    /// `pending`, and it answers at once.
+    #[test]
+    fn hub_close_self_schedules_without_asking_the_app() {
+        let dir = std::env::temp_dir().join(format!("mulpex-close-self2-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 3);
+        let out: Value = serde_json::from_str(&hub_close(&ctx, &json!({ "to": "self" })).unwrap()).unwrap();
+        assert_eq!(out["closing_self"], json!(true));
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(
+            std::fs::read_to_string(crate::closeself_path(&dir, 3)).unwrap(),
+            "pending"
+        );
+        assert!(!dir.join("termreq").exists(), "a self-close must not queue an app request");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3387,9 +3461,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mulpex-close-dedup-{}", new_uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = test_ctx(&dir, 1);
-        let ids = close_targets(&ctx, &json!({ "to": ["40", "claude#40", 41] })).unwrap();
+        let ids = close_targets(&ctx, &json!({ "to": ["40", "claude#40", 41] })).unwrap().ids;
         assert_eq!(ids, vec![40, 41]);
-        assert_eq!(close_targets(&ctx, &json!({ "to": 40 })).unwrap(), vec![40]);
+        assert_eq!(close_targets(&ctx, &json!({ "to": 40 })).unwrap().ids, vec![40]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

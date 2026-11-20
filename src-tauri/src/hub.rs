@@ -117,6 +117,9 @@ pub fn start(app: AppHandle) {
                 // (an empty dir read) and it changes `session_infos`, so the diff
                 // below is what actually repaints the row.
                 core.process_name_requests();
+                // hub_close on yourself: rows whose calling turn has ended.
+                // Closes like ⌘W; the next tick's reap removes the row.
+                core.process_self_closes();
                 // ⌘M is undone by the user simply talking to the row again. Same
                 // shape as the name requests above: an empty dir read per tick,
                 // and the session diff below is what redraws the sidebar.

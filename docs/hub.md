@@ -718,10 +718,31 @@ description of what rides it. The `mpx` daemon reads the same dir and applies th
   batch into a tool error, where nothing the caller asked for happened. Five workers must still
   close when the sixth is mid-turn.
 
-**Self-close is refused, not deferred.** Killing the caller means the MCP call never returns: the
-instance is gone before it can say what it did, and whatever it was mid-way through reporting goes
-with it. An orchestrator closes its workers; a worker that has reported is closed by whoever
-spawned it.
+**Self-close is deferred to the end of the calling turn** (since 2026-11-20; it was refused
+before). The user asks a worker to "wrap yourself up when done", and needing a second claude to do
+it was the friction. Killing the caller inside the call is still wrong — the MCP call would never
+return and whatever it was about to say would be lost — so naming yourself (`"self"`, `"me"`, your
+number or address; alone or in a list with others) only schedules it:
+
+- **`hub_close` (helper) writes `closeself/<id>` = `pending`** and answers at once. No app request:
+  nothing about live state can refuse it (the caller is by definition mid-turn, which is exactly
+  what the busy check rejects). In a mixed list it is written only after the app answered for the
+  others, so a call that errors never leaves a hidden close behind.
+- **`hook::stop` turns it `ready`** when that turn really ends — and skips the unread-mail block
+  while a close is pending (unread mail bounces to its senders on close, the user's chosen rule).
+  Not on a codex turn that ends asking the user (`needs`); that turn ends after the answer.
+  Background work does not hold it open: the instance asked to go, and the close takes it along.
+- **`Core::process_self_closes` (poll loop)** closes a `ready` row through `Core::close` — the ⌘W
+  path — skipping a row ⌘S holds, and drops marks for rows that are not open.
+- **A real user prompt cancels it** (`userpromptsubmit`, the branch that knows the turn is the
+  user's): if they interrupted that turn (no `Stop`) and then talk to it, they want it alive. Peer
+  mail does not cancel. A ⌘⇧R restart and `forget_*_files` clear the mark too.
+
+No sidebar indicator for the pending state — the row just goes once the turn ends. Measured: a real
+`claude -p` (Haiku) calling `hub_close {to: "self"}` through the real helper left `closeself/3` =
+`ready` after its turn; the app half is `state::self_close_waits_for_ready_then_closes_the_row`
+(real PTY sessions); the helper half `mcp::hub_close_names_yourself_every_way` and
+`mcp::hub_close_self_schedules_without_asking_the_app`.
 
 **Busy is `mulpex_core::close_busy_reason`, shared by both frontends** — a policy about when it is
 safe to kill someone's work must not exist in two copies that can drift. It checks the **delivery
@@ -738,7 +759,7 @@ undelivered mail bounces back to its senders, and `closing` is what makes the ki
 *removable* by the next reap rather than kept as a failed start. Nothing prunes the store on
 either frontend: both derive it from the live session list every tick.
 
-Pinned by `mcp::hub_close_refuses_self_all_and_other_projects`,
+Pinned by `mcp::hub_close_refuses_all_and_other_projects`,
 `mcp::hub_close_dedups_the_same_instance_written_two_ways`,
 `a_spawn_still_in_flight_is_busy_even_though_it_looks_idle` (the `waiting`-vs-in-flight case that
 motivates the check order) and `state::close_instance_closes_idle_claudes_and_refuses_the_rest`,

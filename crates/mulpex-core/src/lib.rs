@@ -255,6 +255,20 @@ pub fn compactreq_path(state_dir: &std::path::Path, id: usize) -> std::path::Pat
     state_dir.join(COMPACTREQ_DIR).join(id.to_string())
 }
 
+/// `closeself/<id>` = that instance asked to close ITSELF (`hub_close` naming its
+/// own row). One word: `pending` (written by the helper's `hub_close`; the turn
+/// that called it is still running), `ready` (written by `hook::stop` once that
+/// turn really ended idle). The app closes a `ready` row on its next poll tick
+/// (`Core::process_self_closes`) — the same `Core::close` ⌘W takes. Deferred
+/// to the turn's end because killing the caller inside the call would lose its
+/// reply and whatever it was about to say.
+pub const CLOSESELF_DIR: &str = "closeself";
+
+/// `closeself/<id>` for one instance.
+pub fn closeself_path(state_dir: &std::path::Path, id: usize) -> std::path::PathBuf {
+    state_dir.join(CLOSESELF_DIR).join(id.to_string())
+}
+
 /// `compacting/<id>` for one instance — the hook's own PreCompact→SessionStart
 /// flag (`hook::precompact`). The app reads it to tell a compaction that ran from
 /// one Claude Code refused.
