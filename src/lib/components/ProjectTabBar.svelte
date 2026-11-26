@@ -9,6 +9,7 @@
   import { activeHost, activeHostOnline, hosts } from "../hosts";
   import HostSwitcher from "./HostSwitcher.svelte";
   import { boards, proposalCount } from "../board";
+  import { questions, countIn } from "../questions";
 
   let {
     onselect,
@@ -115,6 +116,7 @@
     {@const ready = readyCount(p)}
     {@const needs = needsCount(p)}
     {@const props = proposalCount($boards.get(p.handle))}
+    {@const qs = countIn($questions, p.handle)}
     <div
       class="tab"
       class:active={p.handle === $activeProjectHandle}
@@ -157,6 +159,14 @@
               : ''} you"
           >
             {needs}
+          </span>
+        {/if}
+        {#if qs > 0}
+          <span
+            class="badge qs"
+            title="{qs} async question{qs === 1 ? '' : 's'} waiting for your answer"
+          >
+            ?{qs}
           </span>
         {/if}
         {#if props > 0}
@@ -268,6 +278,11 @@
   .badge.board {
     background: var(--accent);
     color: var(--bg);
+  }
+  .badge.qs {
+    background: color-mix(in srgb, var(--dot-needs) 25%, transparent);
+    color: var(--dot-needs);
+    box-shadow: inset 0 0 0 1px var(--dot-needs);
   }
   .badge.needs {
     background: var(--dot-needs);

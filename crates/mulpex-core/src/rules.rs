@@ -241,7 +241,18 @@ identify ALL potential assumptions your plan/implementation would rely on (about
 scope, file/library choices, edge cases, expected behavior). Use the AskUserQuestion tool to \
 verify those assumptions with the user FIRST, so the resulting plan or implementation is \
 perfectly aligned with their requirements — aim for zero unverified assumptions. Do not silently \
-pick a default on anything that could reasonably go more than one way; ask.";
+pick a default on anything that could reasonably go more than one way; ask.
+ASYNC QUESTIONS — AskUserQuestion normally blocks you until the user answers. When a question \
+does NOT block everything (you have other work that does not depend on its answer), ask it \
+asynchronously instead: call AskUserQuestion exactly as usual and add metadata: {\"source\": \
+\"async\"}. Mulpex shows it to the user as a card, and you get back \"Queued as async question \
+qN\" at once (it is shown like a hook error — it is not one, and not a refusal). Continue ONLY \
+with work that does not depend on the answer; never assume an answer or build on a guessed one. \
+The answer arrives later as a hub message from Mulpex beginning \"[async qN]\". Change an open \
+question with mcp__mulpex__hub_question_edit, withdraw one you no longer need with \
+mcp__mulpex__hub_question_cancel. If you run out of independent work while answers are still \
+open, end your turn saying which question you are waiting on — the answer wakes you. Without the \
+flag AskUserQuestion stays blocking: use that whenever the answer decides what you do next.";
 
 /// A task another instance handed this one at spawn (`hub_spawn`): who assigned it
 /// and the work to do. When present, the fresh session's one-shot injected prompt
@@ -586,7 +597,7 @@ mod tests {
         );
     }
 
-    const CLAUDE_RULES_FNV: &str = "929e6e55bea8899c";
+    const CLAUDE_RULES_FNV: &str = "a055527d9069d37a";
 
     #[test]
     fn codex_rules_drop_claude_only_tools_and_explain_the_ring() {

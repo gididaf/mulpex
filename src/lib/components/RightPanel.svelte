@@ -1,6 +1,6 @@
 <script lang="ts">
-  // The side panel (⌘⇧L): a column right of the terminal with three fixed tabs,
-  // Board · Pins · Explain. The Board is the project's; Pins and Explain show the
+  // The side panel (⌘⇧L): a column right of the terminal with four fixed tabs,
+  // Board · Questions · Pins · Explain. The Board is the project's; Pins and Explain show the
   // focused instance's content. Tabs never close — only the panel hides.
   //
   // A real column, so the terminal narrows instead of being covered. That
@@ -16,6 +16,8 @@
   import BoardTab from "./BoardTab.svelte";
   import PinsTab from "./PinsTab.svelte";
   import ExplainTab from "./ExplainTab.svelte";
+  import QuestionsTab from "./QuestionsTab.svelte";
+  import { questions, countIn } from "../questions";
 
   /** The row the panel shares with the terminal, to turn a drag into a fraction. */
   let { row }: { row: HTMLElement | undefined } = $props();
@@ -26,11 +28,13 @@
   /** Cards a claude changed since the user last opened them, plus column
    *  proposals waiting for an answer. */
   const boardCount = $derived(h != null ? unreadCount($boards.get(h)) + proposalCount($boards.get(h)) : 0);
+  const qCount = $derived(h != null ? countIn($questions, h) : 0);
   const pinCount = $derived(h != null && id != null ? ($pins.get(pinKey(h, id))?.length ?? 0) : 0);
   const ex = $derived(h != null && id != null ? $explains.get(explainKey(h, id)) : undefined);
 
   const TABS: { tab: PanelTab; label: string }[] = [
     { tab: "board", label: "Board" },
+    { tab: "questions", label: "Questions" },
     { tab: "pins", label: "Pins" },
     { tab: "explain", label: "Explain" },
   ];
@@ -93,6 +97,7 @@
         >
           {t.label}
           {#if t.tab === "board" && boardCount}<span class="count" title="Cards a claude updated since you last opened them, and column changes waiting for you">{boardCount}</span>{/if}
+          {#if t.tab === "questions" && qCount}<span class="count q" title="Open async questions in this project">{qCount}</span>{/if}
           {#if t.tab === "pins" && pinCount}<span class="count dim">{pinCount}</span>{/if}
           {#if t.tab === "explain" && ex}<span class="dot" class:live={isStreaming(ex)}></span>{/if}
         </button>
@@ -103,6 +108,8 @@
   <div class="body">
     {#if $rightPanel.tab === "board"}
       <BoardTab />
+    {:else if $rightPanel.tab === "questions"}
+      <QuestionsTab />
     {:else if $rightPanel.tab === "pins"}
       <PinsTab />
     {:else}
@@ -189,6 +196,10 @@
     font-size: 0.7rem;
     line-height: 1.1rem;
     text-align: center;
+  }
+  .count.q {
+    background: var(--dot-needs);
+    color: #2a0a0d;
   }
   .count.dim {
     background: var(--border);

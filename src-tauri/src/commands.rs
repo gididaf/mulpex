@@ -345,6 +345,47 @@ pub fn board_archived(state: State<AppState>, project_handle: ProjectHandle, off
     }
 }
 
+/// Every open async question in the project (`mulpex_core::questions`).
+/// `questions-changed` follows any change from the poll loop.
+#[tauri::command]
+pub fn questions_get(state: State<AppState>, project_handle: ProjectHandle) -> serde_json::Value {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.questions_view(),
+        None => serde_json::Value::Array(vec![]),
+    }
+}
+
+/// Submit a card: `answers` is index-aligned with its questions, each
+/// `{picks: [labels], other?: text, notes?: text}`.
+#[tauri::command]
+pub fn question_answer(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    qid: String,
+    rev: u32,
+    answers: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.question_answer(id, &qid, rev, &answers),
+        None => Err("that project is closed".into()),
+    }
+}
+
+/// Close a card unanswered; the claude is told to use its own judgment.
+#[tauri::command]
+pub fn question_dismiss(
+    state: State<AppState>,
+    project_handle: ProjectHandle,
+    id: usize,
+    qid: String,
+) -> Result<(), String> {
+    match state.ws.lock().unwrap().project(project_handle) {
+        Some(core) => core.question_dismiss(id, &qid),
+        None => Err("that project is closed".into()),
+    }
+}
+
 /// The user's edit to the board. Returns the board as it now stands;
 /// `board-changed` follows from the poll loop, which is what reaches a remote
 /// desktop and the phone.

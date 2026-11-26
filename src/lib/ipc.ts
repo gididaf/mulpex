@@ -450,6 +450,38 @@ export type BoardEdit =
   | { op: "approve"; proposal: number }
   | { op: "reject"; proposal: number; reason: string };
 
+/** One option of an async question — AskUserQuestion's own shape. */
+export interface QOption {
+  label: string;
+  description?: string;
+  preview?: string;
+}
+export interface QItem {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: QOption[];
+}
+/** An open async question card (`mulpex_core::questions::Card`). */
+export interface QCard {
+  qid: string;
+  instance: number;
+  ts: number;
+  rev: number;
+  questions: QItem[];
+}
+export interface QAnswer {
+  picks: string[];
+  other?: string;
+  notes?: string;
+}
+
+export const questionsGet = (projectHandle: ProjectHandle) => call<QCard[]>("questions_get", { projectHandle });
+export const questionAnswer = (projectHandle: ProjectHandle, id: number, qid: string, rev: number, answers: QAnswer[]) =>
+  call<void>("question_answer", { projectHandle, id, qid, rev, answers });
+export const questionDismiss = (projectHandle: ProjectHandle, id: number, qid: string) =>
+  call<void>("question_dismiss", { projectHandle, id, qid });
+
 export const boardGet = (projectHandle: ProjectHandle) => call<Board | null>("board_get", { projectHandle });
 /** One page of the archive, newest archived first. */
 export const boardArchived = (projectHandle: ProjectHandle, offset: number, limit: number) =>

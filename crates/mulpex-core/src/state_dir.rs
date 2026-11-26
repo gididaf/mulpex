@@ -93,6 +93,7 @@ pub fn write_state_dir(state_dir: &Path, helper_path: &Path) -> std::io::Result<
         "terminals",
         "terminals/cursors",
         "termreq",
+        crate::questions::QUESTIONS_DIR,
     ] {
         std::fs::create_dir_all(state_dir.join(sub))?;
     }

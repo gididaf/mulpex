@@ -907,6 +907,35 @@ by the user). Comments always count. The outbox is **saved in the board file**, 
 - **Every change marks the store dirty**; the poll loop emits `board-changed {handle}` (forwarded
   to remote desktops) and bumps `board_rev` in the phone's view.
 
+## Async questions (AskUserQuestion with `metadata.source: "async"`)
+
+The real AskUserQuestion blocks claude until the user answers. A claude that has other work not
+depending on the answer calls it **exactly as usual** plus `metadata: {"source": "async"}` (an
+existing optional field of the tool's schema). Using the real tool rather than a new MCP one is
+the point: the model is trained on its 1–4 questions / 2–4 options shape and fills it well.
+
+- **The hook** (`hook.rs::askq` → `queue_async_question`): flagged → card file
+  `questions/<id>/<qid>.json` (`mulpex_core::questions`, qids `q1, q2…` unique per project via
+  `create_new` on `questions/ids/<qid>`), **no** `dialog/` file, **no** `needs`, and
+  `permissionDecision: "deny"` with `questions::queued_reason`. Claude Code shows it as
+  `PreToolUse:AskUserQuestion hook error: Queued as async question qN…`, which is why the reason
+  (and `PLANNING_RULES`) say twice that it is not an error or a refusal. Unflagged, or a payload that
+  fails `questions::validate` → the old path, the real dialog opens.
+- **The rule** lives in `PLANNING_RULES` (`ASYNC QUESTIONS —`), not `HUB_RULES`: codex has its own
+  planning rules and must never read "AskUserQuestion".
+- **Edit / cancel**: `hub_question_edit(id, questions)` and `hub_question_cancel(id)` are done by the
+  helper on the file directly (no `app_request`); only the owner instance can touch its card. Edit
+  bumps `rev`.
+- **The app**: the poll loop compares `questions::signature` (instance, qid, rev) per project and
+  emits `questions-changed {handle}` (forwarded to remote desktops). `question_answer` checks the
+  `rev` the user saw (an edit meanwhile refuses the answer), sends **one** Mulpex message per card in
+  AskUserQuestion's own result wording prefixed `[async qN]`
+  (`questions::answer_message`), then deletes the card. `question_dismiss` sends
+  `questions::dismissed_message` ("use your best judgment, and say what you chose").
+  Cards die with the instance (`forget_session_files`).
+- The answer reaches an idle claude through the normal listener wake. Measured end to end on
+  2026-11-26 (verification-log).
+
 ## Codex instances
 
 A codex is a full hub peer: same MCP server (tool names are `mcp__mulpex__hub_*` there too, but the server gets its `MULPEX_*` through an explicit `env` table — it does not inherit), hooks passed per launch, `codex#N` addresses in the shared number space (`parse_address` accepts it; `hub_instances` reports `agent` and `address`, read from `agents/<id>`). `hub_spawn` takes `agent` (default: the spawner's), `hub_remote_open` takes `agent` (default claude). Codex has no monitors, so the **app** wakes it: `wake.rs` runs `codex queue` and counts a ring only when the codex's UserPromptSubmit hook acks it (`wake/<id>.ack`), shown on the row either way. → [codex.md](codex.md)

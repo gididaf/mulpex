@@ -274,6 +274,29 @@ pub(crate) fn tool_defs() -> Value {
             },
         },
         {
+            "name": "hub_question_edit",
+            "description": "Replace an async question you asked (an AskUserQuestion call with metadata.source \"async\", queued as qN) that the user has not answered yet. Pass its id and the full new `questions` array in AskUserQuestion's own shape (1-4 questions, each with question, header, options of {label, description, preview?}, multiSelect). The user's picks whose option label still exists are kept. Refused if it was already answered, dismissed or cancelled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The question id, e.g. \"q7\"." },
+                    "questions": { "type": "array", "items": { "type": "object" }, "description": "The new questions, same schema as AskUserQuestion's `questions`." },
+                },
+                "required": ["id", "questions"],
+            },
+        },
+        {
+            "name": "hub_question_cancel",
+            "description": "Withdraw an async question you asked (queued as qN) that you no longer need answered. Its card disappears from the user's Questions tab. Refused if it was already answered or dismissed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The question id, e.g. \"q7\"." },
+                },
+                "required": ["id"],
+            },
+        },
+        {
             "name": "hub_reply_broadcast",
             "description": "Answer a question the USER asked every claude at once (Mulpex's \"Ask All Claudes\"). Use it ONLY when a message from Mulpex asks you to, passing the id that message gives — it is the one way to reply to Mulpex (hub_send cannot reach it). Your answer is shown to the user next to every other claude's and summarized, so make it short, self-contained and to the point.",
             "inputSchema": {
@@ -387,6 +410,8 @@ fn call_tool(ctx: &Ctx, params: Option<&Value>) -> Result<String, String> {
         // A claude whose tool list predates the Board.
         "hub_todo" => Err("hub_todo was replaced by the project's Board — use mcp__mulpex__hub_board.".into()),
         "hub_reply_broadcast" => hub_reply_broadcast(ctx, &args),
+        "hub_question_edit" => hub_question_edit(ctx, &args),
+        "hub_question_cancel" => hub_question_cancel(ctx, &args),
         "hub_terminal_open" => hub_terminal_open(ctx, &args),
         "hub_terminal_send" => hub_terminal_send(ctx, &args),
         "hub_terminal_read" => hub_terminal_read(ctx, &args),
@@ -1480,6 +1505,29 @@ fn hub_close(ctx: &Ctx, args: &Value) -> Result<String, String> {
 /// `hub_board` — forwarded whole to the app, which owns the board (`board.rs`
 /// in the app) and validates the call; `from` is always this instance, so
 /// every change is stamped with who made it.
+/// `hub_question_edit`: the helper rewrites the card itself (`questions.rs`);
+/// the app's poll loop sees the bumped `rev`.
+fn hub_question_edit(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let id = question_id(args)?;
+    let questions = args.get("questions").cloned().ok_or("missing `questions`")?;
+    let card = crate::questions::edit(&ctx.state_dir, ctx.instance, &id, questions)?;
+    Ok(json!({ "ok": true, "id": card.qid, "rev": card.rev }).to_string())
+}
+
+fn hub_question_cancel(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let id = question_id(args)?;
+    crate::questions::cancel(&ctx.state_dir, ctx.instance, &id)?;
+    Ok(json!({ "ok": true, "id": id, "cancelled": true }).to_string())
+}
+
+fn question_id(args: &Value) -> Result<String, String> {
+    let id = args.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("missing or bad `id` (e.g. \"q7\")".into());
+    }
+    Ok(id.to_string())
+}
+
 fn hub_board(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
     if action.is_empty() {

@@ -21,6 +21,7 @@ pub mod hook;
 pub mod listen;
 pub mod mcp;
 pub mod persist;
+pub mod questions;
 pub mod registry;
 pub mod remote;
 pub mod rules;

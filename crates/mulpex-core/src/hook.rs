@@ -647,9 +647,31 @@ fn self_close_pending(ctx: &Ctx) -> bool {
 fn askq(ctx: &Ctx) -> anyhow::Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    if let Some(reason) = queue_async_question(ctx, &input) {
+        emit("deny", Some(&reason), None);
+        return Ok(());
+    }
     write_dialog(ctx, &input);
     write_needs(ctx);
     Ok(())
+}
+
+/// An AskUserQuestion flagged `metadata.source: "async"` becomes a card
+/// (`questions.rs`) instead of a dialog: no `dialog/` file, no `needs`, and the
+/// tool is denied with a reason the model reads as "queued, keep going".
+/// Measured on claude 2.1.332 (docs/verification-log.md): the deny stops the
+/// dialog under `--dangerously-skip-permissions` and the model carries on.
+/// `None` = not async (or unsaveable), so the real dialog opens as before.
+fn queue_async_question(ctx: &Ctx, payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let input = v.get("tool_input")?;
+    if !crate::questions::is_async(input) {
+        return None;
+    }
+    let questions = input.get("questions")?.clone();
+    crate::questions::validate(&questions).ok()?;
+    let card = crate::questions::create(&ctx.state_dir, ctx.instance, questions).ok()?;
+    Some(crate::questions::queued_reason(&card.qid))
 }
 
 /// Keep what the dialog asks (`dialog/<id>.json`), so Remote Control can offer
@@ -2423,6 +2445,28 @@ mod tests {
             state_dir,
             agent: Agent::Claude,
         }
+    }
+
+    #[test]
+    fn an_async_askq_becomes_a_card_and_a_flagless_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("mulpex-askq-{}", crate::persist::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = test_ctx(&dir, 4);
+        let qs = r#"[{"question":"Which?","header":"H","multiSelect":false,"options":[{"label":"A","description":""},{"label":"B","description":""}]}]"#;
+        let plain = format!(r#"{{"tool_name":"AskUserQuestion","tool_input":{{"questions":{qs}}}}}"#);
+        assert!(queue_async_question(&ctx, &plain).is_none());
+        let flagged = format!(
+            r#"{{"tool_name":"AskUserQuestion","tool_input":{{"questions":{qs},"metadata":{{"source":"async"}}}}}}"#
+        );
+        let reason = queue_async_question(&ctx, &flagged).expect("queued");
+        assert!(reason.starts_with("Queued as async question q1"), "{reason}");
+        let cards = crate::questions::list(&dir);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].instance, 4);
+        // Async never touches the dialog or the status word.
+        assert!(!crate::dialog_path(&dir, 4).exists());
+        assert!(!dir.join("4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn codex_ctx(dir: &Path, instance: usize) -> Ctx {

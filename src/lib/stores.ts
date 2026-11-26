@@ -45,6 +45,9 @@ export interface ProjectState {
   tasks: Map<number, string>;
   hub: HubSnapshot | null;
   activeSessionId: number | null;
+  /** id → open async questions (`questions.ts`). A row with any waits on the
+   *  user, so it counts in the red badge like `needs`. */
+  qopen?: Map<number, number>;
 }
 
 /** All open projects, keyed by handle in tab order. */
@@ -371,7 +374,10 @@ export function needsCount(p: ProjectState): number {
   return p.sessions.filter(
     (s) =>
       !s.muted &&
-      (p.statuses.get(s.id) === "needs" || wakeStuck(p.wake?.get(s.id)) || !!p.deaf?.has(s.id)),
+      (p.statuses.get(s.id) === "needs" ||
+        wakeStuck(p.wake?.get(s.id)) ||
+        !!p.deaf?.has(s.id) ||
+        (p.qopen?.get(s.id) ?? 0) > 0),
   ).length;
 }
 

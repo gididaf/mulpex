@@ -2556,6 +2556,8 @@ impl Core {
     fn forget_session_files(&self, id: usize) {
         let _ = std::fs::remove_file(self.state_dir.join(id.to_string()));
         let _ = std::fs::remove_file(self.state_dir.join("tasks").join(id.to_string()));
+        // Async questions die with the instance that asked them.
+        mulpex_core::questions::forget_instance(&self.state_dir, id);
         // The transcript this id was writing to. Left behind, a recycled number
         // would adopt the dead instance's conversation on its first tick.
         let _ = std::fs::remove_file(mulpex_core::session_id_path(&self.state_dir, id));
@@ -2757,6 +2759,58 @@ impl Core {
     }
 
     /// The board as the panel draws it, plus the claudes a message is waiting for.
+/// Every open async question (`mulpex_core::questions`) in this project.
+    pub fn questions_view(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            mulpex_core::questions::list(&self.state_dir)
+                .iter()
+                .map(|c| c.to_json())
+                .collect(),
+        )
+    }
+
+    /// What the poll loop compares to know the Questions tab must reload.
+    pub fn questions_signature(&self) -> Vec<(usize, String, u32)> {
+        mulpex_core::questions::signature(&self.state_dir)
+    }
+
+    /// The user answered card `qid` of instance `id`: one hub message in
+    /// AskUserQuestion's own result wording, then the card goes. `rev` is the
+    /// version the user answered — an edit that landed meanwhile refuses the
+    /// answer, so nobody answers a question they never saw.
+    pub fn question_answer(
+        &self,
+        id: usize,
+        qid: &str,
+        rev: u32,
+        answers: &[serde_json::Value],
+    ) -> Result<(), String> {
+        let card = mulpex_core::questions::read(&self.state_dir, id, qid)
+            .ok_or("that question is no longer open")?;
+        if card.rev != rev {
+            return Err("claude changed this question meanwhile — check it again".into());
+        }
+        let answers: Vec<_> = answers
+            .iter()
+            .map(mulpex_core::questions::Answer::from_json)
+            .collect();
+        let body = mulpex_core::questions::answer_message(&card, &answers);
+        self.send_app_message(id, &body)
+            .ok_or("could not deliver the answer")?;
+        mulpex_core::questions::remove(&self.state_dir, id, qid);
+        Ok(())
+    }
+
+    /// The user closed card `qid` without answering.
+    pub fn question_dismiss(&self, id: usize, qid: &str) -> Result<(), String> {
+        if !mulpex_core::questions::remove(&self.state_dir, id, qid) {
+            return Err("that question is no longer open".into());
+        }
+        self.send_app_message(id, &mulpex_core::questions::dismissed_message(qid))
+            .ok_or("could not tell the claude")?;
+        Ok(())
+    }
+
     pub fn board_view(&self) -> serde_json::Value {
         let mut v = self.board.with(|b| {
             let mut v = serde_json::to_value(b.without_archive()).unwrap_or_default();
@@ -4641,6 +4695,44 @@ mod tests {
         )
         .unwrap();
         (root, core)
+    }
+
+    /// An async question card answered from the panel becomes one Mulpex hub
+    /// message in AskUserQuestion's own wording, and the card goes; an answer
+    /// to an outdated `rev` is refused; a dismiss tells the claude so.
+    #[test]
+    fn async_questions_answer_and_dismiss() {
+        let (_g, root, core) = scratch_core("asyncq");
+        let qs = serde_json::json!([{"question":"Which color?","header":"Color","multiSelect":true,
+            "options":[{"label":"Red","description":""},{"label":"Blue","description":""}]}]);
+        let a = mulpex_core::questions::create(&core.state_dir, 3, qs.clone()).unwrap();
+        let b = mulpex_core::questions::create(&core.state_dir, 3, qs.clone()).unwrap();
+        assert_eq!(core.questions_view().as_array().unwrap().len(), 2);
+        mulpex_core::questions::edit(&core.state_dir, 3, &a.qid, qs).unwrap();
+        let ans = vec![serde_json::json!({"picks":["Red","Blue"],"other":"Green","notes":"bright"})];
+        assert!(core.question_answer(3, &a.qid, 1, &ans).is_err(), "rev 1 was edited to rev 2");
+        core.question_answer(3, &a.qid, 2, &ans).unwrap();
+        assert!(core.question_answer(3, &a.qid, 2, &ans).is_err(), "answered once only");
+        core.question_dismiss(3, &b.qid).unwrap();
+        assert!(core.questions_view().as_array().unwrap().is_empty());
+        let mut bodies: Vec<(u64, String)> = std::fs::read_dir(core.state_dir.join("inbox").join("3"))
+            .unwrap()
+            .flatten()
+            .map(|f| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(f.path()).unwrap()).unwrap();
+                assert_eq!(v["from_app"], true);
+                (v["ts"].as_u64().unwrap_or(0), v["body"].as_str().unwrap().to_string())
+            })
+            .collect();
+        bodies.sort();
+        let all = bodies.iter().map(|b| b.1.clone()).collect::<Vec<_>>().join("\n");
+        assert!(all.contains(&format!(
+            "[async {}] Your questions have been answered: \"Which color?\"=\"Red, Blue, Green\" (user notes: bright).",
+            a.qid
+        )), "{all}");
+        assert!(all.contains(&format!("[async {}] Question {} was dismissed", b.qid, b.qid)), "{all}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `hub_board` is refused while the board is off; on, a claude's call lands

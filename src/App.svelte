@@ -112,6 +112,7 @@
   import { addPin, dropPins, loadPins, reloadPins } from "./lib/pins";
   import { openPanel, togglePanel, toggleTab } from "./lib/rightPanel";
   import { boards, dropBoard, loadBoard, setBoardOn, takeDrop } from "./lib/board";
+  import { dropQuestions, loadQuestions } from "./lib/questions";
   import { autoCompactTick, dropCompact, toggleCompact } from "./lib/compact";
   import { applyExplainProgress, dropExplains, startExplain } from "./lib/explain";
   import { initAttention } from "./lib/attention";
@@ -179,6 +180,7 @@
     });
     void loadPins(info.handle);
     void loadBoard(info.handle);
+    void loadQuestions(info.handle, true);
     await tick(); // let TerminalView children mount + create their terminals
     const snap = await getHubSnapshot(info.handle).catch(() => null);
     if (snap) applyHubFor(info.handle, snap);
@@ -236,6 +238,7 @@
     terminals.disposeProject(handle);
     dropPins(handle);
     dropBoard(handle);
+    dropQuestions(handle);
     dropExplains(handle);
     removeProject(handle);
   }
@@ -1821,6 +1824,7 @@
       listen<SessionExitedEvent>("pins-changed", (e) => void reloadPins(e.payload.handle, e.payload.id)),
       // The Board changed — by a claude, a remote desktop, the phone, or a message delivered.
       listen<{ handle: ProjectHandle }>("board-changed", (e) => void loadBoard(e.payload.handle)),
+      listen<{ handle: ProjectHandle }>("questions-changed", (e) => void loadQuestions(e.payload.handle)),
       // A remote desktop opened, closed or reordered a project here.
       listen<WorkspaceInfo>("projects-changed", (e) => void applyWorkspace(0, e.payload)),
       // A remote desktop starting to mirror one of this Mulpex's panes.

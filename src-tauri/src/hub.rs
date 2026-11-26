@@ -34,6 +34,8 @@ pub fn start(app: AppHandle) {
         // sidebar. It also closes a standing gap: a rename or a mute changed the
         // backend and emitted nothing.
         let mut last_sessions: HashMap<ProjectHandle, Vec<SessionInfo>> = HashMap::new();
+        // Async questions (`questions/`): `(instance, qid, rev)` per project.
+        let mut last_questions: HashMap<ProjectHandle, Vec<(usize, String, u32)>> = HashMap::new();
         // When a lost daemon could not be replaced, so the retry waits a little
         // instead of trying (and logging) five times a second.
         let mut recover_after: Option<std::time::Instant> = None;
@@ -87,6 +89,7 @@ pub fn start(app: AppHandle) {
             // Boards that changed this tick, by whoever: a claude's `hub_board`,
             // a desktop/phone edit, a delivered message.
             let mut boards_changed: Vec<ProjectHandle> = Vec::new();
+            let mut questions_changed: Vec<ProjectHandle> = Vec::new();
             // Codex rows with no thread yet, whose wake line the window types.
             let mut wakes: Vec<CodexWake> = Vec::new();
             // What every project publishes about itself to the others. This loop
@@ -178,6 +181,11 @@ pub fn start(app: AppHandle) {
                 if core.board.take_dirty() {
                     boards_changed.push(core.handle);
                 }
+                let qsig = core.questions_signature();
+                if last_questions.get(&core.handle) != Some(&qsig) {
+                    questions_changed.push(core.handle);
+                    last_questions.insert(core.handle, qsig);
+                }
                 batch.push((core.handle, removed, snap, sessions));
             }
             drop(ws);
@@ -197,6 +205,9 @@ pub fn start(app: AppHandle) {
             }
             for handle in boards_changed {
                 let _ = app.emit("board-changed", serde_json::json!({ "handle": handle }));
+            }
+            for handle in questions_changed {
+                let _ = app.emit("questions-changed", serde_json::json!({ "handle": handle }));
             }
             for (handle, removed, snap, sessions) in batch {
                 for id in &removed {
@@ -225,6 +236,7 @@ pub fn start(app: AppHandle) {
             }
             // Forget closed projects so their handles don't linger in the map.
             last.retain(|h, _| live.contains(h));
+            last_questions.retain(|h, _| live.contains(h));
         }
     });
 }

@@ -129,6 +129,9 @@
   /** What a parent row shows about its family: how many rows it has, and —
    *  when folded — whether any of them is waiting on you, since that row is
    *  out of sight. Muted rows are silent here as everywhere. */
+  /** Open async questions of row `id` (questions.ts). */
+  const qopen = (id: number): number => $activeProject?.qopen?.get(id) ?? 0;
+
   function familyOf(id: number): { count: number; needs: boolean } {
     const kids = descendantsOf($sessions, id);
     return {
@@ -139,7 +142,8 @@
           !k.failed &&
           ($statuses.get(k.id) === "needs" ||
             wakeStuck($activeProject?.wake?.get(k.id)) ||
-            !!$activeProject?.deaf?.has(k.id)),
+            !!$activeProject?.deaf?.has(k.id) ||
+            qopen(k.id) > 0),
       ),
     };
   }
@@ -459,6 +463,15 @@
               onclick={() => openPanel("board")}>▦ {s.board_open}{#if s.board_unread}<span class="pdot"></span>{/if}</span
             >
           {/if}
+          {#if !shell && qopen(s.id)}
+            <!-- Async questions this claude is waiting on (questions.ts). -->
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
+              class="todos qs"
+              title="{qopen(s.id)} async question(s) waiting for your answer"
+              onclick={() => openPanel("questions")}>? {qopen(s.id)}</span
+            >
+          {/if}
           {#if !shell && s.outdated && !s.failed}
             <!-- Started on an older build's hub rules/tools (spawnprint.rs).
                  Its own click: restarting must not also select the row. -->
@@ -753,6 +766,11 @@
     font-size: 0.68rem;
     line-height: 1.05rem;
     cursor: pointer;
+  }
+  .todos.qs {
+    background: var(--dot-needs, #e5534b);
+    color: #fff;
+    font-weight: 700;
   }
   .todos.urgent {
     background: var(--dot-needs, #e5534b);

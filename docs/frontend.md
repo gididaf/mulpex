@@ -514,6 +514,21 @@ The round lives in `lib/broadcast.ts`, not in the popup:
 **Shortcut:** ⌘⇧B is declared in the menu and claimed in `onGlobalKey`, like ⌘⇧K. The backend is
 in [hub.md](hub.md).
 
+## Questions tab (async AskUserQuestion)
+
+The side panel's second tab (`QuestionsTab.svelte`, `QuestionCard.svelte`, `lib/questions.ts`)
+lists every open async question in the active project, grouped by claude, the focused one first.
+A card is the real dialog drawn in HTML: radio / checkboxes, an inline "Type something." row (typing selects it; single-answer: it and an option exclude each other; multi: both count), a preview pane beside the
+options when any option has a `preview`, per-question notes, one Submit (enabled once every
+question has an answer) and Dismiss. Each question picks its own direction (Hebrew → RTL). Unsent
+picks are kept in memory per card (`draftFor`) and survive switching; when claude edits the card
+(`rev`), picks whose label still exists stay.
+
+Attention: `ProjectState.qopen` (id → open cards) is filled by `loadQuestions`; a row with any
+counts in `needsCount` (red tab badge, dock badge) and in its parent's family dot, and the row shows
+a red `? N` pill that opens the tab. The project tab shows `?N`. A new card from the claude you are
+looking at opens the panel on the Questions tab. Backend: docs/hub.md "Async questions".
+
 ## Hub panel is Messages only
 
 `HubPanel.svelte` renders **Messages** and nothing else. It used to show **Waiting** and **Locks**

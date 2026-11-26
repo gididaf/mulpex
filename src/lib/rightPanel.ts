@@ -1,5 +1,5 @@
-// The side panel: one column right of the terminal with three fixed tabs —
-// To Do · Pins · Explain. Tabs never close; only the whole panel shows or
+// The side panel: one column right of the terminal with four fixed tabs —
+// Board · Questions · Pins · Explain. Tabs never close; only the whole panel shows or
 // hides (⌘⇧L, or the ✕ in its header).
 //
 // One switch for the whole app, not per instance: every PTY shares one
@@ -9,7 +9,7 @@
 
 import { writable } from "svelte/store";
 
-export type PanelTab = "board" | "pins" | "explain";
+export type PanelTab = "board" | "questions" | "pins" | "explain";
 
 export interface RightPanel {
   open: boolean;
@@ -24,7 +24,7 @@ export const PANEL_MIN_FRAC = 0.15;
 export const PANEL_MAX_FRAC = 0.6;
 export const clampFrac = (f: number) => Math.min(PANEL_MAX_FRAC, Math.max(PANEL_MIN_FRAC, f));
 
-const TABS: PanelTab[] = ["board", "pins", "explain"];
+const TABS: PanelTab[] = ["board", "questions", "pins", "explain"];
 
 function load(): RightPanel {
   const def: RightPanel = { open: false, frac: 0.3, tab: "board" };

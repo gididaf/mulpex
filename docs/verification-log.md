@@ -2777,3 +2777,25 @@ Measured on the fix, hidden-window app (`target/headless`), home `~/.mulpex-dev-
   (the old ones exited on their own).
 - **Not measured**: the remote-desktop path (a Mac driving a host whose daemon dies) — the event is
   forwarded with its `slot` (code only); a project whose `Core::open` fails during recovery.
+
+## 2026-11-26 — async AskUserQuestion via a PreToolUse deny (docs/hub.md)
+
+Real `claude` 2.1.332 on a tmux PTY, scrubbed env, isolated `CLAUDE_CONFIG_DIR`,
+`--dangerously-skip-permissions`.
+
+- **`metadata` reaches the hook.** A probe hook logged `tool_input` =
+  `{"questions":[…],"metadata":{"source":"async"}}` — the model sets the field when asked.
+- **A deny stops the dialog under skip-permissions.** `permissionDecision:"deny"` + reason: no dialog,
+  the model got `PreToolUse:AskUserQuestion hook error: <reason>` as the result, carried on with the
+  rest of the prompt and said it was waiting on q1.
+- **End to end with the real helper** (settings/mcp/plugin from a live scratch dir, helper path swapped
+  to the worktree's release build, the `ASYNC QUESTIONS` paragraph appended). Prompt named no flag
+  ("ask me which language… must not hold up the README"): the model flagged it async **on its own**,
+  wrote README.md, held hello.sh, ended its turn waiting (status `waiting`, no `dialog/` file).
+  `hub_question_edit` added an option (`rev` 2). A Mulpex-format inbox message woke the idle claude via
+  the plugin listener and it wrote hello.sh in the answered language. Cancel (q2) and a dismissal (q3)
+  behaved as worded.
+- **Not measured**: the app's own `question_answer` writing to a live claude (unit-tested in
+  `state.rs::async_questions_answer_and_dismiss`, same `send_app_message` as every app message); the
+  panel inside the real Tauri window (DOM-tested headless with a mocked backend).
+
